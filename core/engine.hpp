@@ -733,6 +733,14 @@ public:
     // [S,D] buffer.  The generation loop must not run the legacy HC collapse
     // a second time for that result.
     bool qwen4exp_full_graph_output_ready = false;
+    // Graph-native MTP. Set before the Qwen4Exp graph is built: the decode and
+    // prefill graphs then also read back the wide pre-head residual (D * HC per
+    // token), which the draft consumes. Decode overwrites qwen4exp_wide_out with
+    // one token; prefill appends one row per prompt token to qwen4exp_wide_prompt
+    // (cleared when a prefill starts at position 0).
+    bool qwen4exp_wide_export = false;
+    std::vector<float> qwen4exp_wide_out;
+    std::vector<float> qwen4exp_wide_prompt;
     // Generic completion flag for graph families without historical per-family flags.
     bool full_graph_output_ready = false;
     // Set after model-family detection when Qwen full-graph decode is the
@@ -750,6 +758,8 @@ public:
     bool cuda_moe_graph_device_expert_trailing = false;
     std::string cuda_moe_layered_fallback_reason;
     uint64_t full_graph_decode_runs = 0;
+    uint64_t full_graph_decode_run_ns = 0;
+    uint64_t full_graph_prefill_runs = 0;
     uint64_t layered_moe_s1_forwards = 0;
     uint64_t legacy_moe_s1_expert_dispatches = 0;
     // The Qwen full decode graph may also produce the next-token logits in
@@ -922,6 +932,9 @@ public:
     // accidentally enable MTP for Qwen/DeepSeek.
     bool mtp_enabled = false;
     int mtp_draft_tokens = 3;
+    // Graph-native Qwen4Exp MTP (EngineConfig::mtp_graph). Implies
+    // qwen4exp_wide_export so the full graph publishes the draft's inputs.
+    bool mtp_graph_native = false;
 
     // Set from EngineConfig::cpu_offload_max_experts at startup (main.cpp).
     // 0 = off (default). See that field's own extensive comment

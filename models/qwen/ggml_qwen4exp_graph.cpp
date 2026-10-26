@@ -163,8 +163,11 @@ bool qwen4exp_full_graph_sync_state_to_host(StreamingEngine &engine) {
   return true;
 }
 
+void qwen4exp_full_graph_state_shutdown();  // checkpoint pool (graph_checkpoint.cpp)
+
 void qwen4exp_full_graph_shutdown() {
   zeromoe::graphcfg::log_consulted("qwen4exp-full-graph");
+  qwen4exp_full_graph_state_shutdown();
   // Explicit, EARLY teardown (before the CUDA driver itself starts
   // shutting down) is why this function exists at all -- see g_graph's
   // own destroy()'s comment. The two Phase 2 suffix globals are exactly
@@ -324,8 +327,11 @@ int qwen4exp_full_graph_suggested_batch() { return qwen4exp_graph::g_qwen4exp_su
 
 bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
                                  const int *token_ids) {
-  if (!env_enabled() || S <= 1 || pos_base < 0 ||
-      engine.family_ops.family != ModelFamily::Qwen4Exp)
+  const bool supported_family =
+      engine.family_ops.family == ModelFamily::Qwen4Exp ||
+      engine.family_ops.family == ModelFamily::Qwen;
+  if (!full_graph_enabled_for_engine(engine) || !supported_family || S <= 1 ||
+      pos_base < 0)
     return false;
   // A batch after the first continues the previous batch of the same prompt (recurrent state, dense KV rows, PLE window
   // are in the engine). The paths with their own per-layer machinery are not continued.
@@ -456,7 +462,7 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   g->S = S;
   g->pos_base = pos_base;
   g->D = c.hidden;
-  g->HC = c.hc_mult;
+  g->HC = engine.family_ops.family == ModelFamily::Qwen ? 1 : c.hc_mult;
   g->n_layers = c.n_layers;
   g->H = c.n_heads;
   g->Hkv = std::max(1, c.n_head_kv);
@@ -468,9 +474,16 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   g->value_dim = c.ssm_inner_size;
   g->conv_dim = 2 * g->key_dim + g->value_dim;
   g->d_conv = c.ssm_conv_kernel;
-  g->device_expert_layers =
-      std::min(qwen4exp_full_graph_device_expert_layers(), c.n_layers);
-  g->device_expert_trailing = env_device_expert_trailing();
+  if (engine.family_ops.family == ModelFamily::Qwen) {
+    g->device_expert_layers = std::clamp(
+        engine.cuda_moe_graph_device_expert_layers, 0, c.n_layers);
+    g->device_expert_trailing =
+        engine.cuda_moe_graph_device_expert_trailing;
+  } else {
+    g->device_expert_layers =
+        std::min(qwen4exp_full_graph_device_expert_layers(), c.n_layers);
+    g->device_expert_trailing = env_device_expert_trailing();
+  }
   const char *partial_gate_up =
       zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_PARTIAL_GATE_UP");
   // partial_gate_up's boundary math (layer==device_expert_layers, the
@@ -826,5 +839,9 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &, float *, int,
   return false;
 }
 void qwen4exp_full_graph_shutdown() {}
+bool qwen4exp_full_graph_state_save(StreamingEngine &, int &) { return false; }
+bool qwen4exp_full_graph_state_restore(StreamingEngine &, int) { return false; }
+void qwen4exp_full_graph_state_release(int) {}
+size_t qwen4exp_full_graph_state_bytes(StreamingEngine &) { return 0; }
 
 #endif

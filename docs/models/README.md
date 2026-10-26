@@ -12,6 +12,7 @@ decode throughput, peak memory, and the selected strategy**.
 | Model | Family (GGUF arch) | Quant | Decode band (tok/s) | Starter profile | Model notes |
 |---|---|---|---|---|---|
 | Qwen 3.8 Flash | `Qwen4Exp` (`qwen4exp`) | Q2_0 | 39 – 43 | [`qwen38-flash.toml`](../../configs/qwen38-flash.toml) | [`qwen38-flash.md`](qwen38-flash.md) |
+| Qwen3.6 35B-A3B | `Qwen` (`qwen35moe`) | UD-IQ2_M | 115.1 – 115.4 | [`qwen36_35b_a3b_iq2m_5060_tg400.toml`](../../configs/bench/qwen36_35b_a3b_iq2m_5060_tg400.toml) | [`qwen36-35b-a3b.md`](qwen36-35b-a3b.md) |
 | GLM 5.3 Flash | `GLM5NEXT` (`glm5next`) | AJ-IQ2_XXS | 6.5 – 8.5 | [`glm53-flash.toml`](../../configs/glm53-flash.toml) | [`glm53-flash.md`](glm53-flash.md) |
 | Ling 3.1 Flash | `BailingMoE3` (`bailingmoe3`) | AD-IQ1_S | 9.0 – 11.5 | [`ling31-flash.toml`](../../configs/ling31-flash.toml) | [`ling31-flash.md`](ling31-flash.md) |
 | DeepSeek 4.1 Flash | `DeepSeek_V41` (`deepseek41`) | Q2_K | 1.8 – 3.2 | [`deepseek41-flash.toml`](../../configs/deepseek41-flash.toml) | [`deepseek41-flash.md`](deepseek41-flash.md) |
@@ -34,6 +35,10 @@ manually-edited fork silently drops this hook and disables the CPU lane**, see t
 
 The consolidated measurements and benchmark-only profiles are in
 [`configs/bench/perf-baselines.md`](../../configs/bench/perf-baselines.md).
+
+## In progress
+
+None. Qwen3.6-35B-A3B has passed full-graph execution, teacher-forced parity, and the decode performance gates; it is listed with the accepted model profiles above.
 
 The bands are deliberately wide (≈±15 %) because the models are **not bit-deterministic** under
 near-tie routing and single-run decode spread is real (e.g. Qwen 24.6–28.7 tok/s). A regression is

@@ -67,23 +67,50 @@ std::expected<void, std::string> EngineRunner::apply_graph_tuning() {
 
 std::expected<void, std::string>
 EngineRunner::resolve_cuda_moe_graph_policy() {
-  if (!engine.cuda_moe_graph_policy_applies)
-    return {};
-
+  const bool cpu_only = config.cpu_only || std::getenv("ZEROMOE_CPU_ONLY");
+  const bool cuda_moe = !cpu_only && !gpu.topology.devices.empty() &&
+                        engine.model_file.architecture_config.n_experts > 0;
+  engine.cuda_moe_graph_policy_applies = cuda_moe;
   const FullGraphModel *model = engine.family_ops.graph_model;
   if (!model) {
+    if (!cuda_moe)
+      return {};
+    const auto arch_it = engine.model_file.kv_string.find("general.architecture");
+    const std::string architecture =
+        arch_it == engine.model_file.kv_string.end() ? "unknown"
+                                                     : arch_it->second;
     return std::unexpected(
-        "CUDA MoE graph policy lost its FullGraphModel adapter after planning");
+        "CUDA MoE architecture '" + architecture +
+        "' has no registered FullGraphModel adapter; layered CUDA decode is not a supported onboarding path");
   }
+  if (!cuda_moe)
+    return {};
 
-  const GraphMemoryPlan plan = model->decode_memory_plan(engine);
-  engine.cuda_moe_graph_memory_plan =
-      plan.fit == GraphMemoryFit::Fits
-          ? "fits"
-          : plan.fit == GraphMemoryFit::Insufficient ? "insufficient" : "unknown";
-  engine.cuda_moe_graph_device_expert_layers = plan.device_expert_layers;
-  engine.cuda_moe_graph_device_expert_trailing =
-      plan.device_expert_trailing;
+  const GraphMemoryPlan plan = model->plan_decode_memory(engine);
+  switch (plan.fit) {
+  case GraphMemoryFit::Fits:
+    engine.cuda_moe_graph_memory_plan = "fits";
+    break;
+  case GraphMemoryFit::Insufficient:
+    engine.cuda_moe_graph_memory_plan = "insufficient";
+    break;
+  case GraphMemoryFit::Unsupported:
+    engine.cuda_moe_graph_memory_plan = "unsupported";
+    if (plan.reason.empty())
+      return std::unexpected(std::string(model->name()) +
+                             " planner rejected the model topology without a reason");
+    return std::unexpected(std::string(model->name()) +
+                           " does not support this model topology: " +
+                           plan.reason);
+  case GraphMemoryFit::Unknown:
+    engine.cuda_moe_graph_memory_plan = "unknown";
+    break;
+  }
+  if (plan.device_expert_layers >= 0) {
+    engine.cuda_moe_graph_device_expert_layers = plan.device_expert_layers;
+    engine.cuda_moe_graph_device_expert_trailing =
+        plan.device_expert_trailing;
+  }
 
   if (plan.fit == GraphMemoryFit::Insufficient) {
     if (plan.reason.empty() || plan.required_device_bytes == 0 ||
@@ -134,6 +161,8 @@ std::expected<void, std::string> EngineRunner::run() {
     return result;
   if (auto result = load_model(); !result)
     return result;
+  if (auto result = resolve_cuda_moe_graph_policy(); !result)
+    return result;
   if (auto result = apply_graph_tuning(); !result)
     return result;
   if (auto result = resolve_cuda_moe_graph_policy(); !result)
@@ -152,8 +181,9 @@ std::expected<void, std::string> EngineRunner::run() {
     return result;
   if (auto result = start_workers(); !result)
     return result;
-  if (auto result = run_repl(); !result)
-    return result;
+  auto serve_result = config.serve_api ? run_api() : run_repl();
+  if (!serve_result)
+    request_failure = serve_result.error();
   if (auto result = shutdown_and_report(); !result)
     return result;
   return {};
@@ -313,6 +343,8 @@ std::expected<void, std::string> EngineRunner::apply_engine_config() {
   engine.glm5next_moe_prefill_gpu = config.glm5next_moe_prefill_gpu;
   engine.glm5next_dense_prefill_fusion = config.glm5next_dense_prefill_fusion;
   engine.mtp_enabled = config.mtp_enabled;
+  engine.mtp_graph_native = config.mtp_graph && config.mtp_enabled;
+  engine.qwen4exp_wide_export = engine.mtp_graph_native;
   engine.mtp_draft_tokens = config.mtp_draft_tokens;
   engine.prompt_cache = config.prompt_cache;
   return {};

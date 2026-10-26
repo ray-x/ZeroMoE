@@ -4,6 +4,7 @@
 // declarations live in ggml_qwen4exp_graph_internal.hpp.
 
 #include "ggml_qwen4exp_graph_internal.hpp"
+#include "tensor_trace.hpp"
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
 
@@ -13,14 +14,17 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
                                     float *hidden_states, int pos_base,
                                     const int *token_ids, float *logits,
                                     int vocab) {
-  if (!qwen4exp_full_graph_decode_enabled() || !hidden_states || pos_base < 0 ||
+  if (!full_graph_decode_enabled_for_engine(engine) || !hidden_states ||
+      pos_base < 0 ||
       !g_graph || !g_graph->ready || !g_graph->decode_mode ||
       g_graph->engine != &engine || g_graph->S != 1 ||
       pos_base >= g_graph->kv_capacity ||
       ((logits == nullptr) != (vocab <= 0)))
     return false;
   FullGraph &g = *g_graph;
-  if (engine.hc_stream_buf.size() < static_cast<size_t>(g.D) * g.HC)
+  const bool standard_qwen = engine.family_ops.family == ModelFamily::Qwen;
+  if (!standard_qwen &&
+      engine.hc_stream_buf.size() < static_cast<size_t>(g.D) * g.HC)
     return false;
   if (has_ple_layer(engine.model_file.architecture_config) &&
       (!g.ple_embedding || !token_ids))
@@ -32,9 +36,20 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
   if (logits && (!g.logits || ggml_nelements(g.logits) < vocab))
     return false;
 
-  std::memcpy(g.input->data, engine.hc_stream_buf.data(),
+  const float *graph_input = standard_qwen
+                                 ? hidden_states
+                                 : engine.hc_stream_buf.data();
+  std::memcpy(g.input->data, graph_input,
               static_cast<size_t>(g.D) * g.HC * sizeof(float));
-  static_cast<int32_t *>(g.positions->data)[0] = pos_base;
+  auto *positions = static_cast<int32_t *>(g.positions->data);
+  if (g.position_ids_per_token == 4) {
+    positions[0] = pos_base;
+    positions[1] = pos_base;
+    positions[2] = pos_base;
+    positions[3] = 0;
+  } else {
+    positions[0] = pos_base;
+  }
   auto *mask = static_cast<ggml_fp16_t *>(g.attn_mask->data);
   for (int k = 0; k < g.kv_capacity; ++k)
     mask[k] = ggml_fp32_to_fp16(k <= pos_base ? 0.0f : -INFINITY);
@@ -345,8 +360,18 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
     g.stage_slots.clear();
     g.stage_slot = nullptr;
   }
-  ggml_backend_tensor_get(g.output, hidden_states, 0,
-                          static_cast<size_t>(g.D) * sizeof(float));
+  // Standard Qwen's full decode graph also computes and returns next-token
+  // logits. The host hidden row is not consumed by the next step (the next
+  // token embedding replaces it), and reading it back adds a synchronous
+  // device-to-host transfer every token. Preserve it for graph modes whose
+  // host path consumes hidden states, speculative decoding, or diagnostics.
+  const bool need_host_hidden =
+      !standard_qwen || !logits || engine.mtp_enabled ||
+      trace_gate("HIDDEN") ||
+      zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP");
+  if (need_host_hidden)
+    ggml_backend_tensor_get(g.output, hidden_states, 0,
+                            static_cast<size_t>(g.D) * sizeof(float));
   if (g.stage_enabled) {
     double l1 = 0.0;
     bool finite = true;
@@ -362,6 +387,18 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
   if (logits) {
     ggml_backend_tensor_get(g.logits, logits, 0,
                             static_cast<size_t>(vocab) * sizeof(float));
+  }
+  if (engine.qwen4exp_wide_export && !standard_qwen) {
+    const size_t wide_n = static_cast<size_t>(g.D) * g.HC;
+    if (!g.final_streams || !ggml_is_contiguous(g.final_streams) ||
+        static_cast<size_t>(ggml_nelements(g.final_streams)) != wide_n) {
+      LOG_ERROR("[QWEN-MTP-EXPORT] decode graph has no contiguous wide "
+                "residual of %zu floats\n", wide_n);
+      return false;
+    }
+    engine.qwen4exp_wide_out.resize(wide_n);
+    ggml_backend_tensor_get(g.final_streams, engine.qwen4exp_wide_out.data(), 0,
+                            wide_n * sizeof(float));
   }
   g.decode_last_pos = pos_base;
   g.decode_host_state_dirty = env_prefill_state_handoff_enabled();
@@ -447,11 +484,13 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
 bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
                              int S, int pos_base, const int *token_ids) {
   // Prefill-only while recurrent and dense KV state writeback is validated.
-  if (!env_enabled() || !hidden_states || S <= 1 || pos_base < 0 || !g_graph ||
+  if (!full_graph_enabled_for_engine(engine) || !hidden_states || S <= 1 ||
+      pos_base < 0 || !g_graph ||
       !g_graph->ready || g_graph->engine != &engine || g_graph->S != S ||
       g_graph->pos_base != pos_base || g_graph->decode_mode)
     return false;
   FullGraph &g = *g_graph;
+  const bool standard_qwen = engine.family_ops.family == ModelFamily::Qwen;
   const auto reset_host_recurrent_state = [&]() {
     for (auto &history : engine.qwen4exp_conv_history)
       std::fill(history.begin(), history.end(), 0.0f);
@@ -465,9 +504,15 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
     return false;
   };
   if (engine.qwen4exp_full_graph_logits_target && g.logits &&
-      engine.qwen4exp_full_graph_logits_target_size <
-          ggml_nelements(g.logits))
-    return fail("prefill logits destination is too small");
+      engine.qwen4exp_full_graph_logits_target_size < g.logits->ne[0]) {
+    LOG_ERROR("[GGML-QWEN-FULL] prefill logits shape mismatch: target=%d "
+              "graph=[%lld,%lld] model_vocab=%d\n",
+              engine.qwen4exp_full_graph_logits_target_size,
+              static_cast<long long>(g.logits->ne[0]),
+              static_cast<long long>(g.logits->ne[1]),
+              engine.model_file.architecture_config.vocab);
+    return fail("prefill last-token logits destination too small");
+  }
   LOG_INFO(
       "[GGML-QWEN-FULL] execute candidate S=%d gdn=%zu kv=%zu ple_layer=%d\n",
       S, g.gdn_layers.size(), g.kv_layers.size(), g.ple_layer);
@@ -530,10 +575,14 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
   } else if (has_ple_layer(engine.model_file.architecture_config)) {
     return fail("PLE graph input is missing");
   }
+  const float *prefill_input =
+      standard_qwen ? hidden_states : engine.hc_stream_buf.data();
   if (g.host_inputs.empty() ||
-      engine.hc_stream_buf.size() < static_cast<size_t>(g.D) * g.HC * S)
-    return fail("expanded HC input is missing or too small");
-  std::memcpy(g.host_inputs[0], engine.hc_stream_buf.data(),
+      (!standard_qwen &&
+       engine.hc_stream_buf.size() < static_cast<size_t>(g.D) * g.HC * S))
+    return fail(standard_qwen ? "standard Qwen prefill input is missing"
+                              : "expanded HC input is missing or too small");
+  std::memcpy(g.host_inputs[0], prefill_input,
               static_cast<size_t>(g.D) * g.HC * S * sizeof(float));
 
   // Real-hardware incident (2026-09-09, GLM5NEXT side): a 480-token prompt
@@ -577,10 +626,36 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
   const auto t_sync_end = std::chrono::steady_clock::now();
   ggml_backend_tensor_get(g.output, hidden_states, 0,
                           static_cast<size_t>(g.D) * S * sizeof(float));
+  if (engine.qwen4exp_wide_export &&
+      engine.family_ops.family != ModelFamily::Qwen) {
+    const size_t wide_n = static_cast<size_t>(g.D) * g.HC * S;
+    if (!g.final_streams || !ggml_is_contiguous(g.final_streams) ||
+        static_cast<size_t>(ggml_nelements(g.final_streams)) != wide_n) {
+      LOG_ERROR("[QWEN-MTP-EXPORT] prefill graph has no contiguous wide "
+                "residual of %zu floats\n", wide_n);
+      return false;
+    }
+    if (pos_base == 0) engine.qwen4exp_wide_prompt.clear();
+    const size_t before = engine.qwen4exp_wide_prompt.size();
+    if (before != static_cast<size_t>(pos_base) * g.D * g.HC) {
+      LOG_ERROR("[QWEN-MTP-EXPORT] prefill batch at pos %d does not continue "
+                "the exported rows (%zu floats held)\n", pos_base, before);
+      return false;
+    }
+    engine.qwen4exp_wide_prompt.resize(before + wide_n);
+    ggml_backend_tensor_get(g.final_streams,
+                            engine.qwen4exp_wide_prompt.data() + before, 0,
+                            wide_n * sizeof(float));
+  }
   if (g.logits && engine.qwen4exp_full_graph_logits_target) {
+    // Standard Qwen builds logits for every prompt row; Qwen4Exp builds them
+    // for the last row only. Read the last column that actually exists.
+    const size_t last_column =
+        static_cast<size_t>(std::max<int64_t>(g.logits->ne[1], 1) - 1);
     ggml_backend_tensor_get(g.logits,
-                            engine.qwen4exp_full_graph_logits_target, 0,
-                            ggml_nbytes(g.logits));
+                            engine.qwen4exp_full_graph_logits_target,
+                            last_column * g.logits->nb[1],
+                            static_cast<size_t>(g.logits->ne[0]) * sizeof(float));
     engine.qwen4exp_full_graph_logits_ready = true;
   }
   // Prefill's own all-layers dump: build_graph() populates

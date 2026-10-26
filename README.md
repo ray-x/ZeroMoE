@@ -36,21 +36,17 @@ ZeroMoE/
 ├── scripts/                       # Build and validation helpers
 ├── patches/                       # ggml patch series
 ├── docs/                          # Design notes and model recipes
-└── api/                           # Optional API gateway (not included in this snapshot)
+└── server/                        # Optional native C++ OpenAI/Anthropic API server
 
 ```
 
 ## Build and Installation Pipeline
 
-For a smaller configuration surface, start with the
-[configuration guide](docs/configuration.md): Release CPU/CUDA build presets,
-normal versus advanced help, canonical graph keys, and legacy compatibility.
-
 ### Linux + CUDA (full engine)
 
 Run the automated setup tool. It validates the required compilers (`g++`,
-`nvcc`) and builds the engine. Optional API dependencies are installed only
-when the API server and its requirements file are present:
+`nvcc`) and builds the engine. Enable the native C++ HTTP server separately
+with `-DZEROMOE_BUILD_SERVER=ON`:
 
 ```bash
 chmod +x setup.sh
@@ -64,10 +60,24 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DZEROMOE_USE_GGML=ON
 cmake --build build -j$(nproc)
 ```
 
+For the smaller configuration surface (Release CPU/CUDA presets, normal versus
+advanced help, canonical `graph_*` keys and legacy compatibility), start with
+the [configuration guide](docs/configuration.md).
+
 AVX-512 VNNI is enabled by default for CPU performance. On a CPU without
 AVX-512 VNNI, compiling with it enabled may cause an illegal-instruction
 failure. Configure with `-DZEROMOE_ENABLE_AVX512_VNNI=OFF` to disable VNNI in
 both ZeroMoE and ggml CPU kernels.
+
+### OpenAI and Anthropic APIs
+
+The optional C++ server exposes Chat Completions and Messages, including SSE,
+Qwen tool calls, cancellation, and bounded request queues. It runs in the engine
+process with one inference owner; no Python gateway is needed.
+
+See [API server](docs/api-server.md) for CPU/CUDA build commands, authentication,
+examples, feature limits, and the experimental opt-in CPU prompt-state cache.
+Native CUDA prompt caching is not yet available for API requests.
 
 Before inference, edit a profile's `model_path` and any related model,
 mirror, expert-store, or usage-profile paths for resources available on your
@@ -114,9 +124,7 @@ cmake --build build -j$(sysctl -n hw.ncpu)
 
 #### ggml-cuda / full-graph decode build
 
-The ggml-backed full-graph prefill/decode path requires linking ggml's CUDA backend.
-The Qwen recipe enables it through engine defaults; legacy
-`ZEROMOE_QWEN4EXP_FULL_GRAPH*` environment overrides remain supported:
+The experimental ggml-backed full-graph prefill/decode path (`ZEROMOE_QWEN4EXP_FULL_GRAPH*` env vars at runtime) requires linking ggml's CUDA backend:
 
 ```bash
 cmake -S . -B build -DZEROMOE_USE_GGML=ON -DZEROMOE_USE_GGML_CUDA=ON
@@ -124,6 +132,15 @@ cmake --build build -j$(nproc)
 ```
 
 `ZEROMOE_ENABLE_CUDA_GRAPHS` (default **ON**) enables ggml's CUDA graph capture/replay for this path. ggml's own default for `GGML_CUDA_GRAPHS` is OFF for any consumer other than llama.cpp itself, so without this, a plain `ZEROMOE_USE_GGML_CUDA=ON` build silently compiles out CUDA graph capture — every decode step then falls back to launching each graph node's kernel individually instead of replaying one captured graph per split. Measured impact on this project's Qwen4Exp full-graph decode: **~20 tok/s with graphs enabled vs. ~8 tok/s silently disabled**, on identical hardware/model/config. Opt out with `-DZEROMOE_ENABLE_CUDA_GRAPHS=OFF` if you need to A/B against the non-graph path.
+
+CUDA architecture selection defaults to automatic detection from
+`nvidia-smi` before any CUDA targets, including ggml-cuda, are configured.
+On a 3090 + 5060 Ti host, the detected list is `86;120a`. Set
+`CUDA_ARCH='86;120a'` for the build scripts or pass
+`-DCMAKE_CUDA_ARCHITECTURES='86;120a'` directly to CMake to override detection.
+For a GPU-less build host, supply the architectures explicitly. Verify that a
+5060 Ti benchmark binary contains `sm_120a`; an `sm_86`-only build is not a
+valid performance comparison.
 
 #### Runtime settings (host-node mode, CPU threads, CUDA schedule)
 
@@ -460,12 +477,13 @@ quant handling or expert placement should pass all that apply.
 
 ### 0. CUDA MoE graph-selection gate
 
-Before implementing CUDA kernels for a new MoE, trace its GGUF family through
-`resolve_family_ops()` to the `FullGraphModel` registry. A CUDA MoE without a
-registered graph adapter is unsupported; do not route it through the legacy
-layer-by-layer expert executor. Layered decode is allowed only when the graph
-memory planner reports insufficient capacity with required/available byte
-counts and a reason. A graph build/run failure is not a memory plan.
+Before implementing CUDA kernels for a new MoE, trace its exact GGUF
+architecture through `resolve_family_ops()` to the `FullGraphModel` registry.
+The adapter's `plan_decode_memory()` must reject unsupported architectures or
+tensor topologies before large allocations. Only an `Insufficient` result with
+required/available byte counts and a reason permits layered decode; `Unknown`
+requires graph decode, and `Unsupported` fails startup. Graph build/run failure
+is not a memory plan.
 
 For a full-fit hardware run, require graph decode to be enabled and exercised,
 with zero legacy one-token forwards or per-expert dispatches:
@@ -473,6 +491,25 @@ with zero legacy one-token forwards or per-expert dispatches:
 ```bash
 python3 tools/check_full_graph_moe_run.py <run.log> --full-fit
 ```
+
+For Qwen3.5/Qwen3.6 full-fit runs, also pass
+`--require-all-expert-layers-on-device` to require the graph's placement proof
+to report all expert layers resident on the device.
+
+Coherent output is a smoke check, not a performance pass. For a same-GGUF,
+same-GPU combined prompt/decode reference, save `llama-bench` JSON and enforce
+the default 90% steady-decode bar with:
+
+```bash
+llama-bench -m /path/to/model.gguf -pg 16,400 -ngl 99 -dev CUDA1 \
+    -mg 0 -sm none -t 10 -r 3 -o json > llama-bench.json
+python3 tools/check_full_graph_moe_perf.py <run.log> llama-bench.json \
+    --n-prompt 16 --n-gen 400 --device CUDA1
+```
+
+The ZeroMoE gate uses time spent in graph decode replays and reports graph
+construction/upload separately. A result below the bar keeps onboarding in
+progress; it is not accepted because generated text happens to look coherent.
 
 Use `--allow-memory-fallback` only for a run whose log records an explicit
 insufficient-memory plan and its reason.

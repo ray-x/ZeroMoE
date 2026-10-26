@@ -16,7 +16,15 @@ namespace qwen4exp_graph {
 bool feed_decode_common_inputs(FullGraph &g, int pos_base) {
   if (!g.positions || !g.attn_mask || !g.decode_indices)
     return false;
-  static_cast<int32_t *>(g.positions->data)[0] = pos_base;
+  auto *positions = static_cast<int32_t *>(g.positions->data);
+  if (g.position_ids_per_token == 4) {
+    positions[0] = pos_base;
+    positions[1] = pos_base;
+    positions[2] = pos_base;
+    positions[3] = 0;
+  } else {
+    positions[0] = pos_base;
+  }
   auto *mask = static_cast<ggml_fp16_t *>(g.attn_mask->data);
   for (int k = 0; k < g.kv_capacity; ++k)
     mask[k] = ggml_fp32_to_fp16(k <= pos_base ? 0.0f : -INFINITY);
@@ -33,14 +41,16 @@ bool feed_decode_common_inputs(FullGraph &g, int pos_base) {
 bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
                                         const int *token_ids) {
   const auto decode_prepare_started = std::chrono::steady_clock::now();
-  if (!qwen4exp_full_graph_decode_enabled() || pos_base < 0 ||
-      engine.family_ops.family != ModelFamily::Qwen4Exp)
+  if (!full_graph_decode_enabled_for_engine(engine) || pos_base < 0 ||
+      (engine.family_ops.family != ModelFamily::Qwen4Exp &&
+       engine.family_ops.family != ModelFamily::Qwen))
     return false;
   // Keep the same fail-closed rule as prefill.  A full-graph decode call
   // takes precedence over the layered token dispatcher, so allowing this
   // combination would make the configured CPUOffload layers disappear from
   // the actual execution path rather than run through Milestone B.
-  if (engine.qwen4exp_cpu_offload &&
+  if (engine.family_ops.family == ModelFamily::Qwen4Exp &&
+      engine.qwen4exp_cpu_offload &&
       !engine.qwen4exp_cpu_offload_layers.empty() &&
       !env_qwen4exp_host_node_enabled()) {
     LOG_ERROR(
@@ -63,11 +73,83 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   const bool has_graph_prefill =
       g_graph && g_graph->ready && g_graph->engine == &engine &&
       !g_graph->decode_mode;
-  if (!continuing_decode && !has_graph_prefill) {
+  // Qwen3.5/Qwen3.6 currently use the shared Qwen executor for prompt
+  // prefill. Its K/V and recurrent state are authoritative; the first
+  // full-graph decode copies them into graph-owned device tensors once.
+  // Validate every layer before allocating the decode graph.
+  bool has_qwen_host_prefill_state = false;
+  if (engine.family_ops.family == ModelFamily::Qwen &&
+      !continuing_decode && !has_graph_prefill) {
+    if (pos_base < 0) {
+      LOG_ERROR("[GGML-QWEN-FULL-DECODE] host prefill position is invalid: %d\n",
+                pos_base);
+    } else if (engine.qwen4exp_recur_state.size() <
+                   static_cast<size_t>(c.n_layers) ||
+               engine.qwen4exp_conv_history.size() <
+                   static_cast<size_t>(c.n_layers) ||
+               engine.Kc.size() < static_cast<size_t>(c.n_layers) ||
+               engine.Vc.size() < static_cast<size_t>(c.n_layers)) {
+      LOG_ERROR("[GGML-QWEN-FULL-DECODE] host prefill cache vectors are short: "
+                "layers=%d recurrent=%zu history=%zu K=%zu V=%zu\n",
+                c.n_layers, engine.qwen4exp_recur_state.size(),
+                engine.qwen4exp_conv_history.size(), engine.Kc.size(),
+                engine.Vc.size());
+    } else {
+      const size_t state_size =
+          static_cast<size_t>(c.ssm_state_size) * c.ssm_state_size *
+          std::max(1, c.ssm_time_step_rank);
+      const size_t conv_width =
+          2ull * c.ssm_group_count * c.ssm_state_size + c.ssm_inner_size;
+      const size_t history_size =
+          static_cast<size_t>(std::max(0, c.ssm_conv_kernel - 1)) * conv_width;
+      has_qwen_host_prefill_state = true;
+      for (int layer = 0; layer < c.n_layers; ++layer) {
+        if (qwen35moe_is_gdn_layer(c, layer)) {
+          const size_t state_got = engine.qwen4exp_recur_state[layer].size();
+          const size_t history_got = engine.qwen4exp_conv_history[layer].size();
+          if (state_got != state_size || history_got != history_size) {
+            LOG_ERROR("[GGML-QWEN-FULL-DECODE] GDN host state mismatch at "
+                      "layer=%d state=%zu/%zu history=%zu/%zu\n",
+                      layer, state_got, state_size, history_got, history_size);
+            has_qwen_host_prefill_state = false;
+            break;
+          }
+        } else if (!engine.Kc[layer] || !engine.Vc[layer]) {
+          LOG_ERROR("[GGML-QWEN-FULL-DECODE] attention host KV missing at "
+                    "layer=%d K=%d V=%d\n",
+                    layer, engine.Kc[layer] != nullptr,
+                    engine.Vc[layer] != nullptr);
+          has_qwen_host_prefill_state = false;
+          break;
+        }
+      }
+      if (has_qwen_host_prefill_state && pos_base == 0) {
+        // A one-token prompt has no preceding prefill batch. The allocated
+        // recurrent vectors are the initial recurrent-memory state.
+        for (int layer = 0; layer < c.n_layers; ++layer) {
+          if (!qwen35moe_is_gdn_layer(c, layer))
+            continue;
+          std::fill(engine.qwen4exp_recur_state[layer].begin(),
+                    engine.qwen4exp_recur_state[layer].end(), 0.0f);
+          std::fill(engine.qwen4exp_conv_history[layer].begin(),
+                    engine.qwen4exp_conv_history[layer].end(), 0.0f);
+        }
+      }
+      if (has_qwen_host_prefill_state)
+        LOG_INFO("[GGML-QWEN-FULL-DECODE] validated Qwen host state for "
+                 "%d layers at position %d\n", c.n_layers, pos_base);
+    }
+  }
+  if (!continuing_decode && !has_graph_prefill &&
+      !has_qwen_host_prefill_state) {
     LOG_ERROR("[GGML-QWEN-FULL-DECODE] refusing decode: state was not seeded "
-              "by a successful full-graph prefill\n");
+              "by a successful full-graph prefill or validated Qwen host "
+              "prefill state\n");
     return false;
   }
+  if (!continuing_decode && !has_graph_prefill && has_qwen_host_prefill_state)
+    LOG_INFO("[GGML-QWEN-FULL-DECODE] seeding device KV/GDN state from "
+             "validated Qwen prefill caches at position %d\n", pos_base);
 
   // Decode full-graph mode is intentionally stricter than the ordinary graph:
   // host-resident expert planes must already be in complete DDR graph arenas,
@@ -93,7 +175,8 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   // session-level commit. Both share the same usage-ranked expert set
   // (plan_partial_layer/qwen4exp_partial_layer_gpu_ids) -- Phase 2 just
   // decides per-token instead of once at prefill.
-  plan_partial_layer(engine); // Phase 1/2 shared: usage-ranked expert set
+  if (engine.family_ops.family != ModelFamily::Qwen)
+    plan_partial_layer(engine); // Qwen full-fit uses every expert on device.
   if (g_graph && g_graph->ready && g_graph->engine == &engine &&
       g_graph->decode_mode && g_graph->kv_capacity >= required &&
       g_graph->decode_last_pos + 1 == pos_base) {
@@ -141,10 +224,11 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   FullGraph *prefill_arena_source = nullptr;
   FullGraph *prefill_state_source = nullptr;
   const bool decode_compact_arena_needed =
-      (engine.qwen4exp_partial_layer >= 0 &&
-       !engine.qwen4exp_partial_layer_gpu_ids.empty()) ||
-      (engine.qwen4exp_gpu_stage_enabled &&
-       !engine.qwen4exp_gpu_stage_layers.empty());
+      engine.family_ops.family != ModelFamily::Qwen &&
+      ((engine.qwen4exp_partial_layer >= 0 &&
+        !engine.qwen4exp_partial_layer_gpu_ids.empty()) ||
+       (engine.qwen4exp_gpu_stage_enabled &&
+        !engine.qwen4exp_gpu_stage_layers.empty()));
   const bool borrow_prefill_arenas = env_decode_borrow_prefill_arenas() &&
                                      !decode_compact_arena_needed;
   if (env_decode_borrow_prefill_arenas() && decode_compact_arena_needed) {
@@ -191,6 +275,15 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
       !prefill_state_handoff &&
       !sync_prefill_recurrent_state_to_host(*prefill_state_source))
     return false;
+  if (engine.family_ops.family == ModelFamily::Qwen &&
+      prefill_state_source && !prefill_state_handoff) {
+    // Standard Qwen prefill writes recurrent/KV state to the validated host
+    // caches. Decode owns fresh device state and seeds it once from those
+    // caches; the prefill graph remains only the dense/expert arena owner.
+    prefill_state_source = nullptr;
+    LOG_INFO("[GGML-QWEN-FULL-DECODE] using host-prefilled KV/GDN state "
+             "for one-time device seeding; borrowing weight arenas separately\n");
+  }
   if (prefill_arena_source && prefill_arena_source->sched &&
       !prefill_state_handoff) {
     ggml_backend_sched_free(prefill_arena_source->sched);
@@ -251,7 +344,7 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     g->device = dev;
     g->S = 1;
     g->D = c.hidden;
-    g->HC = c.hc_mult;
+    g->HC = engine.family_ops.family == ModelFamily::Qwen ? 1 : c.hc_mult;
     g->n_layers = c.n_layers;
     g->H = c.n_heads;
     g->Hkv = std::max(1, c.n_head_kv);
@@ -272,11 +365,21 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     // g_qwen4exp_build_graph_retry_smaller_expert_layers's own comment.
     // Phase 2's prefix/suffix build_one() calls never set it, so this is a
     // no-op for them.
-    g->device_expert_layers =
-        std::max(0, std::min(qwen4exp_full_graph_device_expert_layers(),
-                             c.n_layers) -
-                        device_expert_layers_shrink);
-    g->device_expert_trailing = env_device_expert_trailing();
+    if (engine.family_ops.family == ModelFamily::Qwen) {
+      // A full-fit Qwen planner commits the complete expert set to the graph.
+      // Do not turn a graph allocation failure into an implicit partial-MoE
+      // residency retry; that run must fail closed.
+      g->device_expert_layers = std::clamp(
+          engine.cuda_moe_graph_device_expert_layers, 0, c.n_layers);
+      g->device_expert_trailing =
+          engine.cuda_moe_graph_device_expert_trailing;
+    } else {
+      g->device_expert_layers =
+          std::max(0, std::min(qwen4exp_full_graph_device_expert_layers(),
+                               c.n_layers) -
+                          device_expert_layers_shrink);
+      g->device_expert_trailing = env_device_expert_trailing();
+    }
     const char *partial_gate_up =
         zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_PARTIAL_GATE_UP");
     // partial_gate_up's boundary math (layer==device_expert_layers, the
@@ -511,8 +614,10 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
                                   hist_n * sizeof(float));
       }
       const size_t kv_row = static_cast<size_t>(g->Hkv) * g->hd;
-      const size_t kv_bytes =
-          static_cast<size_t>(pos_base) * kv_row * sizeof(float);
+  const size_t head_stride =
+      static_cast<size_t>(g->kv_capacity) * g->hd;
+  const size_t packed_kv_bytes =
+      static_cast<size_t>(pos_base) * g->hd * sizeof(float);
       for (size_t i = 0; i < g->kv_layers.size(); ++i) {
         const int l = g->kv_layers[i];
         if (i >= g->kv_state_k.size() || i >= g->kv_state_v.size() ||
@@ -520,13 +625,39 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
             l >= static_cast<int>(engine.Vc.size()) || !engine.Kc[l] ||
             !engine.Vc[l])
           return nullptr;
-        if (kv_bytes > 0) {
-          if (g->state_handoff_tensors.count(g->kv_state_k[i]) == 0)
-            ggml_backend_tensor_set(g->kv_state_k[i], engine.Kc[l], 0,
-                                    kv_bytes);
-          if (g->state_handoff_tensors.count(g->kv_state_v[i]) == 0)
-            ggml_backend_tensor_set(g->kv_state_v[i], engine.Vc[l], 0,
-                                    kv_bytes);
+    if (packed_kv_bytes > 0) {
+      // The host cache is position-major [position, head, head_dim]. The
+      // decode graph's [head, capacity, head_dim] tensor has position as the
+      // fast row index within each head. Pack each head's prefix into that
+      // layout; copying kv_bytes linearly silently interleaves heads and
+      // makes the first dense-attention decode diverge after GDN prefill.
+      std::vector<float> head_rows(
+          static_cast<size_t>(pos_base) * g->hd);
+      for (int h = 0; h < g->Hkv; ++h) {
+        for (int p = 0; p < pos_base; ++p) {
+          const float *src = engine.Kc[l] +
+                             static_cast<size_t>(p) * kv_row +
+                             static_cast<size_t>(h) * g->hd;
+          std::memcpy(head_rows.data() + static_cast<size_t>(p) * g->hd,
+                      src, static_cast<size_t>(g->hd) * sizeof(float));
+        }
+        const size_t dst_offset =
+            static_cast<size_t>(h) * head_stride * sizeof(float);
+        if (g->state_handoff_tensors.count(g->kv_state_k[i]) == 0)
+          ggml_backend_tensor_set(g->kv_state_k[i], head_rows.data(),
+                                  dst_offset, packed_kv_bytes);
+        if (g->state_handoff_tensors.count(g->kv_state_v[i]) == 0) {
+          for (int p = 0; p < pos_base; ++p) {
+            const float *src = engine.Vc[l] +
+                               static_cast<size_t>(p) * kv_row +
+                               static_cast<size_t>(h) * g->hd;
+            std::memcpy(head_rows.data() + static_cast<size_t>(p) * g->hd,
+                        src, static_cast<size_t>(g->hd) * sizeof(float));
+          }
+          ggml_backend_tensor_set(g->kv_state_v[i], head_rows.data(),
+                                  dst_offset, packed_kv_bytes);
+        }
+      }
         }
       }
       if (g->ple_layer >= 0 && g->ple_hist_storage) {
@@ -628,10 +759,28 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     if (!g)
       return false;
   }
-  LOG_INFO("[GGML-QWEN-FULL-DECODE] enabled: one scheduler submission per "
-           "token, KV capacity=%d, device GDN/KV/PLE state, DDR expert "
-           "arenas=%d\n",
-           g->kv_capacity, c.n_layers);
+  if (engine.family_ops.family == ModelFamily::Qwen &&
+      (g->device_expert_layers != c.n_layers ||
+       !g->split_gpu_expert_ids.empty())) {
+    LOG_ERROR("[QWEN35MOE-GRAPH] planner selected a full-fit run, but graph "
+              "placement is incomplete (device_layers=%d/%d split_layers=%zu); "
+              "refusing partial expert residency\n",
+              g->device_expert_layers, c.n_layers,
+              g->split_gpu_expert_ids.size());
+    return false;
+  }
+  if (engine.family_ops.family == ModelFamily::Qwen) {
+    LOG_INFO("[QWEN35MOE-GRAPH] decode ready: expert_layers_on_gpu=%d/%d "
+             "experts_per_layer=%d expert_arena_bytes=%zu dense_arena_bytes=%zu "
+             "kv_capacity=%d; no CPU expert or layered decode path\n",
+             g->device_expert_layers, c.n_layers, c.n_experts,
+             g->expert.capacity, g->dense.capacity, g->kv_capacity);
+  } else {
+    LOG_INFO("[GGML-QWEN-FULL-DECODE] enabled: one scheduler submission per "
+             "token, KV capacity=%d, device GDN/KV/PLE state, DDR expert "
+             "arenas=%d\n",
+             g->kv_capacity, c.n_layers);
+  }
   g_graph = std::move(g);
   LOG_INFO("[GGML-QWEN-FULL-DECODE-SETUP] prepare_total=%.1fms "
            "(function entry through ready graph)\n",

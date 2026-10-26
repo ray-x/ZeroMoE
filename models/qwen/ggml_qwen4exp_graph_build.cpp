@@ -12,6 +12,258 @@ using namespace qwen4exp_graph;
 
 namespace qwen4exp_graph {
 
+// Qwen3.5/Qwen3.6 MoE uses the same GDN/full-attention and routed expert
+// operators as Qwen4Exp, but has the standard transformer residual layout:
+// attention norm -> attention -> residual -> FFN norm -> MoE -> residual.
+// Keep the operator implementation shared while making this family-specific
+// block explicit; Qwen's CUDA path must not inherit Qwen4Exp's HC/PLE graph.
+static ggml_tensor *build_qwen35moe_graph_layer(FullGraph &g,
+                                                ggml_tensor *res,
+                                                int layer) {
+  if (!g.engine || !res || layer < 0 || layer >= g.n_layers)
+    return nullptr;
+
+  const bool decode = g.decode_mode;
+  const auto &c = g.engine->model_file.architecture_config;
+  const std::string p = "blk." + std::to_string(layer) + ".";
+  auto probe = [&](const char *label, ggml_tensor *value) {
+    if (!value || !g.graph ||
+        !zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP"))
+      return;
+    const std::string name = "qwen35_" + std::string(label) + "_" +
+                             std::to_string(layer);
+    ggml_set_name(value, name.c_str());
+    ggml_set_output(value);
+    ggml_build_forward_expand(g.graph, value);
+    g.gdn_probe_taps.emplace_back(layer, label, value);
+  };
+  ggml_tensor *attn_norm = resident_tensor(g, g.ctx, p + "attn_norm.weight");
+  if (!attn_norm)
+    return nullptr;
+  ggml_tensor *attn_in = ggml_mul(
+      g.ctx, ggml_rms_norm(g.ctx, res, c.eps), attn_norm);
+  if (!attn_in)
+    return nullptr;
+
+  ggml_tensor *attn_out = nullptr;
+  if (qwen35moe_is_gdn_layer(c, layer)) {
+    ggml_tensor *qkv = resident_tensor(g, g.ctx, p + "attn_qkv.weight");
+    ggml_tensor *gate = resident_tensor(g, g.ctx, p + "attn_gate.weight");
+    ggml_tensor *alpha = resident_tensor(g, g.ctx, p + "ssm_alpha.weight");
+    ggml_tensor *beta = resident_tensor(g, g.ctx, p + "ssm_beta.weight");
+    ggml_tensor *dt = resident_tensor(g, g.ctx, p + "ssm_dt.bias");
+    ggml_tensor *a = resident_tensor(g, g.ctx, p + "ssm_a");
+    ggml_tensor *conv = resident_tensor(g, g.ctx, p + "ssm_conv1d.weight");
+    ggml_tensor *norm = resident_tensor(g, g.ctx, p + "ssm_norm.weight");
+    ggml_tensor *out = resident_tensor(g, g.ctx, p + "ssm_out.weight");
+    if (!qkv || !gate || !alpha || !beta || !dt || !a || !conv || !norm ||
+        !out)
+      return nullptr;
+
+    const int hist = g.d_conv - 1;
+    ggml_tensor *hist_in = nullptr;
+    ggml_tensor *state_in = nullptr;
+    if (decode || g.prefill_device_state_inputs) {
+      hist_in = new_device_state_tensor(
+          g, GGML_TYPE_F32, {hist, g.conv_dim, 1},
+          "qwen35_gdn_history");
+      state_in = new_device_state_tensor(
+          g, GGML_TYPE_F32, {g.gdn_hd, g.gdn_hd, g.Hv_gdn, 1},
+          "qwen35_gdn_state");
+      if (!hist_in || !state_in)
+        return nullptr;
+      g.gdn_hist_storage.push_back(hist_in);
+      g.gdn_state_storage.push_back(state_in);
+    } else {
+      hist_in = host_input(
+          g, g.ctx, GGML_TYPE_F32, {hist, g.conv_dim, 1},
+          static_cast<size_t>(hist) * g.conv_dim * sizeof(float),
+          "qwen35_prefill_gdn_history");
+      state_in = host_input(
+          g, g.ctx, GGML_TYPE_F32,
+          {g.gdn_hd, g.gdn_hd, g.Hv_gdn, 1},
+          static_cast<size_t>(g.gdn_hd) * g.gdn_hd * g.Hv_gdn * sizeof(float),
+          "qwen35_prefill_gdn_state");
+      if (!hist_in || !state_in)
+        return nullptr;
+      g.gdn_hist_inputs.push_back(static_cast<float *>(hist_in->data));
+      g.gdn_state_inputs.push_back(static_cast<float *>(state_in->data));
+    }
+
+    ggml_tensor *state_out = nullptr;
+    ggml_tensor *hist_out = nullptr;
+    attn_out = build_gdn(g, g.ctx, attn_in, layer, qkv, gate, alpha, beta,
+                         dt, a, conv, norm, out, hist_in, state_in,
+                         &state_out, &hist_out);
+    if (!attn_out || !state_out || !hist_out)
+      return nullptr;
+    if (decode) {
+      const int64_t state_elements =
+          static_cast<int64_t>(g.gdn_hd) * g.gdn_hd * g.Hv_gdn;
+      const size_t state_row = ggml_row_size(GGML_TYPE_F32, state_elements);
+      ggml_tensor *state_cache_view = ggml_view_3d(
+          g.ctx, g.gdn_state_storage.back(), state_elements, 1, 1, state_row,
+          state_row, 0);
+      ggml_tensor *state_update =
+          ggml_cpy(g.ctx, state_out, state_cache_view);
+      if (!state_update)
+        return nullptr;
+      g.gdn_state_updates.push_back(state_update);
+      // Put the state-cache CPY directly after GDN's output views. ggml-cuda
+      // can then fuse the snapshot write into GATED_DELTA_NET instead of
+      // materializing the 2 MiB state tensor and copying it back every token.
+      ggml_build_forward_expand(g.graph, state_update);
+      g.gdn_hist_updates.push_back(
+          ggml_cpy(g.ctx, hist_out, g.gdn_hist_storage.back()));
+    } else {
+      g.gdn_state_out.push_back(state_out);
+      g.gdn_hist_out.push_back(hist_out);
+    }
+    g.gdn_layers.push_back(layer);
+  } else {
+    ggml_tensor *wq = dense_weight(g, g.ctx, layer, "attn_q.weight");
+    ggml_tensor *wk = dense_weight(g, g.ctx, layer, "attn_k.weight");
+    ggml_tensor *wv = dense_weight(g, g.ctx, layer, "attn_v.weight");
+    ggml_tensor *wqn = dense_weight(g, g.ctx, layer, "attn_q_norm.weight");
+    ggml_tensor *wkn = dense_weight(g, g.ctx, layer, "attn_k_norm.weight");
+    ggml_tensor *wo = dense_weight(g, g.ctx, layer, "attn_output.weight");
+    if (!wq || !wk || !wv || !wqn || !wkn || !wo)
+      return nullptr;
+    if (decode) {
+      ggml_tensor *k_cache = new_device_state_tensor(
+          g, GGML_TYPE_F32, {g.hd, g.kv_capacity * g.Hkv},
+          "qwen35_decode_kv_k");
+      ggml_tensor *v_cache = new_device_state_tensor(
+          g, GGML_TYPE_F32, {g.hd, g.kv_capacity * g.Hkv},
+          "qwen35_decode_kv_v");
+      if (!k_cache || !v_cache)
+        return nullptr;
+      g.kv_state_k.push_back(k_cache);
+      g.kv_state_v.push_back(v_cache);
+      attn_out = build_full_attention_decode(
+          g, g.ctx, attn_in, layer, wq, wk, wv, wqn, wkn, wo, k_cache, v_cache);
+    } else {
+      ggml_tensor *k_cache = nullptr;
+      ggml_tensor *v_cache = nullptr;
+      attn_out = build_full_attention(g, g.ctx, attn_in, layer, wq, wk, wv,
+                                      wqn, wkn, wo, &k_cache, &v_cache);
+      if (!k_cache || !v_cache)
+        return nullptr;
+      g.kv_k.push_back(k_cache);
+      g.kv_v.push_back(v_cache);
+    }
+    if (!attn_out)
+      return nullptr;
+    g.kv_layers.push_back(layer);
+  }
+  probe("attn_output", attn_out);
+
+  if (zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP")) {
+    ggml_tensor *tap_attn = ggml_cont(g.ctx, attn_out);
+    if (!tap_attn)
+      return nullptr;
+    ggml_set_name(tap_attn,
+                  ("qwen35_attn_out_" + std::to_string(layer)).c_str());
+    ggml_set_output(tap_attn);
+    ggml_build_forward_expand(g.graph, tap_attn);
+  }
+
+  res = ggml_add(g.ctx, res, attn_out);
+  ggml_tensor *ffn_norm =
+      resident_tensor(g, g.ctx, p + "post_attention_norm.weight");
+  if (!ffn_norm)
+    return nullptr;
+  ggml_tensor *ffn_in =
+      ggml_mul(g.ctx, ggml_rms_norm(g.ctx, res, c.eps), ffn_norm);
+  ggml_tensor *router = resident_tensor(g, g.ctx, p + "ffn_gate_inp.weight");
+  ggml_tensor *bias = nullptr;
+  if (!ffn_in || !router)
+    return nullptr;
+
+  if (zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP")) {
+    ggml_tensor *tap_x = ggml_cont(g.ctx, ffn_in);
+    ggml_tensor *tap_logits = ggml_mul_mat(g.ctx, router, ffn_in);
+    ggml_tensor *tap_probs = tap_logits ? ggml_soft_max(g.ctx, tap_logits)
+                                        : nullptr;
+    if (!tap_x || !tap_logits || !tap_probs)
+      return nullptr;
+    ggml_set_name(tap_x, ("qwen35_ffn_input_" + std::to_string(layer)).c_str());
+    ggml_set_name(tap_logits,
+                  ("qwen35_router_logits_" + std::to_string(layer)).c_str());
+    ggml_set_name(tap_probs,
+                  ("qwen35_router_probs_" + std::to_string(layer)).c_str());
+    ggml_set_output(tap_x);
+    ggml_set_output(tap_logits);
+    ggml_set_output(tap_probs);
+    ggml_build_forward_expand(g.graph, tap_x);
+    ggml_build_forward_expand(g.graph, tap_logits);
+    ggml_build_forward_expand(g.graph, tap_probs);
+    g.probe_taps.emplace_back(layer, tap_x, tap_probs);
+    g.router_logits_taps.emplace_back(layer, tap_logits);
+  }
+
+  SplitExpertWeight gate =
+      expert_weight_split(g, g.ctx, layer, "ffn_gate_exps.weight");
+  SplitExpertWeight up =
+      expert_weight_split(g, g.ctx, layer, "ffn_up_exps.weight");
+  SplitExpertWeight down =
+      expert_weight_split(g, g.ctx, layer, "ffn_down_exps.weight");
+  if (!gate.cpu || !up.cpu || !down.cpu)
+    return nullptr;
+  if (g.engine->family_ops.family == ModelFamily::Qwen &&
+      (!graph_expert_projection_resident(g, layer, "ffn_gate_exps.weight") ||
+       !graph_expert_projection_resident(g, layer, "ffn_up_exps.weight") ||
+       !graph_expert_projection_resident(g, layer, "ffn_down_exps.weight")))
+    return nullptr;
+  const bool split = gate.gpu && up.gpu && down.gpu;
+  const std::vector<int> *split_ids = nullptr;
+  if (split) {
+    const auto ids = g.split_gpu_expert_ids.find(layer);
+    if (ids != g.split_gpu_expert_ids.end() && !ids->second.empty())
+      split_ids = &ids->second;
+  }
+  const bool probe_moe =
+      zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP") != nullptr;
+  ggml_tensor *route_ids = nullptr;
+  ggml_tensor *route_weights = nullptr;
+  ggml_tensor *moe = build_moe(
+      g, g.ctx, ffn_in, layer, router, bias, gate.cpu, up.cpu, down.cpu,
+      split ? gate.gpu : nullptr, split ? up.gpu : nullptr,
+      split ? down.gpu : nullptr, split_ids, nullptr,
+      probe_moe ? &route_ids : nullptr, nullptr, false,
+      nullptr, nullptr, probe_moe ? &route_weights : nullptr);
+  if (!moe)
+    return nullptr;
+  probe("moe_routed", moe);
+  if (probe_moe && route_ids)
+    probe("route_ids", ggml_cast(g.ctx, route_ids, GGML_TYPE_F32));
+  if (probe_moe && route_weights)
+    probe("route_weights", route_weights);
+
+  if (c.n_expert_shared > 0) {
+    ggml_tensor *shared_gate =
+        resident_tensor(g, g.ctx, p + "ffn_gate_shexp.weight");
+    ggml_tensor *shared_up =
+        resident_tensor(g, g.ctx, p + "ffn_up_shexp.weight");
+    ggml_tensor *shared_down =
+        resident_tensor(g, g.ctx, p + "ffn_down_shexp.weight");
+    ggml_tensor *shared_scalar =
+        resident_tensor(g, g.ctx, p + "ffn_gate_inp_shexp.weight");
+    if (!shared_gate || !shared_up || !shared_down)
+      return nullptr;
+    ggml_tensor *shared = build_shared(g, g.ctx, ffn_in, layer, shared_gate,
+                                       shared_up, shared_down, shared_scalar);
+    if (!shared)
+      return nullptr;
+    probe("moe_shared", shared);
+    moe = ggml_add(g.ctx, moe, shared);
+  }
+  probe("moe_combined", moe);
+  ggml_tensor *post_moe = ggml_add(g.ctx, res, moe);
+  probe("post_moe", post_moe);
+  return post_moe;
+}
+
 bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
   g_qwen4exp_build_graph_retry_smaller_expert_layers = false;
   // Timing split (2026-09-17): full-graph decode's FIRST call pays a real
@@ -64,11 +316,29 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
   if (!g.graph)
     return false;
 
-  g.input = host_input(g, g.ctx, GGML_TYPE_F32, {g.D, g.HC, g.S},
-                       static_cast<size_t>(g.D) * g.HC * g.S * sizeof(float),
-                       "qwen_full_input");
-  g.positions = host_input(g, g.ctx, GGML_TYPE_I32, {g.S},
-                           static_cast<size_t>(g.S) * sizeof(int32_t),
+  if (g.engine->family_ops.family == ModelFamily::Qwen) {
+    // Standard Qwen uses one [D,S] residual stream. Keeping HC=1 as an
+    // explicit graph dimension here turns qkv projections into [*,1,S],
+    // which breaks the prefill GDN history concat against its [hist,conv]
+    // state. Match llama.cpp's [D,S] graph layout for this family.
+    g.input = host_input(g, g.ctx, GGML_TYPE_F32, {g.D, g.S},
+                         static_cast<size_t>(g.D) * g.S * sizeof(float),
+                         "qwen_full_input");
+  } else {
+    g.input = host_input(g, g.ctx, GGML_TYPE_F32, {g.D, g.HC, g.S},
+                         static_cast<size_t>(g.D) * g.HC * g.S * sizeof(float),
+                         "qwen_full_input");
+  }
+  g.position_ids_per_token =
+      g.engine->family_ops.family == ModelFamily::Qwen &&
+              g.engine->model_file.architecture_config.rope_sections.size() == 4
+          ? 4
+          : 1;
+  const size_t position_count =
+      static_cast<size_t>(g.S) * g.position_ids_per_token;
+  g.positions = host_input(g, g.ctx, GGML_TYPE_I32,
+                           {static_cast<int64_t>(position_count)},
+                           position_count * sizeof(int32_t),
                            "qwen_full_positions");
   if (g.decode_mode) {
     g.attn_mask = host_input(
@@ -91,8 +361,17 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     return false;
   auto *pos = static_cast<int32_t *>(g.positions->data);
   auto *mask = static_cast<ggml_fp16_t *>(g.attn_mask->data);
-  for (int i = 0; i < g.S; ++i)
-    pos[i] = g.decode_mode ? i : g.pos_base + i;
+  for (int i = 0; i < g.S; ++i) {
+    const int position = g.decode_mode ? i : g.pos_base + i;
+    if (g.position_ids_per_token == 4) {
+      pos[i] = position;
+      pos[g.S + i] = position;
+      pos[2 * g.S + i] = position;
+      pos[3 * g.S + i] = 0;
+    } else {
+      pos[i] = position;
+    }
+  }
   if (g.decode_mode) {
     for (int k = 0; k < g.kv_capacity; ++k)
       mask[k] = ggml_fp32_to_fp16(0.0f);
@@ -147,6 +426,24 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       g.decode_mode && g.engine->qwen4exp_track_router_usage;
   for (int l = 0; l < g.n_layers; ++l) {
     const std::string p = "blk." + std::to_string(l) + ".";
+    if (g.engine->family_ops.family == ModelFamily::Qwen) {
+      if (const char *probe_dir =
+              zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP");
+          probe_dir && probe_dir[0]) {
+        ggml_tensor *layer_input = ggml_cont(g.ctx, res);
+        if (!layer_input)
+          return false;
+        ggml_set_name(layer_input, ("qwen35_layer_input_" +
+                                    std::to_string(l)).c_str());
+        ggml_set_output(layer_input);
+        ggml_build_forward_expand(g.graph, layer_input);
+        g.layer_input_taps.emplace_back(l, layer_input);
+      }
+      res = build_qwen35moe_graph_layer(g, res, l);
+      if (!res)
+        return false;
+      continue;
+    }
     if (qwen4exp_is_ple_layer(c, l)) {
       if (!ple_embedding)
         return false;
@@ -600,43 +897,63 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     }
   }
 
-  {
-  ggml_tensor *on = resident_tensor(g, g.ctx, "output_hc_norm.weight");
-  ggml_tensor *od = resident_tensor(g, g.ctx, "output_hc_down.weight");
-  ggml_tensor *ou = resident_tensor(g, g.ctx, "output_hc_up.weight");
-  if (!on || !od || !ou)
-    return false;
-  g.final_streams = res;
-  g.output = hc_mix(g, g.ctx, res, on, od, ou, nullptr, nullptr);
-  if (!g.decode_mode) {
-    ggml_set_output(g.final_streams);
-    ggml_build_forward_expand(g.graph, g.final_streams);
-  }
-  ggml_set_output(g.output);
-  ggml_build_forward_expand(g.graph, g.output);
-  if (g.decode_mode || qwen4exp_full_graph_decode_enabled()) {
-    ggml_tensor *lm_in = g.decode_mode
-                            ? g.output
-                            : ggml_view_2d(g.ctx, g.output, g.D, 1,
-                                           g.output->nb[1],
-                                           (g.S - 1) * g.output->nb[1]);
+  if (g.engine->family_ops.family == ModelFamily::Qwen) {
+    // Standard Qwen output has one residual stream; the LM-head norm is
+    // applied for logits while `output` remains the final hidden state.
+    g.final_streams = res;
+    g.output = res;
+    ggml_set_output(g.output);
+    ggml_build_forward_expand(g.graph, g.output);
     ggml_tensor *out_norm =
         resident_tensor(g, g.ctx, "output_norm.weight");
-    if (out_norm) {
-      lm_in = ggml_mul(
-          g.ctx,
-          ggml_rms_norm(g.ctx, lm_in,
-                        g.engine->model_file.architecture_config.eps),
-          out_norm);
-    }
-    ggml_tensor *out_weight =
-        resident_tensor(g, g.ctx, "output.weight");
-    if (!out_weight)
+    ggml_tensor *out_weight = resident_tensor(g, g.ctx, "output.weight");
+    if (!out_norm || !out_weight)
       return false;
+    ggml_tensor *lm_in = ggml_mul(
+        g.ctx,
+        ggml_rms_norm(g.ctx, g.output,
+                      g.engine->model_file.architecture_config.eps),
+        out_norm);
     g.logits = ggml_mul_mat(g.ctx, out_weight, lm_in);
     ggml_set_output(g.logits);
     ggml_build_forward_expand(g.graph, g.logits);
-  }
+  } else {
+    ggml_tensor *on = resident_tensor(g, g.ctx, "output_hc_norm.weight");
+    ggml_tensor *od = resident_tensor(g, g.ctx, "output_hc_down.weight");
+    ggml_tensor *ou = resident_tensor(g, g.ctx, "output_hc_up.weight");
+    if (!on || !od || !ou)
+      return false;
+    g.final_streams = res;
+    g.output = hc_mix(g, g.ctx, res, on, od, ou, nullptr, nullptr);
+    if (!g.decode_mode || g.engine->qwen4exp_wide_export) {
+      ggml_set_output(g.final_streams);
+      ggml_build_forward_expand(g.graph, g.final_streams);
+    }
+    ggml_set_output(g.output);
+    ggml_build_forward_expand(g.graph, g.output);
+    if (g.decode_mode || qwen4exp_full_graph_decode_enabled()) {
+      ggml_tensor *lm_in = g.decode_mode
+                               ? g.output
+                               : ggml_view_2d(g.ctx, g.output, g.D, 1,
+                                              g.output->nb[1],
+                                              (g.S - 1) * g.output->nb[1]);
+      ggml_tensor *out_norm =
+          resident_tensor(g, g.ctx, "output_norm.weight");
+      if (out_norm) {
+        lm_in = ggml_mul(
+            g.ctx,
+            ggml_rms_norm(g.ctx, lm_in,
+                          g.engine->model_file.architecture_config.eps),
+            out_norm);
+      }
+      ggml_tensor *out_weight =
+          resident_tensor(g, g.ctx, "output.weight");
+      if (!out_weight)
+        return false;
+      g.logits = ggml_mul_mat(g.ctx, out_weight, lm_in);
+      ggml_set_output(g.logits);
+      ggml_build_forward_expand(g.graph, g.logits);
+    }
   }
   if (!g.decode_mode) {
     for (ggml_tensor *t : g.kv_k) {
@@ -899,7 +1216,8 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       // this flag's own comment for why init_device_expert_arena's existing
       // allow_layer_clamp retry doesn't already cover it (that check runs
       // BEFORE the scheduler's own workspace is known to be needed).
-      if (err == cudaSuccess && g.device_expert_layers > 0)
+      if (err == cudaSuccess && g.device_expert_layers > 0 &&
+          g.engine->family_ops.family != ModelFamily::Qwen)
         g_qwen4exp_build_graph_retry_smaller_expert_layers = true;
       return false;
     }
@@ -1158,6 +1476,9 @@ bool sync_decode_state_to_host(FullGraph &g) {
   }
   const size_t row = static_cast<size_t>(g.Hkv) * g.hd;
   const int rows = std::min(std::max(0, g.decode_last_pos + 1), g.kv_capacity);
+  const size_t kv_device_head_stride =
+      static_cast<size_t>(g.kv_capacity) * g.hd;
+  const size_t kv_head_bytes = static_cast<size_t>(rows) * g.hd * sizeof(float);
   for (size_t i = 0; i < g.kv_layers.size(); ++i) {
     const int l = g.kv_layers[i];
     if (i >= g.kv_state_k.size() || i >= g.kv_state_v.size() || l < 0 ||
@@ -1165,10 +1486,30 @@ bool sync_decode_state_to_host(FullGraph &g) {
         l >= static_cast<int>(engine.Vc.size()) || !engine.Kc[l] ||
         !engine.Vc[l])
       return false;
-    const size_t bytes = static_cast<size_t>(rows) * row * sizeof(float);
-    if (bytes > 0) {
-      ggml_backend_tensor_get(g.kv_state_k[i], engine.Kc[l], 0, bytes);
-      ggml_backend_tensor_get(g.kv_state_v[i], engine.Vc[l], 0, bytes);
+    if (kv_head_bytes > 0) {
+      // Device KV state is head-major [head, position, head_dim], while the
+      // host attention cache is position-major [position, head, head_dim].
+      // Unpack each head's prefix instead of copying a flattened prefix with
+      // the wrong head/position order.
+      std::vector<float> head_rows(static_cast<size_t>(rows) * g.hd);
+      for (int h = 0; h < g.Hkv; ++h) {
+        const size_t device_offset =
+            static_cast<size_t>(h) * kv_device_head_stride * sizeof(float);
+        ggml_backend_tensor_get(g.kv_state_k[i], head_rows.data(),
+                                device_offset, kv_head_bytes);
+        for (int p = 0; p < rows; ++p)
+          std::memcpy(engine.Kc[l] + static_cast<size_t>(p) * row +
+                          static_cast<size_t>(h) * g.hd,
+                      head_rows.data() + static_cast<size_t>(p) * g.hd,
+                      static_cast<size_t>(g.hd) * sizeof(float));
+        ggml_backend_tensor_get(g.kv_state_v[i], head_rows.data(),
+                                device_offset, kv_head_bytes);
+        for (int p = 0; p < rows; ++p)
+          std::memcpy(engine.Vc[l] + static_cast<size_t>(p) * row +
+                          static_cast<size_t>(h) * g.hd,
+                      head_rows.data() + static_cast<size_t>(p) * g.hd,
+                      static_cast<size_t>(g.hd) * sizeof(float));
+      }
     }
   }
   if (g.ple_layer >= 0 && g.ple_hist_storage) {

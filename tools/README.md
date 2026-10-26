@@ -28,15 +28,14 @@ One binary, four subcommands:
 
 ```bash
 # From the repo root, via the wrapper (rebuilds if stale, then runs):
-./tools/run_gguf_tool.sh <pack|io|verify> [args...]
+./tools/run_gguf_tool.sh <pack|io|verify|plan|dma|mix|offload> [args...]
 
-# Or directly:
-c++ -std=c++23 -O2 -Iinclude tools/gguf_tool.cpp tools/gguf_pack.cpp \
-    tools/gguf_io.cpp tools/gguf_verify.cpp tools/gguf_plan.cpp -o build/gguf_tool
+# The wrapper is the standalone build path and includes all subcommands:
+./tools/run_gguf_tool.sh plan /path/to/model.gguf --gpu-id 1 \
+    --context-size 4096 --max-new-tokens 256
 
-# Or via CMake (standalone tools/CMakeLists.txt, or the main build's target):
-cmake -S . -B build && cmake --build build --target gguf_tool
-# binary lands at ./build/gguf_tool
+# Use the standalone wrapper when the main CMake/ggml tree is paused or
+# unavailable; it does not initialize or modify the llama.cpp submodule.
 ```
 
 ## EXL3 safetensors

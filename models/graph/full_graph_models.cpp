@@ -21,6 +21,11 @@
 
 #include <cstdlib>
 #include <algorithm>
+#include <initializer_list>
+#include <limits>
+#if defined(ZEROMOE_USE_GGML_CUDA)
+#include <cuda_runtime.h>
+#endif
 
 namespace {
 
@@ -84,6 +89,318 @@ class Qwen4ExpGraphModel final : public FullGraphModelBase<Qwen4ExpGraphModel> {
         r.vocab > 0 ? r.vocab : e.qwen4exp_full_graph_logits_target_size;
     return qwen4exp_full_graph_decode_run(e, r.hidden_states, r.pos_base,
                                           r.token_ids, logits, vocab);
+  }
+};
+
+class Qwen35MoEGraphModel final : public FullGraphModelBase<Qwen35MoEGraphModel> {
+public:
+  bool supports_architecture(const StreamingEngine &engine) const {
+    const auto it = engine.model_file.kv_string.find("general.architecture");
+    return it != engine.model_file.kv_string.end() &&
+           it->second == "qwen35moe";
+  }
+  bool tensor_shape(const StreamingEngine &engine, const std::string &name,
+                    std::initializer_list<uint64_t> expected) const {
+    const auto it = engine.model_file.tensors.find(name);
+    if (it == engine.model_file.tensors.end()) {
+      LOG_ERROR("[QWEN35MOE-TOPOLOGY] required tensor is missing: %s\n",
+                name.c_str());
+      return false;
+    }
+    if (it->second.shape.size() != expected.size()) {
+      LOG_ERROR("[QWEN35MOE-TOPOLOGY] tensor %s rank=%zu expected=%zu\n",
+                name.c_str(), it->second.shape.size(), expected.size());
+      return false;
+    }
+    if (!zeromoe::quant::find(static_cast<uint32_t>(it->second.type))) {
+      LOG_ERROR("[QWEN35MOE-TOPOLOGY] tensor %s has unsupported GGML type=%u\n",
+                name.c_str(), static_cast<unsigned>(it->second.type));
+      return false;
+    }
+    auto want = expected.begin();
+    for (size_t axis = 0; axis < it->second.shape.size(); ++axis) {
+      const uint64_t dim = it->second.shape[axis];
+      if (dim != *want) {
+        LOG_ERROR("[QWEN35MOE-TOPOLOGY] tensor %s shape mismatch axis=%zu "
+                  "got=%llu expected=%llu\n",
+                  name.c_str(), axis, static_cast<unsigned long long>(dim),
+                  static_cast<unsigned long long>(*want));
+        return false;
+      }
+      ++want;
+    }
+    return true;
+  }
+  bool supports_graph_topology(const StreamingEngine &engine) const {
+    const auto &c = engine.model_file.architecture_config;
+    if (!supports_architecture(engine) || c.n_layers <= 0 || c.hidden <= 0 ||
+        c.n_heads <= 0 || c.head_dim <= 0 || c.n_head_kv <= 0 ||
+        c.n_experts <= 0 || c.topk <= 0 || c.moe_inter <= 0 ||
+        c.n_expert_shared <= 0 || c.ssm_group_count <= 0 ||
+        c.ssm_state_size <= 0 || c.ssm_inner_size <= 0 ||
+        c.ssm_conv_kernel <= 0 || c.ssm_time_step_rank <= 0) {
+      LOG_ERROR("[QWEN35MOE-TOPOLOGY] invalid architecture dimensions: "
+                "arch=%s layers=%d hidden=%d heads=%d head_dim=%d kv_heads=%d "
+                "experts=%d topk=%d moe_inter=%d shared=%d ssm={groups=%d "
+                "state=%d inner=%d conv=%d rank=%d}\n",
+                "qwen35moe",
+                c.n_layers, c.hidden, c.n_heads, c.head_dim, c.n_head_kv,
+                c.n_experts, c.topk, c.moe_inter, c.n_expert_shared,
+                c.ssm_group_count, c.ssm_state_size, c.ssm_inner_size,
+                c.ssm_conv_kernel, c.ssm_time_step_rank);
+      return false;
+    }
+
+    const uint64_t D = static_cast<uint64_t>(c.hidden);
+    const uint64_t H = static_cast<uint64_t>(c.n_heads);
+    const uint64_t Hkv = static_cast<uint64_t>(c.n_head_kv);
+    const uint64_t hd = static_cast<uint64_t>(c.head_dim);
+    const uint64_t E = static_cast<uint64_t>(c.n_experts);
+    const uint64_t F = static_cast<uint64_t>(c.moe_inter);
+    const uint64_t shared_width = F * static_cast<uint64_t>(c.n_expert_shared);
+    const uint64_t conv =
+        2ull * static_cast<uint64_t>(c.ssm_group_count) *
+            static_cast<uint64_t>(c.ssm_state_size) +
+        static_cast<uint64_t>(c.ssm_inner_size);
+    const auto has = [&](int layer, const char *stem,
+                         std::initializer_list<uint64_t> shape) {
+      return tensor_shape(engine,
+                          "blk." + std::to_string(layer) + "." + stem,
+                          shape);
+    };
+
+    for (int layer = 0; layer < c.n_layers; ++layer) {
+      if (!has(layer, "attn_norm.weight", {D}) ||
+          !has(layer, "post_attention_norm.weight", {D}) ||
+          !has(layer, "ffn_gate_inp.weight", {D, E}) ||
+          !has(layer, "ffn_gate_exps.weight", {D, F, E}) ||
+          !has(layer, "ffn_up_exps.weight", {D, F, E}) ||
+          !has(layer, "ffn_down_exps.weight", {F, D, E}) ||
+          !has(layer, "ffn_gate_shexp.weight", {D, shared_width}) ||
+          !has(layer, "ffn_up_shexp.weight", {D, shared_width}) ||
+          !has(layer, "ffn_down_shexp.weight", {shared_width, D}) ||
+          !has(layer, "ffn_gate_inp_shexp.weight", {D}))
+        return false;
+
+      if (qwen35moe_is_gdn_layer(c, layer)) {
+        if (!has(layer, "attn_qkv.weight", {D, conv}) ||
+            !has(layer, "attn_gate.weight",
+                 {D, static_cast<uint64_t>(c.ssm_inner_size)}) ||
+            !has(layer, "ssm_alpha.weight",
+                 {D, static_cast<uint64_t>(c.ssm_time_step_rank)}) ||
+            !has(layer, "ssm_beta.weight",
+                 {D, static_cast<uint64_t>(c.ssm_time_step_rank)}) ||
+            !has(layer, "ssm_dt.bias",
+                 {static_cast<uint64_t>(c.ssm_time_step_rank)}) ||
+            !has(layer, "ssm_a",
+                 {static_cast<uint64_t>(c.ssm_time_step_rank)}) ||
+            !has(layer, "ssm_conv1d.weight",
+                 {static_cast<uint64_t>(c.ssm_conv_kernel), conv}) ||
+            !has(layer, "ssm_norm.weight",
+                 {static_cast<uint64_t>(c.ssm_state_size)}) ||
+            !has(layer, "ssm_out.weight",
+                 {static_cast<uint64_t>(c.ssm_inner_size), D}))
+          return false;
+      } else {
+        if (!has(layer, "attn_q.weight", {D, 2 * H * hd}) ||
+            !has(layer, "attn_k.weight", {D, Hkv * hd}) ||
+            !has(layer, "attn_v.weight", {D, Hkv * hd}) ||
+            !has(layer, "attn_q_norm.weight", {hd}) ||
+            !has(layer, "attn_k_norm.weight", {hd}) ||
+            !has(layer, "attn_output.weight", {H * hd, D}))
+          return false;
+      }
+    }
+    const auto output = engine.model_file.tensors.find("output.weight");
+    return tensor_shape(engine, "output_norm.weight", {D}) &&
+           output != engine.model_file.tensors.end() &&
+           zeromoe::quant::find(static_cast<uint32_t>(output->second.type)) &&
+           output->second.shape.size() == 2 && output->second.shape[0] == D &&
+           output->second.shape[1] > 0;
+  }
+  ModelFamily family() const override { return ModelFamily::Qwen; }
+  const char *name() const override { return "qwen35moe-full-graph"; }
+  GraphRuntimeTuning runtime_tuning(const StreamingEngine &) const override {
+    return {};
+  }
+  void shutdown() const override { qwen4exp_full_graph_shutdown(); }
+  bool enabled(const StreamingEngine &engine,
+               ModelGraphPhase phase) const override {
+#if defined(ZEROMOE_USE_GGML_CUDA)
+return supports_architecture(engine) && !engine.mtp_enabled &&
+       engine.model_file.architecture_config.n_experts > 0 &&
+       (phase == ModelGraphPhase::Decode ||
+        (phase == ModelGraphPhase::Prefill &&
+         engine.cuda_moe_full_graph_decode_required));
+#else
+    (void)engine;
+    (void)phase;
+    return false;
+#endif
+  }
+  GraphMemoryPlan plan_decode_memory(const StreamingEngine &engine) const override {
+    GraphMemoryPlan plan;
+    const auto &c = engine.model_file.architecture_config;
+    if (!supports_graph_topology(engine)) {
+      plan.fit = GraphMemoryFit::Unsupported;
+      plan.reason =
+          "qwen35moe architecture or required tensor topology is unsupported";
+      return plan;
+    }
+    if (engine.mtp_enabled) {
+      plan.fit = GraphMemoryFit::Unsupported;
+      plan.reason = "Qwen3.5/3.6 graph decode does not support MTP";
+      return plan;
+    }
+    if (engine.max_t <= 0) {
+      plan.reason = "Qwen full-graph planner cannot size KV state without max_t";
+      return plan;
+    }
+
+    auto add_saturating = [](size_t a, size_t b) {
+      return b > std::numeric_limits<size_t>::max() - a
+                 ? std::numeric_limits<size_t>::max()
+                 : a + b;
+    };
+    auto mul_saturating = [](size_t a, size_t b) {
+      return a != 0 && b > std::numeric_limits<size_t>::max() / a
+                 ? std::numeric_limits<size_t>::max()
+                 : a * b;
+    };
+
+    size_t weights = 0;
+    for (const auto &entry : engine.model_file.tensors)
+      weights = add_saturating(weights, entry.second.size_bytes);
+
+    const int kv_heads = std::max(1, c.n_head_kv);
+    const int head_dim = c.head_dim > 0
+                             ? c.head_dim
+                             : c.hidden / std::max(1, c.n_heads);
+    const size_t kv_capacity = static_cast<size_t>(engine.max_t);
+    size_t full_attention_layers = 0;
+    size_t gdn_layers = 0;
+    for (int layer = 0; layer < c.n_layers; ++layer) {
+      if (qwen35moe_is_gdn_layer(c, layer))
+        ++gdn_layers;
+      else
+        ++full_attention_layers;
+    }
+    size_t kv_bytes = mul_saturating(
+        mul_saturating(mul_saturating(mul_saturating(
+                           full_attention_layers, 2),
+                       static_cast<size_t>(head_dim)),
+                   static_cast<size_t>(kv_heads)),
+        mul_saturating(kv_capacity, sizeof(float)));
+    const size_t conv_width = static_cast<size_t>(
+        2 * c.ssm_group_count * c.ssm_state_size + c.ssm_inner_size);
+    const size_t gdn_state_per_layer = add_saturating(
+        mul_saturating(static_cast<size_t>(std::max(0, c.ssm_conv_kernel - 1)),
+                       conv_width),
+        mul_saturating(
+            mul_saturating(static_cast<size_t>(c.ssm_state_size),
+                           static_cast<size_t>(c.ssm_state_size)),
+            static_cast<size_t>(std::max(1, c.ssm_time_step_rank))));
+    const size_t gdn_bytes = mul_saturating(
+        mul_saturating(gdn_layers, gdn_state_per_layer), sizeof(float));
+    constexpr size_t kDecodeWorkspaceBytes =
+        2ull * 1024ull * 1024ull * 1024ull;
+    // A small allowance covers arena alignment and graph metadata. The
+    // 2 GiB workspace matches the existing Qwen CUDA graph allocator floor.
+    const size_t alignment_bytes = weights / 100;
+    plan.required_device_bytes = add_saturating(
+        add_saturating(add_saturating(weights, alignment_bytes),
+                       add_saturating(kv_bytes, gdn_bytes)),
+        kDecodeWorkspaceBytes);
+    plan.device_expert_layers = c.n_layers;
+    plan.device_expert_trailing = false;
+
+#if defined(ZEROMOE_USE_GGML_CUDA)
+    int active_device = -1;
+    int target_device = engine.gpu_device_id;
+    if (cudaGetDevice(&active_device) != cudaSuccess)
+      active_device = -1;
+    if (target_device < 0)
+      target_device = active_device;
+    if (target_device < 0 || cudaSetDevice(target_device) != cudaSuccess) {
+      plan.reason = "CUDA could not select the Qwen graph device for memory planning";
+      return plan;
+    }
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    const cudaError_t mem_status = cudaMemGetInfo(&free_bytes, &total_bytes);
+    if (active_device >= 0 && active_device != target_device)
+      cudaSetDevice(active_device);
+    if (mem_status != cudaSuccess || free_bytes == 0) {
+      plan.reason = "CUDA could not report free VRAM for Qwen full-graph planning";
+      return plan;
+    }
+    plan.available_device_bytes = free_bytes;
+    plan.fit = plan.required_device_bytes <= free_bytes
+                   ? GraphMemoryFit::Fits
+                   : GraphMemoryFit::Insufficient;
+    plan.reason =
+        "Qwen full graph requires all model tensors, F32 KV/GDN state for " +
+        std::to_string(engine.max_t) + " positions, and a 2 GiB decode workspace";
+    (void)total_bytes;
+    return plan;
+#else
+    plan.reason = "Qwen full-graph CUDA memory planning is unavailable in this build";
+    return plan;
+#endif
+  }
+  GraphEngineCaps engine_caps(const StreamingEngine &) const override {
+    return {false, false, false, true};
+  }
+  int device_expert_layers() const override { return 0; }
+  int device_expert_layers(const StreamingEngine &engine) const override {
+    return engine.cuda_moe_graph_device_expert_layers;
+  }
+  bool device_expert_trailing() const override { return false; }
+  moe_routed::RouterSpec router_spec(const ArchitectureConfig &c,
+                                      int n_tokens) const override {
+    // Match CPUQwenMoEBackend: softmax over all experts, top-k, then
+    // renormalize the selected weights. That path does not use group routing
+    // or a GGUF selection-bias tensor.
+    auto spec = moe_routed::router_spec(c, n_tokens,
+                                        /*honor_gating_func=*/false);
+    spec.weights_norm = true;
+    spec.n_groups = 0;
+    spec.n_groups_used = 0;
+    return spec;
+  }
+  bool supports_cpu_lane() const override { return false; }
+  int min_prefill_batch() const override { return 2; }
+  bool requires_full_graph_prefill(
+      const StreamingEngine &engine) const override {
+    return supports_architecture(engine) &&
+           engine.cuda_moe_full_graph_decode_required;
+  }
+  bool prefill_prepare(StreamingEngine &engine,
+                       const ModelGraphRequest &request) const {
+    return qwen4exp_full_graph_prepare(engine, request.n_tokens,
+                                       request.pos_base, request.token_ids);
+}
+  bool prefill_run(StreamingEngine &engine,
+                   const ModelGraphRequest &request) const {
+    return qwen4exp_full_graph_run(engine, request.hidden_states,
+                                   request.n_tokens, request.pos_base,
+                                   request.token_ids);
+  }
+  bool decode_prepare(StreamingEngine &engine,
+                      const ModelGraphRequest &request) const {
+    return qwen4exp_full_graph_decode_prepare(
+        engine, request.pos_base, request.token_ids);
+  }
+  bool decode_run(StreamingEngine &engine,
+                  const ModelGraphRequest &request) const {
+    float *logits = request.logits ? request.logits
+                                   : engine.qwen4exp_full_graph_logits_target;
+    const int vocab = request.vocab > 0
+                          ? request.vocab
+                          : engine.qwen4exp_full_graph_logits_target_size;
+    return qwen4exp_full_graph_decode_run(
+        engine, request.hidden_states, request.pos_base, request.token_ids,
+        logits, vocab);
   }
 };
 
@@ -445,12 +762,12 @@ void log_graph_capabilities(const FullGraphModel &m, const StreamingEngine &e) {
   }
   const GraphEngineCaps c = m.engine_caps(e);
   LOG_INFO("[GRAPH-CAPS] %s: prefill=%d decode=%d cpu_lane=%d prefill_continuation=%d native_moe_cache=%d "
-           "graph_only=%d device_expert_layers=%d trailing=%d aliases_vram_cache=%d "
+           "graph_only=%d device_expert_layers=%d trailing=%d aliases_vram_cache=%d owns_expert_storage=%d "
            "ram_cache_with_preload=%d replaces_active_layer_area=%d min_prefill_batch=%d max_prefill_tokens=%d\n",
            m.name(), m.enabled(e, ModelGraphPhase::Prefill), m.enabled(e, ModelGraphPhase::Decode),
            m.supports_cpu_lane(), m.supports_prefill_continuation(e), m.uses_native_moe_cache(), m.graph_only(),
            m.device_expert_layers(e), m.device_expert_trailing(), c.aliases_vram_cache,
-           c.ram_cache_with_preload, c.replaces_active_layer_area, m.min_prefill_batch(),
+           c.owns_expert_storage, c.ram_cache_with_preload, c.replaces_active_layer_area, m.min_prefill_batch(),
            m.max_prefill_tokens(e));
   const GraphRuntimeTuning tuning = m.runtime_tuning(e);
   if (tuning.requires_preloaded_ddr_experts ||
@@ -466,12 +783,15 @@ void log_graph_capabilities(const FullGraphModel &m, const StreamingEngine &e) {
 
 const FullGraphModel *full_graph_model(ModelFamily family) {
   static const Qwen4ExpGraphModel qwen;
+static const Qwen35MoEGraphModel qwen35moe;
   static const Glm5NextGraphModel glm;
   static const GlmDsaGraphModel glm_dsa;
   static const Ling31FlashGraphModel ling;
   static const DeepseekV41GraphModel dsv41;
   static const MiMo2GraphModel mimo;
   switch (family) {
+case ModelFamily::Qwen:
+return &qwen35moe;
   case ModelFamily::MiMo2:
     return &mimo;
   case ModelFamily::Qwen4Exp:

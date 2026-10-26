@@ -434,6 +434,10 @@ inline bool qwen4exp_is_gdn_layer(const ArchitectureConfig &config, int layer_id
   return false;
 }
 
+inline bool qwen35moe_is_gdn_layer(const ArchitectureConfig &config,
+                                   int layer_idx) {
+  return qwen4exp_is_gdn_layer(config, layer_idx);
+}
 inline bool qwen4exp_is_ple_layer(const ArchitectureConfig &config, int layer_idx) {
   return std::find(config.ple_layers.begin(), config.ple_layers.end(),
                    (int64_t)layer_idx) != config.ple_layers.end();

@@ -223,6 +223,10 @@ void print_usage(bool all = false) {
       << "       ./zeromoe --gen-config [output.toml]\n\n"
       << "Options:\n"
       << "  --config <file>  Load engine config from TOML file\n"
+      << "  --serve          Serve OpenAI and Anthropic APIs (optional server build)\n"
+      << "  --host <host>    API bind address (default: 127.0.0.1)\n"
+      << "  --port <port>    API port (default: 8080)\n"
+      << "  --api-model <id> API model name (default: zeromoe)\n"
       << "  --gen-config     Generate a sample config file and exit\n"
       << "  --model <path>   Path to GGUF model file or directory\n"
       << "  --ram <GB>       Strict RAM budget in GB (default: auto-detect 88% "
@@ -263,11 +267,10 @@ void print_usage(bool all = false) {
       << "  --expert-fetch-threads <N>  OMP threads for parallel disk reads of "
          "a layer's topk cache misses (default: 4)\n"
       << "  --raw-prompt     Skip the chat-template wrap; tokenize stdin "
-         "verbatim (needed by\n"
-      << "                   api_server.py, which already applies its own "
-         "formatting; also\n"
-      << "                   useful for token-count-fair benchmarking against "
-         "other engines)\n"
+         "verbatim (useful for\n"
+      << "                   externally formatted prompts and token-count-fair "
+         "benchmarks;\n"
+      << "                   cannot be combined with --serve)\n"
       << "  --system-prompt <text>  Prepend a system-role message ahead of the "
          "user turn\n"
       << "                   (chat-template modes only; ignored with "
@@ -491,11 +494,32 @@ int main(int argc, char *argv[]) {
   // the resulting startup checks for a deliberate, known-safe case
   // (e.g. two instances on disjoint GPU sets).
   bool force_start_cli = false;
+  bool serve_api_cli = false;
+  std::string api_host_cli = "127.0.0.1";
+  std::string api_model_cli = "zeromoe";
+  int api_port_cli = 8080;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
     if (arg == "--config" && i + 1 < argc)
       config_path = argv[++i];
+    else if (arg == "--serve")
+      serve_api_cli = true;
+    else if (arg == "--host" && i + 1 < argc)
+      api_host_cli = argv[++i];
+    else if (arg == "--port" && i + 1 < argc) {
+      try {
+        size_t end = 0;
+        const std::string value = argv[++i];
+        api_port_cli = std::stoi(value, &end);
+        if (end != value.size() || api_port_cli <= 0 || api_port_cli > 65535)
+          throw std::invalid_argument("port");
+      } catch (const std::exception &) {
+        std::cerr << "Error: --port must be in [1, 65535]\n";
+        return 1;
+      }
+    } else if (arg == "--api-model" && i + 1 < argc)
+      api_model_cli = argv[++i];
     else if (arg == "--prompt" && i + 1 < argc)
       prompt_cli = argv[++i];
     else if (arg == "--gen-config") {
@@ -656,6 +680,32 @@ int main(int argc, char *argv[]) {
   }
 
   // --ram / --verbose-moe always override the config file's values, if given
+  config.serve_api = serve_api_cli;
+  config.api_host = api_host_cli;
+  config.api_port = api_port_cli;
+  config.api_model = api_model_cli;
+#ifndef ZEROMOE_BUILD_SERVER
+  if (config.serve_api) {
+    std::cerr << "Error: --serve requires -DZEROMOE_BUILD_SERVER=ON\n";
+    return 1;
+  }
+#endif
+  if (config.serve_api && (config.raw_prompt || raw_prompt_cli || zeromoe::bench::plan().enabled)) {
+    std::cerr << "Error: --serve cannot be combined with raw prompt or benchmark mode\n";
+    return 1;
+  }
+  if (config.serve_api && (config.api_model.empty() || config.api_host.empty())) {
+    std::cerr << "Error: --api-model and --host cannot be empty\n";
+    return 1;
+  }
+  if (config.serve_api && config.api_host != "127.0.0.1" && config.api_host != "::1" &&
+      config.api_host != "localhost") {
+    const char *key = std::getenv("ZEROMOE_API_KEY");
+    if (!key || !key[0]) {
+      std::cerr << "Error: non-loopback --host requires ZEROMOE_API_KEY\n";
+      return 1;
+    }
+  }
   if (ram_budget_gb > 0)
     config.host_ram_gb = ram_budget_gb;
   if (!prompt_cli.empty())

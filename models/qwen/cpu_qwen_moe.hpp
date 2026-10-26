@@ -143,6 +143,11 @@ inline void QwenModelTraits::inspect_tensors(const GGUFFile &model) {
   }
 }
 
+struct CPUQwenSequenceState final : CPUBackendState {
+  std::vector<std::vector<float>> recurrent;
+  std::vector<std::vector<float>> convolution;
+};
+
 // CPU-only Qwen MoE backend.
 class CPUQwenMoEBackend : public CPUModelBackend {
 public:
@@ -152,6 +157,31 @@ public:
   const char *name() const override {
     return "Qwen3.6 MoE (CPU, hybrid LinearAttention+DenseQKV)";
   }
+  bool supports_sequence_state() const override { return true; }
+  void reset_sequence() override {
+    linear_attn_states.clear();
+    conv_history.clear();
+  }
+  size_t sequence_state_bytes() const override {
+    size_t bytes = sizeof(CPUQwenSequenceState) +
+                   (linear_attn_states.size() + conv_history.size()) * sizeof(std::vector<float>);
+    for (const auto &v : linear_attn_states) bytes += v.size() * sizeof(float);
+    for (const auto &v : conv_history) bytes += v.size() * sizeof(float);
+    return bytes;
+  }
+  std::unique_ptr<CPUBackendState> save_sequence_state() const override {
+    auto state = std::make_unique<CPUQwenSequenceState>();
+    state->recurrent = linear_attn_states;
+    state->convolution = conv_history;
+    return state;
+  }
+  bool restore_sequence_state(const CPUBackendState &state) override {
+    const auto *qwen = dynamic_cast<const CPUQwenSequenceState *>(&state);
+    if (!qwen) return false;
+    linear_attn_states = qwen->recurrent;
+    conv_history = qwen->convolution;
+    return true;
+  }
 
   CPULayerType layer_type(int layer_idx) const override {
     return traits.layer_types[layer_idx];
@@ -159,11 +189,13 @@ public:
 
   void forward_layer(CPUEngine &engine, int layer_idx, float *hidden_states,
                      int S, int pos_base) override;
+  bool last_forward_succeeded() const override { return forward_ok_; }
 
   bool lm_head(CPUEngine &engine, const float *hidden, float *logits,
                int S) override;
 
 private:
+  bool forward_ok_ = true;
   // Standard dense QKV attention block (for the 10 transformer layers).
   void forward_dense_attention(CPUEngine &engine, int layer_idx,
                                float *hidden_states, int S, int pos_base);
@@ -247,8 +279,18 @@ inline void CPUQwenMoEBackend::forward_moe_ffn(CPUEngine &engine, int layer_idx,
   // Router: [S, D] @ [D, n_experts] -> gate logits [S, n_experts]
   std::string router_key = prefix + "ffn_gate_inp.weight";
   const CPUQuantizedTensor *router = engine.find_layer(router_key);
-  if (!router || !router->host_ptr)
+  if (!router || !router->host_ptr) {
+    if (c.n_experts > 0) {
+      LOG_ERROR("[CPU-QWEN] Missing router in %s\n", prefix.c_str());
+      forward_ok_ = false;
+    }
     return;
+  }
+  if (c.n_experts <= 0 || topk <= 0 || topk > c.n_experts || moe_inter <= 0) {
+    LOG_ERROR("[CPU-QWEN] Invalid expert dimensions in %s\n", prefix.c_str());
+    forward_ok_ = false;
+    return;
+  }
 
   std::vector<float> gate_logits((size_t)S * c.n_experts, 0.0f);
   matmul(gate_logits.data(), hidden_states,
@@ -259,12 +301,16 @@ inline void CPUQwenMoEBackend::forward_moe_ffn(CPUEngine &engine, int layer_idx,
   std::vector<float> topk_weight((size_t)S * topk);
   for (int s = 0; s < S; ++s) {
     float *logits = gate_logits.data() + s * c.n_experts;
-    // Sanitize non-finite logits before softmax/top-k.  NaN breaks the strict
+    // Reject non-finite logits before softmax/top-k. NaN breaks the strict
     // weak ordering required by std::partial_sort (notably on libc++), which
     // can hang or crash when NaN propagates from upstream quant/dequant bugs.
     for (int e = 0; e < c.n_experts; ++e) {
       if (std::isnan(logits[e]) || std::isinf(logits[e]))
-        logits[e] = -1.0e30f;
+        forward_ok_ = false;
+    }
+    if (!forward_ok_) {
+      LOG_ERROR("[CPU-QWEN] Non-finite router logits in %s\n", prefix.c_str());
+      return;
     }
     // softmax
     float mx = *std::max_element(logits, logits + c.n_experts);
@@ -308,8 +354,11 @@ inline void CPUQwenMoEBackend::forward_moe_ffn(CPUEngine &engine, int layer_idx,
       int e = topk_idx[s * topk + k];
       engine.route_usage.bump(layer_idx, e);
       CPUExpertSlot *slot = engine.expert_cache.get(layer_idx, e);
-      if (!slot)
-        continue;
+      if (!slot) {
+        LOG_ERROR("[CPU-QWEN] Failed to load expert %d in %s\n", e, prefix.c_str());
+        forward_ok_ = false;
+        return;
+      }
 
       // gate(x) @ W_gate -> [moe_inter]
       std::vector<float> gate_proj(moe_inter);
@@ -322,6 +371,7 @@ inline void CPUQwenMoEBackend::forward_moe_ffn(CPUEngine &engine, int layer_idx,
                      gate_proj.data(), D, moe_inter, 1);
       dequant_matmul(slot->up_type, slot->slab + slot->gate_size, slot->up_size,
                      x, up_proj.data(), D, moe_inter, 1);
+      if (!forward_ok_) return;
 
       silu_inplace(gate_proj.data(), moe_inter);
       elem_mul(gate_proj.data(), gate_proj.data(), up_proj.data(), moe_inter);
@@ -329,6 +379,7 @@ inline void CPUQwenMoEBackend::forward_moe_ffn(CPUEngine &engine, int layer_idx,
       dequant_matmul(
           slot->down_type, slot->slab + slot->gate_size + slot->up_size,
           slot->down_size, gate_proj.data(), down_proj.data(), moe_inter, D, 1);
+      if (!forward_ok_) return;
 
       float w = topk_weight[s * topk + k];
       for (int i = 0; i < D; ++i)
@@ -407,6 +458,7 @@ inline void CPUQwenMoEBackend::forward_moe_ffn(CPUEngine &engine, int layer_idx,
       }
     }
     if (bad > 0) {
+      forward_ok_ = false;
       LOG_ERROR("[CPU-QWEN] forward_moe_ffn layer=%d seq=%d has %d/%d NaN/Inf "
                 "(first=%g)\n",
                 layer_idx, s, bad, D, first_bad);
@@ -481,9 +533,11 @@ inline void CPUQwenMoEBackend::dequant_matmul(GGUFType type, const uint8_t *w,
       ++ok_rows;
   }
   if (ok_rows != O) {
+    forward_ok_ = false;
     LOG_ERROR("[CPU-QWEN] dequant_matmul: only %d/%d rows dequantized (type=%u "
               "I=%d O=%d S=%d)\n",
               ok_rows, O, static_cast<uint32_t>(type), I, O, S);
+    return;
   }
   matmul(y, x, wf.data(), S, I, O);
 }

@@ -7,6 +7,7 @@
 #include "ggml_qwen4exp_graph_internal.hpp"
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
+#include "qwen4exp_graph_ops.hpp"
 
 using namespace qwen4exp_graph;
 
@@ -15,58 +16,24 @@ namespace qwen4exp_graph {
 ggml_tensor *hc_mix(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
                     ggml_tensor *norm, ggml_tensor *down, ggml_tensor *up,
                     ggml_tensor *inject, ggml_tensor **inject_out) {
-  ggml_tensor *xn =
-      ggml_rms_norm(ctx, x, g.engine->model_file.architecture_config.eps);
-  xn = ggml_reshape_2d(ctx, xn, g.D * g.HC, g.S);
-  xn = ggml_mul(ctx, xn, norm);
-  ggml_tensor *lo = ggml_mul_mat(ctx, down, xn);
-  lo = ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f / static_cast<float>(g.HC)));
-  ggml_tensor *gate_logits = ggml_mul_mat(ctx, up, lo);
-  ggml_tensor *gate = ggml_sigmoid(ctx, gate_logits);
-  ggml_tensor *gated = ggml_mul(ctx, xn, gate);
-  ggml_tensor *g3 = ggml_reshape_3d(ctx, gated, g.D, g.HC, g.S);
-
-  ggml_tensor *mixed =
-      ggml_cont(ctx, ggml_view_2d(ctx, g3, g.D, g.S,
-                                  ggml_row_size(g3->type, g.D) * g.HC, 0));
-  for (int h = 1; h < g.HC; ++h) {
-    ggml_tensor *s =
-        ggml_view_2d(ctx, g3, g.D, g.S, ggml_row_size(g3->type, g.D) * g.HC,
-                     ggml_row_size(g3->type, g.D) * h);
-    mixed = ggml_add(ctx, mixed, s);
-  }
-  mixed = ggml_scale(ctx, mixed, 1.0f / static_cast<float>(g.HC));
-  if (inject_out) {
-    *inject_out = inject ? ggml_mul_mat(ctx, inject, xn) : nullptr;
-  }
-  return mixed;
+  return qwen4exp_ops::hc_mix(
+      {g.D, g.HC, g.S, g.engine->model_file.architecture_config.eps},
+      ctx, x, norm, down, up, inject, inject_out);
 }
 
 ggml_tensor *hc_combine(FullGraph &g, ggml_context *ctx, ggml_tensor *residual,
                         ggml_tensor *block, ggml_tensor *inject) {
-  ggml_tensor *w = ggml_scale(
-      ctx, ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / g.HC)), 2.0f);
-  w = ggml_reshape_3d(ctx, w, 1, g.HC, g.S);
-  ggml_tensor *b = ggml_reshape_3d(ctx, block, g.D, 1, g.S);
-  b = ggml_repeat_4d(ctx, b, g.D, g.HC, g.S, 1);
-  return ggml_add(ctx, residual, ggml_mul(ctx, b, w));
+  return qwen4exp_ops::hc_combine(
+      {g.D, g.HC, g.S, g.engine->model_file.architecture_config.eps},
+      ctx, residual, block, inject);
 }
 
 ggml_tensor *build_shared(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                           int layer, ggml_tensor *gate, ggml_tensor *up,
                           ggml_tensor *down, ggml_tensor *scalar_gate) {
-  if (!gate || !up || !down)
-    return nullptr;
-  ggml_tensor *gate_out = ggml_mul_mat(ctx, gate, cur);
-  ggml_tensor *up_out = ggml_mul_mat(ctx, up, cur);
-  ggml_tensor *act = ggml_swiglu_split(ctx, gate_out, up_out);
-  ggml_tensor *out = ggml_mul_mat(ctx, down, act);
-  if (scalar_gate) {
-    ggml_tensor *sg = ggml_sigmoid(ctx, ggml_mul_mat(ctx, scalar_gate, cur));
-    out = ggml_mul(ctx, out, sg);
-  }
+  (void)g;
   (void)layer;
-  return out;
+  return qwen4exp_ops::shared_expert(ctx, cur, gate, up, down, scalar_gate);
 }
 
 // ggml-cuda's gated_delta_net kernel reads AND writes its per-head recurrent
@@ -101,18 +68,33 @@ ggml_tensor *build_gdn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                        ggml_tensor **state_out, ggml_tensor **hist_out) {
   ggml_tensor *qkv = ggml_mul_mat(ctx, w_qkv, cur);
   auto diag = [&](const char *label, ggml_tensor *value) {
+    if (!value || !g.graph ||
+        !zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP"))
+      return;
+    const std::string name = "qwen35_" + std::string(label) + "_" +
+                             std::to_string(layer);
+    ggml_set_name(value, name.c_str());
+    ggml_set_output(value);
+    ggml_build_forward_expand(g.graph, value);
+    g.gdn_probe_taps.emplace_back(layer, label, value);
   };
+  diag("gdn_input", cur);
   // These snapshots are deliberately taken before and inside the GDN node.
   // The existing attention-output dump only tells us that the discrepancy is
   // present after the recurrent block; these boundaries separate qkv GEMM,
   // convolution, GDN/state update, and the final output projection.
   diag("gdn_qkv", qkv);
   ggml_tensor *z = ggml_mul_mat(ctx, w_gate, cur);
+  diag("gdn_z", z);
   ggml_tensor *alpha = ggml_mul_mat(ctx, w_alpha, cur);
+  diag("gdn_alpha", alpha);
   ggml_tensor *beta_raw = ggml_mul_mat(ctx, w_beta, cur);
+  diag("gdn_beta_raw", beta_raw);
   ggml_tensor *glog =
       ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, alpha, w_dt)), w_a);
+  diag("gdn_decay", glog);
   ggml_tensor *beta = ggml_sigmoid(ctx, beta_raw);
+  diag("gdn_beta", beta);
 
   ggml_tensor *conv_in = ggml_concat(ctx, hist_in, ggml_transpose(ctx, qkv), 0);
   diag("gdn_conv_in", conv_in);
@@ -130,10 +112,22 @@ ggml_tensor *build_gdn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       ggml_view_4d(ctx, conv, g.gdn_hd, g.Hv_gdn, g.S, 1,
                    ggml_row_size(GGML_TYPE_F32, g.gdn_hd), row, row * g.S,
                    ggml_row_size(GGML_TYPE_F32, 2 * g.key_dim));
-  q = ggml_l2_norm(ctx, q, g.engine->model_file.architecture_config.eps);
-  k = ggml_l2_norm(ctx, k, g.engine->model_file.architecture_config.eps);
+  // Match llama.cpp's build_gdn_l2_norm op sequence. The mathematically
+  // equivalent GGML_OP_L2_NORM has a different reduction/rounding path and
+  // introduces a small Q/K drift before the routed expert matmuls.
+  const float eps = g.engine->model_file.architecture_config.eps;
+  const float q_norm_n = static_cast<float>(q->ne[0]);
+  const float k_norm_n = static_cast<float>(k->ne[0]);
+  q = ggml_scale(ctx, ggml_rms_norm(ctx, q, eps / q_norm_n),
+                 1.0f / std::sqrt(q_norm_n));
+  k = ggml_scale(ctx, ggml_rms_norm(ctx, k, eps / k_norm_n),
+                 1.0f / std::sqrt(k_norm_n));
+  diag("gdn_q_norm", q);
+  diag("gdn_k_norm", k);
+  diag("gdn_v", v);
   glog = ggml_reshape_4d(ctx, glog, 1, g.Hv_gdn, g.S, 1);
   beta = ggml_reshape_4d(ctx, beta, 1, g.Hv_gdn, g.S, 1);
+  diag("gdn_state_in", state_in);
   ggml_tensor *gdn =
       ggml_gated_delta_net(ctx, q, k, v, glog, beta, state_in, 1);
   diag("gdn_output", gdn);
@@ -158,23 +152,45 @@ ggml_tensor *build_gdn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       ggml_view_4d(ctx, gdn, g.gdn_hd, g.gdn_hd, g.Hv_gdn, 1, hd_row, state_row,
                    state_row * g.Hv_gdn,
                    static_cast<size_t>(g.value_dim) * g.S * sizeof(float));
-  *state_out = ggml_cont(ctx, state_raw);
+  // Qwen's decode graph can feed this contiguous snapshot view directly to a
+  // cache CPY. ggml-cuda recognizes the GATED_DELTA_NET -> VIEW -> CPY pattern
+  // and writes the recurrent snapshot into the persistent state buffer from
+  // the GDN kernel. Wrapping it in CONT forces an extra full-state D2D copy
+  // and prevents that fusion. Keep the historical materialization for the
+  // Qwen4Exp/HC path, which also exposes this state to host consumers.
+  *state_out = g.engine->family_ops.family == ModelFamily::Qwen
+                   ? state_raw
+                   : ggml_cont(ctx, state_raw);
+  diag("gdn_state_out", *state_out);
   ggml_tensor *norm = ggml_mul(
       ctx,
       ggml_rms_norm(ctx, core, g.engine->model_file.architecture_config.eps),
       w_norm);
   diag("gdn_norm", norm);
   ggml_tensor *z4 = ggml_reshape_4d(ctx, z, g.gdn_hd, g.Hv_gdn, g.S, 1);
-  ggml_tensor *z_gate = ggml_sigmoid(ctx, z4);
+  // Qwen3.5's GatedDeltaNet output uses SiLU(z); Qwen4Exp uses sigmoid(z).
+  // The recurrent-state and projection math remains shared between families.
+  ggml_tensor *z_gate =
+      g.engine->family_ops.family == ModelFamily::Qwen
+          ? ggml_silu(ctx, z4)
+          : ggml_sigmoid(ctx, z4);
   ggml_tensor *gated = ggml_mul(ctx, norm, z_gate);
   diag("gdn_gated", gated);
   ggml_tensor *out_input = ggml_reshape_2d(ctx, gated, g.value_dim, g.S);
   ggml_tensor *out = ggml_mul_mat(ctx, w_out, out_input);
   diag("gdn_output_projection", out);
-  *hist_out =
-      ggml_cont(ctx, ggml_view_3d(ctx, conv_in, g.d_conv - 1, g.conv_dim, 1,
-                                  conv_in->nb[1], conv_in->nb[2],
-                                  ggml_row_size(conv_in->type, g.S)));
+  ggml_tensor *history_view =
+      ggml_view_3d(ctx, conv_in, g.d_conv - 1, g.conv_dim, 1,
+                   conv_in->nb[1], conv_in->nb[2],
+                   ggml_row_size(conv_in->type, g.S));
+  // Qwen cache writeback copies this strided history view directly into its
+  // persistent CUDA state tensor, matching llama.cpp's build_conv_state path.
+  // CONT followed by CPY materializes the same 96 KiB history twice per GDN
+  // layer and decode token.
+  *hist_out = g.engine->family_ops.family == ModelFamily::Qwen &&
+                      g.decode_mode
+                  ? history_view
+                  : ggml_cont(ctx, history_view);
   (void)layer;
   return out;
 }
@@ -186,45 +202,77 @@ ggml_tensor *build_full_attention(FullGraph &g, ggml_context *ctx,
                                   ggml_tensor *w_o, ggml_tensor **k_cache,
                                   ggml_tensor **v_cache) {
   ggml_tensor *qfull = ggml_mul_mat(ctx, w_q, cur);
+  auto diag = [&](const char *label, ggml_tensor *value) {
+    if (!value || !g.graph ||
+        !zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP"))
+      return;
+    const std::string name = "qwen35_" + std::string(label) + "_" +
+                             std::to_string(layer);
+    ggml_set_name(value, name.c_str());
+    ggml_set_output(value);
+    ggml_build_forward_expand(g.graph, value);
+    g.gdn_probe_taps.emplace_back(layer, label, value);
+  };
+  diag("full_qg_proj", qfull);
   ggml_tensor *q =
       ggml_view_3d(ctx, qfull, g.hd, g.H, g.S, sizeof(float) * g.hd * 2,
                    sizeof(float) * g.hd * 2 * g.H, 0);
+  diag("full_q_view", q);
   q = ggml_mul(
       ctx, ggml_rms_norm(ctx, q, g.engine->model_file.architecture_config.eps),
       w_qn);
+  diag("full_q_norm", q);
   ggml_tensor *k =
       ggml_reshape_3d(ctx, ggml_mul_mat(ctx, w_k, cur), g.hd, g.Hkv, g.S);
   k = ggml_mul(
       ctx, ggml_rms_norm(ctx, k, g.engine->model_file.architecture_config.eps),
       w_kn);
+  diag("full_k_norm", k);
   ggml_tensor *v =
       ggml_reshape_3d(ctx, ggml_mul_mat(ctx, w_v, cur), g.hd, g.Hkv, g.S);
+  diag("full_v", v);
   const int n_rot = g.engine->model_file.architecture_config.rope_n_rot > 0
                         ? g.engine->model_file.architecture_config.rope_n_rot
                         : g.hd;
-  // Qwen4Exp's upstream rope_type is IMROPE (interleaved M-RoPE), whose
-  // cos/sin pairing is NEOX-ordered (rotate-half), not the adjacent-pair
-  // (2j,2j+1) ordering GGML_ROPE_TYPE_NORMAL applies. For text-only decode
-  // every M-RoPE section carries the same scalar position (no vision/video
-  // tokens), so IMROPE's per-section theta selection is provably identical
-  // to plain single-axis NEOX rope (ggml.h's own ggml_rope_multi comment:
-  // "the theta for each dim is computed the same way as ggml_rope_ext, no
-  // matter the section") -- ggml_rope_ext with GGML_ROPE_TYPE_NEOX is exact,
-  // not an approximation, and needs no 4x-wide position tensor. Also use
-  // this model's real rope.freq_base (10,000,000 for this checkpoint) --
-  // plain ggml_rope()'s 5-arg wrapper silently hardcodes ggml's generic
-  // 10,000 default, which is wrong for Qwen4Exp by 1000x.
+  // Qwen3.5/3.6 uses IMRoPE with model-provided sections and four position
+  // lanes, even for text-only inputs. The section pattern changes which head
+  // dimensions rotate together; collapsing it to NEOX produced a measurable
+  // divergence at the first full-attention layer. Qwen4Exp retains its
+  // separate NEOX path. Use the checkpoint's rope.freq_base (10,000,000),
+  // rather than ggml_rope()'s generic 10,000 default.
   const float rope_freq_base =
       g.engine->model_file.get_config_float("rope.freq_base", 10000.0f);
   const auto &rope_c = g.engine->model_file.architecture_config;
-  q = ggml_rope_ext(ctx, q, g.positions, nullptr, n_rot, GGML_ROPE_TYPE_NEOX,
-                     rope_c.rope_n_ctx_orig, rope_freq_base,
-                     rope_c.rope_freq_scale, rope_c.rope_ext_factor,
-                     rope_c.rope_attn_factor, 32.0f, 1.0f);
-  k = ggml_rope_ext(ctx, k, g.positions, nullptr, n_rot, GGML_ROPE_TYPE_NEOX,
-                     rope_c.rope_n_ctx_orig, rope_freq_base,
-                     rope_c.rope_freq_scale, rope_c.rope_ext_factor,
-                     rope_c.rope_attn_factor, 32.0f, 1.0f);
+  if (g.position_ids_per_token == 4) {
+    if (rope_c.rope_sections.size() != 4)
+      return nullptr;
+    int sections[GGML_MROPE_SECTIONS];
+    for (size_t i = 0; i < GGML_MROPE_SECTIONS; ++i)
+      sections[i] = static_cast<int>(rope_c.rope_sections[i]);
+    q = ggml_rope_multi(ctx, q, g.positions, nullptr, n_rot, sections,
+                        GGML_ROPE_TYPE_IMROPE, rope_c.rope_n_ctx_orig,
+                        rope_freq_base, rope_c.rope_freq_scale,
+                        rope_c.rope_ext_factor, rope_c.rope_attn_factor,
+                        32.0f, 1.0f);
+    k = ggml_rope_multi(ctx, k, g.positions, nullptr, n_rot, sections,
+                        GGML_ROPE_TYPE_IMROPE, rope_c.rope_n_ctx_orig,
+                        rope_freq_base, rope_c.rope_freq_scale,
+                        rope_c.rope_ext_factor, rope_c.rope_attn_factor,
+                        32.0f, 1.0f);
+  } else {
+    q = ggml_rope_ext(ctx, q, g.positions, nullptr, n_rot,
+                      GGML_ROPE_TYPE_NEOX, rope_c.rope_n_ctx_orig,
+                      rope_freq_base, rope_c.rope_freq_scale,
+                      rope_c.rope_ext_factor, rope_c.rope_attn_factor, 32.0f,
+                      1.0f);
+    k = ggml_rope_ext(ctx, k, g.positions, nullptr, n_rot,
+                      GGML_ROPE_TYPE_NEOX, rope_c.rope_n_ctx_orig,
+                      rope_freq_base, rope_c.rope_freq_scale,
+                      rope_c.rope_ext_factor, rope_c.rope_attn_factor, 32.0f,
+                      1.0f);
+  }
+  diag("full_q_rope", q);
+  diag("full_k_rope", k);
   // The host dense KV cache stores the same normalized and rotated K/V values
   // that llama.cpp's graph writes to its cache.  Keep these F32 tensors before the
   // layout-only permute/cast used by flash attention.
@@ -259,15 +307,22 @@ ggml_tensor *build_full_attention(FullGraph &g, ggml_context *ctx,
   ggml_tensor *attn = ggml_flash_attn_ext(
       ctx, q, k, v, g.attn_mask, 1.0f / std::sqrt(static_cast<float>(g.hd)),
       0.0f, 0.0f);
+  diag("full_attn", attn);
   ggml_tensor *gate =
       ggml_view_3d(ctx, qfull, g.hd, g.H, g.S, sizeof(float) * g.hd * 2,
                    sizeof(float) * g.hd * 2 * g.H, sizeof(float) * g.hd);
   gate = ggml_reshape_3d(ctx, ggml_cont_2d(ctx, gate, g.H * g.hd, g.S), g.hd,
                          g.H, g.S);
-  attn = ggml_mul(ctx, attn, ggml_sigmoid(ctx, gate));
+  diag("full_gate", gate);
+  ggml_tensor *gate_sigmoid = ggml_sigmoid(ctx, gate);
+  diag("full_gate_sigmoid", gate_sigmoid);
+  attn = ggml_mul(ctx, attn, gate_sigmoid);
+  diag("full_attn_gated", attn);
   attn = ggml_reshape_2d(ctx, attn, g.H * g.hd, g.S);
   (void)layer;
-  return ggml_mul_mat(ctx, w_o, attn);
+  ggml_tensor *out = ggml_mul_mat(ctx, w_o, attn);
+  diag("full_output_projection", out);
+  return out;
 }
 
 // Decode variant of build_full_attention().  K/V are appended directly to a
@@ -279,64 +334,41 @@ ggml_tensor *build_full_attention_decode(
     ggml_tensor *w_q, ggml_tensor *w_k, ggml_tensor *w_v, ggml_tensor *w_qn,
     ggml_tensor *w_kn, ggml_tensor *w_o, ggml_tensor *k_storage,
     ggml_tensor *v_storage) {
-  ggml_tensor *qfull = ggml_mul_mat(ctx, w_q, cur);
-  ggml_tensor *q = ggml_view_3d(
-      ctx, qfull, g.hd, g.H, 1, sizeof(float) * g.hd * 2,
-      sizeof(float) * g.hd * 2 * g.H, 0);
-  q = ggml_mul(
-      ctx, ggml_rms_norm(ctx, q, g.engine->model_file.architecture_config.eps),
-      w_qn);
-  ggml_tensor *k = ggml_reshape_3d(
-      ctx, ggml_mul_mat(ctx, w_k, cur), g.hd, g.Hkv, 1);
-  k = ggml_mul(
-      ctx, ggml_rms_norm(ctx, k, g.engine->model_file.architecture_config.eps),
-      w_kn);
-  ggml_tensor *v = ggml_reshape_3d(
-      ctx, ggml_mul_mat(ctx, w_v, cur), g.hd, g.Hkv, 1);
-  const int n_rot = g.engine->model_file.architecture_config.rope_n_rot > 0
-                        ? g.engine->model_file.architecture_config.rope_n_rot
-                        : g.hd;
-  // See build_full_attention() above for why NEOX ordering + the model's
-  // real rope.freq_base (not GGML_ROPE_TYPE_NORMAL + ggml's hardcoded
-  // 10,000 default) is the correct, exact substitute for IMROPE here.
-  const float rope_freq_base =
-      g.engine->model_file.get_config_float("rope.freq_base", 10000.0f);
   const auto &rope_c = g.engine->model_file.architecture_config;
-  q = ggml_rope_ext(ctx, q, g.positions, nullptr, n_rot, GGML_ROPE_TYPE_NEOX,
-                     rope_c.rope_n_ctx_orig, rope_freq_base,
-                     rope_c.rope_freq_scale, rope_c.rope_ext_factor,
-                     rope_c.rope_attn_factor, 32.0f, 1.0f);
-  k = ggml_rope_ext(ctx, k, g.positions, nullptr, n_rot, GGML_ROPE_TYPE_NEOX,
-                     rope_c.rope_n_ctx_orig, rope_freq_base,
-                     rope_c.rope_freq_scale, rope_c.rope_ext_factor,
-                     rope_c.rope_attn_factor, 32.0f, 1.0f);
-
-  ggml_tensor *k2 = ggml_reshape_2d(ctx, k, g.hd, g.Hkv);
-  ggml_tensor *v2 = ggml_reshape_2d(ctx, v, g.hd, g.Hkv);
-  ggml_tensor *kset = ggml_set_rows(ctx, k_storage, k2, g.decode_indices);
-  ggml_tensor *vset = ggml_set_rows(ctx, v_storage, v2, g.decode_indices);
-  ggml_tensor *kcache = ggml_reshape_4d(
-      ctx, kset, g.hd, g.kv_capacity, g.Hkv, 1);
-  ggml_tensor *vcache = ggml_reshape_4d(
-      ctx, vset, g.hd, g.kv_capacity, g.Hkv, 1);
-
-  q = ggml_permute(ctx, q, 0, 2, 1, 3);
-  if (kcache->type == GGML_TYPE_F32)
-    kcache = ggml_cast(ctx, kcache, GGML_TYPE_F16);
-  if (vcache->type == GGML_TYPE_F32)
-    vcache = ggml_cast(ctx, vcache, GGML_TYPE_F16);
-  ggml_tensor *attn = ggml_flash_attn_ext(
-      ctx, q, kcache, vcache, g.attn_mask,
-      1.0f / std::sqrt(static_cast<float>(g.hd)), 0.0f, 0.0f);
-  ggml_tensor *gate = ggml_view_3d(
-      ctx, qfull, g.hd, g.H, 1, sizeof(float) * g.hd * 2,
-      sizeof(float) * g.hd * 2 * g.H, sizeof(float) * g.hd);
-  gate = ggml_reshape_3d(ctx, ggml_cont_2d(ctx, gate, g.H * g.hd, 1), g.hd,
-                         g.H, 1);
-  attn = ggml_mul(ctx, attn, ggml_sigmoid(ctx, gate));
-  attn = ggml_reshape_2d(ctx, attn, g.H * g.hd, 1);
   (void)layer;
-  return ggml_mul_mat(ctx, w_o, attn);
+  qwen4exp_ops::AttentionShape attention{
+      g.H,
+      g.Hkv,
+      g.hd,
+      g.kv_capacity,
+      rope_c.rope_n_rot > 0 ? rope_c.rope_n_rot : g.hd,
+      rope_c.rope_n_ctx_orig,
+      rope_c.eps,
+      g.engine->model_file.get_config_float("rope.freq_base", 10000.0f),
+      rope_c.rope_freq_scale,
+      rope_c.rope_ext_factor,
+      rope_c.rope_attn_factor};
+  if (g.position_ids_per_token == 4) {
+    if (rope_c.rope_sections.size() != GGML_MROPE_SECTIONS)
+      return nullptr;
+    attention.rope_mode = GGML_ROPE_TYPE_IMROPE;
+    for (size_t i = 0; i < GGML_MROPE_SECTIONS; ++i)
+      attention.rope_sections[i] = static_cast<int>(rope_c.rope_sections[i]);
+  }
+  auto diag = [&](const char *label, ggml_tensor *value) {
+    if (!value || !g.graph ||
+        !zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP"))
+      return;
+    const std::string name = "qwen35_" + std::string(label) + "_" +
+                             std::to_string(layer);
+    ggml_set_name(value, name.c_str());
+    ggml_set_output(value);
+    ggml_build_forward_expand(g.graph, value);
+    g.gdn_probe_taps.emplace_back(layer, label, value);
+  };
+  return qwen4exp_ops::attention_decode(
+      attention, ctx, cur, w_q, w_k, w_v, w_qn, w_kn, w_o, k_storage,
+      v_storage, g.positions, g.decode_indices, g.attn_mask, nullptr, diag);
 }
 
 bool prepare_ple_embedding(FullGraph &g, std::vector<float> &embedding, int S,

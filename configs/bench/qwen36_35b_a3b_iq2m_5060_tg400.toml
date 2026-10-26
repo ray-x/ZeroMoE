@@ -1,0 +1,50 @@
+# Matched 1-token-prefix / 400-token decode profile for the RTX 5060 Ti.
+# Context 401 matches llama-bench -pg 1,400. MTP remains disabled.
+# Set device_id, moe_ggml_device, and GPU name for a different host.
+
+model_path = "/home/ray/vllm-workspace/Qwen3.6-35B-A3B-UD-IQ2_M.gguf"
+log_path = "build_qwen36_sm120/results/qwen36_fullfit_normfix_context401.log"
+log_level = "INFO"
+
+context_size = 401
+max_new_tokens = 400
+temperature = 0.0
+top_p = 1.0
+enable_thinking = false
+mtp_enabled = false
+prompt_cache = false
+
+host_ram_gb = 32.0
+ram_preload_all_experts = false
+ram_pinned_budget_gb = 0.0
+ram_cache_total_experts = 0
+freeze_usage_stats = true
+pin_topk_per_layer = 0
+pinned_vram_capacity = 0
+pin_vram_lru_fraction = 0.0
+pin_ram_fraction = 0.0
+use_active_layer_area = false
+
+direct_io = false
+io_uring = false
+drop_pages = false
+omp_max_threads = 10
+expert_fetch_threads = 4
+prefetch_worker_threads = 2
+
+# Token routing and any prefill-layer CUDA ops must use the same physical GPU
+# selected by the full-graph memory planner.
+moe_ggml_device = 1
+moe_ggml_mul_mat_id = true
+moe_gpu_accum = true
+expert_gpu_activation = true
+
+[[gpus]]
+device_id = 1
+name = "NVIDIA GeForce RTX 5060 Ti"
+role = "dense+moe"
+vram_gb = 16.0
+dense_gb = 0.0
+kv_cache_gb = 0.0
+moe_cache_gb = 0.0
+active_layer_capacity_slots = 0

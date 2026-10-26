@@ -64,7 +64,7 @@ bool cpu_forward_layer(CPUEngine &engine, int layer_idx, float *hidden_states,
   if (!engine.backend)
     return false;
   engine.backend->forward_layer(engine, layer_idx, hidden_states, S, pos_base);
-  return true;
+  return engine.backend->last_forward_succeeded();
 }
 
 bool cpu_lm_head(CPUEngine &engine, const float *hidden, float *logits, int S) {

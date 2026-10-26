@@ -898,7 +898,72 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
   // Reference for every key/constraint: llama.cpp branch
   // qwen4exp/qwen3.8-flash-next (src/models/qwen4exp.cpp's
   // load_arch_hparams, conversion/qwen4exp.py's set_gguf_parameters).
-  if (fam == ModelFamily::Qwen4Exp) {
+if (fam == ModelFamily::Qwen && arch0 == "qwen35moe") {
+  c.qwen4exp_recurrent_layers =
+      file.get_config_int_array("attention.recurrent_layers");
+  c.qwen4exp_full_attention_interval =
+      file.get_config_int("full_attention_interval", 4);
+  if (c.qwen4exp_full_attention_interval <= 1 ||
+      (!c.qwen4exp_recurrent_layers.empty() &&
+       c.qwen4exp_recurrent_layers.size() < static_cast<size_t>(n_layer_all))) {
+    LOG_STREAM_ERROR() << "[QWEN35MOE] invalid recurrent layer map or "
+                       << "full_attention_interval="
+                       << c.qwen4exp_full_attention_interval << ".\n";
+    return false;
+  }
+  c.rope_sections = file.get_config_int_array("rope.dimension_sections");
+  c.rope_n_rot = file.get_config_int("rope.dimension_count", 0);
+  int64_t rope_section_pairs = 0;
+  for (const int64_t section : c.rope_sections) {
+    if (section < 0) {
+      LOG_STREAM_ERROR() << "[QWEN35MOE] negative IMRoPE section size.\n";
+      return false;
+    }
+    rope_section_pairs += section;
+  }
+  if (c.rope_sections.size() != 4 || c.rope_n_rot <= 0 ||
+      c.rope_n_rot > c.head_dim || (c.rope_n_rot % 2) != 0 ||
+      rope_section_pairs * 2 != c.rope_n_rot) {
+    LOG_STREAM_ERROR() << "[QWEN35MOE] invalid IMRoPE metadata: n_rot="
+                       << c.rope_n_rot << " head_dim=" << c.head_dim
+                       << " section_pairs=" << rope_section_pairs
+                       << " sections=" << c.rope_sections.size() << ".\n";
+    return false;
+  }
+  c.ssm_conv_kernel = file.get_config_int("ssm.conv_kernel", 0);
+  c.ssm_inner_size = file.get_config_int("ssm.inner_size", 0);
+  c.ssm_state_size = file.get_config_int("ssm.state_size", 0);
+  c.ssm_time_step_rank = file.get_config_int("ssm.time_step_rank", 0);
+  c.ssm_group_count = file.get_config_int("ssm.group_count", 0);
+  if (c.ssm_conv_kernel <= 1 || c.ssm_inner_size <= 0 ||
+      c.ssm_state_size <= 0 || c.ssm_time_step_rank <= 0 ||
+      c.ssm_group_count <= 0 ||
+      c.ssm_inner_size != c.ssm_state_size * c.ssm_time_step_rank ||
+      c.ssm_time_step_rank % c.ssm_group_count != 0) {
+    LOG_STREAM_ERROR() << "[QWEN35MOE] invalid SSM/GDN metadata: conv="
+                       << c.ssm_conv_kernel << " inner=" << c.ssm_inner_size
+                       << " state=" << c.ssm_state_size << " rank="
+                       << c.ssm_time_step_rank << " groups="
+                       << c.ssm_group_count << ".\n";
+    return false;
+  }
+  int n_gdn = 0;
+  for (int l = 0; l < c.n_layers; ++l)
+    if (qwen35moe_is_gdn_layer(c, l))
+      ++n_gdn;
+  if (n_gdn <= 0 || n_gdn >= c.n_layers) {
+    LOG_STREAM_ERROR() << "[QWEN35MOE] layer map must contain both GDN and "
+                       << "full-attention layers; got " << n_gdn << "/"
+                       << c.n_layers << " GDN layers.\n";
+    return false;
+  }
+  LOG_STREAM_INFO() << "[QWEN35MOE] hybrid attention map: " << n_gdn
+                    << " GDN + " << c.n_layers - n_gdn
+                    << " full-attention layers; interval="
+                    << c.qwen4exp_full_attention_interval << "\n";
+}
+
+if (fam == ModelFamily::Qwen4Exp) {
     // Per-layer hybrid map. The converter does NOT write
     // attention.recurrent_layers today -- qwen4exp.cpp itself falls back to
     // the full_attention_interval rule (default 4) in that case, and so do
@@ -1298,17 +1363,16 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
   // ---------- See llama.cpp's build_moe_ffn (llama-graph.cpp) for the
   // reference algorithm.
   c.n_expert_shared = file.get_config_int("expert_shared_count", 0);
-  if (fam == ModelFamily::Qwen4Exp && c.n_expert_shared == 0) {
-    // qwen4exp's converter (conversion/qwen4exp.py -> qwen.py's Qwen3Next
-    // base) writes expert_shared_feed_forward_length but NOT
-    // expert_shared_count; qwen4exp.cpp's load_arch_tensors creates the
-    // shexp tensors unconditionally. Derive the count from the widths so
-    // the shared expert isn't silently skipped (execution_layer.cpp gates
-    // the whole shexp path on n_expert_shared > 0).
+  if ((fam == ModelFamily::Qwen4Exp ||
+       (fam == ModelFamily::Qwen && arch0 == "qwen35moe")) &&
+      c.n_expert_shared == 0) {
+    // These Qwen hybrid GGUFs can publish shared-expert width without a
+    // count. Derive the count so the shared expert is not omitted from the
+    // graph or its topology checks.
     int shexp_len = file.get_config_int("expert_shared_feed_forward_length", 0);
     if (shexp_len > 0 && c.moe_inter > 0) {
       c.n_expert_shared = std::max(1, shexp_len / c.moe_inter);
-      LOG_STREAM_INFO() << "[QWEN4EXP] expert_shared_count absent; derived "
+      LOG_STREAM_INFO() << "[QWEN-MOE] expert_shared_count absent; derived "
                         << c.n_expert_shared << " from shared width "
                         << shexp_len << " / expert width " << c.moe_inter
                         << "\n";
@@ -1738,6 +1802,8 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
   LOG_STREAM_INFO() << "[GRAPH] Attention type: "
                     << (fam == ModelFamily::GLM5NEXT
                             ? "HYBRID KDA (recurrent) + MLA (absorbed, DSA layers)"
+                          : fam == ModelFamily::Qwen && arch0 == "qwen35moe"
+                                ? "HYBRID GDN (recurrent) + dense full attention"
                         : fam == ModelFamily::DeepSeek_V41
                             ? "MLA (raw SWA + shared compressed KV/indexer, Engram)"
                         : c.cache_shape == CacheShape::MLAAbsorbed
@@ -1755,7 +1821,10 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
     // live inside the hc_* tensors pushed by its own branch below).
     if (fam != ModelFamily::Qwen4Exp) {
       dense_preload_manifest.push_back(p + "attn_norm.weight");
-      dense_preload_manifest.push_back(p + "ffn_norm.weight");
+      if (fam == ModelFamily::Qwen && arch0 == "qwen35moe")
+        dense_preload_manifest.push_back(p + "post_attention_norm.weight");
+      else
+        dense_preload_manifest.push_back(p + "ffn_norm.weight");
     }
 
     if (fam == ModelFamily::Qwen4Exp) {
@@ -1808,6 +1877,19 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
         dense_preload_manifest.push_back(p + "ple_norm_query.weight");
         dense_preload_manifest.push_back(p + "ple_norm_conv.weight");
         dense_preload_manifest.push_back(p + "ple_conv1d.weight");
+      }
+    } else if (fam == ModelFamily::Qwen && arch0 == "qwen35moe") {
+      if (qwen35moe_is_gdn_layer(c, l)) {
+        for (const char *name : {"attn_qkv.weight", "attn_gate.weight",
+                                 "ssm_conv1d.weight", "ssm_dt.bias", "ssm_a",
+                                 "ssm_beta.weight", "ssm_alpha.weight",
+                                 "ssm_norm.weight", "ssm_out.weight"})
+          dense_preload_manifest.push_back(p + name);
+      } else {
+        for (const char *name : {"attn_q.weight", "attn_k.weight",
+                                 "attn_v.weight", "attn_q_norm.weight",
+                                 "attn_k_norm.weight", "attn_output.weight"})
+          dense_preload_manifest.push_back(p + name);
       }
     } else if (fam == ModelFamily::MiMo2) {
       if (file.tensors.count(p + "attn_qkv.weight")) {
@@ -2039,10 +2121,10 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
       dense_preload_manifest.push_back(p + "ffn_gate_shexp.weight");
       dense_preload_manifest.push_back(p + "ffn_up_shexp.weight");
       dense_preload_manifest.push_back(p + "ffn_down_shexp.weight");
-      if (fam == ModelFamily::Qwen4Exp) {
-        // Qwen4Exp's shared expert has its OWN per-token sigmoid gate
-        // (ffn_gate_inp_shexp, a [n_embd] vector -- qwen4exp.cpp's
-        // build_layer_ffn), unlike GLM/DeepSeek's ungated shexp.
+      if (fam == ModelFamily::Qwen4Exp ||
+          (fam == ModelFamily::Qwen && arch0 == "qwen35moe")) {
+        // Both Qwen hybrid MoE architectures have their own per-token
+        // sigmoid gate for the shared expert.
         dense_preload_manifest.push_back(p + "ffn_gate_inp_shexp.weight");
       }
       // Packed routed experts (streamed from disk, NOT preloaded here)

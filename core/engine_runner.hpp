@@ -80,6 +80,7 @@ private:
   std::expected<void, std::string> preload_experts();
   std::expected<void, std::string> start_workers();
   std::expected<void, std::string> run_repl();
+  std::expected<void, std::string> run_api();
   std::expected<void, std::string> shutdown_and_report();
   std::vector<StreamingEngine::UsageEntry> sanitize_usage_entries(
       const std::string &path, const char *source,

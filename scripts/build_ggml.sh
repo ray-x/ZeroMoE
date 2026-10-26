@@ -10,8 +10,8 @@
 # Environment:
 #   GGML_REPO     git repo holding upstream llama.cpp   (required)
 #   GGML_COMMIT   upstream commit to build              (default 8baabd53b, ggml 0.27.0)
-#   CUDA_ARCH     default 86. Native SASS for sm_86 plus embedded PTX, which is what lets the sm_120
-#                 GPU JIT the kernels; a build without PTX fails on that GPU with "no kernel image".
+#   CUDA_ARCH     optional explicit CMake architecture list (e.g. '86;120a'). By default,
+#                 detect all GPUs visible to nvidia-smi at build time.
 #   EXTRA_PATCH_DIRS  more patch directories to apply after the series, space separated
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -22,7 +22,7 @@ OUT=$(realpath -m "${1:?usage: build_ggml.sh <out-dir>}")
 GGML_REPO=${GGML_REPO:-$ROOT/third_party/llama.cpp}
 [[ -d "$GGML_REPO/.git" || -f "$GGML_REPO/.git" ]] || { echo "GGML_REPO is not a git checkout: $GGML_REPO" >&2; exit 1; }
 GGML_COMMIT=${GGML_COMMIT:-HEAD}
-CUDA_ARCH=${CUDA_ARCH:-86}
+CUDA_ARCH=$(CUDA_ARCH="${CUDA_ARCH:-}" "$ROOT/scripts/detect_cuda_arch.sh")
 SRC=$OUT/ggml-src
 
 if [[ -e $SRC ]]; then echo "$SRC exists; remove it first (the patches are applied once)"; exit 1; fi

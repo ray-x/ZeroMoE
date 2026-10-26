@@ -26,6 +26,9 @@ namespace qwen4exp_graph {
 // budget set during prefill (S>1) simply plans nothing here, no error.
 void plan_expert_vram_split(FullGraph &g) {
   g.split_gpu_expert_ids.clear();
+  if (g.engine && g.engine->family_ops.family == ModelFamily::Qwen &&
+      g.engine->cuda_moe_full_graph_decode_required)
+    return; // The fit planner owns the complete Qwen expert placement.
   if (g.S != 1)
     return;
 

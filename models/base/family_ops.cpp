@@ -683,6 +683,27 @@ FamilyOps resolve_family_ops(ModelFamily fam, const ArchitectureConfig &c) {
     ops.attention_fn = &dense_attention_gguf;
     ops.alloc_cache_fn = &alloc_dense_kv_cache;
     break;
+case ModelFamily::Qwen:
+// The qwen35moe architecture is a hybrid GDN/full-attention model. Its
+// exact architecture parser populates the shared Qwen layer map and SSM
+// dimensions before family resolution. Keep ordinary Qwen architectures on
+// the dense path unless that topology evidence is present.
+if (c.ssm_conv_kernel > 1 && c.ssm_state_size > 0 &&
+    c.ssm_inner_size > 0 && c.ssm_time_step_rank > 0 &&
+    c.ssm_group_count > 0 && c.qwen4exp_full_attention_interval > 1) {
+  ops.attn_type = AttentionType::SSM;
+  ops.cache_shape = CacheShape::DenseKV;
+  ops.default_gating = GatingFunc::Softmax;
+  ops.attention_fn = &qwen4exp_attention_gguf;
+  ops.alloc_cache_fn = &alloc_qwen4exp_cache;
+} else {
+  ops.attn_type = AttentionType::DenseQKV;
+  ops.cache_shape = CacheShape::DenseKV;
+  ops.default_gating = GatingFunc::Softmax;
+  ops.attention_fn = &dense_attention_gguf;
+  ops.alloc_cache_fn = &alloc_dense_kv_cache;
+}
+break;
   }
   return ops;
 }

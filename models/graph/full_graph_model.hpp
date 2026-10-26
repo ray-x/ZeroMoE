@@ -62,7 +62,12 @@ struct GraphRuntimeTuning {
 // authorized only for an explicit Insufficient result with a reason from the
 // model's memory planner. Unknown is deliberately fail-closed: a missing or
 // incomplete plan must not silently select the legacy per-layer executor.
-enum class GraphMemoryFit : std::uint8_t { Unknown, Fits, Insufficient };
+enum class GraphMemoryFit : std::uint8_t {
+  Unknown,
+  Fits,
+  Insufficient,
+  Unsupported,
+};
 
 struct GraphMemoryPlan {
   GraphMemoryFit fit = GraphMemoryFit::Unknown;
@@ -71,7 +76,7 @@ struct GraphMemoryPlan {
   // Device-resident MoE layer block selected by the planner, if the family
   // uses a graph-owned expert arena. Cache-aliasing/native-cache graphs may
   // leave this at zero and report that capability separately.
-  int device_expert_layers = 0;
+  int device_expert_layers = -1;
   bool device_expert_trailing = false;
   std::string reason;
 };
@@ -110,7 +115,10 @@ class FullGraphModel {
   virtual bool uses_native_moe_cache() const { return false; }
   // Whether this model has no semantically valid layered implementation.
   // Even when false, CUDA MoE layered fallback still requires an explicit
-  // Insufficient result from decode_memory_plan().
+  // Insufficient result from plan_decode_memory(). Unsupported is an explicit
+  // architecture/topology rejection and fails startup; it never authorizes a
+  // memory fallback. Unknown means the model is supported but capacity could
+  // not be established, so graph execution remains mandatory.
   virtual bool graph_only() const { return false; }
   // Whether the dense VRAM pool should hold token_embd.weight. Every embedding lookup in the engine reads the host
   // copy (one row per token), so the default is CPU/DDR; a family whose graph embeds on the GPU overrides this to true.
@@ -138,6 +146,12 @@ class FullGraphModel {
   // Whether a prefill chunk that starts after position 0 can run through the graph, continuing the state the earlier
   // chunk left in the engine (build() is then asked with pos_base > 0 and may still decline a particular chunk).
   virtual bool supports_prefill_continuation(const StreamingEngine &) const { return false; }
+  // Some decode graphs require graph-produced recurrent/KV state from the
+  // prompt pass. Such adapters must make full-fit prefill fatal on build/run
+  // failure instead of silently using a different stateful executor.
+  virtual bool requires_full_graph_prefill(const StreamingEngine &) const {
+    return false;
+  }
 
   // Number of MoE layers whose routed experts the graph places in VRAM.
   virtual int device_expert_layers() const = 0;

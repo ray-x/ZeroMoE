@@ -7,9 +7,13 @@
 // (argc-1, argv+1) so each subcommand parses its own args starting at its
 // own argv[0] == the subcommand name.
 //
-// Build (no CMake / no CUDA -- macOS and Linux):
-//   c++ -std=c++23 -O2 -Iinclude tools/gguf_tool.cpp tools/gguf_pack.cpp \
-//       tools/gguf_io.cpp tools/gguf_verify.cpp tools/gguf_plan.cpp -o build/gguf_tool
+// Standalone build (no CMake, CUDA, or llama.cpp submodule):
+//   c++ -std=c++23 -O2 -Iinclude -Icore -Imodels/base -Imemory \
+//     -Imodels/graph -Ibackends/ggml -Ibackends/cpu -Icuda \
+//     tools/gguf_tool.cpp tools/gguf_pack.cpp tools/gguf_io.cpp \
+//     tools/gguf_verify.cpp tools/gguf_plan.cpp tools/gguf_offload.cpp \
+//     tools/gguf_dma.cpp tools/gguf_mix.cpp tools/gguf_mirror.cpp \
+//     -o /tmp/gguf_tool
 #include "gguf_common.hpp"
 #include <cstdio>
 #include <cstring>

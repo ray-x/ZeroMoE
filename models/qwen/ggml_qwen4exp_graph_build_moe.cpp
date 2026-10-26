@@ -6,6 +6,8 @@
 
 #include "ggml_qwen4exp_graph_internal.hpp"
 
+#include <cstdlib>
+
 #if defined(ZEROMOE_USE_GGML_CUDA)
 
 using namespace qwen4exp_graph;
@@ -831,6 +833,7 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   // (see build_gpu_stage_node's own comment on why that would desync the
   // real combine weights from real routing).
   if (g.decode_mode && g.S == 1 && g.engine &&
+      g.engine->family_ops.family == ModelFamily::Qwen4Exp &&
       g.engine->qwen4exp_gpu_stage_layer_enabled(layer)) {
     const int stage_idx = build_gpu_stage_node(g, ctx, ids, layer);
     if (stage_idx >= 0) {
@@ -886,7 +889,9 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   const bool split_planned_for_layer =
       split_gpu_ids && !split_gpu_ids->empty() && gate_exps_gpu &&
       up_exps_gpu && down_exps_gpu;
-  if (g.decode_mode && env_qwen4exp_host_node_enabled() &&
+  if (g.decode_mode &&
+      g.engine->family_ops.family == ModelFamily::Qwen4Exp &&
+      env_qwen4exp_host_node_enabled() &&
       g.engine->qwen4exp_cpu_offload_layer_enabled(layer) &&
       !split_planned_for_layer) {
     // The marker returns the already weighted/reduced routed result, so it
@@ -900,7 +905,9 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       return nullptr;
     return host_node;
   }
-  if (g.decode_mode && env_qwen4exp_host_node_enabled() &&
+  if (g.decode_mode &&
+      g.engine->family_ops.family == ModelFamily::Qwen4Exp &&
+      env_qwen4exp_host_node_enabled() &&
       g.engine->qwen4exp_cpu_offload_layer_enabled(layer) &&
       split_planned_for_layer && qwen4exp_host_node_timing_enabled()) {
     LOG_INFO("[QWEN4EXP-HOST-NODE] layer=%d bypassed whole-layer marker "
@@ -1126,7 +1133,33 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     ew.gate = gate_exps;
     ew.up = up_exps;
     ew.down = down_exps;
-    const moe_routed::FfnNodes ffn = moe_routed::expert_ffn(ctx, ew, input3, ids);
+    const moe_routed::FfnNodes ffn =
+        moe_routed::expert_ffn(ctx, ew, input3, ids);
+    const char *probe_dump =
+        zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP");
+    const char *probe_layer_text =
+        zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_LAYER");
+    const int probe_layer = probe_layer_text ? std::atoi(probe_layer_text) : 0;
+    if (g.engine->family_ops.family == ModelFamily::Qwen &&
+        layer == probe_layer && probe_dump) {
+      auto probe_expert = [&](const char *label, ggml_tensor *value) {
+        if (!value || !g.graph)
+          return;
+        const std::string name = "qwen35_expert_" + std::string(label) + "_" +
+                                 std::to_string(layer);
+        ggml_set_name(value, name.c_str());
+        ggml_set_output(value);
+        ggml_build_forward_expand(g.graph, value);
+        g.gdn_probe_taps.emplace_back(layer, "expert_" + std::string(label),
+                                      value);
+      };
+      // Select one layer so the diagnostic exposes projection arithmetic
+      // without retaining every expert intermediate across the full graph.
+      probe_expert("gate", ffn.gate);
+      probe_expert("up", ffn.up);
+      probe_expert("act", ffn.act);
+      probe_expert("down", ffn.down);
+    }
     ggml_tensor *up = ffn.up;
     ggml_tensor *gate = ffn.gate;
     ggml_tensor *gate_up = ffn.gate_up; // only set on the fused path

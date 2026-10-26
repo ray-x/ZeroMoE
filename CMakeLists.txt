@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Resolver/default/binding tests need neither CUDA nor model weights.
 enable_testing()
 add_executable(graph_settings_test tests/test_graph_settings.cpp)
 target_include_directories(graph_settings_test PRIVATE core models/graph backends/cpu)
@@ -18,10 +19,21 @@ add_test(NAME graph_settings_binding COMMAND graph_settings_binding_test)
 set_tests_properties(graph_settings_binding PROPERTIES ENVIRONMENT_MODIFICATION
     "ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=unset:;ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=unset:;ZEROMOE_PHASE_CACHE_MIB=unset:")
 
+add_executable(mtp_graph_contract_test EXCLUDE_FROM_ALL
+    tests/test_mtp_graph_contract.cpp)
+target_include_directories(mtp_graph_contract_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/models/graph)
+
+add_executable(mtp_speculation_test EXCLUDE_FROM_ALL
+    tests/test_mtp_speculation.cpp)
+target_include_directories(mtp_speculation_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/models/graph)
+
 # ---------------------------------------------------------------------------
 # Build options
 # ---------------------------------------------------------------------------
 option(ZEROMOE_CPU_ONLY "Disable CUDA and build CPU-only components" OFF)
+option(ZEROMOE_BUILD_SERVER "Build the optional C++ OpenAI/Anthropic API server" OFF)
 option(ZEROMOE_USE_GGML "Use ggml (via llama.cpp source tree) for quantized CPU kernels" OFF)
 option(ZEROMOE_USE_GGML_CUDA
        "Build/link ggml-cuda for the experimental MUL_MAT_ID prefill backend"
@@ -56,6 +68,32 @@ option(ZEROMOE_GGML_DEBUG_PATCHES
        OFF)
 option(ZEROMOE_USE_LLAMA_CPP "Deprecated alias for ZEROMOE_USE_GGML" OFF)
 option(ZEROMOE_METAL "Enable Apple Metal GPU backend (requires ggml)" OFF)
+
+# Resolve the architecture list before add_subdirectory(ggml): ggml-cuda
+# creates its CUDA targets during that call, so detecting architectures later
+# would affect ZeroMoE's kernels but leave ggml-cuda with a different target.
+if(NOT ZEROMOE_CPU_ONLY AND
+   (NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR
+    CMAKE_CUDA_ARCHITECTURES STREQUAL "" OR
+    CMAKE_CUDA_ARCHITECTURES STREQUAL "native"))
+    execute_process(
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/scripts/detect_cuda_arch.sh"
+        RESULT_VARIABLE _zeromoe_detect_arch_result
+        OUTPUT_VARIABLE _zeromoe_detected_archs
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_VARIABLE _zeromoe_detect_arch_error)
+    if(_zeromoe_detect_arch_result EQUAL 0 AND _zeromoe_detected_archs)
+        set(CMAKE_CUDA_ARCHITECTURES "${_zeromoe_detected_archs}")
+        message(STATUS "ZeroMoE auto-detected CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+    else()
+        set(CMAKE_CUDA_ARCHITECTURES native)
+        message(STATUS "ZeroMoE CUDA architecture detection unavailable; using CMake native")
+        if(_zeromoe_detect_arch_error)
+            string(STRIP "${_zeromoe_detect_arch_error}" _zeromoe_detect_arch_error)
+            message(STATUS "ZeroMoE CUDA architecture detection detail: ${_zeromoe_detect_arch_error}")
+        endif()
+    endif()
+endif()
 
 # On macOS the CPU-only binary is the only usable engine, and real MoE models
 # are almost always quantized.  Default ggml fetch to ON here; users can still
@@ -295,6 +333,25 @@ if(ZEROMOE_USE_GGML)
     else()
         include(cmake/ZeroMoEGgmlPatches.cmake)
         zeromoe_apply_ggml_patches("${ZEROMOE_GGML_ROOT}")
+        # The common build-tree copy has no .git directory. Without an
+        # explicit revision, ggml's version probe can walk up to ZeroMoE's
+        # repository and stamp the application commit as GGML_COMMIT.
+        set(_zeromoe_ggml_build_commit "")
+        if(EXISTS "${ZEROMOE_GGML_ROOT}/.git")
+            execute_process(
+                COMMAND git -C "${ZEROMOE_GGML_ROOT}" rev-parse --short HEAD
+                OUTPUT_VARIABLE _zeromoe_ggml_build_commit
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET)
+        endif()
+        if(NOT _zeromoe_ggml_build_commit AND ZEROMOE_GGML_COMMIT)
+            set(_zeromoe_ggml_build_commit "${ZEROMOE_GGML_COMMIT}")
+        endif()
+        if(NOT _zeromoe_ggml_build_commit)
+            set(_zeromoe_ggml_build_commit "unknown")
+        endif()
+        set(GGML_BUILD_COMMIT "${_zeromoe_ggml_build_commit}")
+        message(STATUS "ZeroMoE: GGML source revision=${GGML_BUILD_COMMIT}")
         add_subdirectory("${ZEROMOE_GGML_ROOT}" ggml-build)
     endif()
     message(STATUS "ZeroMoE: using ggml at ${ZEROMOE_GGML_ROOT}")
@@ -407,6 +464,7 @@ if(NOT ZEROMOE_CPU_ONLY)
         core/engine_runner_ram.cpp
         core/engine_runner_preload.cpp
         core/engine_runner_session.cpp
+        core/engine_runner_api.cpp
         core/perf_report_summary.cpp
         core/perf_report_dump_a.cpp
         core/perf_report_dump_b.cpp
@@ -446,6 +504,8 @@ if(NOT ZEROMOE_CPU_ONLY)
         backends/cpu/ggml_grids.cpp
         backends/ggml/ggml_moe_backend.cpp
         models/graph/ggml_moe_graph_builder.cpp
+        models/graph/mtp_graph_runtime.cpp
+        models/qwen/qwen4exp_mtp_graph.cpp
         backends/ggml/ggml_moe_transfer_manager.cpp
         backends/ggml/ggml_moe_runner.cpp
         backends/ggml/ggml_router_runner.cpp
@@ -460,6 +520,7 @@ if(NOT ZEROMOE_CPU_ONLY)
         models/qwen/ggml_qwen4exp_graph_build_moe.cpp
         models/qwen/ggml_qwen4exp_graph_decode_prepare.cpp
         models/qwen/ggml_qwen4exp_graph_diag.cpp
+        models/qwen/ggml_qwen4exp_graph_checkpoint.cpp
         models/qwen/ggml_qwen4exp_graph_expert_bind.cpp
         models/qwen/ggml_qwen4exp_graph_host_node.cpp
         models/qwen/ggml_qwen4exp_graph_placement.cpp
@@ -484,6 +545,7 @@ if(NOT ZEROMOE_CPU_ONLY)
         backends/ggml/ggml_gdn_proj_backend.cpp
         models/glm/ggml_glm5next_proj_backend.cpp
         core/mtp_speculative.cpp
+        core/qwen4exp_graph_mtp.cpp
         backends/cpu/kernels_cpu.cpp
         models/qwen/qwen_moe.cpp
         models/base/model_factory.cpp
@@ -501,7 +563,7 @@ if(NOT ZEROMOE_CPU_ONLY)
     target_compile_definitions(zeromoe PRIVATE ZEROMOE_EXL3_CUDA=1)
     set_target_properties(zeromoe PROPERTIES
         CUDA_SEPARABLE_COMPILATION OFF
-        CUDA_ARCHITECTURES 86        # Ampere; adjust via -DCMAKE_CUDA_ARCHITECTURES
+        CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     )
     target_link_libraries(zeromoe PRIVATE ${ZEROMOE_EXL3_UPSTREAM_LIB}
         CUDA::cudart
@@ -580,6 +642,8 @@ if(NOT ZEROMOE_CPU_ONLY)
         backends/cpu/ggml_grids.cpp
         backends/ggml/ggml_moe_backend.cpp
         models/graph/ggml_moe_graph_builder.cpp
+        models/graph/mtp_graph_runtime.cpp
+        models/qwen/qwen4exp_mtp_graph.cpp
         backends/ggml/ggml_moe_transfer_manager.cpp
         backends/ggml/ggml_moe_runner.cpp
         backends/ggml/ggml_router_runner.cpp
@@ -594,6 +658,7 @@ if(NOT ZEROMOE_CPU_ONLY)
         models/qwen/ggml_qwen4exp_graph_build_moe.cpp
         models/qwen/ggml_qwen4exp_graph_decode_prepare.cpp
         models/qwen/ggml_qwen4exp_graph_diag.cpp
+        models/qwen/ggml_qwen4exp_graph_checkpoint.cpp
         models/qwen/ggml_qwen4exp_graph_expert_bind.cpp
         models/qwen/ggml_qwen4exp_graph_host_node.cpp
         models/qwen/ggml_qwen4exp_graph_placement.cpp
@@ -618,6 +683,7 @@ if(NOT ZEROMOE_CPU_ONLY)
         backends/ggml/ggml_gdn_proj_backend.cpp
         models/glm/ggml_glm5next_proj_backend.cpp
         core/mtp_speculative.cpp
+        core/qwen4exp_graph_mtp.cpp
         backends/cpu/kernels_cpu.cpp
         models/qwen/qwen_moe.cpp
         models/base/model_factory.cpp
@@ -663,6 +729,24 @@ if(NOT ZEROMOE_CPU_ONLY)
         endif()
     endif()
 
+    if(ZEROMOE_USE_GGML_CUDA)
+        # Reuse engine linkage without changing its production entry point.
+        get_target_property(MTP_ENGINE_SOURCES zeromoe SOURCES)
+        list(REMOVE_ITEM MTP_ENGINE_SOURCES core/main.cpp)
+        add_executable(qwen4exp_mtp_parity EXCLUDE_FROM_ALL
+            tests/mtp/zeromoe_mtp_parity.cpp ${MTP_ENGINE_SOURCES})
+        target_include_directories(qwen4exp_mtp_parity PRIVATE
+            $<TARGET_PROPERTY:zeromoe,INCLUDE_DIRECTORIES>)
+        target_compile_definitions(qwen4exp_mtp_parity PRIVATE
+            $<TARGET_PROPERTY:zeromoe,COMPILE_DEFINITIONS>)
+        target_compile_options(qwen4exp_mtp_parity PRIVATE
+            $<TARGET_PROPERTY:zeromoe,COMPILE_OPTIONS>)
+        target_link_libraries(qwen4exp_mtp_parity PRIVATE
+            $<TARGET_PROPERTY:zeromoe,LINK_LIBRARIES>)
+        set_target_properties(qwen4exp_mtp_parity PROPERTIES
+            CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
+    endif()
+
     # Pure-header lifecycle contract test for the R2 strategy migration. It has
     # no ggml/GPU dependencies; build it explicitly with:
     #   cmake --build <build-dir> --target strategy_lifecycle_test
@@ -699,6 +783,8 @@ if(NOT ZEROMOE_CPU_ONLY)
             ${ZEROMOE_GGML_SRC_DIR})
         target_link_libraries(quant_table_test PRIVATE ggml)
     endif()
+    add_executable(graph_settings_test EXCLUDE_FROM_ALL tests/test_graph_settings.cpp)
+    target_include_directories(graph_settings_test PRIVATE ${ZEROMOE_INCLUDE_DIRS})
     add_executable(resident_memory_policy_test EXCLUDE_FROM_ALL tests/test_resident_memory_policy.cpp)
     target_include_directories(resident_memory_policy_test PRIVATE ${ZEROMOE_INCLUDE_DIRS})
     add_executable(phase_route_test EXCLUDE_FROM_ALL tests/test_phase_routes.cpp)
@@ -1139,7 +1225,9 @@ else()
     endif()
 
     if(ZEROMOE_USE_GGML)
-        target_sources(kernels_cpu PRIVATE backends/cpu/ggml_dequant.cpp)
+        target_sources(kernels_cpu PRIVATE
+            backends/cpu/ggml_dequant.cpp
+            backends/cpu/ggml_grids.cpp)
         target_link_libraries(kernels_cpu PUBLIC ggml)
         target_compile_definitions(kernels_cpu PUBLIC ZEROMOE_USE_GGML=1)
         target_include_directories(kernels_cpu PUBLIC ${ZEROMOE_GGML_SRC_DIR})
@@ -1153,8 +1241,7 @@ else()
     endif()
 
     # CPU-only inference binary (zeromoe_cpu)
-    add_executable(zeromoe_cpu
-        backends/cpu/cpu_main.cpp
+    add_library(zeromoe_cpu_runtime STATIC
         backends/exl3/exl3_decode.cpp
         backends/cpu/cpu_dense.cpp
         backends/cpu/cpu_engine.cpp
@@ -1163,11 +1250,15 @@ else()
         models/qwen/cpu_qwen_moe.cpp
         models/qwen/cpu_qwen4exp.cpp
     )
-    target_include_directories(zeromoe_cpu PRIVATE
+    target_include_directories(zeromoe_cpu_runtime PUBLIC
         ${ZEROMOE_INCLUDE_DIRS}
         ${CMAKE_CURRENT_SOURCE_DIR}/models
     )
-    target_link_libraries(zeromoe_cpu PRIVATE kernels_cpu)
+    target_link_libraries(zeromoe_cpu_runtime PUBLIC kernels_cpu)
+    add_executable(zeromoe_cpu backends/cpu/cpu_main.cpp)
+    if(NOT ZEROMOE_BUILD_SERVER)
+        target_link_libraries(zeromoe_cpu PRIVATE zeromoe_cpu_runtime)
+    endif()
 
     # When the kernel backend contains Objective-C++ (Metal dispatch), the
     # final executable must link the Objective-C runtime / Foundation so the
@@ -1179,7 +1270,7 @@ else()
         endforeach()
     endif()
     if(OpenMP_CXX_FOUND)
-        target_link_libraries(zeromoe_cpu PRIVATE OpenMP::OpenMP_CXX)
+        target_link_libraries(zeromoe_cpu_runtime PUBLIC OpenMP::OpenMP_CXX)
     endif()
 
     # Tools
@@ -1187,6 +1278,25 @@ else()
 endif()
 
 message(STATUS "ZeroMoE: configure done")
+
+if(ZEROMOE_BUILD_SERVER)
+    enable_testing()
+    add_subdirectory(server)
+    if(TARGET zeromoe)
+        target_link_libraries(zeromoe PRIVATE zeromoe_server)
+        target_compile_definitions(zeromoe PRIVATE ZEROMOE_BUILD_SERVER=1)
+    else()
+        add_library(zeromoe_cpu_api STATIC backends/cpu/cpu_api.cpp)
+        target_link_libraries(zeromoe_cpu_api PUBLIC zeromoe_cpu_runtime zeromoe_server)
+        target_link_libraries(zeromoe_cpu PRIVATE zeromoe_cpu_api)
+        target_compile_definitions(zeromoe_cpu PRIVATE ZEROMOE_BUILD_SERVER=1)
+        if(ZEROMOE_SERVER_TESTS)
+            add_executable(cpu_api_tests tests/cpu_api_test.cpp)
+            target_link_libraries(cpu_api_tests PRIVATE zeromoe_cpu_api)
+            add_test(NAME cpu_api_tests COMMAND cpu_api_tests)
+        endif()
+    endif()
+endif()
 
 # EXL3 bench targets compile backends/exl3/exl3_upstream_ops.cu directly and need the
 # upstream kernel library plus the torch stub include path.

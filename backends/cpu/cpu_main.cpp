@@ -5,8 +5,15 @@
 #include "exllamav3_backend.hpp"
 #include "logger.hpp"
 #include "model_family.hpp"
+#ifdef ZEROMOE_BUILD_SERVER
+#include "cpu_api.hpp"
+#include <csignal>
+static volatile std::sig_atomic_t cpu_api_stop = 0;
+static void stop_cpu_api(int) { cpu_api_stop = 1; }
+#endif
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -16,7 +23,9 @@
 
 static void print_usage(const char *argv0) {
   std::cerr << "Usage: " << argv0
-            << " --config <path.toml> [--prompt \"<text>\"] [--ngen N]\n";
+            << " --config <path.toml> [--prompt \"<text>\"] [--ngen N]\n"
+            << "  --serve [--host 127.0.0.1] [--port 8080] [--api-model zeromoe]\n"
+            << "  --api-cache-mib N  Opt-in CPU prompt checkpoints (default: 0, disabled)\n";
 }
 
 static std::string parse_arg(int argc, char **argv, const std::string &flag,
@@ -48,6 +57,53 @@ int main(int argc, char **argv) {
     print_usage(argv[0]);
     return 0;
   }
+  bool serve = false;
+  for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "--serve") serve = true;
+#ifndef ZEROMOE_BUILD_SERVER
+  if (serve) {
+    std::cerr << "Error: --serve requires -DZEROMOE_BUILD_SERVER=ON\n";
+    return 1;
+  }
+#endif
+#ifdef ZEROMOE_BUILD_SERVER
+  zeromoe::server::Options api_options;
+  std::string api_model = "zeromoe";
+  size_t api_cache_bytes = 0;
+  if (serve) {
+    try {
+      auto value = [&](const char *flag, const std::string &fallback) {
+        for (int i = 1; i < argc; ++i) {
+          if (std::string(argv[i]) != flag) continue;
+          if (i + 1 == argc || std::string(argv[i + 1]).starts_with("--"))
+            throw std::invalid_argument(std::string(flag) + " requires a value");
+          return std::string(argv[i + 1]);
+        }
+        return fallback;
+      };
+      auto integer = [&](const char *flag, int fallback, int lo, int hi) {
+        const auto s = value(flag, std::to_string(fallback));
+        int n = 0;
+        const auto [end, error] = std::from_chars(s.data(), s.data() + s.size(), n);
+        if (error != std::errc{} || end != s.data() + s.size() || n < lo || n > hi)
+          throw std::invalid_argument(std::string("invalid ") + flag);
+        return n;
+      };
+      api_options.host = value("--host", "127.0.0.1");
+      api_options.port = integer("--port", 8080, 1, 65535);
+      api_model = value("--api-model", "zeromoe");
+      api_cache_bytes = static_cast<size_t>(integer("--api-cache-mib", 0, 0, 4096)) * 1024 * 1024;
+      if (api_options.host.empty() || api_model.empty())
+        throw std::invalid_argument("--host and --api-model cannot be empty");
+      if (const char *key = std::getenv("ZEROMOE_API_KEY")) api_options.api_key = key;
+      if (api_options.host != "127.0.0.1" && api_options.host != "::1" &&
+          api_options.host != "localhost" && api_options.api_key.empty())
+        throw std::invalid_argument("non-loopback binding requires ZEROMOE_API_KEY");
+    } catch (const std::exception &e) {
+      std::cerr << "[CPU-API] " << e.what() << "\n";
+      return 1;
+    }
+  }
+#endif
   std::string config_path = parse_arg(argc, argv, "--config", "");
   if (config_path.empty()) {
     print_usage(argv[0]);
@@ -64,6 +120,10 @@ int main(int argc, char **argv) {
   cfg.print();
 
   if (cfg.model_format == "exl3") {
+    if (serve) {
+      std::cerr << "Error: CPU API serving currently requires a GGUF Qwen MoE model\n";
+      return 1;
+    }
     if (cfg.exl3_backend == "exllamav3") {
       std::vector<std::string> overrides{
           "--ngen", std::to_string(parse_int_arg(argc, argv, "--ngen", cfg.max_new_tokens)),
@@ -123,6 +183,10 @@ int main(int argc, char **argv) {
                                        ".safetensors") == 0;
 
   if (is_safetensors) {
+    if (serve) {
+      std::cerr << "Error: CPU API serving requires a GGUF with embedded tokenizer metadata\n";
+      return 1;
+    }
     if (!engine.build_from_safetensors(engine.config.model_path,
                                        engine.config.context_size)) {
       std::cerr << "[CPU-MAIN] Safetensors engine build failed.\n";
@@ -162,6 +226,37 @@ int main(int argc, char **argv) {
       parse_arg(argc, argv, "--reasoning-effort", "");
   if (!reasoning_effort_cli.empty())
     engine.config.reasoning_effort = reasoning_effort_cli;
+
+#ifdef ZEROMOE_BUILD_SERVER
+  if (serve) {
+    using namespace zeromoe::server;
+    try {
+      if (engine.config.raw_prompt || !engine.tokenizer.has_chatml_template())
+        throw ApiError(400, "CPU serving requires the Qwen ChatML template, not raw prompts");
+      ModelInfo model;
+      model.id = api_model;
+      model.context_size = engine.max_t;
+      model.default_max_tokens = engine.config.max_new_tokens;
+      model.max_output_tokens = engine.config.max_new_tokens;
+      model.temperature = engine.config.temperature;
+      model.top_p = engine.config.top_p;
+      model.tools = true;
+      model.starts_thinking = engine.config.enable_thinking;
+      CPUBackend backend(engine, api_cache_bytes,
+                         [] { return cpu_api_stop != 0; });
+      Server server(backend, model, api_options);
+      const auto old_int = std::signal(SIGINT, stop_cpu_api);
+      const auto old_term = std::signal(SIGTERM, stop_cpu_api);
+      server.run([] { return cpu_api_stop != 0; });
+      std::signal(SIGINT, old_int);
+      std::signal(SIGTERM, old_term);
+      return 0;
+    } catch (const std::exception &e) {
+      std::cerr << "[CPU-API] " << e.what() << "\n";
+      return 1;
+    }
+  }
+#endif
 
   // Startup/model loading is complete here. In CLI mode the prompt argument
   // is already available, so this is the closest equivalent to receiving the

@@ -103,6 +103,7 @@ static bool all_finite(const float *x, int n, const char *what, int layer_idx) {
 void CPUQwenMoEBackend::forward_layer(CPUEngine &engine, int layer_idx,
                                       float *hidden_states, int S,
                                       int pos_base) {
+  forward_ok_ = true;
   CPULayerType lt = layer_type(layer_idx);
   int D = engine.model_file.architecture_config.hidden;
   const char *kind = lt == CPULayerType::LinearAttention ? "linear" : "dense";
@@ -115,6 +116,7 @@ void CPUQwenMoEBackend::forward_layer(CPUEngine &engine, int layer_idx,
   } else {
     forward_dense_attention(engine, layer_idx, hidden_states, S, pos_base);
   }
+  if (!forward_ok_) return;
 
   debug_print_norm("post-attn", layer_idx, hidden_states, S, D, pos_base);
 
@@ -183,6 +185,7 @@ void CPUQwenMoEBackend::forward_dense_attention(CPUEngine &engine,
     LOG_ERROR("[CPU-QWEN] Dense attention dimension mismatch in %s: "
               "D=%d H=%d n_kv_heads=%d d_head=%d\n",
               prefix.c_str(), D, H, n_kv_heads, d_head);
+    forward_ok_ = false;
     return;
   }
   int rotary_dim = static_cast<int>(
@@ -213,6 +216,7 @@ void CPUQwenMoEBackend::forward_dense_attention(CPUEngine &engine,
   std::vector<float> V((size_t)S * n_kv_heads * d_head);
   project_qkv_dense(engine, layer_idx, normed.data(), S, Q.data(), gate.data(),
                     K.data(), V.data());
+  if (!forward_ok_) return;
 
   // 3. Per-head Q/K RMSNorm, then partial RoPE.
   const CPUQuantizedTensor *qnorm =
@@ -242,6 +246,7 @@ void CPUQwenMoEBackend::forward_dense_attention(CPUEngine &engine,
   std::vector<float> attn_out((size_t)S * D, 0.0f);
   dense_attention(engine, layer_idx, Q.data(), K.data(), V.data(), S, pos_base,
                   gate.data(), attn_out.data());
+  if (!forward_ok_) return;
 
   // 5. Residual add.
   for (size_t i = 0; i < attn_out.size(); ++i)
@@ -267,6 +272,11 @@ void CPUQwenMoEBackend::project_qkv_dense(const CPUEngine &engine,
   const CPUQuantizedTensor *q = engine.find_layer(prefix + "attn_q.weight");
   const CPUQuantizedTensor *k = engine.find_layer(prefix + "attn_k.weight");
   const CPUQuantizedTensor *v = engine.find_layer(prefix + "attn_v.weight");
+  if (!q || !k || !v || !q->host_ptr || !k->host_ptr || !v->host_ptr) {
+    LOG_ERROR("[CPU-QWEN] Missing dense-attention projections in %s\n", prefix.c_str());
+    forward_ok_ = false;
+    return;
+  }
 
   if (q && q->host_ptr) {
     // Qwen attn_q projects hidden -> interleaved-per-head [Q, gate] pairs:
@@ -407,7 +417,8 @@ void CPUQwenMoEBackend::dense_attention(CPUEngine &engine, int layer_idx,
   if (wo && wo->host_ptr) {
     matmul(out, head_out.data(), tensor_f32(wo), S, H * d_head, D);
   } else {
-    std::memset(out, 0, (size_t)S * D * sizeof(float));
+    LOG_ERROR("[CPU-QWEN] Missing attention output projection in %s\n", prefix.c_str());
+    forward_ok_ = false;
   }
 }
 
@@ -544,11 +555,13 @@ void CPUQwenMoEBackend::forward_linear_attention(CPUEngine &engine,
     LOG_ERROR("[CPU-QWEN] Invalid linear-attention dims at layer=%d: "
               "n_k_h=%d k_dim=%d n_v_h=%d v_dim=%d conv_k=%d\n",
               layer_idx, n_k_h, k_dim, n_v_h, v_dim, conv_k);
+    forward_ok_ = false;
     return;
   }
   if (n_v_h % n_k_h != 0) {
     LOG_ERROR("[CPU-QWEN] n_v_h=%d is not divisible by n_k_h=%d at layer=%d\n",
               n_v_h, n_k_h, layer_idx);
+    forward_ok_ = false;
     return;
   }
 
@@ -581,10 +594,12 @@ void CPUQwenMoEBackend::forward_linear_attention(CPUEngine &engine,
   CPUQuantizedTensor *norm_weight =
       engine.find_layer(prefix + "ssm_norm.weight");
   CPUQuantizedTensor *out_proj = engine.find_layer(prefix + "ssm_out.weight");
-  if (!qkv || !zgate || !alpha_t || !beta_t || !conv_w || !ssm_a ||
-      !ssm_dt_bias || !norm_weight || !out_proj) {
+  if (!tensor_f32(qkv) || !tensor_f32(zgate) || !tensor_f32(alpha_t) ||
+      !tensor_f32(beta_t) || !tensor_f32(conv_w) || !tensor_f32(ssm_a) ||
+      !tensor_f32(ssm_dt_bias) || !tensor_f32(norm_weight) || !tensor_f32(out_proj)) {
     LOG_ERROR("[CPU-QWEN] Missing linear-attention tensors in %s\n",
               prefix.c_str());
+    forward_ok_ = false;
     return;
   }
   if (!all_finite(tensor_f32(qkv), qkv->meta.shape[0] * qkv->meta.shape[1],
@@ -592,7 +607,8 @@ void CPUQwenMoEBackend::forward_linear_attention(CPUEngine &engine,
       !all_finite(tensor_f32(out_proj),
                   out_proj->meta.shape[0] * out_proj->meta.shape[1],
                   "ssm_out weight", layer_idx)) {
-    // keep going; log already emitted
+    forward_ok_ = false;
+    return;
   }
 
   std::vector<float> mixed_qkv((size_t)S * qkv_total);
@@ -735,6 +751,7 @@ void CPUQwenMoEBackend::forward_linear_attention(CPUEngine &engine,
     LOG_ERROR("[CPU-QWEN] Refusing to allocate absurd linear-attention state "
               "at layer=%d: n_v_h=%d k_dim=%d v_dim=%d -> %zu floats\n",
               layer_idx, n_v_h, k_dim, v_dim, state_size);
+    forward_ok_ = false;
     return;
   }
   if (linear_attn_states.size() <= (size_t)layer_idx)
