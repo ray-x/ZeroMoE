@@ -16,7 +16,15 @@ namespace qwen4exp_graph {
 bool feed_decode_common_inputs(FullGraph &g, int pos_base) {
   if (!g.positions || !g.attn_mask || !g.decode_indices)
     return false;
-  static_cast<int32_t *>(g.positions->data)[0] = pos_base;
+  auto *positions = static_cast<int32_t *>(g.positions->data);
+  if (g.position_ids_per_token == 4) {
+    positions[0] = pos_base;
+    positions[1] = pos_base;
+    positions[2] = pos_base;
+    positions[3] = 0;
+  } else {
+    positions[0] = pos_base;
+  }
   auto *mask = static_cast<ggml_fp16_t *>(g.attn_mask->data);
   for (int k = 0; k < g.kv_capacity; ++k)
     mask[k] = ggml_fp32_to_fp16(k <= pos_base ? 0.0f : -INFINITY);
@@ -606,8 +614,10 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
                                   hist_n * sizeof(float));
       }
       const size_t kv_row = static_cast<size_t>(g->Hkv) * g->hd;
-      const size_t kv_bytes =
-          static_cast<size_t>(pos_base) * kv_row * sizeof(float);
+  const size_t head_stride =
+      static_cast<size_t>(g->kv_capacity) * g->hd;
+  const size_t packed_kv_bytes =
+      static_cast<size_t>(pos_base) * g->hd * sizeof(float);
       for (size_t i = 0; i < g->kv_layers.size(); ++i) {
         const int l = g->kv_layers[i];
         if (i >= g->kv_state_k.size() || i >= g->kv_state_v.size() ||
@@ -615,13 +625,39 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
             l >= static_cast<int>(engine.Vc.size()) || !engine.Kc[l] ||
             !engine.Vc[l])
           return nullptr;
-        if (kv_bytes > 0) {
-          if (g->state_handoff_tensors.count(g->kv_state_k[i]) == 0)
-            ggml_backend_tensor_set(g->kv_state_k[i], engine.Kc[l], 0,
-                                    kv_bytes);
-          if (g->state_handoff_tensors.count(g->kv_state_v[i]) == 0)
-            ggml_backend_tensor_set(g->kv_state_v[i], engine.Vc[l], 0,
-                                    kv_bytes);
+    if (packed_kv_bytes > 0) {
+      // The host cache is position-major [position, head, head_dim]. The
+      // decode graph's [head, capacity, head_dim] tensor has position as the
+      // fast row index within each head. Pack each head's prefix into that
+      // layout; copying kv_bytes linearly silently interleaves heads and
+      // makes the first dense-attention decode diverge after GDN prefill.
+      std::vector<float> head_rows(
+          static_cast<size_t>(pos_base) * g->hd);
+      for (int h = 0; h < g->Hkv; ++h) {
+        for (int p = 0; p < pos_base; ++p) {
+          const float *src = engine.Kc[l] +
+                             static_cast<size_t>(p) * kv_row +
+                             static_cast<size_t>(h) * g->hd;
+          std::memcpy(head_rows.data() + static_cast<size_t>(p) * g->hd,
+                      src, static_cast<size_t>(g->hd) * sizeof(float));
+        }
+        const size_t dst_offset =
+            static_cast<size_t>(h) * head_stride * sizeof(float);
+        if (g->state_handoff_tensors.count(g->kv_state_k[i]) == 0)
+          ggml_backend_tensor_set(g->kv_state_k[i], head_rows.data(),
+                                  dst_offset, packed_kv_bytes);
+        if (g->state_handoff_tensors.count(g->kv_state_v[i]) == 0) {
+          for (int p = 0; p < pos_base; ++p) {
+            const float *src = engine.Vc[l] +
+                               static_cast<size_t>(p) * kv_row +
+                               static_cast<size_t>(h) * g->hd;
+            std::memcpy(head_rows.data() + static_cast<size_t>(p) * g->hd,
+                        src, static_cast<size_t>(g->hd) * sizeof(float));
+          }
+          ggml_backend_tensor_set(g->kv_state_v[i], head_rows.data(),
+                                  dst_offset, packed_kv_bytes);
+        }
+      }
         }
       }
       if (g->ple_layer >= 0 && g->ple_hist_storage) {

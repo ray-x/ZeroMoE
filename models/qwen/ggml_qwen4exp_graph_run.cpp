@@ -41,7 +41,15 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
                                  : engine.hc_stream_buf.data();
   std::memcpy(g.input->data, graph_input,
               static_cast<size_t>(g.D) * g.HC * sizeof(float));
-  static_cast<int32_t *>(g.positions->data)[0] = pos_base;
+  auto *positions = static_cast<int32_t *>(g.positions->data);
+  if (g.position_ids_per_token == 4) {
+    positions[0] = pos_base;
+    positions[1] = pos_base;
+    positions[2] = pos_base;
+    positions[3] = 0;
+  } else {
+    positions[0] = pos_base;
+  }
   auto *mask = static_cast<ggml_fp16_t *>(g.attn_mask->data);
   for (int k = 0; k < g.kv_capacity; ++k)
     mask[k] = ggml_fp32_to_fp16(k <= pos_base ? 0.0f : -INFINITY);

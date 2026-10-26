@@ -465,6 +465,9 @@ struct FullGraph : zeromoe::graph::GraphCore {
   // Chunked prefill: the tokens before this batch, and per full-attention layer the host inputs holding the K/V rows of
   // the earlier batches (filled from the engine's dense KV cache before the run).
   int pos_base = 0;
+  // Standard Qwen3.5/3.6 IMRoPE carries four section positions per token;
+  // Qwen4Exp and the older single-axis paths use one.
+  int position_ids_per_token = 1;
   struct PrevKv {
     int layer = -1;
     float *k = nullptr, *v = nullptr;

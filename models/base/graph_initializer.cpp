@@ -911,6 +911,25 @@ if (fam == ModelFamily::Qwen && arch0 == "qwen35moe") {
                        << c.qwen4exp_full_attention_interval << ".\n";
     return false;
   }
+  c.rope_sections = file.get_config_int_array("rope.dimension_sections");
+  c.rope_n_rot = file.get_config_int("rope.dimension_count", 0);
+  int64_t rope_section_pairs = 0;
+  for (const int64_t section : c.rope_sections) {
+    if (section < 0) {
+      LOG_STREAM_ERROR() << "[QWEN35MOE] negative IMRoPE section size.\n";
+      return false;
+    }
+    rope_section_pairs += section;
+  }
+  if (c.rope_sections.size() != 4 || c.rope_n_rot <= 0 ||
+      c.rope_n_rot > c.head_dim || (c.rope_n_rot % 2) != 0 ||
+      rope_section_pairs * 2 != c.rope_n_rot) {
+    LOG_STREAM_ERROR() << "[QWEN35MOE] invalid IMRoPE metadata: n_rot="
+                       << c.rope_n_rot << " head_dim=" << c.head_dim
+                       << " section_pairs=" << rope_section_pairs
+                       << " sections=" << c.rope_sections.size() << ".\n";
+    return false;
+  }
   c.ssm_conv_kernel = file.get_config_int("ssm.conv_kernel", 0);
   c.ssm_inner_size = file.get_config_int("ssm.inner_size", 0);
   c.ssm_state_size = file.get_config_int("ssm.state_size", 0);

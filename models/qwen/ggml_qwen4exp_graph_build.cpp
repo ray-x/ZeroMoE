@@ -26,6 +26,17 @@ static ggml_tensor *build_qwen35moe_graph_layer(FullGraph &g,
   const bool decode = g.decode_mode;
   const auto &c = g.engine->model_file.architecture_config;
   const std::string p = "blk." + std::to_string(layer) + ".";
+  auto probe = [&](const char *label, ggml_tensor *value) {
+    if (!value || !g.graph ||
+        !zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP"))
+      return;
+    const std::string name = "qwen35_" + std::string(label) + "_" +
+                             std::to_string(layer);
+    ggml_set_name(value, name.c_str());
+    ggml_set_output(value);
+    ggml_build_forward_expand(g.graph, value);
+    g.gdn_probe_taps.emplace_back(layer, label, value);
+  };
   ggml_tensor *attn_norm = resident_tensor(g, g.ctx, p + "attn_norm.weight");
   if (!attn_norm)
     return nullptr;
@@ -145,6 +156,7 @@ static ggml_tensor *build_qwen35moe_graph_layer(FullGraph &g,
       return nullptr;
     g.kv_layers.push_back(layer);
   }
+  probe("attn_output", attn_out);
 
   if (zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP")) {
     ggml_tensor *tap_attn = ggml_cont(g.ctx, attn_out);
@@ -210,13 +222,23 @@ static ggml_tensor *build_qwen35moe_graph_layer(FullGraph &g,
     if (ids != g.split_gpu_expert_ids.end() && !ids->second.empty())
       split_ids = &ids->second;
   }
+  const bool probe_moe =
+      zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP") != nullptr;
+  ggml_tensor *route_ids = nullptr;
+  ggml_tensor *route_weights = nullptr;
   ggml_tensor *moe = build_moe(
       g, g.ctx, ffn_in, layer, router, bias, gate.cpu, up.cpu, down.cpu,
       split ? gate.gpu : nullptr, split ? up.gpu : nullptr,
-      split ? down.gpu : nullptr, split_ids, nullptr, nullptr, nullptr, false,
-      nullptr, nullptr);
+      split ? down.gpu : nullptr, split_ids, nullptr,
+      probe_moe ? &route_ids : nullptr, nullptr, false,
+      nullptr, nullptr, probe_moe ? &route_weights : nullptr);
   if (!moe)
     return nullptr;
+  probe("moe_routed", moe);
+  if (probe_moe && route_ids)
+    probe("route_ids", ggml_cast(g.ctx, route_ids, GGML_TYPE_F32));
+  if (probe_moe && route_weights)
+    probe("route_weights", route_weights);
 
   if (c.n_expert_shared > 0) {
     ggml_tensor *shared_gate =
@@ -233,9 +255,13 @@ static ggml_tensor *build_qwen35moe_graph_layer(FullGraph &g,
                                        shared_up, shared_down, shared_scalar);
     if (!shared)
       return nullptr;
+    probe("moe_shared", shared);
     moe = ggml_add(g.ctx, moe, shared);
   }
-  return ggml_add(g.ctx, res, moe);
+  probe("moe_combined", moe);
+  ggml_tensor *post_moe = ggml_add(g.ctx, res, moe);
+  probe("post_moe", post_moe);
+  return post_moe;
 }
 
 bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
@@ -303,8 +329,16 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
                          static_cast<size_t>(g.D) * g.HC * g.S * sizeof(float),
                          "qwen_full_input");
   }
-  g.positions = host_input(g, g.ctx, GGML_TYPE_I32, {g.S},
-                           static_cast<size_t>(g.S) * sizeof(int32_t),
+  g.position_ids_per_token =
+      g.engine->family_ops.family == ModelFamily::Qwen &&
+              g.engine->model_file.architecture_config.rope_sections.size() == 4
+          ? 4
+          : 1;
+  const size_t position_count =
+      static_cast<size_t>(g.S) * g.position_ids_per_token;
+  g.positions = host_input(g, g.ctx, GGML_TYPE_I32,
+                           {static_cast<int64_t>(position_count)},
+                           position_count * sizeof(int32_t),
                            "qwen_full_positions");
   if (g.decode_mode) {
     g.attn_mask = host_input(
@@ -327,8 +361,17 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     return false;
   auto *pos = static_cast<int32_t *>(g.positions->data);
   auto *mask = static_cast<ggml_fp16_t *>(g.attn_mask->data);
-  for (int i = 0; i < g.S; ++i)
-    pos[i] = g.decode_mode ? i : g.pos_base + i;
+  for (int i = 0; i < g.S; ++i) {
+    const int position = g.decode_mode ? i : g.pos_base + i;
+    if (g.position_ids_per_token == 4) {
+      pos[i] = position;
+      pos[g.S + i] = position;
+      pos[2 * g.S + i] = position;
+      pos[3 * g.S + i] = 0;
+    } else {
+      pos[i] = position;
+    }
+  }
   if (g.decode_mode) {
     for (int k = 0; k < g.kv_capacity; ++k)
       mask[k] = ggml_fp32_to_fp16(0.0f);
@@ -1433,6 +1476,9 @@ bool sync_decode_state_to_host(FullGraph &g) {
   }
   const size_t row = static_cast<size_t>(g.Hkv) * g.hd;
   const int rows = std::min(std::max(0, g.decode_last_pos + 1), g.kv_capacity);
+  const size_t kv_device_head_stride =
+      static_cast<size_t>(g.kv_capacity) * g.hd;
+  const size_t kv_head_bytes = static_cast<size_t>(rows) * g.hd * sizeof(float);
   for (size_t i = 0; i < g.kv_layers.size(); ++i) {
     const int l = g.kv_layers[i];
     if (i >= g.kv_state_k.size() || i >= g.kv_state_v.size() || l < 0 ||
@@ -1440,10 +1486,30 @@ bool sync_decode_state_to_host(FullGraph &g) {
         l >= static_cast<int>(engine.Vc.size()) || !engine.Kc[l] ||
         !engine.Vc[l])
       return false;
-    const size_t bytes = static_cast<size_t>(rows) * row * sizeof(float);
-    if (bytes > 0) {
-      ggml_backend_tensor_get(g.kv_state_k[i], engine.Kc[l], 0, bytes);
-      ggml_backend_tensor_get(g.kv_state_v[i], engine.Vc[l], 0, bytes);
+    if (kv_head_bytes > 0) {
+      // Device KV state is head-major [head, position, head_dim], while the
+      // host attention cache is position-major [position, head, head_dim].
+      // Unpack each head's prefix instead of copying a flattened prefix with
+      // the wrong head/position order.
+      std::vector<float> head_rows(static_cast<size_t>(rows) * g.hd);
+      for (int h = 0; h < g.Hkv; ++h) {
+        const size_t device_offset =
+            static_cast<size_t>(h) * kv_device_head_stride * sizeof(float);
+        ggml_backend_tensor_get(g.kv_state_k[i], head_rows.data(),
+                                device_offset, kv_head_bytes);
+        for (int p = 0; p < rows; ++p)
+          std::memcpy(engine.Kc[l] + static_cast<size_t>(p) * row +
+                          static_cast<size_t>(h) * g.hd,
+                      head_rows.data() + static_cast<size_t>(p) * g.hd,
+                      static_cast<size_t>(g.hd) * sizeof(float));
+        ggml_backend_tensor_get(g.kv_state_v[i], head_rows.data(),
+                                device_offset, kv_head_bytes);
+        for (int p = 0; p < rows; ++p)
+          std::memcpy(engine.Vc[l] + static_cast<size_t>(p) * row +
+                          static_cast<size_t>(h) * g.hd,
+                      head_rows.data() + static_cast<size_t>(p) * g.hd,
+                      static_cast<size_t>(g.hd) * sizeof(float));
+      }
     }
   }
   if (g.ple_layer >= 0 && g.ple_hist_storage) {

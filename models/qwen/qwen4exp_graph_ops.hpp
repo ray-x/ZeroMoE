@@ -1,6 +1,8 @@
 #pragma once
 
 #include <vector>
+#include <array>
+#include <functional>
 
 #include "ggml.h"
 
@@ -69,34 +71,60 @@ inline ggml_tensor *shared_expert(ggml_context *ctx, ggml_tensor *cur,
 struct AttentionShape {
   int H, Hkv, hd, capacity, n_rot, original_context;
   float eps, freq_base, freq_scale, ext_factor, attn_factor;
+  int rope_mode = GGML_ROPE_TYPE_NEOX;
+  std::array<int, GGML_MROPE_SECTIONS> rope_sections{};
 };
 
-// Text-only IMRoPE uses the same NEOX substitution as the target graph.
 inline ggml_tensor *attention_decode(
     const AttentionShape &g, ggml_context *ctx, ggml_tensor *cur,
     ggml_tensor *w_q, ggml_tensor *w_k, ggml_tensor *w_v, ggml_tensor *w_qn,
     ggml_tensor *w_kn, ggml_tensor *w_o, ggml_tensor *k_storage,
     ggml_tensor *v_storage, ggml_tensor *positions, ggml_tensor *indices,
-    ggml_tensor *mask, std::vector<ggml_tensor *> *norm_nodes = nullptr) {
+    ggml_tensor *mask, std::vector<ggml_tensor *> *norm_nodes = nullptr,
+    const std::function<void(const char *, ggml_tensor *)> &probe = {}) {
+  auto diag = [&](const char *name, ggml_tensor *tensor) {
+    if (probe && tensor)
+      probe(name, tensor);
+  };
   ggml_tensor *qfull = ggml_mul_mat(ctx, w_q, cur);
+  diag("full_qg_proj", qfull);
   ggml_tensor *q = ggml_view_3d(ctx, qfull, g.hd, g.H, 1,
                                sizeof(float) * g.hd * 2,
                                sizeof(float) * g.hd * 2 * g.H, 0);
+  diag("full_q_view", q);
   ggml_tensor *q_rms = ggml_rms_norm(ctx, q, g.eps);
   q = ggml_mul(ctx, q_rms, w_qn);
+  diag("full_q_norm", q);
   ggml_tensor *k = ggml_reshape_3d(
       ctx, ggml_mul_mat(ctx, w_k, cur), g.hd, g.Hkv, 1);
   ggml_tensor *k_rms = ggml_rms_norm(ctx, k, g.eps);
   k = ggml_mul(ctx, k_rms, w_kn);
+  diag("full_k_norm", k);
   if (norm_nodes) norm_nodes->insert(norm_nodes->end(), {q_rms, k_rms});
   ggml_tensor *v = ggml_reshape_3d(
       ctx, ggml_mul_mat(ctx, w_v, cur), g.hd, g.Hkv, 1);
-  q = ggml_rope_ext(ctx, q, positions, nullptr, g.n_rot, GGML_ROPE_TYPE_NEOX,
-                    g.original_context, g.freq_base, g.freq_scale,
-                    g.ext_factor, g.attn_factor, 32.0f, 1.0f);
-  k = ggml_rope_ext(ctx, k, positions, nullptr, g.n_rot, GGML_ROPE_TYPE_NEOX,
-                    g.original_context, g.freq_base, g.freq_scale,
-                    g.ext_factor, g.attn_factor, 32.0f, 1.0f);
+  diag("full_v", v);
+  if (g.rope_mode == GGML_ROPE_TYPE_IMROPE ||
+      g.rope_mode == GGML_ROPE_TYPE_MROPE) {
+    auto sections = g.rope_sections;
+    q = ggml_rope_multi(ctx, q, positions, nullptr, g.n_rot,
+                        sections.data(), g.rope_mode,
+                        g.original_context, g.freq_base, g.freq_scale,
+                        g.ext_factor, g.attn_factor, 32.0f, 1.0f);
+    k = ggml_rope_multi(ctx, k, positions, nullptr, g.n_rot,
+                        sections.data(), g.rope_mode,
+                        g.original_context, g.freq_base, g.freq_scale,
+                        g.ext_factor, g.attn_factor, 32.0f, 1.0f);
+  } else {
+    q = ggml_rope_ext(ctx, q, positions, nullptr, g.n_rot, g.rope_mode,
+                      g.original_context, g.freq_base, g.freq_scale,
+                      g.ext_factor, g.attn_factor, 32.0f, 1.0f);
+    k = ggml_rope_ext(ctx, k, positions, nullptr, g.n_rot, g.rope_mode,
+                      g.original_context, g.freq_base, g.freq_scale,
+                      g.ext_factor, g.attn_factor, 32.0f, 1.0f);
+  }
+  diag("full_q_rope", q);
+  diag("full_k_rope", k);
   ggml_tensor *k2 = ggml_reshape_2d(ctx, k, g.hd, g.Hkv);
   ggml_tensor *v2 = ggml_reshape_2d(ctx, v, g.hd, g.Hkv);
   ggml_tensor *kset = ggml_set_rows(ctx, k_storage, k2, indices);
@@ -113,14 +141,21 @@ inline ggml_tensor *attention_decode(
   ggml_tensor *attn = ggml_flash_attn_ext(
       ctx, q, kcache, vcache, mask,
       1.0f / std::sqrt(static_cast<float>(g.hd)), 0.0f, 0.0f);
+  diag("full_attn", attn);
   ggml_tensor *gate = ggml_view_3d(
       ctx, qfull, g.hd, g.H, 1, sizeof(float) * g.hd * 2,
       sizeof(float) * g.hd * 2 * g.H, sizeof(float) * g.hd);
   gate = ggml_reshape_3d(ctx, ggml_cont_2d(ctx, gate, g.H * g.hd, 1),
                          g.hd, g.H, 1);
-  attn = ggml_mul(ctx, attn, ggml_sigmoid(ctx, gate));
+  diag("full_gate", gate);
+  ggml_tensor *gate_sigmoid = ggml_sigmoid(ctx, gate);
+  diag("full_gate_sigmoid", gate_sigmoid);
+  attn = ggml_mul(ctx, attn, gate_sigmoid);
+  diag("full_attn_gated", attn);
   attn = ggml_reshape_2d(ctx, attn, g.H * g.hd, 1);
-  return ggml_mul_mat(ctx, w_o, attn);
+  ggml_tensor *out = ggml_mul_mat(ctx, w_o, attn);
+  diag("full_output_projection", out);
+  return out;
 }
 
 } // namespace qwen4exp_ops

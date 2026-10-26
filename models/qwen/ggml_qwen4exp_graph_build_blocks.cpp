@@ -226,29 +226,43 @@ ggml_tensor *build_full_attention(FullGraph &g, ggml_context *ctx,
   const int n_rot = g.engine->model_file.architecture_config.rope_n_rot > 0
                         ? g.engine->model_file.architecture_config.rope_n_rot
                         : g.hd;
-  // Qwen4Exp's upstream rope_type is IMROPE (interleaved M-RoPE), whose
-  // cos/sin pairing is NEOX-ordered (rotate-half), not the adjacent-pair
-  // (2j,2j+1) ordering GGML_ROPE_TYPE_NORMAL applies. For text-only decode
-  // every M-RoPE section carries the same scalar position (no vision/video
-  // tokens), so IMROPE's per-section theta selection is provably identical
-  // to plain single-axis NEOX rope (ggml.h's own ggml_rope_multi comment:
-  // "the theta for each dim is computed the same way as ggml_rope_ext, no
-  // matter the section") -- ggml_rope_ext with GGML_ROPE_TYPE_NEOX is exact,
-  // not an approximation, and needs no 4x-wide position tensor. Also use
-  // this model's real rope.freq_base (10,000,000 for this checkpoint) --
-  // plain ggml_rope()'s 5-arg wrapper silently hardcodes ggml's generic
-  // 10,000 default, which is wrong for Qwen4Exp by 1000x.
+  // Qwen3.5/3.6 uses IMRoPE with model-provided sections and four position
+  // lanes, even for text-only inputs. The section pattern changes which head
+  // dimensions rotate together; collapsing it to NEOX produced a measurable
+  // divergence at the first full-attention layer. Qwen4Exp retains its
+  // separate NEOX path. Use the checkpoint's rope.freq_base (10,000,000),
+  // rather than ggml_rope()'s generic 10,000 default.
   const float rope_freq_base =
       g.engine->model_file.get_config_float("rope.freq_base", 10000.0f);
   const auto &rope_c = g.engine->model_file.architecture_config;
-  q = ggml_rope_ext(ctx, q, g.positions, nullptr, n_rot, GGML_ROPE_TYPE_NEOX,
-                     rope_c.rope_n_ctx_orig, rope_freq_base,
-                     rope_c.rope_freq_scale, rope_c.rope_ext_factor,
-                     rope_c.rope_attn_factor, 32.0f, 1.0f);
-  k = ggml_rope_ext(ctx, k, g.positions, nullptr, n_rot, GGML_ROPE_TYPE_NEOX,
-                     rope_c.rope_n_ctx_orig, rope_freq_base,
-                     rope_c.rope_freq_scale, rope_c.rope_ext_factor,
-                     rope_c.rope_attn_factor, 32.0f, 1.0f);
+  if (g.position_ids_per_token == 4) {
+    if (rope_c.rope_sections.size() != 4)
+      return nullptr;
+    int sections[GGML_MROPE_SECTIONS];
+    for (size_t i = 0; i < GGML_MROPE_SECTIONS; ++i)
+      sections[i] = static_cast<int>(rope_c.rope_sections[i]);
+    q = ggml_rope_multi(ctx, q, g.positions, nullptr, n_rot, sections,
+                        GGML_ROPE_TYPE_IMROPE, rope_c.rope_n_ctx_orig,
+                        rope_freq_base, rope_c.rope_freq_scale,
+                        rope_c.rope_ext_factor, rope_c.rope_attn_factor,
+                        32.0f, 1.0f);
+    k = ggml_rope_multi(ctx, k, g.positions, nullptr, n_rot, sections,
+                        GGML_ROPE_TYPE_IMROPE, rope_c.rope_n_ctx_orig,
+                        rope_freq_base, rope_c.rope_freq_scale,
+                        rope_c.rope_ext_factor, rope_c.rope_attn_factor,
+                        32.0f, 1.0f);
+  } else {
+    q = ggml_rope_ext(ctx, q, g.positions, nullptr, n_rot,
+                      GGML_ROPE_TYPE_NEOX, rope_c.rope_n_ctx_orig,
+                      rope_freq_base, rope_c.rope_freq_scale,
+                      rope_c.rope_ext_factor, rope_c.rope_attn_factor, 32.0f,
+                      1.0f);
+    k = ggml_rope_ext(ctx, k, g.positions, nullptr, n_rot,
+                      GGML_ROPE_TYPE_NEOX, rope_c.rope_n_ctx_orig,
+                      rope_freq_base, rope_c.rope_freq_scale,
+                      rope_c.rope_ext_factor, rope_c.rope_attn_factor, 32.0f,
+                      1.0f);
+  }
   diag("full_q_rope", q);
   diag("full_k_rope", k);
   // The host dense KV cache stores the same normalized and rotated K/V values
@@ -314,14 +328,39 @@ ggml_tensor *build_full_attention_decode(
     ggml_tensor *v_storage) {
   const auto &rope_c = g.engine->model_file.architecture_config;
   (void)layer;
+  qwen4exp_ops::AttentionShape attention{
+      g.H,
+      g.Hkv,
+      g.hd,
+      g.kv_capacity,
+      rope_c.rope_n_rot > 0 ? rope_c.rope_n_rot : g.hd,
+      rope_c.rope_n_ctx_orig,
+      rope_c.eps,
+      g.engine->model_file.get_config_float("rope.freq_base", 10000.0f),
+      rope_c.rope_freq_scale,
+      rope_c.rope_ext_factor,
+      rope_c.rope_attn_factor};
+  if (g.position_ids_per_token == 4) {
+    if (rope_c.rope_sections.size() != GGML_MROPE_SECTIONS)
+      return nullptr;
+    attention.rope_mode = GGML_ROPE_TYPE_IMROPE;
+    for (size_t i = 0; i < GGML_MROPE_SECTIONS; ++i)
+      attention.rope_sections[i] = static_cast<int>(rope_c.rope_sections[i]);
+  }
+  auto diag = [&](const char *label, ggml_tensor *value) {
+    if (!value || !g.graph ||
+        !zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP"))
+      return;
+    const std::string name = "qwen35_" + std::string(label) + "_" +
+                             std::to_string(layer);
+    ggml_set_name(value, name.c_str());
+    ggml_set_output(value);
+    ggml_build_forward_expand(g.graph, value);
+    g.gdn_probe_taps.emplace_back(layer, label, value);
+  };
   return qwen4exp_ops::attention_decode(
-      {g.H, g.Hkv, g.hd, g.kv_capacity,
-       rope_c.rope_n_rot > 0 ? rope_c.rope_n_rot : g.hd,
-       rope_c.rope_n_ctx_orig, rope_c.eps,
-       g.engine->model_file.get_config_float("rope.freq_base", 10000.0f),
-       rope_c.rope_freq_scale, rope_c.rope_ext_factor, rope_c.rope_attn_factor},
-      ctx, cur, w_q, w_k, w_v, w_qn, w_kn, w_o, k_storage, v_storage,
-      g.positions, g.decode_indices, g.attn_mask);
+      attention, ctx, cur, w_q, w_k, w_v, w_qn, w_kn, w_o, k_storage,
+      v_storage, g.positions, g.decode_indices, g.attn_mask, nullptr, diag);
 }
 
 bool prepare_ple_embedding(FullGraph &g, std::vector<float> &embedding, int S,

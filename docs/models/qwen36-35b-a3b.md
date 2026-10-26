@@ -5,9 +5,10 @@
 The Qwen full-graph adapter builds with CUDA. The 5060 Ti full-fit request path
 passes graph-prefill, graph-decode, and all-expert-placement gates. Performance
 has varied across repeated runs: one run passed the 90% llama.cpp bar, while
-the latest repeat reached 89.2%. Teacher-forced parity is still in progress:
-GDN matches llama.cpp, but the first full-attention layer (layer 3) currently
-diverges after RoPE, so the model is not yet accepted as supported.
+the latest repeat reached 89.2%. Teacher-forced parity has moved past the
+layer-3 RoPE defect, but broader numerical parity remains open: router inputs
+drift by up to 7.81%, and six layers select a different near-boundary expert.
+The model is not yet accepted as supported.
 
 ## GGUF architecture
 
@@ -91,8 +92,8 @@ benchmark at 122.73 tok/s. A later repeat on the pending changes measured
 109.82 tok/s median (9.106 ms/token p50, 9.136 ms/token p95); its graph-only
 counter was 109.44 tok/s, or 89.2% of llama.cpp, so that repeat failed the
 default 90% performance gate. Both runs passed the full-fit graph execution
-gate. This performance variation and the outstanding layer-3 RoPE parity
-failure keep onboarding in progress. The passing-run ZeroMoE bench JSON is
+gate. This performance variation and the outstanding numerical-parity gaps
+keep onboarding in progress. The passing-run ZeroMoE bench JSON is
 `logs/qwen36_fullgraph_pg16_tg400_moe_fusion.json`; llama.cpp JSON is
 `logs/qwen36_llama_bench_pg16_tg400_cuda1.json`.
 The repeat artifacts are `logs/qwen36_fullgraph_pg16_tg400_repeat_20261026.json`
@@ -109,3 +110,44 @@ The main graph-runtime optimizations measured during this work were:
   broadcast-add kernel per remaining route.
 - Standard Qwen skips the unused final hidden-state D2H readback when graph
   logits are available and MTP or hidden-state diagnostics are disabled.
+
+## Teacher-forced parity update
+
+The latest saved comparison used the raw prompt `Tell a story.` (tokens
+`39113, 264, 3255, 13`) and forced decode input token `146377` at position 4.
+It compares the same GGUF through ZeroMoE and the llama.cpp CUDA trace. The
+ZeroMoE trace contains four prompt rows followed by one decode row. Its files
+are in `/tmp/qwen36_zero_gdn_decode_probe_rerun`; the llama.cpp reference is in
+`/tmp/qwen36_llama_full_parity`.
+
+The corrected four-lane IMRoPE and decode KV-cache packing remove the earlier
+layer-3 RoPE divergence. At layer 3 prefill, Q/K after RoPE differ by
+0.91%/0.94% relative RMS, attention context by 1.00%, and the output
+projection by 1.02%. At decode, Q/K differ by 0.71%/0.89%, attention context
+by 1.02%, and the output projection by 1.33%. Layer-0 GDN is especially
+close: normalized Q/K differ
+by 1.2e-6/3.1e-6, the GDN core by 4.2e-5, and its output projection by
+0.0115% relative RMS.
+
+The remaining drift accumulates through the 40-layer MoE stack. Router logits
+differ by 0.37% mean and 0.69% maximum relative RMS; softmax probabilities
+differ by 1.87% mean and 4.18% maximum. The MoE input differs by 3.92% mean,
+reaching 7.81% at layer 39. The top-8 expert set matches in 34/40 layers;
+layers 14, 17, 31, 33, 37, and 38 each replace one expert near the top-8
+boundary, whose probability gap is below 3e-4 and as small as 9e-7. Among
+layers with the same expert set, routed-MoE output differs by 4.96% mean and
+10.78% maximum relative RMS. The six changed sets produce 14% to 31%
+routed-output differences. This points to accumulated arithmetic differences
+and top-k sensitivity, rather than another layer-3 RoPE or cache-layout bug.
+
+The measurements reproduced in a fresh 2026-10-27 run. The full-graph gate
+passed with one graph prefill, one graph decode, all 40 expert layers on the
+device, and zero layered forwards or legacy expert dispatches. The gate log is
+`/tmp/qwen36_parity_retry.log`; probe diagnostics were enabled, so its decode
+timing is not a performance measurement. Earlier retries intermittently
+reported `cudaGetDeviceCount == 0` or hit the existing-process preflight; the
+successful run used no `--force-start`.
+
+An earlier failed retry wrote preflight-only output to the profile's default
+log path, replacing its prior contents. The benchmark JSON artifacts remain;
+rerun the benchmark to regenerate the standard full-run log.
