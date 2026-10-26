@@ -46,5 +46,24 @@ int main() {
   MtpGraphCursor invalid({0, 6, 4, 40});
   check(!invalid.validate(r).empty(), "reject invalid graph shape");
   if (!failures) std::puts("MTP graph contract: PASS");
+  {
+    MtpGraphCursor rw({2, 6, 4, 40});
+    std::vector<float> e(2, 1), h(6, 2), n(6), l(4);
+    for (int p = 0; p < 5; ++p) {
+      MtpGraphRequest q{p, e, h, n, l};
+      check(rw.validate(q).empty(), "rewind setup replay");
+      rw.commit();
+    }
+    check(rw.rewind(3).empty() && rw.next_position() == 3, "rewind to prefix");
+    check(!rw.rewind(4).empty() && rw.next_position() == 3, "reject forward rewind");
+    check(!rw.rewind(-1).empty(), "reject negative rewind");
+    MtpGraphRequest stale{4, e, h, n, l};
+    check(!rw.validate(stale).empty(), "rewound cursor rejects stale position");
+    MtpGraphRequest again{3, e, h, n, l};
+    check(rw.validate(again).empty(), "rewound cursor re-appends at target");
+    check(rw.rewind(0).empty() && rw.next_position() == 0, "rewind to zero");
+    rw.poison();
+    check(!rw.rewind(0).empty(), "poisoned cursor refuses rewind");
+  }
   return failures ? 1 : 0;
 }

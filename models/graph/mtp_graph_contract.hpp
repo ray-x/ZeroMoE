@@ -56,6 +56,18 @@ class MtpGraphCursor {
   }
 
   void commit() { ++next_position_; }
+  // Logical rollback of the draft's attention K/V. Valid because the draft
+  // owns only K/V at fixed addresses: rows at or beyond the cursor are masked
+  // and overwritten by the next append, so no other state can diverge.
+  // Never moves forward, and never un-poisons (a failed submission may have
+  // left K/V in an unknown partial state; only reset recovers that).
+  std::string rewind(int position) {
+    if (poisoned_) return "draft graph requires reset after execution failure";
+    if (position < 0 || position > next_position_)
+      return "draft rewind target outside the committed prefix";
+    next_position_ = position;
+    return {};
+  }
   void poison() { poisoned_ = true; }
   void reset() { next_position_ = 0; poisoned_ = false; }
   int next_position() const { return next_position_; }

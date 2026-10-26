@@ -46,6 +46,9 @@ class MtpGraphRuntime {
 
   bool replay(const MtpGraphRequest &request, std::string &error);
   bool reset(std::string &error);
+  // Drops draft K/V rows at or after `position` (see MtpGraphCursor::rewind).
+  // Invalidates diagnostics from the last replay.
+  bool rewind(int position, std::string &error);
   bool read_diagnostic(const std::string &name, std::span<float> output,
                        std::string &error) const;
   bool read_ids(const std::string &name, std::span<int32_t> output,

@@ -201,6 +201,14 @@ bool MtpGraphRuntime::reset(std::string &error) {
   return true;
 }
 
+bool MtpGraphRuntime::rewind(int position, std::string &error) {
+  error = cursor_.rewind(position);
+  if (!error.empty()) return false;
+  ggml_backend_sched_synchronize(state_->sched);
+  has_output_ = false;
+  return true;
+}
+
 bool MtpGraphRuntime::read_diagnostic(
     const std::string &name, std::span<float> output, std::string &error) const {
   error.clear();

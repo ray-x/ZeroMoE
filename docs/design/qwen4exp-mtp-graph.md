@@ -254,6 +254,37 @@ target-graph multi-token verification, rejected-prefix state reconciliation,
 chunked target hidden export, generation error propagation, and teacher-forced
 per-frame validation, with no layered target decode.
 
+## Target verification driver (2026-10-26)
+
+`models/graph/mtp_speculation.hpp` is the model-agnostic speculative loop. It
+reaches the target and draft only through `SpecTarget` (step, save, restore,
+release) and `SpecDraft` (step, rewind), so it is proven on the CPU against a
+deterministic fake before any GPU run (`tests/test_mtp_speculation.cpp`).
+
+Cycle: a pending token `y` the target has not processed; the draft proposes
+`d1..dk` (pairing `y` with the preceding true target hidden, then its own
+residual); the target steps `y, d1..dk` one token at a time with a checkpoint
+before each step after the first; exact speculative sampling accepts `a`
+drafts and draws the correction from `norm(max(0, p - q))` (or the bonus
+token when all are accepted); the target is restored to the checkpoint taken
+before step `a+1`, which is exactly the state after `d_a`, with no replay; the
+draft rewinds to the pending position and rebuilds the accepted rows from the
+true target hiddens.
+
+Proven by the CPU test: greedy output is identical to plain decoding for
+perfect, noisy and adversarial drafts and for `k = 0..5`; the first three
+sampled tokens match the target's exact joint distribution (TV < 0.005 over
+120k runs) for good and bad drafts; EOS, caller stop and capacity truncation;
+target/draft failures propagate and every checkpoint is released. Six
+deliberate bugs (skipped or wrong restore, residual not subtracted, draft
+rebuilt with its own residual, always-accept, skipped rewind) each fail the
+suite. `MtpGraphRuntime::rewind` is the draft's rollback; it is exact because
+the draft owns only K/V.
+
+This proves the loop, not the model integration: the Qwen target adapter
+(wide-residual export from decode, device state checkpoints) and the GPU
+teacher-forced validation remain, and the production startup guard stays.
+
 ## Standalone implementation and reproduction
 
 The experimental entry point is `qwen4exp_mtp::create` in
@@ -290,6 +321,9 @@ Build and run the dependency-free session and comparator tests:
 ```sh
 c++ -std=c++23 -Imodels/graph tests/test_mtp_graph_contract.cpp \
     -o /tmp/zeromoe-mtp-contract
+c++ -std=c++23 -O2 -Imodels/graph tests/test_mtp_speculation.cpp \
+    -o /tmp/zeromoe-mtp-spec
+/tmp/zeromoe-mtp-spec
 /tmp/zeromoe-mtp-contract
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p test_mtp_parity.py
 ```
