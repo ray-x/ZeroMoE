@@ -16,6 +16,7 @@ using namespace zeromoe::graph;
 namespace {
 
 constexpr size_t W = 4;
+bool g_batch = false;  // run every scenario once stepwise and once with batched verification
 
 uint32_t mix(uint32_t a, uint32_t b, uint32_t c = 0) {
   uint32_t x = a * 2654435761u ^ (b + 0x9e3779b9u) * 40503u ^ (c + 77u) * 2246822519u;
@@ -41,6 +42,18 @@ struct FakeTarget : SpecTarget {
   int steps = 0, live = 0, next_handle = 1, fail_at = -1, restores = 0;
   std::map<int, uint32_t> checkpoints;
   explicit FakeTarget(size_t vocab) : V(vocab) {}
+  bool supports_batch() const override { return g_batch; }
+  int batches = 0, batch_tokens = 0;
+  bool step_batch(std::span<const int> tokens, int position, std::span<float> wide,
+                  std::span<float> logits, std::string &error) override {
+    ++batches;
+    batch_tokens += int(tokens.size());
+    for (size_t i = 0; i < tokens.size(); ++i)
+      if (!step(tokens[i], position + int(i), wide.subspan(i * W, W),
+                logits.subspan(i * V, V), error))
+        return false;
+    return true;
+  }
   bool step(int token, int position, std::span<float> wide, std::span<float> logits,
             std::string &error) override {
     if (steps++ == fail_at) { error = "injected target failure"; return false; }
@@ -169,9 +182,8 @@ std::vector<int> plain_decode(size_t V, const std::vector<int> &prompt, int max_
   return out;
 }
 
-}  // namespace
-
-int main() {
+int run_all(bool batch) {
+  g_batch = batch;
   int failures = 0;
   const auto check = [&](bool ok, const char *name) {
     if (!ok) { std::fprintf(stderr, "FAIL: %s\n", name); ++failures; }
@@ -181,7 +193,8 @@ int main() {
   //    quality (perfect, noisy, adversarial) and draft length, including k=0.
   {
     const size_t V = 24;
-    bool all_equal = true, no_leak = true, ordered = true, steps_ok = true;
+    bool all_equal = true, no_leak = true, ordered = true, steps_ok = true, batch_state_ok = true;
+    uint64_t batch_passes = 0, replays = 0, perfect_replays = 0;
     uint64_t total_accepted = 0, total_drafted = 0;
     for (float noise : {0.0f, 0.15f, 0.6f, 3.0f})
       for (int K : {0, 1, 2, 3, 5})
@@ -210,7 +223,17 @@ int main() {
           }
           no_leak = no_leak && target.live == 0;
           ordered = ordered && !draft.order_violation && int(got.size()) <= max_new;
-          steps_ok = steps_ok && stats.target_steps == stats.cycles + stats.drafted;
+          // Tokens processed beyond replays are exactly y plus every draft.
+          steps_ok = steps_ok && stats.target_steps + stats.target_batch_tokens -
+                                         stats.replay_tokens == stats.cycles + stats.drafted;
+          if (!batch) steps_ok = steps_ok && stats.target_batches == 0 && stats.replay_tokens == 0;
+          if (batch) {
+            batch_passes += stats.target_batches;
+            replays += stats.replay_tokens;
+            if (noise == 0.0f) perfect_replays += stats.replay_tokens;
+            batch_state_ok = batch_state_ok && target.batch_tokens == int(stats.target_batch_tokens) &&
+                             target.batches == int(stats.target_batches);
+          }
           total_accepted += stats.accepted;
           total_drafted += stats.drafted;
         }
@@ -220,6 +243,12 @@ int main() {
     check(steps_ok, "target steps == cycles + drafted");
     check(total_drafted > 0 && total_accepted > 0 && total_accepted < total_drafted,
           "test exercises both acceptance and rejection");
+    if (batch) {
+      check(batch_passes > 0, "batched verification path exercised");
+      check(replays > 0, "mid-batch rollback (restore + replay) exercised");
+      check(perfect_replays == 0, "a perfect draft never needs a replay");
+      check(batch_state_ok, "driver and target agree on batch counts");
+    }
   }
 
   // 2) The draft's rebuilt rows are paired with the TRUE target hidden.
@@ -415,6 +444,17 @@ int main() {
           "rejects a draft that was not reset");
   }
 
+  return failures;
+}
+
+}  // namespace
+
+int main() {
+  int failures = 0;
+  for (bool batch : {false, true}) {
+    std::fprintf(stderr, "-- %s verification\n", batch ? "batched" : "stepwise");
+    failures += run_all(batch);
+  }
   std::printf("MTP speculation: %s\n", failures ? "FAIL" : "PASS");
   return failures ? 1 : 0;
 }

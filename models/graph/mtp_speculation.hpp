@@ -14,10 +14,16 @@
 //  * A cycle starts with a *pending* token y that the target has not yet
 //    processed. The draft pairs y with the target hidden of the position
 //    before it, then feeds its own residual back for later drafts.
-//  * Verification steps the target one token at a time over y, d1..dk. A
-//    state checkpoint is taken before every step after the first, so a
-//    rejection at draft a restores exactly the state after processing d_a
-//    without replaying anything.
+//  * Verification has two modes. Stepwise (always available): the target
+//    steps one token at a time over y, d1..dk with a state checkpoint before
+//    every step after the first, so a rejection at draft a restores exactly
+//    the state after processing d_a without replaying anything. Batched (a
+//    target that reports supports_batch()): one checkpoint, then y, d1..dk in a
+//    single pass; a rejection at draft a < k restores the checkpoint and
+//    replays y..d_a (one pass, or one step when a == 0) so the live state is
+//    exactly what plain decoding of the accepted tokens produces. Batched mode
+//    pays off when a k+1 token pass costs well under k+1 steps; a model whose
+//    batch path is no cheaper should leave supports_batch() false.
 //  * The draft's K/V for accepted positions is rebuilt from the true target
 //    hiddens (its drafted rows used its own residual), then the next cycle's
 //    pending token is the correction.
@@ -49,6 +55,19 @@ class SpecTarget {
   // Make the checkpoint's state the live state.
   virtual bool restore(int handle, std::string &error) = 0;
   virtual void release(int handle) = 0;
+  // Optional batched pass. Process tokens[i] at position + i for all i in one
+  // call; `wide` and `logits` receive tokens.size() rows (row i is the output
+  // after tokens[i]). Afterwards the live state stands after the last token.
+  // Row i must be what step() would produce for the same state, up to the
+  // numerics of a batched kernel.
+  virtual bool supports_batch() const { return false; }
+  virtual bool step_batch(std::span<const int> tokens, int position,
+                          std::span<float> wide, std::span<float> logits,
+                          std::string &error) {
+    (void)tokens; (void)position; (void)wide; (void)logits;
+    error = "target does not support batched verification";
+    return false;
+  }
 };
 
 class SpecDraft {
@@ -76,6 +95,7 @@ struct SpecConfig {
   int max_new_tokens = 0;
   int eos_id = -1;
   int max_position = 0;   // exclusive capacity of both target and draft
+  bool batch_verify = true;  // use SpecTarget::step_batch when the target has it
 };
 
 struct SpecPrompt {
@@ -89,6 +109,9 @@ struct SpecPrompt {
 struct SpecStats {
   uint64_t cycles = 0, drafted = 0, accepted = 0, emitted = 0;
   uint64_t target_steps = 0, draft_steps = 0, restores = 0;
+  // Batched verification: passes, tokens they processed, and tokens replayed
+  // after a rejection (the price of rolling back to a mid-batch state).
+  uint64_t target_batches = 0, target_batch_tokens = 0, replay_tokens = 0;
   bool truncated = false;  // stopped because the context capacity was reached
 };
 
@@ -227,21 +250,34 @@ inline bool speculate(SpecTarget &target, SpecDraft &draft,
     }
     stats.drafted += drafts.size();
 
-    // ---- verify: step the target over y, d1..dk with checkpoints ----
+    // ---- verify y, d1..dk ----
+    const bool batched = cfg.batch_verify && k >= 1 && target.supports_batch();
     detail::CheckpointSet checkpoints(target);
     std::vector<float> wides(size_t(k + 1) * W), plogits(size_t(k + 1) * V);
-    for (int j = 0; j <= k; ++j) {
-      if (j >= 1) {
-        int handle = 0;
-        if (!target.save(handle, error)) return false;
-        checkpoints.handles.push_back(handle);  // handles[j-1] = state before step j
+    if (batched) {
+      int handle = 0;
+      if (!target.save(handle, error)) return false;
+      checkpoints.handles.push_back(handle);  // handles[0] = state before y
+      std::vector<int> tokens;
+      tokens.push_back(seq.back());
+      tokens.insert(tokens.end(), drafts.begin(), drafts.end());
+      ++stats.target_batches;
+      stats.target_batch_tokens += tokens.size();
+      if (!target.step_batch(tokens, pos, wides, plogits, error)) return false;
+    } else {
+      for (int j = 0; j <= k; ++j) {
+        if (j >= 1) {
+          int handle = 0;
+          if (!target.save(handle, error)) return false;
+          checkpoints.handles.push_back(handle);  // handles[j-1] = state before step j
+        }
+        const int token = j == 0 ? seq.back() : drafts[size_t(j - 1)];
+        ++stats.target_steps;
+        if (!target.step(token, pos + j,
+                         std::span<float>(wides.data() + size_t(j) * W, W),
+                         std::span<float>(plogits.data() + size_t(j) * V, V), error))
+          return false;
       }
-      const int token = j == 0 ? seq.back() : drafts[size_t(j - 1)];
-      ++stats.target_steps;
-      if (!target.step(token, pos + j,
-                       std::span<float>(wides.data() + size_t(j) * W, W),
-                       std::span<float>(plogits.data() + size_t(j) * V, V), error))
-        return false;
     }
 
     std::vector<std::vector<float>> p(size_t(k + 1));
@@ -278,8 +314,33 @@ inline bool speculate(SpecTarget &target, SpecDraft &draft,
 
     // ---- reconcile target state: it must stand after processing d_accepted ----
     if (accepted < k) {
-      if (!target.restore(checkpoints.handles[size_t(accepted)], error)) return false;
-      ++stats.restores;
+      if (!batched) {
+        if (!target.restore(checkpoints.handles[size_t(accepted)], error)) return false;
+        ++stats.restores;
+      } else {
+        // Roll back to before y and replay y..d_accepted. The replay's rows are
+        // the true ones for the live state, so they feed the draft rebuild.
+        if (!target.restore(checkpoints.handles[0], error)) return false;
+        ++stats.restores;
+        const size_t m = size_t(accepted) + 1;
+        std::vector<int> tokens;
+        tokens.push_back(seq.back());
+        tokens.insert(tokens.end(), drafts.begin(), drafts.begin() + accepted);
+        std::vector<float> replay_logits(m * V);
+        stats.replay_tokens += m;
+        if (m == 1) {
+          ++stats.target_steps;
+          if (!target.step(tokens[0], pos, std::span<float>(wides.data(), W),
+                           std::span<float>(replay_logits.data(), V), error))
+            return false;
+        } else {
+          ++stats.target_batches;
+          stats.target_batch_tokens += m;
+          if (!target.step_batch(tokens, pos, std::span<float>(wides.data(), m * W),
+                                 replay_logits, error))
+            return false;
+        }
+      }
     }
 
     // ---- rebuild the draft rows for t_0..t_accepted from true target hiddens ----
