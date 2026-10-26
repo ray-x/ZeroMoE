@@ -324,8 +324,11 @@ int qwen4exp_full_graph_suggested_batch() { return qwen4exp_graph::g_qwen4exp_su
 
 bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
                                  const int *token_ids) {
-  if (!env_enabled() || S <= 1 || pos_base < 0 ||
-      engine.family_ops.family != ModelFamily::Qwen4Exp)
+  const bool supported_family =
+      engine.family_ops.family == ModelFamily::Qwen4Exp ||
+      engine.family_ops.family == ModelFamily::Qwen;
+  if (!full_graph_enabled_for_engine(engine) || !supported_family || S <= 1 ||
+      pos_base < 0)
     return false;
   // A batch after the first continues the previous batch of the same prompt (recurrent state, dense KV rows, PLE window
   // are in the engine). The paths with their own per-layer machinery are not continued.

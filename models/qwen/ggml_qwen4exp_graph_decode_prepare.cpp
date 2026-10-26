@@ -72,7 +72,7 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   bool has_qwen_host_prefill_state = false;
   if (engine.family_ops.family == ModelFamily::Qwen &&
       !continuing_decode && !has_graph_prefill) {
-    if (pos_base <= 0) {
+    if (pos_base < 0) {
       LOG_ERROR("[GGML-QWEN-FULL-DECODE] host prefill position is invalid: %d\n",
                 pos_base);
     } else if (engine.qwen4exp_recur_state.size() <
@@ -115,10 +115,21 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
           break;
         }
       }
+      if (has_qwen_host_prefill_state && pos_base == 0) {
+        // A one-token prompt has no preceding prefill batch. The allocated
+        // recurrent vectors are the initial recurrent-memory state.
+        for (int layer = 0; layer < c.n_layers; ++layer) {
+          if (!qwen35moe_is_gdn_layer(c, layer))
+            continue;
+          std::fill(engine.qwen4exp_recur_state[layer].begin(),
+                    engine.qwen4exp_recur_state[layer].end(), 0.0f);
+          std::fill(engine.qwen4exp_conv_history[layer].begin(),
+                    engine.qwen4exp_conv_history[layer].end(), 0.0f);
+        }
+      }
       if (has_qwen_host_prefill_state)
-        LOG_INFO("[GGML-QWEN-FULL-DECODE] validated host Qwen KV/GDN prefill "
-                 "state for %d layers at position %d\n",
-                 c.n_layers, pos_base);
+        LOG_INFO("[GGML-QWEN-FULL-DECODE] validated Qwen host state for "
+                 "%d layers at position %d\n", c.n_layers, pos_base);
     }
   }
   if (!continuing_decode && !has_graph_prefill &&
@@ -256,6 +267,15 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
       !prefill_state_handoff &&
       !sync_prefill_recurrent_state_to_host(*prefill_state_source))
     return false;
+  if (engine.family_ops.family == ModelFamily::Qwen &&
+      prefill_state_source && !prefill_state_handoff) {
+    // Standard Qwen prefill writes recurrent/KV state to the validated host
+    // caches. Decode owns fresh device state and seeds it once from those
+    // caches; the prefill graph remains only the dense/expert arena owner.
+    prefill_state_source = nullptr;
+    LOG_INFO("[GGML-QWEN-FULL-DECODE] using host-prefilled KV/GDN state "
+             "for one-time device seeding; borrowing weight arenas separately\n");
+  }
   if (prefill_arena_source && prefill_arena_source->sched &&
       !prefill_state_handoff) {
     ggml_backend_sched_free(prefill_arena_source->sched);

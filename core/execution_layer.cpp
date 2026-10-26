@@ -1058,11 +1058,41 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
   }
   const ModelGraphRequest prefill_graph_request{
       ModelGraphPhase::Prefill, S, pos_base, token_ids, hidden_states};
+  const bool require_full_graph_prefill =
+      engine.qwen4exp_full_graph_required ||
+      (engine.cuda_moe_full_graph_decode_required && graph_model &&
+       graph_model->requires_full_graph_prefill(engine));
+  if (S > 1 && require_full_graph_prefill) {
+    auto fail_graph = [&engine](const char *reason) {
+      engine.qwen4exp_full_graph_failure = reason;
+      LOG_ERROR("[MOE-GRAPH-POLICY] %s; layered execution is disabled\n",
+                reason);
+    };
+    if ((pos_base != 0 &&
+         (!graph_model ||
+          !graph_model->supports_prefill_continuation(engine))) ||
+        !graph_model ||
+        !graph_model->enabled(engine, ModelGraphPhase::Prefill)) {
+      fail_graph("required full-graph prefill adapter is unavailable for this request shape");
+      return;
+    }
+    if (!graph_model->build(engine, prefill_graph_request)) {
+      fail_graph("required full-graph prefill construction failed");
+      return;
+    }
+    if (!graph_model->run(engine, prefill_graph_request)) {
+      fail_graph("required full-graph prefill execution failed");
+      return;
+    }
+    ++engine.full_graph_prefill_runs;
+    return;
+  }
   if (S > 1 && graph_model &&
       (pos_base == 0 || graph_model->supports_prefill_continuation(engine)) &&
       graph_model->enabled(engine, ModelGraphPhase::Prefill) &&
       graph_model->build(engine, prefill_graph_request) &&
       graph_model->run(engine, prefill_graph_request)) {
+    ++engine.full_graph_prefill_runs;
     return;
   }
   if (!engine.qwen4exp_full_graph_failure.empty())
@@ -1079,8 +1109,7 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       engine.cuda_moe_full_graph_decode_required ||
       (engine.qwen4exp_full_graph_required &&
        engine.cuda_moe_layered_fallback_reason.empty());
-  if ((S == 1 && require_decode_graph) ||
-      (S > 1 && engine.qwen4exp_full_graph_required)) {
+  if (S == 1 && require_decode_graph) {
     auto fail_graph = [&engine](const char *reason) {
       engine.qwen4exp_full_graph_failure = reason;
       LOG_ERROR("[MOE-GRAPH-POLICY] %s; layered execution is disabled\n",
@@ -1106,19 +1135,6 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
               std::chrono::steady_clock::now() - graph_run_started)
               .count());
       ++engine.full_graph_decode_runs;
-      return;
-    }
-    if (S > 1) {
-      if (pos_base != 0 || !graph_model ||
-          !graph_model->enabled(engine, ModelGraphPhase::Prefill)) {
-        fail_graph("required full-graph prefill adapter is unavailable for "
-                   "this request shape");
-        return;
-      }
-      if (!graph_model->run(engine, prefill_graph_request)) {
-        fail_graph("required full-graph prefill execution failed");
-        return;
-      }
       return;
     }
     fail_graph("required full graph received an unsupported token shape");

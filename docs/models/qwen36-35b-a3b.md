@@ -2,9 +2,12 @@
 
 ## Status
 
-The Qwen full-graph adapter builds with CUDA and passed the full-fit hardware
-gate on an RTX 5060 Ti on 2026-10-26 using an 8-token smoke run. No 400-token
-performance baseline is recorded yet.
+The Qwen full-graph adapter builds with CUDA, and its decode graph passed the
+full-fit hardware gate on an RTX 5060 Ti on 2026-10-26 using an 8-token smoke
+run. The subsequent required full-graph prefill path exposed a logits
+destination-size error before graph execution. Source now copies only the last
+prompt-token logits, as generation requires, but this fix has not yet been
+verified on the GPU. No 400-token performance result is accepted yet.
 
 ## GGUF architecture
 
@@ -63,11 +66,14 @@ cache.
 The prepared profile is
 [`qwen36_35b_a3b_iq2m_5060.toml`](../../configs/bench/qwen36_35b_a3b_iq2m_5060.toml).
 
-The 8-token gate smoke passed `--full-fit --require-all-expert-layers-on-device`.
-The planner reported `required_device_bytes=14007948866` and
-`available_device_bytes=16338780160`; placement was 40/40 expert layers,
-`graph_decode_runs=7`, and layered/legacy dispatch counters were zero. The
-400-token run below remains the performance measurement.
+The next full-fit verification must pass
+`--full-fit --require-all-expert-layers-on-device --require-full-graph-prefill`.
+The earlier run reported `required_device_bytes=14007948866` and
+`available_device_bytes=16338780160`; placement was 40/40 expert layers and
+`graph_decode_runs=1`, with layered/legacy dispatch counters zero. It reported
+prefill capability but did not record a successful full-graph prefill. That
+decode-only smoke does not establish a full request-path pass. The 400-token
+performance result remains outstanding.
 
 For the performance measurement, run 400 generated tokens and preserve the
 log with graph-use and all-expert placement evidence:
@@ -75,7 +81,7 @@ log with graph-use and all-expert placement evidence:
 ```sh
 <CUDA_BUILD>/zeromoe --config configs/bench/qwen36_35b_a3b_iq2m_5060.toml --ngen 400
 python3 tools/check_full_graph_moe_run.py logs/qwen36_35b_a3b_iq2m_5060.log \
-  --full-fit --require-all-expert-layers-on-device
+  --full-fit --require-all-expert-layers-on-device --require-full-graph-prefill
 ```
 
 Record steady decode speed separately from prefill and first-graph setup.

@@ -751,6 +751,7 @@ public:
     std::string cuda_moe_layered_fallback_reason;
     uint64_t full_graph_decode_runs = 0;
     uint64_t full_graph_decode_run_ns = 0;
+    uint64_t full_graph_prefill_runs = 0;
     uint64_t layered_moe_s1_forwards = 0;
     uint64_t legacy_moe_s1_expert_dispatches = 0;
     // The Qwen full decode graph may also produce the next-token logits in

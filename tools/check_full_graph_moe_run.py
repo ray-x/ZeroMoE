@@ -28,7 +28,11 @@ def main() -> int:
                       help="accept only an explicit insufficient-memory planner result")
     parser.add_argument("--require-all-expert-layers-on-device", action="store_true",
                         help="also require the Qwen full-fit placement proof line")
+    parser.add_argument("--require-full-graph-prefill", action="store_true",
+                        help="require enabled prefill graph and a successful graph prefill")
     args = parser.parse_args()
+    if args.require_full_graph_prefill and not args.full_fit:
+        return fail("--require-full-graph-prefill requires --full-fit")
 
     try:
         lines = args.log.read_text(errors="replace").splitlines()
@@ -50,6 +54,7 @@ def main() -> int:
         return fail("graph capability and execution-gate family do not match")
     try:
         graph_runs = int(gate_fields["graph_decode_runs"])
+        graph_prefill_runs = int(gate_fields.get("graph_prefill_runs", "0"))
         layered_tokens = int(gate_fields["layered_s1_forwards"])
         legacy_dispatches = int(gate_fields["legacy_s1_expert_dispatches"])
     except (KeyError, ValueError):
@@ -66,6 +71,11 @@ def main() -> int:
             return fail("graph decode was enabled but no graph decode run was recorded")
         if layered_tokens or legacy_dispatches:
             return fail("full-fit run entered layered decode or the legacy per-expert executor")
+        if args.require_full_graph_prefill:
+            if cap_fields.get("prefill") != "1":
+                return fail("graph prefill is not enabled in [GRAPH-CAPS]")
+            if graph_prefill_runs <= 0:
+                return fail("full-fit run recorded no successful full-graph prefill")
     else:
         if policy != "memory-fallback" or memory_plan != "insufficient":
             return fail("fallback requires an explicit insufficient-memory planner result")

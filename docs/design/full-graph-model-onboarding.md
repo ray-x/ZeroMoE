@@ -25,8 +25,9 @@ python3 tools/check_full_graph_moe_run.py run.log --full-fit
 ```
 
 For Qwen3.5/Qwen3.6 full-fit runs, add
-`--require-all-expert-layers-on-device`. This also checks that the placement
-proof reports every expert layer and a nonzero full expert count per layer.
+`--require-all-expert-layers-on-device --require-full-graph-prefill`. These
+also require a successful prefill graph and verify the placement proof reports
+every expert layer and a nonzero full expert count per layer.
 
 The gate requires an enabled decode adapter, a `Fits` memory plan, at least one
 successful graph decode, and zero layered decode tokens or legacy per-expert

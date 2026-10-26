@@ -453,11 +453,13 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
 bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
                              int S, int pos_base, const int *token_ids) {
   // Prefill-only while recurrent and dense KV state writeback is validated.
-  if (!env_enabled() || !hidden_states || S <= 1 || pos_base < 0 || !g_graph ||
+  if (!full_graph_enabled_for_engine(engine) || !hidden_states || S <= 1 ||
+      pos_base < 0 || !g_graph ||
       !g_graph->ready || g_graph->engine != &engine || g_graph->S != S ||
       g_graph->pos_base != pos_base || g_graph->decode_mode)
     return false;
   FullGraph &g = *g_graph;
+  const bool standard_qwen = engine.family_ops.family == ModelFamily::Qwen;
   const auto reset_host_recurrent_state = [&]() {
     for (auto &history : engine.qwen4exp_conv_history)
       std::fill(history.begin(), history.end(), 0.0f);
@@ -471,9 +473,15 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
     return false;
   };
   if (engine.qwen4exp_full_graph_logits_target && g.logits &&
-      engine.qwen4exp_full_graph_logits_target_size <
-          ggml_nelements(g.logits))
-    return fail("prefill logits destination is too small");
+      engine.qwen4exp_full_graph_logits_target_size < g.logits->ne[0]) {
+    LOG_ERROR("[GGML-QWEN-FULL] prefill logits shape mismatch: target=%d "
+              "graph=[%lld,%lld] model_vocab=%d\n",
+              engine.qwen4exp_full_graph_logits_target_size,
+              static_cast<long long>(g.logits->ne[0]),
+              static_cast<long long>(g.logits->ne[1]),
+              engine.model_file.architecture_config.vocab);
+    return fail("prefill last-token logits destination too small");
+  }
   LOG_INFO(
       "[GGML-QWEN-FULL] execute candidate S=%d gdn=%zu kv=%zu ple_layer=%d\n",
       S, g.gdn_layers.size(), g.kv_layers.size(), g.ple_layer);
@@ -536,10 +544,14 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
   } else if (has_ple_layer(engine.model_file.architecture_config)) {
     return fail("PLE graph input is missing");
   }
+  const float *prefill_input =
+      standard_qwen ? hidden_states : engine.hc_stream_buf.data();
   if (g.host_inputs.empty() ||
-      engine.hc_stream_buf.size() < static_cast<size_t>(g.D) * g.HC * S)
-    return fail("expanded HC input is missing or too small");
-  std::memcpy(g.host_inputs[0], engine.hc_stream_buf.data(),
+      (!standard_qwen &&
+       engine.hc_stream_buf.size() < static_cast<size_t>(g.D) * g.HC * S))
+    return fail(standard_qwen ? "standard Qwen prefill input is missing"
+                              : "expanded HC input is missing or too small");
+  std::memcpy(g.host_inputs[0], prefill_input,
               static_cast<size_t>(g.D) * g.HC * S * sizeof(float));
 
   // Real-hardware incident (2026-09-09, GLM5NEXT side): a 480-token prompt
@@ -585,8 +597,9 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
                           static_cast<size_t>(g.D) * S * sizeof(float));
   if (g.logits && engine.qwen4exp_full_graph_logits_target) {
     ggml_backend_tensor_get(g.logits,
-                            engine.qwen4exp_full_graph_logits_target, 0,
-                            ggml_nbytes(g.logits));
+                            engine.qwen4exp_full_graph_logits_target,
+                            static_cast<size_t>(S - 1) * g.logits->nb[1],
+                            static_cast<size_t>(g.logits->ne[0]) * sizeof(float));
     engine.qwen4exp_full_graph_logits_ready = true;
   }
   // Prefill's own all-layers dump: build_graph() populates

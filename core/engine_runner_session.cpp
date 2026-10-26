@@ -505,11 +505,12 @@ std::expected<void, std::string> EngineRunner::shutdown_and_report() {
         ? static_cast<double>(engine.full_graph_decode_runs) * 1.0e9 /
               static_cast<double>(engine.full_graph_decode_run_ns)
         : 0.0;
-    LOG_INFO("[MOE-GRAPH-GATE] family=%s policy=%s memory_plan=%s graph_decode_runs=%llu graph_decode_run_ms=%.3f steady_decode_tps=%.2f layered_s1_forwards=%llu legacy_s1_expert_dispatches=%llu\n",
+    LOG_INFO("[MOE-GRAPH-GATE] family=%s policy=%s memory_plan=%s graph_prefill_runs=%llu graph_decode_runs=%llu graph_decode_run_ms=%.3f steady_decode_tps=%.2f layered_s1_forwards=%llu legacy_s1_expert_dispatches=%llu\n",
              graph_model ? graph_model->name() : "missing",
              engine.cuda_moe_full_graph_decode_required ? "required"
                  : "memory-fallback",
              engine.cuda_moe_graph_memory_plan.c_str(),
+             (unsigned long long)engine.full_graph_prefill_runs,
              (unsigned long long)engine.full_graph_decode_runs,
              graph_decode_run_ms, graph_decode_tps,
              (unsigned long long)engine.layered_moe_s1_forwards,

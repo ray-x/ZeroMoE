@@ -43,9 +43,11 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <sched.h>
 #include <unistd.h>
 #include <vector>
@@ -69,6 +71,14 @@ extern "C" cudaGraph_t zeromoe_ggml_cuda_get_captured_graph(
 extern "C" void *zeromoe_qwen4exp_unpack_staged_payload_kernel_ptr();
 
 namespace qwen4exp_graph {
+
+inline bool full_graph_enabled_for_engine(const StreamingEngine &engine) {
+  // Generic Qwen graphs are enabled by the shared CUDA MoE memory planner.
+  // Qwen4Exp retains its explicit legacy opt-in switches.
+  if (engine.family_ops.family == ModelFamily::Qwen)
+    return engine.cuda_moe_full_graph_decode_required;
+  return qwen4exp_full_graph_enabled();
+}
 
 inline bool full_graph_decode_enabled_for_engine(const StreamingEngine &engine) {
   // The CUDA MoE onboarding planner is the sole gate for generic Qwen:
@@ -539,6 +549,8 @@ struct FullGraph : zeromoe::graph::GraphCore {
   // same semantic boundary.
   // ZEROMOE_QWEN4EXP_PROBE_DUMP: per-layer (FFN input, router probs) taps for offline next-layer predictor studies.
   std::vector<std::tuple<int, ggml_tensor *, ggml_tensor *>> probe_taps;
+  std::vector<std::pair<int, ggml_tensor *>> router_logits_taps;
+std::vector<std::tuple<int, std::string, ggml_tensor *>> gdn_probe_taps;
 // Optional input hidden state at each layer boundary, emitted alongside the
 // router-probability probes so it can be compared with llama.cpp's
 // t_layer_inp[il] for the same teacher-forced token.

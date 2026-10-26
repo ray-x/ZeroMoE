@@ -68,6 +68,15 @@ ggml_tensor *build_gdn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                        ggml_tensor **state_out, ggml_tensor **hist_out) {
   ggml_tensor *qkv = ggml_mul_mat(ctx, w_qkv, cur);
   auto diag = [&](const char *label, ggml_tensor *value) {
+    if (!value || !g.graph ||
+        !zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP"))
+      return;
+    const std::string name = "qwen35_" + std::string(label) + "_" +
+                             std::to_string(layer);
+    ggml_set_name(value, name.c_str());
+    ggml_set_output(value);
+    ggml_build_forward_expand(g.graph, value);
+    g.gdn_probe_taps.emplace_back(layer, label, value);
   };
   // These snapshots are deliberately taken before and inside the GDN node.
   // The existing attention-output dump only tells us that the discrepancy is
@@ -75,11 +84,16 @@ ggml_tensor *build_gdn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   // convolution, GDN/state update, and the final output projection.
   diag("gdn_qkv", qkv);
   ggml_tensor *z = ggml_mul_mat(ctx, w_gate, cur);
+  diag("gdn_z", z);
   ggml_tensor *alpha = ggml_mul_mat(ctx, w_alpha, cur);
+  diag("gdn_alpha", alpha);
   ggml_tensor *beta_raw = ggml_mul_mat(ctx, w_beta, cur);
+  diag("gdn_beta_raw", beta_raw);
   ggml_tensor *glog =
       ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, alpha, w_dt)), w_a);
+  diag("gdn_decay", glog);
   ggml_tensor *beta = ggml_sigmoid(ctx, beta_raw);
+  diag("gdn_beta", beta);
 
   ggml_tensor *conv_in = ggml_concat(ctx, hist_in, ggml_transpose(ctx, qkv), 0);
   diag("gdn_conv_in", conv_in);
@@ -99,6 +113,9 @@ ggml_tensor *build_gdn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                    ggml_row_size(GGML_TYPE_F32, 2 * g.key_dim));
   q = ggml_l2_norm(ctx, q, g.engine->model_file.architecture_config.eps);
   k = ggml_l2_norm(ctx, k, g.engine->model_file.architecture_config.eps);
+  diag("gdn_q_norm", q);
+  diag("gdn_k_norm", k);
+  diag("gdn_v", v);
   glog = ggml_reshape_4d(ctx, glog, 1, g.Hv_gdn, g.S, 1);
   beta = ggml_reshape_4d(ctx, beta, 1, g.Hv_gdn, g.S, 1);
   ggml_tensor *gdn =

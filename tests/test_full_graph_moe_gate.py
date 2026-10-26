@@ -69,6 +69,25 @@ class FullGraphMoeGateTests(unittest.TestCase):
         result = self.run_gate(log, "--full-fit")
         self.assertNotEqual(result.returncode, 0)
 
+    def test_full_fit_can_require_graph_prefill(self):
+        log = (
+            "[GRAPH-CAPS] qwen35moe: prefill=1 decode=1 cpu_lane=0\n"
+            "[MOE-GRAPH-GATE] family=qwen35moe policy=required memory_plan=fits "
+            "graph_prefill_runs=2 graph_decode_runs=31 layered_s1_forwards=0 "
+            "legacy_s1_expert_dispatches=0\n"
+        )
+        args = ("--full-fit", "--require-full-graph-prefill")
+        self.assertEqual(self.run_gate(log, *args).returncode, 0)
+        self.assertNotEqual(
+            self.run_gate(log.replace("prefill=1", "prefill=0"), *args).returncode,
+            0,
+        )
+        self.assertNotEqual(
+            self.run_gate(log.replace("graph_prefill_runs=2", "graph_prefill_runs=0"),
+                          *args).returncode,
+            0,
+        )
+
     def test_memory_fallback_requires_explicit_capacity_reason(self):
         log = (
             "[GRAPH-CAPS] qwen35moe: prefill=1 decode=1 cpu_lane=1\n"

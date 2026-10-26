@@ -394,7 +394,8 @@ void qwen4exp_scan_captured_graph_writes(FullGraph &g,
 void qwen_probe_dump(FullGraph &g) {
   const char *dir = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP");
   if (!dir || !dir[0] ||
-      (g.probe_taps.empty() && g.layer_input_taps.empty()))
+    (g.probe_taps.empty() && g.layer_input_taps.empty() &&
+      g.router_logits_taps.empty() && g.gdn_probe_taps.empty()))
     return;
   for (auto &[l, x, p] : g.probe_taps) {
     std::vector<float> a((size_t)ggml_nelements(x)), b((size_t)ggml_nelements(p));
@@ -405,6 +406,28 @@ void qwen_probe_dump(FullGraph &g) {
     xo.write(reinterpret_cast<const char *>(a.data()), (std::streamsize)(a.size() * sizeof(float)));
     std::ofstream so(base + ".s.bin", std::ios::binary | std::ios::app);
     so.write(reinterpret_cast<const char *>(b.data()), (std::streamsize)(b.size() * sizeof(float)));
+  }
+  for (auto &[l, logits] : g.router_logits_taps) {
+    std::vector<float> values((size_t)ggml_nelements(logits));
+    ggml_backend_tensor_get(logits, values.data(), 0,
+                            values.size() * sizeof(float));
+    const std::string path = std::string(dir) + "/L" +
+                             std::to_string(l) + ".router_logits.bin";
+    std::ofstream out(path, std::ios::binary | std::ios::app);
+    out.write(reinterpret_cast<const char *>(values.data()),
+              static_cast<std::streamsize>(values.size() * sizeof(float)));
+  }
+  for (auto &[l, label, tensor] : g.gdn_probe_taps) {
+    if (!tensor || tensor->type != GGML_TYPE_F32)
+      continue;
+    std::vector<float> values(static_cast<size_t>(ggml_nelements(tensor)));
+    ggml_backend_tensor_get(tensor, values.data(), 0,
+                            values.size() * sizeof(float));
+    const std::string path = std::string(dir) + "/L" + std::to_string(l) +
+                             "." + label + ".bin";
+    std::ofstream out(path, std::ios::binary | std::ios::app);
+    out.write(reinterpret_cast<const char *>(values.data()),
+              static_cast<std::streamsize>(values.size() * sizeof(float)));
   }
   for (auto &[l, hidden] : g.layer_input_taps) {
     std::vector<float> values((size_t)ggml_nelements(hidden));

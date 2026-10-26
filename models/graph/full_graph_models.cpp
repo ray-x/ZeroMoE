@@ -227,9 +227,11 @@ public:
   bool enabled(const StreamingEngine &engine,
                ModelGraphPhase phase) const override {
 #if defined(ZEROMOE_USE_GGML_CUDA)
-return phase == ModelGraphPhase::Decode && supports_architecture(engine) &&
-       !engine.mtp_enabled &&
-       engine.model_file.architecture_config.n_experts > 0;
+return supports_architecture(engine) && !engine.mtp_enabled &&
+       engine.model_file.architecture_config.n_experts > 0 &&
+       (phase == ModelGraphPhase::Decode ||
+        (phase == ModelGraphPhase::Prefill &&
+         engine.cuda_moe_full_graph_decode_required));
 #else
     (void)engine;
     (void)phase;
@@ -367,13 +369,22 @@ return phase == ModelGraphPhase::Decode && supports_architecture(engine) &&
     return spec;
   }
   bool supports_cpu_lane() const override { return false; }
-bool prefill_prepare(StreamingEngine &,
-                     const ModelGraphRequest &) const {
-  return false;
+  int min_prefill_batch() const override { return 2; }
+  bool requires_full_graph_prefill(
+      const StreamingEngine &engine) const override {
+    return supports_architecture(engine) &&
+           engine.cuda_moe_full_graph_decode_required;
+  }
+  bool prefill_prepare(StreamingEngine &engine,
+                       const ModelGraphRequest &request) const {
+    return qwen4exp_full_graph_prepare(engine, request.n_tokens,
+                                       request.pos_base, request.token_ids);
 }
-bool prefill_run(StreamingEngine &,
-                 const ModelGraphRequest &) const {
-  return false;
+  bool prefill_run(StreamingEngine &engine,
+                   const ModelGraphRequest &request) const {
+    return qwen4exp_full_graph_run(engine, request.hidden_states,
+                                   request.n_tokens, request.pos_base,
+                                   request.token_ids);
   }
   bool decode_prepare(StreamingEngine &engine,
                       const ModelGraphRequest &request) const {
