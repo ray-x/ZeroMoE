@@ -84,29 +84,45 @@ in `docs/env-vars.md`, 10 CPU threads (`omp_max_threads=10`, the config default 
 layer split (`configs/bench/qwen4exp_tg400_iq1m_22_26.toml`) is only the CPU/GPU comparison recipe against llama.cpp.
 
 The full record, with the hardware, build, model files, config and environment it was taken with, is
-`bench/results/qwen38-flash.json`. Reproduce it with `bench/perf_report.py` (usage in its docstring); render it with
-`bench/perf_report.py render bench/results/qwen38-flash.json`. Each figure is the median of 3 accepted runs on a quiet
-machine (a run counts only if it produced all its tokens and nothing else used the CPU during decode). Decode speed is
-1000 / mean(iter_total ms) over steps >= 3; peak is the best 32-step window; prompts are the fixed files in
-`bench/prompts/`, 200 generated tokens.
+`bench/results/qwen38-flash.json`. How it is measured and how to reproduce it: `docs/performance-measurement.md`
+(`bench/perf_report.py run ...`, `bench/perf_report.py render ...`). The figures are medians of 3 accepted requests per
+prompt from one `zeromoe --bench` process (a request counts only if it produced all its tokens and nothing else used the CPU
+while it ran; 1 of 18 were rejected and rerun), 200 generated tokens, fixed prompts in `bench/prompts/`. Decode is
+1000 / mean(step ms) over steps >= 3; peak is the best 32-step window.
 
-| Prompt | Prefill tok/s | Decode avg tok/s (range) | Decode peak tok/s | First-request setup | Second-request setup | Decode incl. setup tok/s |
+**Real text**
+
+| Prompt | Prefill tok/s (range) | Decode tok/s (range) | Decode peak tok/s | Time to first token | Second-request setup | Decode incl. setup tok/s |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 28 tokens | 23.8 (23.3-23.8) | 45.3 (44.4-45.7) | 48.4 | 1.9 s | 0.11 s | 43.7 |
-| 743 tokens | 211.5 (210.1-211.6) | 42.1 (41.7-44.2) | 47.2 | 1.9 s | 0.39 s | 38.6 |
-| 1,707 tokens | 425.4 (424.3-426.3) | 43.8 (42.5-44.3) | 50.2 | 1.9 s | 0.69 s | 37.7 |
+| 28 tokens | 27.3 (27.2-27.4) | 46.0 (45.8-46.1) | 48.7 | 1.20 s | 0.10 s | 44.9 |
+| 743 tokens | 218.2 (218.2-219.1) | 44.1 (42.9-44.2) | 50.6 | 3.88 s | 0.38 s | 40.4 |
+| 1,707 tokens | 438.9 (438.6-439.2) | 44.7 (42.7-45.1) | 50.2 | 4.72 s | 0.67 s | 38.7 |
 
-Prefill average over the three lengths: 220.2 tok/s (compare models by the per-length numbers; the 28-token prompt takes the
-decode-style path, not the batched prefill).
+Prefill average over the three lengths: 228.1 tok/s (compare models by the per-length numbers; the 28-token prompt takes
+the decode-style path, not the batched prefill).
 
-**Long decode** (28-token prompt, 1,500 generated tokens, 2 runs): average 41.1 tok/s. Per 250 tokens: 42.5 / 40.5 / 45.6 /
-43.6 / 39.6 / 36.4. The two runs generate identical text, so this spread comes from what is generated (which experts it
-routes to) as well as from the growing context; the last 250 tokens are 14% slower than the first. Read it as a spread of
-36-46 tok/s around 41, not as a steady trend.
+**Long decode** (28-token prompt, 1500 generated tokens, 2 runs): average 40.4 tok/s. Per ~249 tokens: 44.0 / 38.6 / 46.0 / 42.6 / 38.3 / 35.0. The last part
+is 20% slower than the first. Greedy output is the same on every run, so the spread comes from what is generated (which experts
+it routes to) as well as from the growing context. Read it as a spread of 35-46 tok/s, not as a steady trend.
+
+**Random tokens** (llama-bench style: `llama-bench -p 512 -n 128` equivalent, seed 1; `zeromoe --bench-random-pp 512 --bench-random-tg 128`)
+
+| Test | Tokens/s (range) | Peak tok/s |
+| --- | ---: | ---: |
+| pp512 (prompt of 512 random ids) | 159.3 (157.7-159.6) | - |
+| tg128 (one random token, then 128 steps each fed a random token) | 27.1 (27.1-27.8) | 28.6 |
+
+Random ids route to random experts, which the hot-expert placement (tuned on real text, about 93% of routing in VRAM)
+does not favour, so decode is about 41% below the real-text figure above. Report both when comparing with llama.cpp.
 
 Setup: Xeon W-2235 (6 cores / 12 threads, AVX-512 with VNNI, no VBMI), 125 GiB DDR4, RTX 3090 24 GiB on PCIe Gen3 x16 (350 W),
-CachyOS, CUDA 13.3, ggml `8baabd53b` with the patch series, binary from commit `b1dd830` (its Qwen source is identical to the
-current `master`). The RTX 5060 Ti was hidden (`CUDA_VISIBLE_DEVICES=0`).
+CachyOS, CUDA 13.3, ggml `8baabd53b` with the patch series, binary from commit `ca0c144`. The RTX 5060 Ti was hidden
+(`CUDA_VISIBLE_DEVICES=0`).
+
+*Method change:* the first version of this record (taken before `zeromoe --bench` existed) started a new process per request
+and scraped log lines. It measured prefill 23.8 / 211.5 / 425.4 tok/s and decode 45.3 / 42.1 / 43.8 tok/s. The engine's own
+records, from a warm process, give higher prefill (+3 to +15%, the first request of a fresh process pays one-off costs) and decode within
+1 to 5%; second-request setup is unchanged (0.11 / 0.39 / 0.69 s before, 0.10 / 0.38 / 0.67 s now).
 
 ### Soft expert tier and pinned arenas (measured 2026-10-25, 18 accepted runs, 3 per cell, medians)
 

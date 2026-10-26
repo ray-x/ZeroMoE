@@ -4,6 +4,7 @@
 #include "ggml_mimo2_graph.hpp"
 #include "engine_runner.hpp"
 #include "generation_loop.hpp"
+#include "bench_mode.hpp"
 
 std::expected<void, std::string> EngineRunner::start_workers() {
   const FullGraphModel *graph_model = engine.family_ops.graph_model;
@@ -110,12 +111,25 @@ std::expected<void, std::string> EngineRunner::run_repl() {
   session_start = std::chrono::high_resolution_clock::now();
 
   std::string user_input;
+  // --bench: the turns come from a scripted queue instead of stdin; everything after the turn is read is the
+  // normal request path (see core/bench_mode.hpp).
+  zeromoe::bench::Session bench(zeromoe::bench::plan());
+  if (bench.enabled()) {
+    const std::string err = bench.prepare(engine.prompt_cache, engine.model_file.architecture_config.vocab);
+    if (!err.empty())
+      return std::unexpected(err);
+  }
   while (true) {
     if (g_shutdown_requested.load(std::memory_order_relaxed))
       break;
 
-    std::cout << "\n  User > ";
-    std::getline(std::cin, user_input);
+    if (bench.enabled()) {
+      if (!bench.next(user_input, max_new_tokens))
+        break;
+    } else {
+      std::cout << "\n  User > ";
+      std::getline(std::cin, user_input);
+    }
 
     // Multi-line input support (2026-09): this loop reads exactly one
     // getline() per turn, so a genuinely multi-line message piped via
@@ -154,7 +168,7 @@ std::expected<void, std::string> EngineRunner::run_repl() {
     // failed read — as "time to shut down" rather than looping forever
     // on an unusable stream.
     if (g_shutdown_requested.load(std::memory_order_relaxed) ||
-        std::cin.eof() || std::cin.fail()) {
+        (!bench.enabled() && (std::cin.eof() || std::cin.fail()))) {
       break;
     }
 
@@ -456,6 +470,8 @@ std::expected<void, std::string> EngineRunner::run_repl() {
     generate_text(engine, ram_mgr, tokenizer, prefetcher, prompt_tokens,
                   max_new_tokens, tokenizer.eos_token_id, config.temperature,
                   config.top_p);
+    if (bench.enabled())
+      bench.record();
     if (!engine.qwen4exp_full_graph_failure.empty()) {
       const std::string reason = engine.qwen4exp_full_graph_failure;
       engine.qwen4exp_full_graph_failure.clear();
@@ -474,6 +490,8 @@ std::expected<void, std::string> EngineRunner::run_repl() {
     std::cout << "\n";
   }
 
+  if (bench.enabled())
+    bench.finish();
   return {};
 }
 
