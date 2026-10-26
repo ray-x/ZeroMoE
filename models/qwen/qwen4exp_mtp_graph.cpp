@@ -230,15 +230,7 @@ std::shared_ptr<MtpGraphState> build(
     }
     ggml_set_name(t, name.c_str());
     weights[suffix] = t;
-    if (head) {
-      if (!g->bind_host(t, source->host_ptr, source->meta.size_bytes,
-                         GGML_BACKEND_BUFFER_USAGE_WEIGHTS)) {
-        error = "cannot bind borrowed trunk head";
-        return false;
-      }
-    } else {
-      uploads.emplace_back(t, source);
-    }
+    uploads.emplace_back(t, source);
     return true;
   };
   const int W = c.D * c.HC;
@@ -398,9 +390,11 @@ std::shared_ptr<MtpGraphState> build(
     }
     ggml_backend_sched_set_tensor_backend(g->sched, node, g->cuda);
   }
-  // Keep the borrowed vocabulary-sized head on CPU: no implicit duplicate
-  // upload competing with the target's pinned/LRU expert cache.
-  ggml_backend_sched_set_tensor_backend(g->sched, g->logits, g->cpu);
+  // The vocabulary head runs on the GPU from its own device copy. Borrowing the
+  // host weight and multiplying on the CPU cost ~13.6 ms per draft step (the
+  // rest of the draft step is ~0.4 ms), which made drafting dearer than a
+  // target step. The copy is one head's worth of VRAM, charged to the draft.
+  ggml_backend_sched_set_tensor_backend(g->sched, g->logits, g->cuda);
   if (opts.reference_cpu_norms)
     for (auto *norm : cpu_norms)
       ggml_backend_sched_set_tensor_backend(g->sched, norm, g->cpu);
