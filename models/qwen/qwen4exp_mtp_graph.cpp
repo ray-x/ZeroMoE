@@ -282,7 +282,7 @@ std::shared_ptr<MtpGraphState> build(
     if (!add("ffn_gate_shexp.weight", {c.D, width}) ||
         !add("ffn_up_shexp.weight", {c.D, width}) ||
         !add("ffn_down_shexp.weight", {width, c.D}) ||
-        !add("ffn_gate_inp_shexp.weight", {c.D, 1})) return nullptr;
+        !add("ffn_gate_inp_shexp.weight", {c.D, 1}, true)) return nullptr;
   }
   auto *keys = ggml_new_tensor_2d(g->state_ctx, GGML_TYPE_F32, c.hd,
                                   static_cast<int64_t>(g->kv_capacity) * c.Hkv);

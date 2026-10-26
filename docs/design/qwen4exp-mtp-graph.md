@@ -4,6 +4,17 @@ Status: experimental standalone draft path. This is not end-to-end speculative
 generation support. Keep the full-graph MTP startup rejection until target
 verification and state reconciliation are implemented and validated.
 
+## Real-weight runtime smoke (2026-10-26)
+
+The graph target built and replayed the Qwen3.8-Flash-Next UD-IQ1_M trunk
+with its shared Q4_K_M MTP sidecar on an RTX 3090. With 32 synthetic
+finite fixture rows it completed two graph builds and 96 replays across
+reset and chunked-replay phases; weights used 1,892,929,280 device bytes.
+The dump self-check passed its reset/chunk invariants. These inputs were
+synthetic, so this is a runtime smoke, not numerical parity against
+llama.cpp. The MTP reference fixture and exact reference checkout remain
+required before enabling end-to-end speculative generation.
+
 ## Reference
 
 The reference is llama.cpp commit

@@ -22,6 +22,10 @@ int main(int argc, char **argv) {
     if (!budget_mib || budget_mib > SIZE_MAX / (1 << 20))
       throw std::runtime_error("invalid device budget");
     auto engine = std::make_shared<StreamingEngine>();
+    // This standalone graph harness bypasses EngineRunner::init_host_and_gpu,
+    // which normally seeds MemoryGuard's startup-available baseline before
+    // resident tensor loading.
+    MemoryGuard::configure_host_budget(0);
     if (std::filesystem::is_directory(argv[1]) ||
         std::filesystem::is_directory(argv[2]) ||
         !engine->model_file.load_header(argv[1]) ||
