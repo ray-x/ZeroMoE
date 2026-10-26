@@ -23,7 +23,9 @@ counts by hand.
 Scope agreed for this pass: environment variables and compile-time macros only
 (no CLI or TOML surface changes), limited to controls that are provably
 unreachable rather than merely unused-looking. Each entry names the evidence
-that made the deletion behavior-neutral.
+that made the deletion behavior-neutral. One exception was requested
+explicitly: retiring the dead cuFile feature also removes the `cuda_cufile`
+TOML key (and its CLI help mention) because that key was its only consumer.
 
 ### 2026-10-27 — safe dead-knob batch
 
@@ -46,18 +48,34 @@ Verification for this batch:
 - `python3 -c 'json.load(...)'` validates the updated
   `configuration-knob-audit.json`.
 
+### 2026-10-27 — cuFile / GPUDirect Storage removal
+
+| Control | Surface | Evidence | Change |
+| --- | --- | --- | --- |
+| `ZEROMOE_HAVE_CUFILE` (K0032) | compile definition | Never defined. `CMakeLists.txt` and `cmake/` contained no `CUFILE` detection, so `memory/cufile_io.hpp` always compiled its stub branch: `driver_open()` returned false, `GGUFFile::enable_cufile()` registered no shard, `GpuTopology::upload_expert_cufile()` was never called, and every `cuda_cufile` request fell back to the RAM-mediated upload path. | Deleted the macro, `memory/cufile_io.hpp`, and every call site of the feature it guarded. |
+| `cuda_cufile` (K0554) | TOML | The key fed only the unreachable paths above. Keeping it would accept a setting that can never change behavior. | Deleted the field, TOML parse, `direct_io` validation, startup summary, sample-config block, CLI help mention, perf counters and report line, and README entries. |
+
+This supersedes the earlier "deliberately left in place" classification: the
+feature is retired instead of wired up, per an explicit product decision.
+
+Verification for this batch:
+
+- `zeromoe_cpu`, `graph_settings_test` and `graph_settings_binding_test` build
+  with `-DZEROMOE_CPU_ONLY=ON -DZEROMOE_USE_GGML=ON`.
+- `ctest -R '^graph_settings'` passes 2/2 and
+  `python3 tools/config_inventory.py --check` passes.
+- CUDA-only touched headers are not part of the CPU build; they were
+  host-syntax-checked with the CUDA build's exact defines and include paths
+  (`g++ -fsyntax-only`).
+- `grep -rn "cufile\|cuFile\|CUFILE"` is clean across source, tests, tools,
+  CMake files and shipped configs; only dated historical design/handoff notes
+  still mention the retired feature.
+
 ### Findings deliberately left in place
 
 These look dead but changing them would either alter a supported feature or
 require a product decision, so they are not safe deletions for this batch:
 
-- **`ZEROMOE_HAVE_CUFILE` is never defined.** `memory/cufile_io.hpp` and
-  `core/engine_config.hpp` describe a CMake detection step, but
-  `CMakeLists.txt` and `cmake/` contain no `CUFILE`/`ZEROMOE_HAVE_CUFILE`
-  logic, so the GPUDirect Storage path is always compiled out and
-  `cuda_cufile` requests can never succeed. Fixing this means adding library
-  detection; deleting it means removing a whole I/O feature. Both are separate
-  changes.
 - **`ZEROMOE_QWEN4EXP_ALLLAYERS_DUMP` has no reader.** The name survives only
   in a comment above `all_layers_snapshot` in
   `models/qwen/ggml_qwen4exp_graph_internal.hpp`, a field that is never
@@ -229,7 +247,7 @@ The reference column gives a primary path/line. Use the JSON for exact worktree 
 | K0029 `ZEROMOE_BUILD_SERVER` | api | Configure/build time, not per-request. Exact predicates are in linked evidence. | COMBINE into build preset/internal build policy; retain developer A/B only if active | optional native HTTP serving library/executable integration. Preserve behavior in replacement; full impact/owner in JSON. | HIGH | `backends/cpu/cpu_main.cpp:8` |
 | K0030 `ZEROMOE_EXL3_CUDA` | api, mtp, original, settings | Configure/build time, not per-request. Exact predicates are in linked evidence. | KEEP BUILD CAPABILITY; combine normal choices into CPU/CUDA presets | EXL3: backends/core/models execution/configuration. Preserve behavior in replacement; full impact/owner in JSON. | HIGH | `backends/cpu/cpu_engine.cpp:7` |
 | K0031 `ZEROMOE_EXL3_UPSTREAM` | api, mtp, original, settings | Configure/build time, not per-request; near launch_exl3_scale_device_weight() (lexical context). Exact predicates are in linked evidence. | COMBINE into build preset/internal build policy; retain developer A/B only if active | EXL3: backends execution/configuration. Preserve behavior in replacement; full impact/owner in JSON. | HIGH | `backends/exl3/exl3_aux.cu:112` |
-| K0032 `ZEROMOE_HAVE_CUFILE` | api, mtp, original, settings | Configure/build time, not per-request. Exact predicates are in linked evidence. | COMBINE into build preset/internal build policy; retain developer A/B only if active | cuFile/GPU direct-storage build capability. Preserve behavior in replacement; full impact/owner in JSON. | HIGH | `memory/cufile_io.hpp:47` |
+| K0032 `ZEROMOE_HAVE_CUFILE` | api, mtp, original, settings | Configure/build time, not per-request. Exact predicates are in linked evidence. | **REMOVED 2026-10-27** — was: dead capability macro; no CMake detection ever defined it. | cuFile/GPU direct-storage build capability. Preserve behavior in replacement; full impact/owner in JSON. | HIGH | `memory/cufile_io.hpp:47` |
 | K0033 `ZEROMOE_METAL` | api, mtp, original, settings | Configure/build time, not per-request. Exact predicates are in linked evidence. | KEEP BUILD CAPABILITY; combine normal choices into CPU/CUDA presets | backends execution/configuration. Preserve behavior in replacement; full impact/owner in JSON. | HIGH | `backends/cpu/kernels_cpu_neon.cpp:22` |
 | K0034 `ZEROMOE_USE_GGML` | api, mtp, original, settings | Configure/build time, not per-request. Exact predicates are in linked evidence. | KEEP BUILD CAPABILITY; combine normal choices into CPU/CUDA presets | backends/core/models execution/configuration. Preserve behavior in replacement; full impact/owner in JSON. | HIGH | `backends/cpu/cpu_engine.cpp:21` |
 | K0035 `ZEROMOE_USE_GGML_CUDA` | api, mtp, original, settings | Configure/build time, not per-request. Exact predicates are in linked evidence. | KEEP BUILD CAPABILITY; combine normal choices into CPU/CUDA presets | backends/core/kernels/models execution/configuration. Preserve behavior in replacement; full impact/owner in JSON. | HIGH | `backends/cpu/cpu_engine.cpp:10` |
@@ -776,7 +794,7 @@ The reference column gives a primary path/line. Use the JSON for exact worktree 
 | K0551 `cpu_dot_ggml_iq1m` | api, mtp, original, settings | Input parsed at startup/configuration. Exact predicates are in linked evidence. | INTERNALIZE validated implementation choice; retain DEV experiment only with active evidence | core execution/configuration. Preserve behavior in replacement; full impact/owner in JSON. | MEDIUM | `core/engine_config.hpp:3094` |
 | K0552 `cpu_offload_max_experts` | api, mtp, original, settings | Input parsed at startup/configuration. Exact predicates are in linked evidence. | INTERNALIZE validated implementation choice; retain DEV experiment only with active evidence | expert storage, I/O and CPU/GPU transfer pipeline. Preserve behavior in replacement; full impact/owner in JSON. | HIGH | `core/engine_config.hpp:2731` |
 | K0553 `cpu_only` | api, mtp, original, settings | Input parsed at startup/configuration. Exact predicates are in linked evidence. | KEEP PUBLIC; unify aliases around one intent | core execution/configuration. Preserve behavior in replacement; full impact/owner in JSON. | MEDIUM | `core/engine_config.hpp:2650` |
-| K0554 `cuda_cufile` | api, mtp, original, settings | Input parsed at startup/configuration. Exact predicates are in linked evidence. | INTERNALIZE validated implementation choice; retain DEV experiment only with active evidence | expert storage, I/O and CPU/GPU transfer pipeline. Preserve behavior in replacement; full impact/owner in JSON. | MEDIUM | `core/engine_config.hpp:2854` |
+| K0554 `cuda_cufile` | api, mtp, original, settings | Input parsed at startup/configuration. Exact predicates are in linked evidence. | **REMOVED 2026-10-27** — was: only consumer of the never-defined `ZEROMOE_HAVE_CUFILE`; retired with the feature. | expert storage, I/O and CPU/GPU transfer pipeline. Preserve behavior in replacement; full impact/owner in JSON. | MEDIUM | `core/engine_config.hpp:2854` |
 | K0555 `decode_async_prewarm` | api, mtp, original, settings | Input parsed at startup/configuration; decode-token path. Exact predicates are in linked evidence. | INTERNALIZE validated implementation choice; retain DEV experiment only with active evidence | core execution/configuration. Preserve behavior in replacement; full impact/owner in JSON. | MEDIUM | `core/engine_config.hpp:2860` |
 | K0556 `decode_async_prewarm_max_batch` | api, mtp, original, settings | Input parsed at startup/configuration; decode-token path. Exact predicates are in linked evidence. | INTERNALIZE startup/runtime policy; remove external tuning input after replacement exists | prompt batching/prefill execution. Preserve behavior in replacement; full impact/owner in JSON. | MEDIUM | `core/engine_config.hpp:2861` |
 | K0557 `decode_async_prewarm_nonblocking` | api, mtp, original, settings | Input parsed at startup/configuration; decode-token path. Exact predicates are in linked evidence. | INTERNALIZE validated implementation choice; retain DEV experiment only with active evidence | core execution/configuration. Preserve behavior in replacement; full impact/owner in JSON. | MEDIUM | `core/engine_config.hpp:2863` |

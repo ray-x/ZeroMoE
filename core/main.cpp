@@ -245,8 +245,7 @@ void print_usage(bool all = false) {
       << "                   repacked with tools/gguf_tool pack -- falls back "
          "to buffered\n"
       << "                   reads automatically if unsupported/unaligned)\n"
-      << "                   (unpacked_expert_format and cuda_cufile are "
-         "TOML-config-only; "
+      << "                   (unpacked_expert_format is TOML-config-only; "
          "see --config)\n"
       << "  --io-uring       Batch the async prefetcher's per-expert reads "
          "through io_uring\n"
@@ -380,32 +379,6 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
     set_attn_score_threads(config.attn_score_threads);
   }
 
-  // Declared BEFORE engine/gpu below (destructor runs in REVERSE
-  // declaration order) so cuFileDriverClose() only ever fires AFTER
-  // GpuTopology's own destructor has already deregistered every VRAM
-  // pool/file handle it registered -- deregistering after the driver is
-  // closed would be invalid. Fires on ANY exit path from run_engine
-  // (normal completion or an early std::unexpected return), same
-  // guarantee engine/gpu/ram_mgr already get for free as stack locals.
-  struct CuFileDriverGuard {
-    bool opened = false;
-    ~CuFileDriverGuard() {
-      if (opened)
-        cufile_io::driver_close();
-    }
-  } cufile_driver_guard;
-  if (config.cuda_cufile) {
-    cufile_driver_guard.opened = cufile_io::driver_open();
-    if (cufile_driver_guard.opened) {
-      LOG_STREAM_INFO() << "[CUFILE] Driver opened.\n";
-    } else {
-      LOG_STREAM_WARN()
-          << "[CUFILE] Driver open failed (GDS/nvidia-fs not installed, or "
-             "cuFile not compiled in) -- cuda_cufile falls back to the "
-             "RAM-mediated upload path for this entire run.\n";
-    }
-  }
-
   {
     auto &sink = zeromoe::stats::Sink::instance();
     // Name of the model for the stats records: the file name, or for a shard directory its first .gguf without the
@@ -427,7 +400,7 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
     sink.set_model(model_name);
   }
 
-  EngineRunner runner(config, cufile_driver_guard.opened);
+  EngineRunner runner(config);
   return runner.run();
 }
 

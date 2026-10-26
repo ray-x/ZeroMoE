@@ -373,7 +373,7 @@ checks warm prefill and matched first-to-last decode performance against Bee.
 | `--top_p <F>` | Nucleus sampling top-p threshold (default: 0.90). |
 | `--gpu <ID>` | CUDA device ID for single-GPU mode (default: 0). |
 | `--drop-pages` | Drop expert pages from the OS page cache after use. |
-| `--direct-io` | `O_DIRECT` expert-slab reads (Linux only; requires a model repacked with `tools/gguf_tool pack`). Falls back to buffered reads automatically if unsupported/unaligned. (`unpacked_expert_format` and `cuda_cufile` are TOML-config-only — see `--config`.) |
+| `--direct-io` | `O_DIRECT` expert-slab reads (Linux only; requires a model repacked with `tools/gguf_tool pack`). Falls back to buffered reads automatically if unsupported/unaligned. (`unpacked_expert_format` is TOML-config-only — see `--config`.) |
 | `--io-uring` | Batch the async prefetcher's per-expert reads through `io_uring` (Linux only, kernel ≥ 5.6; independent of `--direct-io`). Falls back to sequential `pread`s automatically if unsupported. |
 | `--prefetch-threads <N>` | Concurrent async prefetcher worker threads (default: 2). |
 | `--verbose-moe` | Log every MoE host-cache hit (high volume, debug only). |
@@ -389,7 +389,7 @@ checks warm prefill and matched first-to-last decode performance against Bee.
 | `--trace-abort-on-nan` | Abort the process at the first NaN/Inf caught by a tensor-trace checkpoint, instead of continuing. Off by default. |
 | `--help`, `-h` | Show the CLI help interface. |
 
-> Most of these flags have a matching TOML key of the same name (e.g. `raw_prompt`, `system_prompt`, `pin_threshold`) for use with `--config`; a config file's values are used unless the equivalent CLI flag is also passed, in which case the CLI flag wins. Run `--gen-config` to see the full set of TOML-only options (e.g. `unpacked_expert_format`, `cuda_cufile`, `pin_strategy`) that have no CLI-flag equivalent.
+> Most of these flags have a matching TOML key of the same name (e.g. `raw_prompt`, `system_prompt`, `pin_threshold`) for use with `--config`; a config file's values are used unless the equivalent CLI flag is also passed, in which case the CLI flag wins. Run `--gen-config` to see the full set of TOML-only options (e.g. `unpacked_expert_format`, `pin_strategy`) that have no CLI-flag equivalent.
 
 ### Optional API gateway
 

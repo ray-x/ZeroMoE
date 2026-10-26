@@ -447,22 +447,19 @@ public:
   // Side-effect-free RAM-tier residency peek -- unlike find_ram_slot
   // (used by the actual hit-servicing paths, which bump hit_count/
   // recency as part of "using" the hit), this exists purely so a CALLER
-  // can decide which read strategy to use BEFORE committing to one: the
-  // cuFile direct-disk-to-VRAM path (GpuTopology::upload_expert_cufile,
-  // via execution_layer.cpp's Phase 3 loading loop) must only ever be
-  // attempted for a genuine double miss (not VRAM-resident AND not
-  // RAM-resident) -- re-reading from disk via cuFile when a perfectly
-  // good copy already sits in host RAM would waste real NVMe bandwidth
-  // for no benefit. Trusts ram_expert_index exactly as find_ram_slot's
-  // own index-hit fast path does (an index miss is genuine absence, an
-  // index hit is real residency -- see that function's own comment for
-  // why this index is a complete, self-healing record) but deliberately
-  // skips the stale-entry re-validation/linear-scan fallback: a false
-  // positive here (index says resident but the slot turns out stale) just
-  // means the caller takes the slower RAM-mediated path instead of
-  // cuFile for that one call -- get_experts_batch's own find_ram_slot
-  // will re-validate for real and correctly re-fetch if needed, so this
-  // peek being occasionally too conservative is safe, never wrong.
+  // can decide which read strategy to use BEFORE committing to one: a
+  // disk read for an expert whose bytes already sit in host RAM would
+  // waste real NVMe bandwidth for no benefit. Trusts ram_expert_index
+  // exactly as find_ram_slot's own index-hit fast path does (an index
+  // miss is genuine absence, an index hit is real residency -- see that
+  // function's own comment for why this index is a complete, self-healing
+  // record) but deliberately skips the stale-entry
+  // re-validation/linear-scan fallback: a false positive here (index says
+  // resident but the slot turns out stale) just means the caller takes
+  // the slower RAM-mediated path instead of a direct disk read for that
+  // one call -- get_experts_batch's own find_ram_slot will re-validate
+  // for real and correctly re-fetch if needed, so this peek being
+  // occasionally too conservative is safe, never wrong.
   //
   // Hardened to take ram_mutex once a second writer thread (a prefetcher
   // worker, via claim_or_wait) genuinely exists: reading ram_expert_index

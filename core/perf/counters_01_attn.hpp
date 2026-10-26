@@ -89,14 +89,6 @@ struct PerfCountersPart01 {
                                              // Attention-vs-Prefill and summed-Throughput fixes
                                              // in this project's history -- fix the counter
                                              // before trusting conclusions drawn from it.
-    std::atomic<double> t_cufile_read{0};   // cuFileRead (GpuTopology::upload_expert_cufile) --
-                                             // deliberately its OWN counter, not folded into
-                                             // t_gpu_upload (the cudaMemcpy H2D one) -- see that
-                                             // function's own comment for why conflating two
-                                             // genuinely different transfer mechanisms into one
-                                             // counter is exactly the mistake this project's own
-                                             // disk=/expert= investigation was burned by once
-                                             // already.
     std::atomic<double> t_gpu_download{0};  // cudaMemcpy D2H -- was bundled into
                                              // whatever counter happened to wrap the
                                              // next call (usually none, since

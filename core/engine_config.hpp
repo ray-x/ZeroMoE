@@ -1220,24 +1220,6 @@ struct EngineConfig {
   // logged warning, never a hard failure.
   bool direct_io = false;
 
-  // NVIDIA cuFile (GPUDirect Storage): DMA a genuine "double miss" expert
-  // (not VRAM-resident AND not host-RAM-resident -- see
-  // RAMSafetyManager::is_ram_resident) straight from NVMe into a VRAM
-  // cache slot, skipping the host-RAM hop entirely. Requires direct_io=true
-  // (cuFile needs the SAME O_DIRECT file descriptor direct_io already
-  // opens -- validated below, not silently assumed) AND the machine
-  // actually having NVIDIA GPUDirect Storage + the nvidia-fs kernel module
-  // installed (a SEPARATE install from the base CUDA Toolkit -- see
-  // CMakeLists.txt's ZEROMOE_HAVE_CUFILE detection). Requesting this
-  // without GDS installed (or on a non-Linux/no-cuFile build) logs a
-  // warning and silently falls back to the existing RAM-mediated upload
-  // path -- never a hard failure, same contract as direct_io/io_uring.
-  // If an expert IS already RAM-resident, this is never used for it
-  // regardless of this setting -- cuFile only ever replaces a disk read
-  // that would otherwise happen anyway, never a RAM->VRAM promotion of
-  // data already in host memory. See CLAUDE.md.
-  bool cuda_cufile = false;
-
   // The model directory was produced by `gguf_tool pack --unpack`: every
   // routed expert's gate/up/down are three SEPARATE tensors
   // (blk.N.ffn_{gate,up,down}.E.weight) instead of one shared packed
@@ -2860,7 +2842,6 @@ inline bool EngineConfig::load(const std::string &path) {
   attn_pilot_vram_promote_dynamic = doc.root.get_bool(
       "attn_pilot_vram_promote_dynamic", attn_pilot_vram_promote_dynamic);
   direct_io = doc.root.get_bool("direct_io", direct_io);
-  cuda_cufile = doc.root.get_bool("cuda_cufile", cuda_cufile);
   prefill_warm_via_prefetcher = doc.root.get_bool("prefill_warm_via_prefetcher",
                                                   prefill_warm_via_prefetcher);
   prefill_opportunistic_promote = doc.root.get_bool(
@@ -3436,16 +3417,6 @@ inline bool EngineConfig::validate() {
     }
   }
 
-  if (cuda_cufile && !direct_io) {
-    std::cerr << "[CONFIG] cuda_cufile=true requires direct_io=true (cuFile "
-                 "registers the SAME "
-              << "O_DIRECT file descriptor direct_io opens -- see "
-                 "GGUFFile::enable_cufile) -- "
-              << "disabling cuda_cufile for this run. Set direct_io=true as "
-                 "well to actually use it.\n";
-    cuda_cufile = false;
-  }
-
   if (pin_strategy != "per_layer_topk" && pin_strategy != "global_topn") {
     std::cerr << "[CONFIG] Unknown pin_strategy '" << pin_strategy
               << "' (expected \"per_layer_topk\" or \"global_topn\") -- "
@@ -3575,13 +3546,6 @@ inline void EngineConfig::print() const {
                          "DMA per expert; "
                          "startup sanity check will FATAL if the model isn't "
                          "actually tight/aligned)\n";
-  LOG_STREAM_INFO() << "[CONFIG] cuFile (GPUDirect Storage direct disk->VRAM): "
-                    << (cuda_cufile ? "requested" : "off")
-                    << (cuda_cufile
-                            ? " (falls back to RAM-mediated upload if "
-                              "GDS/nvidia-fs unavailable -- see [CUFILE] log)"
-                            : "")
-                    << "\n";
   LOG_STREAM_INFO() << "[CONFIG] Prefill warm-up via prefetcher: "
                     << (prefill_warm_via_prefetcher
                             ? "ON"
@@ -4134,20 +4098,6 @@ cpu_offload_max_experts = 0
 # GGUF logs a warning and falls back to buffered reads automatically,
 # never a hard failure. See tools/README.md for the repack workflow.
 direct_io      = false
-
-# cuda_cufile: NVIDIA cuFile (GPUDirect Storage) -- DMA a genuine "double
-# miss" expert (not VRAM-resident AND not already in the host RAM tier)
-# straight from NVMe into a VRAM cache slot, skipping the host-RAM hop
-# entirely. Requires direct_io=true above (cuFile registers the SAME
-# O_DIRECT file descriptor) AND GPUDirect Storage + the nvidia-fs kernel
-# module actually installed on this machine (a separate install from the
-# base CUDA Toolkit -- see CMakeLists.txt's cuFile detection at configure
-# time, and the `-> cuFile (GPUDirect Storage):` build-summary line). Never
-# used when an expert is already RAM-resident, regardless of this setting --
-# only ever replaces a disk read that would happen anyway. Falls back to the
-# existing RAM-mediated upload path on any failure (GDS not installed,
-# driver/handle/buffer registration failure) -- never a hard failure.
-cuda_cufile    = false
 
 # prefill_warm_via_prefetcher: Phase 2 (prefill's cold-start VRAM warm-up)
 # normally loads candidates synchronously, one at a time, blocking inside

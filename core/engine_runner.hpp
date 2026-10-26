@@ -59,8 +59,7 @@
 
 class EngineRunner {
 public:
-  EngineRunner(const EngineConfig &config, bool cufile_driver_opened)
-      : config(config), cufile_driver_opened(cufile_driver_opened) {}
+  explicit EngineRunner(const EngineConfig &config) : config(config) {}
   EngineRunner(const EngineRunner &) = delete;
   EngineRunner &operator=(const EngineRunner &) = delete;
 
@@ -89,7 +88,6 @@ private:
   // Keep an owned copy: model-resolved graph tuning can fill defaults after
   // the GGUF architecture is known without mutating the caller's config.
   EngineConfig config;
-  const bool cufile_driver_opened;
   // Long-lived subsystems (formerly locals of run_engine, same declaration order).
   StreamingEngine engine;
   RAMSafetyManager ram_mgr;

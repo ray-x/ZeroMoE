@@ -544,19 +544,6 @@ void PerfCounters::dump_report_part5(double session_elapsed_s) const {
              (unsigned long)n_cpu_fallback_just_promoted.load(),
              (unsigned long)n_cpu_fallback_upload_failed.load(),
              (unsigned long)n_cpu_fallback_affinity_layer.load());
-    {
-        uint64_t cf_ok = n_cufile_read_ok.load();
-        uint64_t cf_fail = n_cufile_read_fail.load();
-        uint64_t cf_skip = n_cufile_skipped_ram_resident.load();
-        if (cf_ok || cf_fail || cf_skip) {
-            LOG_INFO("cuFile (GDS):        %lu direct disk->VRAM read(s) OK (%.2f GB, %.3f s) / "
-                     "%lu failed (fell back to RAM-mediated upload) / %lu skipped because the "
-                     "expert was already RAM-resident (correct -- cuFile never re-reads disk when "
-                     "a RAM copy already exists)\n",
-                     (unsigned long)cf_ok, bytes_cufile_read.load() / 1e9, t_cufile_read.load(),
-                     (unsigned long)cf_fail, (unsigned long)cf_skip);
-        }
-    }
     if (n_shadow_race_reload_success.load() || n_shadow_race_reload_hard_fail.load()) {
         LOG_INFO("Shadow-race reload:  %lu succeeded (expert still computed, via CPU instead of the "
                  "originally-expected GPU path) / %lu hard-failed (expert's contribution skipped "

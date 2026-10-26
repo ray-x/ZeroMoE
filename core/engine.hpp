@@ -857,16 +857,6 @@ public:
     // Empty until sanity_check_unpacked_format() runs.
     std::vector<bool> layer_has_mixed_expert_sizes;
 
-    // Set from EngineConfig::cuda_cufile at startup (main.cpp), AFTER
-    // confirming GGUFFile::enable_cufile() actually registered at least one
-    // shard AND GpuTopology's expert cache pool(s) registered successfully
-    // (cufile_io::available() plus real per-shard/per-device registration
-    // results) -- this is the single "is cuFile genuinely usable right
-    // now" flag execution_layer.cpp's Phase 3 loading loop checks, distinct
-    // from config.cuda_cufile (the raw request) the same way direct_io/
-    // io_uring already distinguish "requested" from "actually active".
-    bool cuda_cufile_active = false;
-
     // Set from EngineConfig::prefill_warm_via_prefetcher at startup
     // (main.cpp). See that config field's own comment: routes Phase 2's
     // (moe_forward_gguf's S>1 cold-start VRAM warm-up) candidate loads
@@ -1356,10 +1346,10 @@ public:
     // authority on a specific layer's real format -- it stays a real,
     // meaningful user-facing toggle (the ORIGINAL "every layer is unpacked"
     // expectation, still what most callers should assume when it's set),
-    // but the 4 real call sites that make a per-layer packed-vs-unpacked
+    // but the 3 real call sites that make a per-layer packed-vs-unpacked
     // DISPATCH decision (expert_layer_geometry, expert_geometry_for,
-    // build_expert_read_requests, and execution_layer.cpp's cuFile
-    // eligibility block) now ask THIS function instead, so a layer that
+    // build_expert_read_requests) now ask THIS function instead, so a
+    // layer that
     // genuinely has per-expert tensors is used correctly even if the flag
     // is off, and a layer that's still packed falls back correctly even if
     // the flag is on. Mirrors looks_like_unpacked_format's own per-layer
@@ -1522,8 +1512,8 @@ public:
             std::ostringstream o;
             o << "[ALIGN-WARN] general.alignment=" << file_align << " (< " << ALIGN
               << "): tensor ranges need aligned-window staging for O_DIRECT; "
-                 "the Ling bailingmoe3 loader can use it when cuFile is off, "
-                 "while other architectures keep the aligned-file gate. "
+                 "the Ling bailingmoe3 loader can use it, while other "
+                 "architectures keep the aligned-file gate. "
                  "Repacking with `tools/gguf_tool pack --align 4096` can "
                  "remove staging copies.\n";
             emit(o.str());

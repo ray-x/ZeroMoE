@@ -20,7 +20,6 @@
 #include "logger.hpp"
 #include "engine_config.hpp"  // GpuConfig -- allocate_expert_cache's real per-vault-GPU cap
 #include "pilot_confirmed_set.hpp"  // was_pilot_confirmed_resident -- evict_lru race measurement, see that function's comment
-#include "cufile_io.hpp"  // upload_expert_cufile's direct disk->VRAM read path
 
 // Any wait to acquire cache_mutex exceeding this is logged individually
 // (tagged [SLOW-CACHE-MUTEX-WAIT]) -- companion to async_prefetcher.hpp's
@@ -174,15 +173,6 @@ struct GpuDevice {
     // Persistent VRAM allocations
     uint8_t* expert_cache_pool = nullptr;  // For ExpertVault role
     size_t expert_cache_size = 0;
-
-    // True once expert_cache_pool has been successfully cuFileBufRegister'd
-    // (cufile_io.hpp) -- one registration call per cudaMalloc'd pool, not
-    // per-expert-slot (see allocate_expert_cache/add_dual_role_expert_cache,
-    // the two sites that set this). upload_expert_cufile checks this before
-    // ever attempting a cuFileRead into a slot in THIS device's pool --
-    // false is the safe default (falls back to RAM-mediated upload), never
-    // assumed true just because cuFile is compiled in / requested.
-    bool cufile_pool_registered = false;
 };
 
 enum class HardwareProfile {
@@ -1039,7 +1029,6 @@ public:
             if (dev.active_layer_demand_stream) { cudaSetDevice(dev.id); cudaStreamDestroy(dev.active_layer_demand_stream); }
             if (dev.expert_cache_pool) {
                 cudaSetDevice(dev.id);
-                if (dev.cufile_pool_registered) cufile_io::deregister_buffer(dev.expert_cache_pool);
                 cudaFree(dev.expert_cache_pool);
             }
         }
@@ -1048,11 +1037,6 @@ public:
             if (bb.in_flight) cudaEventDestroy(bb.in_flight);
             if (bb.host_ptr) cudaFreeHost(bb.host_ptr);
         }
-        // active_layer_pool is deliberately NEVER cuFileBufRegister'd -- see
-        // upload_expert_cufile's own comment: evict_lru() (which it reuses
-        // for slot selection, same as upload_expert) only ever returns a
-        // slot inside expert_cache_pool/add_dual_role's pool, never this
-        // one, so there is nothing to deregister here.
         if (active_layer_pool) { cudaSetDevice(active_layer_slots.front().gpu_id); cudaFree(active_layer_pool); }
         MemoryGuard::release_host_bytes(host_pinned_reservation_bytes);
         host_pinned_reservation_bytes = 0;
@@ -1391,26 +1375,6 @@ public:
                       << "): " << cache_bytes / 1e9 << " GB"
                       << (requested_bytes > 0 ? " (moe_cache_gb enforced)" : " (auto: total_vram - 1GB)")
                       << "\n";
-
-            // ONE cuFileBufRegister call for the whole pool -- every future
-            // upload_expert_cufile() into any slot inside it is covered by
-            // this single registration, no per-slot/per-expert call needed
-            // (see cufile_io.hpp's own comment on register_buffer). No-op
-            // (cufile_io::available()==false) when cuFile wasn't compiled
-            // in -- cufile_pool_registered simply stays false, and
-            // upload_expert_cufile's own check on it is what actually gates
-            // whether that path is ever attempted for this device.
-            if (dev.expert_cache_pool && cufile_io::available()) {
-                dev.cufile_pool_registered = cufile_io::register_buffer(dev.expert_cache_pool, cache_bytes);
-                if (!dev.cufile_pool_registered) {
-                    LOG_STREAM_WARN() << "[CUFILE] Buffer registration failed for GPU " << dev.id
-                              << "'s expert cache pool -- direct disk->VRAM reads unavailable for "
-                                 "this device, falls back to RAM-mediated upload.\n";
-                } else {
-                    LOG_STREAM_INFO() << "[CUFILE] Buffer registered: GPU " << dev.id
-                              << " expert cache pool (" << cache_bytes / 1e9 << " GB).\n";
-                }
-            }
         }
 
         reindex_expert_vram_cache(expert_slab_bytes);
@@ -1667,17 +1631,9 @@ public:
             saved.emplace_back(i, expert_vram_cache[i]);
         }
 
-        if (dev->cufile_pool_registered) {
-            cufile_io::deregister_buffer(dev->expert_cache_pool);
-            dev->cufile_pool_registered = false;
-        }
         err = cudaFree(dev->expert_cache_pool);
         if (err != cudaSuccess) {
             // The slot pointers are still valid; keep the cache usable.
-            if (cufile_io::available())
-                dev->cufile_pool_registered =
-                    cufile_io::register_buffer(dev->expert_cache_pool,
-                                               dev->expert_cache_size);
             cudaFreeHost(host);
             MemoryGuard::release_host_bytes(bytes);
             LOG_STREAM_WARN() << "[GPU] prefill cache borrow: cudaFree failed on GPU "
@@ -1770,10 +1726,6 @@ public:
         dev->available_vram = dev->available_vram > detached_cache_bytes
                                   ? dev->available_vram - detached_cache_bytes
                                   : 0;
-        if (cufile_io::available())
-            dev->cufile_pool_registered =
-                cufile_io::register_buffer(dev->expert_cache_pool,
-                                           dev->expert_cache_size);
 
         if (detached_cache_host) {
             cudaFreeHost(detached_cache_host);
@@ -1846,23 +1798,6 @@ public:
         LOG_STREAM_INFO() << "[GPU] Dual-role expert cache on " << dev.name << " (GPU " << dev.id
                   << ", also " << ((dev.role == GpuRole::CoreEngine) ? "CoreEngine" : "role") << "): "
                   << cap_bytes / 1e9 << " GB\n";
-        // Same registration as allocate_expert_cache's own pool -- this
-        // device's pool is appended to vault_gpus above, so evict_lru() can
-        // return a slot inside it exactly like any other vault GPU's pool
-        // (see this function's own header comment: "a dual-role device is
-        // indistinguishable from any other vault GPU"), and
-        // upload_expert_cufile must be able to cuFileRead into it too.
-        if (cufile_io::available()) {
-            dev.cufile_pool_registered = cufile_io::register_buffer(dev.expert_cache_pool, cap_bytes);
-            if (!dev.cufile_pool_registered) {
-                LOG_STREAM_WARN() << "[CUFILE] Buffer registration failed for GPU " << dev.id
-                          << "'s dual-role expert cache -- direct disk->VRAM reads unavailable for "
-                             "this device.\n";
-            } else {
-                LOG_STREAM_INFO() << "[CUFILE] Buffer registered: GPU " << dev.id
-                          << " dual-role expert cache (" << cap_bytes / 1e9 << " GB).\n";
-            }
-        }
         reindex_expert_vram_cache(expert_slab_bytes);
         return true;
     }
@@ -2802,125 +2737,6 @@ public:
 
         perf().bytes_gpu_uploaded.fetch_add((int64_t)copy_bytes, std::memory_order_relaxed);
         perf().n_expert_promote.fetch_add(1, std::memory_order_relaxed);
-
-        slot->layer_idx = layer;
-        slot->expert_id = expert_id;
-        slot->last_used_clock = ++cache_clock;
-        vram_swap_stats[swap_key(layer, expert_id)].swap_in++;
-        expert_index[swap_key(layer, expert_id)] = (size_t)(slot - expert_vram_cache.data());
-        return slot;
-    }
-
-    // Direct disk->VRAM read via NVIDIA cuFile (GPUDirect Storage), skipping
-    // the host-RAM hop entirely -- the "genuine double miss" fast path (see
-    // RAMSafetyManager::is_ram_resident and execution_layer.cpp's own
-    // gating: this must NEVER be called for an expert that's already
-    // host-RAM-resident, only for one that's in neither tier). Mirrors
-    // upload_expert's eviction/hold discipline EXACTLY -- same
-    // find_expert/evict_lru/on_vram_evict/bookkeeping sequence, deliberately
-    // NOT reinvented here -- the only thing that changes is the actual byte
-    // transfer: 1-3 synchronous cuFileRead calls straight into
-    // slot->device_ptr instead of one cudaMemcpy from a host buffer.
-    // (gate_off,gb)/(up_off,ub)/(down_off,db) are this expert's three
-    // projections' absolute file offsets + byte sizes (same convention
-    // load_expert_slab/build_expert_read_requests already use) -- when they
-    // happen to be contiguous (always true for unpacked_expert_format, per
-    // its own startup sanity check; sometimes true for packed format) this
-    // issues ONE combined cuFileRead instead of three, same "single DMA"
-    // reasoning as the unpacked-format work.
-    //
-    // Caller contract (not re-validated here, to keep this symmetric with
-    // upload_expert's own "trust the caller" style): `h.valid` must already
-    // be true, and the caller should already know (via
-    // devices[?].cufile_pool_registered) that SOME vault device has a
-    // registered pool -- but evict_lru() below is device-agnostic (it can
-    // return a slot on ANY vault GPU, per the existing shared
-    // expert_vram_cache indexing), so if it happens to pick a slot on a
-    // device whose pool was NOT successfully registered (only possible in a
-    // multi-vault-GPU setup where cuFileBufRegister failed on just one of
-    // them), this returns nullptr after having already evicted that slot's
-    // PREVIOUS occupant for nothing -- a real, narrow inefficiency (one
-    // wasted eviction cycle in an already-rare edge case), not a
-    // correctness issue: evict_lru already left the slot in a valid "empty"
-    // state before this check runs, and the caller's existing
-    // ram_needed_ids fallback still resolves this expert correctly on the
-    // very next path. Not worth adding device-targeting to the shared,
-    // already-delicate evict_lru for this narrow a case -- see CLAUDE.md's
-    // extensive history of eviction-logic regressions before touching that
-    // function for any reason.
-    ExpertLocation* upload_expert_cufile(int layer, int expert_id,
-                                          const cufile_io::FileHandle& h,
-                                          uint64_t gate_off, size_t gb,
-                                          uint64_t up_off, size_t ub,
-                                          uint64_t down_off, size_t db) {
-        size_t bytes = gb + ub + db;
-        if (expert_vram_cache_cap == 0 || bytes == 0 || !h.valid) return nullptr;
-        GPU_TOPO_TIMED_LOCK(lock);
-
-        ExpertLocation* existing = find_expert(layer, expert_id);
-        if (existing) return existing;
-
-        int old_layer = -1, old_expert = -1;
-        ExpertLocation* slot = evict_lru(bytes, &old_layer, &old_expert, -1, layer);
-        if (!slot || !slot->device_ptr) {
-            perf().n_cufile_read_fail.fetch_add(1, std::memory_order_relaxed);
-            LOG_ERROR("[CUFILE]  upload_expert_cufile: evict_lru found NO victim for layer=%d "
-                      "expert=%d (cache_cap=%zu, unpinned_slots=%zu)\n",
-                      layer, expert_id, expert_vram_cache_cap, unpinned_slot_indices.size());
-            return nullptr;
-        }
-        if (!devices[slot->gpu_id].cufile_pool_registered) {
-            // See this function's own header comment -- evict_lru is
-            // device-agnostic and already left this slot correctly empty;
-            // nothing to undo, just decline to write into an unregistered
-            // pool.
-            perf().n_cufile_read_fail.fetch_add(1, std::memory_order_relaxed);
-            return nullptr;
-        }
-
-        // Salvage the outgoing expert into the RAM tier -- identical to
-        // upload_expert's own call, same reasoning (see on_vram_evict's
-        // comment). Must run before the reads below overwrite this slot's
-        // old VRAM content.
-        if (on_vram_evict && old_layer != -1 && old_expert >= 0) {
-            on_vram_evict(old_layer, old_expert, slot->device_ptr, slot->size, slot->gpu_id);
-        }
-
-        cudaSetDevice(slot->gpu_id);
-        // Own timer (t_cufile_read), deliberately NOT sharing t_gpu_upload
-        // (the cudaMemcpy H2D counter) -- this session's own history (see
-        // CLAUDE.md's disk=/expert= investigation) is a direct lesson in
-        // how conflating two genuinely different mechanisms into one
-        // counter hides exactly the kind of regression a real A/B needs to
-        // see separately.
-        PERF_START(cufile_read);
-        bool contiguous = (up_off == gate_off + gb) && (down_off == up_off + ub);
-        bool ok;
-        if (contiguous) {
-            ssize_t r = cufile_io::read(h, slot->device_ptr, bytes, (off_t)gate_off, 0);
-            ok = (r >= 0 && (size_t)r == bytes);
-        } else {
-            ssize_t r1 = cufile_io::read(h, slot->device_ptr, gb, (off_t)gate_off, 0);
-            ssize_t r2 = cufile_io::read(h, slot->device_ptr, ub, (off_t)up_off, (off_t)gb);
-            ssize_t r3 = cufile_io::read(h, slot->device_ptr, db, (off_t)down_off, (off_t)(gb + ub));
-            ok = r1 >= 0 && (size_t)r1 == gb && r2 >= 0 && (size_t)r2 == ub && r3 >= 0 && (size_t)r3 == db;
-        }
-        PERF_END(cufile_read, t_cufile_read);
-        if (!ok) {
-            perf().n_cufile_read_fail.fetch_add(1, std::memory_order_relaxed);
-            LOG_ERROR("[CUFILE]  upload_expert_cufile: cuFileRead failed layer=%d expert=%d gpu=%d "
-                      "bytes=%zu dst=%p\n", layer, expert_id, slot->gpu_id, bytes, (void*)slot->device_ptr);
-            // Same permanent-exclusion discipline as upload_expert's own
-            // cudaMemcpy-failure path -- see ExpertLocation::memcpy_broken
-            // and upload_expert's identical comment on why a failed
-            // address is excluded rather than retried.
-            slot->memcpy_broken = true;
-            return nullptr;
-        }
-
-        perf().bytes_cufile_read.fetch_add((int64_t)bytes, std::memory_order_relaxed);
-        perf().n_expert_promote.fetch_add(1, std::memory_order_relaxed);
-        perf().n_cufile_read_ok.fetch_add(1, std::memory_order_relaxed);
 
         slot->layer_idx = layer;
         slot->expert_id = expert_id;

@@ -1699,12 +1699,9 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
       // freshly PROMOTED into VRAM, never the much larger set that's
       // ALREADY VRAM-resident (pinned or otherwise) and gets
       // redundantly RAM-loaded anyway because this gate never lets
-      // them skip that load. The fix already exists a few lines
-      // below for a DIFFERENT feature (cuFile eligibility) that hit
-      // the exact same packed-only limitation and was updated to use
-      // expert_layer_geometry (the unified dispatcher supporting
-      // both formats) -- that fix was never carried back to this
-      // older variable. Now uses the same unified dispatcher here too.
+      // them skip that load. Now uses expert_layer_geometry, the
+      // unified dispatcher that supports both packed and unpacked
+      // per-expert layouts.
       bool layer_gpu_capable =
           !cpu_only_mode() && !is_cpu_affinity_layer(layer_idx) &&
           ram_mgr.vram_cache &&
@@ -1714,30 +1711,6 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
           gpu_type_supported(shadow_gM->type) &&
           gpu_type_supported(shadow_uM->type) &&
           gpu_type_supported(shadow_dM->type);
-
-      // cuFile (GPUDirect Storage) direct disk->VRAM eligibility for
-      // this layer -- kept as a SEPARATE check from layer_gpu_capable
-      // above (not merged into one, even though both now use
-      // expert_layer_geometry) since the two conditions are otherwise
-      // independent (cuFile also needs cuda_cufile_active) and
-      // merging them would make a future change to one silently
-      // affect the other. Layer-level pre-filter only (cheap,
-      // tensor-table lookups) -- the actual per-expert absolute file
-      // offset is resolved again inside the k-loop below, where the
-      // specific expert_id is known.
-      bool cufile_layer_eligible = !option_b_target &&
-                                   engine.cuda_cufile_active &&
-                                   !is_cpu_affinity_layer(layer_idx) &&
-                                   ram_mgr.vram_cache;
-      if (cufile_layer_eligible) {
-        size_t cf_gb = 0, cf_ub = 0, cf_db = 0;
-        const GGUFTensor *cf_gM = nullptr, *cf_uM = nullptr, *cf_dM = nullptr;
-        cufile_layer_eligible =
-            engine.expert_layer_geometry(layer_idx, cf_gb, cf_ub, cf_db, cf_gM,
-                                         cf_uM, cf_dM) &&
-            gpu_type_supported(cf_gM->type) &&
-            gpu_type_supported(cf_uM->type) && gpu_type_supported(cf_dM->type);
-      }
 
       static thread_local std::vector<int> ram_needed_ids;
       static thread_local std::vector<int> ram_needed_k;
@@ -1787,75 +1760,14 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
             shadowed = true;
           }
         }
-        // cuFile direct disk->VRAM: only ever for a GENUINE double
-        // miss (not shadowed above -- i.e. not already VRAM-
-        // resident -- AND not already RAM-resident). Re-reading
-        // from disk via cuFile when a perfectly good copy already
-        // sits in host RAM would waste real NVMe bandwidth for a
-        // slower net result than the existing RAM->VRAM promotion
-        // path, which is exactly what this check exists to prevent
-        // -- see RAMSafetyManager::is_ram_resident's own comment.
-        if (!shadowed && cufile_layer_eligible) {
-          if (ram_mgr.is_ram_resident(layer_idx, expert_id)) {
-            perf().n_cufile_skipped_ram_resident.fetch_add(
-                1, std::memory_order_relaxed);
-          } else {
-            // Resolve THIS expert's absolute file offsets --
-            // packed format needs expert_id*per_expert_size
-            // added to the shared _exps tensor's base offset;
-            // unpacked format's per-expert tensor offset IS
-            // already absolute (mirrors build_expert_read_
-            // requests' identical packed-vs-unpacked branching).
-            // layer_is_unpacked, not the global flag -- see its own
-            // comment in engine.hpp (2026-09, Phase 5: per-layer mixed
-            // packed/unpacked models). Cached once per layer here since
-            // it's consulted 4 times below, all needing the same answer.
-            bool this_layer_unpacked = engine.layer_is_unpacked(layer_idx);
-            size_t eg = 0, eu = 0, ed = 0;
-            const GGUFTensor *egM = nullptr, *euM = nullptr, *edM = nullptr;
-            bool have_geom =
-                this_layer_unpacked
-                    ? engine.unpacked_expert_geometry(layer_idx, expert_id, eg,
-                                                      eu, ed, egM, euM, edM)
-                    : engine.packed_slab_geometry(layer_idx, eg, eu, ed, egM,
-                                                  euM, edM);
-            if (have_geom) {
-              uint64_t gate_off =
-                  egM->offset +
-                  (this_layer_unpacked ? 0 : (uint64_t)expert_id * eg);
-              uint64_t up_off =
-                  euM->offset +
-                  (this_layer_unpacked ? 0 : (uint64_t)expert_id * eu);
-              uint64_t down_off =
-                  edM->offset +
-                  (this_layer_unpacked ? 0 : (uint64_t)expert_id * ed);
-              const cufile_io::FileHandle *h =
-                  engine.model_file.cufile_handle_for_tensor(*egM);
-              if (h && h->valid) {
-                const ExpertLocation *cf_loc =
-                    ram_mgr.vram_cache->upload_expert_cufile(
-                        layer_idx, expert_id, *h, gate_off, eg, up_off, eu,
-                        down_off, ed);
-                if (cf_loc) {
-                  MoEExpertBlock &shadow = scratch.vram_shadow_blocks[k];
-                  engine.populate_vram_shadow(shadow, layer_idx, expert_id);
-                  scratch.expert_ptrs[k] = &shadow;
-                  scratch.vram_loc_hint[k] = cf_loc;
-                  shadowed = true;
-                }
-              }
-            }
-          }
-        }
         if (!shadowed) {
           ram_needed_ids.push_back(expert_id);
           ram_needed_k.push_back(k);
         } else {
-          // Already VRAM-resident (or cuFile-loaded moments ago
-          // above) -- issue its GPU kernels now instead of waiting
-          // for the blocking get_experts_batch call below, so they
-          // run on the GPU stream concurrently with that call's
-          // disk I/O for this layer's genuine misses.
+          // Already VRAM-resident -- issue its GPU kernels now instead
+          // of waiting for the blocking get_experts_batch call below,
+          // so they run on the GPU stream concurrently with that
+          // call's disk I/O for this layer's genuine misses.
           dispatch_expert_k(k);
         }
       }

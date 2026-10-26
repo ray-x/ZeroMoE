@@ -140,28 +140,6 @@ struct PerfCountersPart07 : PerfCountersPart06 {
     // every call, by design (not an error or an unexpected fallback path).
     std::atomic<uint64_t> n_cpu_fallback_affinity_layer{0};
 
-    // cuFile (GPUDirect Storage) direct disk->VRAM path (config
-    // cuda_cufile, GpuTopology::upload_expert_cufile). n_cufile_read_ok/
-    // fail are the terminal outcome of an ATTEMPTED cuFileRead (mirrors
-    // n_upload_expert_no_victim/n_upload_expert_memcpy_fail's split for the
-    // cudaMemcpy path). n_cufile_skipped_ram_resident is the one that
-    // matters most for confirming this feature's actual contract is being
-    // honored (not just assumed): it fires every time a layer was cuFile-
-    // eligible but the expert turned out to already be RAM-resident, i.e.
-    // the "never re-read from disk if RAM already has it" rule correctly
-    // routed to the existing RAM-mediated promotion path instead. A run
-    // where this stays at 0 despite cuFile being active for real traffic
-    // would be suspicious -- some RAM-tier hits are expected on any warm
-    // cache.
-    std::atomic<uint64_t> n_cufile_read_ok{0};
-    std::atomic<uint64_t> n_cufile_read_fail{0};
-    std::atomic<uint64_t> n_cufile_skipped_ram_resident{0};
-    // Deliberately separate from bytes_gpu_uploaded (the cudaMemcpy H2D
-    // counter, shared by expert-cache promotions and dense-tensor offload)
-    // -- same "don't conflate two different mechanisms" reasoning as
-    // t_cufile_read above.
-    std::atomic<int64_t> bytes_cufile_read{0};
-
     // How often the shadow-fast-path's own emergency RAM reload
     // (execution_layer.cpp, exp->vram_shadow branch) actually fires --
     // its own comment called this "rare" (a shadow-fast-pathed expert
@@ -218,8 +196,7 @@ struct PerfCountersPart07 : PerfCountersPart06 {
     // (see n_prefill_hint_pushed below) -- expect t_prefill_warm_time to
     // collapse toward ~0 in that mode, since the actual read/promote work
     // moves onto the prefetcher's background worker thread; that collapse
-    // is itself the confirmation the mechanism actually changed, same
-    // diagnostic pattern as t_cufile_read vs t_gpu_upload.
+    // is itself the confirmation the mechanism actually changed.
     std::atomic<uint64_t> n_prefill_warm_attempted{0};
     std::atomic<uint64_t> n_prefill_warm_succeeded{0};
     std::atomic<uint64_t> n_prefill_warm_failed{0};

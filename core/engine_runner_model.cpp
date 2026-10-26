@@ -63,9 +63,7 @@ std::expected<void, std::string> EngineRunner::load_model() {
     if (!validate_config(config.graph_settings, families, error))
       return std::unexpected(error);
   }
-  const auto allow_unaligned_direct_io = [this](const GGUFFile &file) {
-    if (config.cuda_cufile)
-      return false;
+  const auto allow_unaligned_direct_io = [](const GGUFFile &file) {
     const auto arch = file.kv_string.find("general.architecture");
     return arch != file.kv_string.end() && arch->second == "bailingmoe3";
   };
@@ -97,19 +95,6 @@ std::expected<void, std::string> EngineRunner::load_model() {
                              "others read from the primary only.\n";
       }
     }
-  }
-
-  // Opt-in, only reachable when the driver actually opened above (config.
-  // cuda_cufile alone doesn't guarantee that -- see cufile_driver_guard).
-  // EngineConfig::validate() already refused cuda_cufile=true without
-  // direct_io=true, so direct_io has already run by this point whenever
-  // this branch is live. engine.cuda_cufile_active (the flag execution_
-  // layer.cpp's Phase 3 loop actually checks) is only set true if at
-  // least one shard genuinely registered -- "requested" vs "actually
-  // active", same distinction direct_io/io_uring already draw.
-  if (config.cuda_cufile && cufile_driver_opened) {
-    int n = engine.model_file.enable_cufile();
-    engine.cuda_cufile_active = (n > 0);
   }
 
   // Optional separate dense GGUF: dense/preloaded tensors read from here,
