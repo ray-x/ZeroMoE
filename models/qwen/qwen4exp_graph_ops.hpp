@@ -81,14 +81,18 @@ inline ggml_tensor *attention_decode(
     ggml_tensor *w_kn, ggml_tensor *w_o, ggml_tensor *k_storage,
     ggml_tensor *v_storage, ggml_tensor *positions, ggml_tensor *indices,
     ggml_tensor *mask, std::vector<ggml_tensor *> *norm_nodes = nullptr,
-    const std::function<void(const char *, ggml_tensor *)> &probe = {}) {
+    const std::function<void(const char *, ggml_tensor *)> &probe = {},
+    int n_tokens = 1) {
+  // n_tokens > 1 is a decode window: positions has n entries, indices has
+  // Hkv * n rows (token-major), mask is [capacity, n] with causal rows.
+  const int n = n_tokens;
   auto diag = [&](const char *name, ggml_tensor *tensor) {
     if (probe && tensor)
       probe(name, tensor);
   };
   ggml_tensor *qfull = ggml_mul_mat(ctx, w_q, cur);
   diag("full_qg_proj", qfull);
-  ggml_tensor *q = ggml_view_3d(ctx, qfull, g.hd, g.H, 1,
+  ggml_tensor *q = ggml_view_3d(ctx, qfull, g.hd, g.H, n,
                                sizeof(float) * g.hd * 2,
                                sizeof(float) * g.hd * 2 * g.H, 0);
   diag("full_q_view", q);
@@ -96,13 +100,13 @@ inline ggml_tensor *attention_decode(
   q = ggml_mul(ctx, q_rms, w_qn);
   diag("full_q_norm", q);
   ggml_tensor *k = ggml_reshape_3d(
-      ctx, ggml_mul_mat(ctx, w_k, cur), g.hd, g.Hkv, 1);
+      ctx, ggml_mul_mat(ctx, w_k, cur), g.hd, g.Hkv, n);
   ggml_tensor *k_rms = ggml_rms_norm(ctx, k, g.eps);
   k = ggml_mul(ctx, k_rms, w_kn);
   diag("full_k_norm", k);
   if (norm_nodes) norm_nodes->insert(norm_nodes->end(), {q_rms, k_rms});
   ggml_tensor *v = ggml_reshape_3d(
-      ctx, ggml_mul_mat(ctx, w_v, cur), g.hd, g.Hkv, 1);
+      ctx, ggml_mul_mat(ctx, w_v, cur), g.hd, g.Hkv, n);
   diag("full_v", v);
   if (g.rope_mode == GGML_ROPE_TYPE_IMROPE ||
       g.rope_mode == GGML_ROPE_TYPE_MROPE) {
@@ -125,8 +129,8 @@ inline ggml_tensor *attention_decode(
   }
   diag("full_q_rope", q);
   diag("full_k_rope", k);
-  ggml_tensor *k2 = ggml_reshape_2d(ctx, k, g.hd, g.Hkv);
-  ggml_tensor *v2 = ggml_reshape_2d(ctx, v, g.hd, g.Hkv);
+  ggml_tensor *k2 = ggml_reshape_2d(ctx, k, g.hd, g.Hkv * n);
+  ggml_tensor *v2 = ggml_reshape_2d(ctx, v, g.hd, g.Hkv * n);
   ggml_tensor *kset = ggml_set_rows(ctx, k_storage, k2, indices);
   ggml_tensor *vset = ggml_set_rows(ctx, v_storage, v2, indices);
   ggml_tensor *kcache = ggml_reshape_4d(
@@ -143,16 +147,16 @@ inline ggml_tensor *attention_decode(
       1.0f / std::sqrt(static_cast<float>(g.hd)), 0.0f, 0.0f);
   diag("full_attn", attn);
   ggml_tensor *gate = ggml_view_3d(
-      ctx, qfull, g.hd, g.H, 1, sizeof(float) * g.hd * 2,
+      ctx, qfull, g.hd, g.H, n, sizeof(float) * g.hd * 2,
       sizeof(float) * g.hd * 2 * g.H, sizeof(float) * g.hd);
-  gate = ggml_reshape_3d(ctx, ggml_cont_2d(ctx, gate, g.H * g.hd, 1),
-                         g.hd, g.H, 1);
+  gate = ggml_reshape_3d(ctx, ggml_cont_2d(ctx, gate, g.H * g.hd, n),
+                         g.hd, g.H, n);
   diag("full_gate", gate);
   ggml_tensor *gate_sigmoid = ggml_sigmoid(ctx, gate);
   diag("full_gate_sigmoid", gate_sigmoid);
   attn = ggml_mul(ctx, attn, gate_sigmoid);
   diag("full_attn_gated", attn);
-  attn = ggml_reshape_2d(ctx, attn, g.H * g.hd, 1);
+  attn = ggml_reshape_2d(ctx, attn, g.H * g.hd, n);
   ggml_tensor *out = ggml_mul_mat(ctx, w_o, attn);
   diag("full_output_projection", out);
   return out;

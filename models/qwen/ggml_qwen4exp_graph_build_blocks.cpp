@@ -368,14 +368,15 @@ ggml_tensor *build_full_attention_decode(
   };
   return qwen4exp_ops::attention_decode(
       attention, ctx, cur, w_q, w_k, w_v, w_qn, w_kn, w_o, k_storage,
-      v_storage, g.positions, g.decode_indices, g.attn_mask, nullptr, diag);
+      v_storage, g.positions, g.decode_indices, g.attn_mask, nullptr, diag,
+      g.S);
 }
 
 bool prepare_ple_embedding(FullGraph &g, std::vector<float> &embedding, int S,
                            int pos_base, const int *token_ids) {
   const auto &c = g.engine->model_file.architecture_config;
   if (!has_ple_layer(c) || !token_ids ||
-      (pos_base != 0 && !(g.decode_mode && S == 1) && g.decode_mode))
+      (pos_base != 0 && g.decode_mode && S != g.S))
     return !has_ple_layer(c);
   const GGUFTensor *table =
       model_tensor(*g.engine, "per_layer_token_embd.weight");
@@ -395,29 +396,24 @@ bool prepare_ple_embedding(FullGraph &g, std::vector<float> &embedding, int S,
     ctx[0] = token_ids[i];
     bool cut = false;
     for (int s = 1; s < c.ple_ngram_size; ++s) {
-      if (g.decode_mode) {
-        const int64_t pos = pos_base + i;
-        const int64_t back = s - i;
-        const auto &history = g.engine->qwen4exp_ple_tok_hist;
-        if (g.engine->qwen4exp_ple_next_pos == pos && back > 0 &&
-            back <= static_cast<int64_t>(history.size())) {
-          const size_t index = history.size() - static_cast<size_t>(back);
-          ctx[s] = history[index];
-        } else {
-          ctx[s] = eos;
-        }
-      } else {
+      {
         const int j = i - s;
+        const int64_t pos = pos_base + i;
         if (j >= 0) {
           ctx[s] = token_ids[j];
-        } else if (pos_base > 0 && g.engine->qwen4exp_ple_next_pos == pos_base) {
-          // Chunked prefill: the tokens before this batch are the previous batch's n-gram window.
+        } else if (g.decode_mode ? g.engine->qwen4exp_ple_next_pos == pos_base
+                                 : (pos_base > 0 &&
+                                    g.engine->qwen4exp_ple_next_pos == pos_base)) {
+          // The tokens before this batch / window are the previous n-gram window.
           const auto &history = g.engine->qwen4exp_ple_tok_hist;
           const int64_t back = s - i;
-          ctx[s] = back <= static_cast<int64_t>(history.size()) ? history[history.size() - (size_t)back] : eos;
+          ctx[s] = back > 0 && back <= static_cast<int64_t>(history.size())
+                       ? history[history.size() - static_cast<size_t>(back)]
+                       : eos;
         } else {
           ctx[s] = eos;
         }
+        (void)pos;
       }
       if (cut || ctx[s] == eos) {
         ctx[s] = eos;

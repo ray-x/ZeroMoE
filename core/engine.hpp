@@ -740,6 +740,9 @@ public:
     // (cleared when a prefill starts at position 0).
     bool qwen4exp_wide_export = false;
     std::vector<float> qwen4exp_wide_out;
+    // Tokens per Qwen4Exp full-graph decode call (1 = ordinary decode). A window
+    // > 1 builds the decode graph for that many consecutive tokens (MTP verify).
+    int qwen4exp_decode_window = 1;
     std::vector<float> qwen4exp_wide_prompt;
     // Generic completion flag for graph families without historical per-family flags.
     bool full_graph_output_ready = false;

@@ -29,7 +29,7 @@ void plan_expert_vram_split(FullGraph &g) {
   if (g.engine && g.engine->family_ops.family == ModelFamily::Qwen &&
       g.engine->cuda_moe_full_graph_decode_required)
     return; // The fit planner owns the complete Qwen expert placement.
-  if (g.S != 1)
+  if (g.S != 1 && !g.decode_mode)
     return;
 
   // Option B is a deterministic usage-driven plan: a static hot set per

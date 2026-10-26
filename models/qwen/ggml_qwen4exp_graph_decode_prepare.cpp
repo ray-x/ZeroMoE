@@ -167,7 +167,7 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     }
   }
 
-  const int required = pos_base + 1;
+  const int required = pos_base + std::clamp(engine.qwen4exp_decode_window, 1, 8);
   const int dev = engine.gpu_device_id >= 0 ? engine.gpu_device_id : 0;
 
   // Whether this session should attempt Phase 2 (true per-token dynamic
@@ -186,7 +186,7 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
         if (!t || t->ple_layer < 0)
           continue;
         std::vector<float> ple;
-        if (!prepare_ple_embedding(*t, ple, 1, pos_base, token_ids) ||
+        if (!prepare_ple_embedding(*t, ple, t->S, pos_base, token_ids) ||
             !t->ple_embedding ||
             ple.size() * sizeof(float) > ggml_nbytes(t->ple_embedding))
           return false;
@@ -342,7 +342,7 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
           g_full_graph_generation.fetch_add(1, std::memory_order_relaxed);
     g->engine = &engine;
     g->device = dev;
-    g->S = 1;
+    g->S = std::clamp(engine.qwen4exp_decode_window, 1, 8);
     g->D = c.hidden;
     g->HC = engine.family_ops.family == ModelFamily::Qwen ? 1 : c.hc_mult;
     g->n_layers = c.n_layers;
@@ -537,7 +537,7 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
                              .count();
     setup_stage_started = std::chrono::steady_clock::now();
     std::vector<float> ple;
-    if (!prepare_ple_embedding(*g, ple, 1, pos_base, token_ids) &&
+    if (!prepare_ple_embedding(*g, ple, g->S, pos_base, token_ids) &&
         has_ple_layer(c)) {
       LOG_ERROR("[GGML-QWEN-FULL-DECODE] graph preparation failed: PLE "
                 "embedding preparation declined\n");

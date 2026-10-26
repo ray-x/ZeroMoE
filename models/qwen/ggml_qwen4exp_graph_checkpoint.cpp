@@ -92,7 +92,7 @@ bool copy_spans(const std::vector<Span> &spans, void *block, bool to_block,
 // recurrent state pending that would outlive a restore.
 FullGraph *live_decode_graph(StreamingEngine &engine) {
   FullGraph *g = g_graph.get();
-  if (!g || !g->ready || !g->decode_mode || g->engine != &engine || g->S != 1 ||
+  if (!g || !g->ready || !g->decode_mode || g->engine != &engine ||
       !g->cuda_raw)
     return nullptr;
   return g;
