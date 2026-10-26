@@ -4,6 +4,8 @@
 // behind this small bridge so the existing per-layer path remains available
 // as a correctness fallback while the full graph is validated on hardware.
 
+#include <cstddef>
+
 struct StreamingEngine;
 
 // Enabled only when ZEROMOE_QWEN4EXP_FULL_GRAPH=1 is present.  The mode is
@@ -63,6 +65,18 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
                                     float *hidden_states, int pos_base,
                                     const int *token_ids, float *logits,
                                     int vocab);
+
+// Device-side checkpoints of the decode graph's recurrent state (GDN state and
+// conv history, PLE history, plus the host PLE window), for graph-native MTP
+// verification. Valid only on the live decode graph that took them; a rebuilt
+// graph invalidates every checkpoint. KV is not copied: decode writes only row
+// `position` and masks reads to `<= position`, so restoring the position
+// restores KV. Device blocks are pooled; release returns them to the pool.
+bool qwen4exp_full_graph_state_save(StreamingEngine &engine, int &handle);
+bool qwen4exp_full_graph_state_restore(StreamingEngine &engine, int handle);
+void qwen4exp_full_graph_state_release(int handle);
+// Bytes one checkpoint occupies (0 when there is no live decode graph).
+size_t qwen4exp_full_graph_state_bytes(StreamingEngine &engine);
 
 // Destroy the graph while the shared CUDA backend is still alive.  The
 // bridge owns scheduler buffers, so leaving this to static destruction runs

@@ -380,6 +380,18 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
     ggml_backend_tensor_get(g.logits, logits, 0,
                             static_cast<size_t>(vocab) * sizeof(float));
   }
+  if (engine.qwen4exp_wide_export && !standard_qwen) {
+    const size_t wide_n = static_cast<size_t>(g.D) * g.HC;
+    if (!g.final_streams || !ggml_is_contiguous(g.final_streams) ||
+        static_cast<size_t>(ggml_nelements(g.final_streams)) != wide_n) {
+      LOG_ERROR("[QWEN-MTP-EXPORT] decode graph has no contiguous wide "
+                "residual of %zu floats\n", wide_n);
+      return false;
+    }
+    engine.qwen4exp_wide_out.resize(wide_n);
+    ggml_backend_tensor_get(g.final_streams, engine.qwen4exp_wide_out.data(), 0,
+                            wide_n * sizeof(float));
+  }
   g.decode_last_pos = pos_base;
   g.decode_host_state_dirty = env_prefill_state_handoff_enabled();
 
@@ -606,6 +618,27 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
   const auto t_sync_end = std::chrono::steady_clock::now();
   ggml_backend_tensor_get(g.output, hidden_states, 0,
                           static_cast<size_t>(g.D) * S * sizeof(float));
+  if (engine.qwen4exp_wide_export &&
+      engine.family_ops.family != ModelFamily::Qwen) {
+    const size_t wide_n = static_cast<size_t>(g.D) * g.HC * S;
+    if (!g.final_streams || !ggml_is_contiguous(g.final_streams) ||
+        static_cast<size_t>(ggml_nelements(g.final_streams)) != wide_n) {
+      LOG_ERROR("[QWEN-MTP-EXPORT] prefill graph has no contiguous wide "
+                "residual of %zu floats\n", wide_n);
+      return false;
+    }
+    if (pos_base == 0) engine.qwen4exp_wide_prompt.clear();
+    const size_t before = engine.qwen4exp_wide_prompt.size();
+    if (before != static_cast<size_t>(pos_base) * g.D * g.HC) {
+      LOG_ERROR("[QWEN-MTP-EXPORT] prefill batch at pos %d does not continue "
+                "the exported rows (%zu floats held)\n", pos_base, before);
+      return false;
+    }
+    engine.qwen4exp_wide_prompt.resize(before + wide_n);
+    ggml_backend_tensor_get(g.final_streams,
+                            engine.qwen4exp_wide_prompt.data() + before, 0,
+                            wide_n * sizeof(float));
+  }
   if (g.logits && engine.qwen4exp_full_graph_logits_target) {
     ggml_backend_tensor_get(g.logits,
                             engine.qwen4exp_full_graph_logits_target,

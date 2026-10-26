@@ -882,7 +882,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       return false;
     g.final_streams = res;
     g.output = hc_mix(g, g.ctx, res, on, od, ou, nullptr, nullptr);
-    if (!g.decode_mode) {
+    if (!g.decode_mode || g.engine->qwen4exp_wide_export) {
       ggml_set_output(g.final_streams);
       ggml_build_forward_expand(g.graph, g.final_streams);
     }

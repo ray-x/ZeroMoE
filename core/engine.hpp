@@ -733,6 +733,14 @@ public:
     // [S,D] buffer.  The generation loop must not run the legacy HC collapse
     // a second time for that result.
     bool qwen4exp_full_graph_output_ready = false;
+    // Graph-native MTP. Set before the Qwen4Exp graph is built: the decode and
+    // prefill graphs then also read back the wide pre-head residual (D * HC per
+    // token), which the draft consumes. Decode overwrites qwen4exp_wide_out with
+    // one token; prefill appends one row per prompt token to qwen4exp_wide_prompt
+    // (cleared when a prefill starts at position 0).
+    bool qwen4exp_wide_export = false;
+    std::vector<float> qwen4exp_wide_out;
+    std::vector<float> qwen4exp_wide_prompt;
     // Generic completion flag for graph families without historical per-family flags.
     bool full_graph_output_ready = false;
     // Set after model-family detection when Qwen full-graph decode is the

@@ -482,6 +482,7 @@ if(NOT ZEROMOE_CPU_ONLY)
         models/qwen/ggml_qwen4exp_graph_build_moe.cpp
         models/qwen/ggml_qwen4exp_graph_decode_prepare.cpp
         models/qwen/ggml_qwen4exp_graph_diag.cpp
+        models/qwen/ggml_qwen4exp_graph_checkpoint.cpp
         models/qwen/ggml_qwen4exp_graph_expert_bind.cpp
         models/qwen/ggml_qwen4exp_graph_host_node.cpp
         models/qwen/ggml_qwen4exp_graph_placement.cpp
@@ -618,6 +619,7 @@ if(NOT ZEROMOE_CPU_ONLY)
         models/qwen/ggml_qwen4exp_graph_build_moe.cpp
         models/qwen/ggml_qwen4exp_graph_decode_prepare.cpp
         models/qwen/ggml_qwen4exp_graph_diag.cpp
+        models/qwen/ggml_qwen4exp_graph_checkpoint.cpp
         models/qwen/ggml_qwen4exp_graph_expert_bind.cpp
         models/qwen/ggml_qwen4exp_graph_host_node.cpp
         models/qwen/ggml_qwen4exp_graph_placement.cpp

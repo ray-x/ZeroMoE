@@ -163,8 +163,11 @@ bool qwen4exp_full_graph_sync_state_to_host(StreamingEngine &engine) {
   return true;
 }
 
+void qwen4exp_full_graph_state_shutdown();  // checkpoint pool (graph_checkpoint.cpp)
+
 void qwen4exp_full_graph_shutdown() {
   zeromoe::graphcfg::log_consulted("qwen4exp-full-graph");
+  qwen4exp_full_graph_state_shutdown();
   // Explicit, EARLY teardown (before the CUDA driver itself starts
   // shutting down) is why this function exists at all -- see g_graph's
   // own destroy()'s comment. The two Phase 2 suffix globals are exactly
@@ -836,5 +839,9 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &, float *, int,
   return false;
 }
 void qwen4exp_full_graph_shutdown() {}
+bool qwen4exp_full_graph_state_save(StreamingEngine &, int &) { return false; }
+bool qwen4exp_full_graph_state_restore(StreamingEngine &, int) { return false; }
+void qwen4exp_full_graph_state_release(int) {}
+size_t qwen4exp_full_graph_state_bytes(StreamingEngine &) { return 0; }
 
 #endif
