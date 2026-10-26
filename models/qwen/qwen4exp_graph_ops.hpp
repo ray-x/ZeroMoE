@@ -1,5 +1,7 @@
 #pragma once
 
+#include <vector>
+
 #include "ggml.h"
 
 #include <cmath>
@@ -75,15 +77,18 @@ inline ggml_tensor *attention_decode(
     ggml_tensor *w_q, ggml_tensor *w_k, ggml_tensor *w_v, ggml_tensor *w_qn,
     ggml_tensor *w_kn, ggml_tensor *w_o, ggml_tensor *k_storage,
     ggml_tensor *v_storage, ggml_tensor *positions, ggml_tensor *indices,
-    ggml_tensor *mask) {
+    ggml_tensor *mask, std::vector<ggml_tensor *> *norm_nodes = nullptr) {
   ggml_tensor *qfull = ggml_mul_mat(ctx, w_q, cur);
   ggml_tensor *q = ggml_view_3d(ctx, qfull, g.hd, g.H, 1,
                                sizeof(float) * g.hd * 2,
                                sizeof(float) * g.hd * 2 * g.H, 0);
-  q = ggml_mul(ctx, ggml_rms_norm(ctx, q, g.eps), w_qn);
+  ggml_tensor *q_rms = ggml_rms_norm(ctx, q, g.eps);
+  q = ggml_mul(ctx, q_rms, w_qn);
   ggml_tensor *k = ggml_reshape_3d(
       ctx, ggml_mul_mat(ctx, w_k, cur), g.hd, g.Hkv, 1);
-  k = ggml_mul(ctx, ggml_rms_norm(ctx, k, g.eps), w_kn);
+  ggml_tensor *k_rms = ggml_rms_norm(ctx, k, g.eps);
+  k = ggml_mul(ctx, k_rms, w_kn);
+  if (norm_nodes) norm_nodes->insert(norm_nodes->end(), {q_rms, k_rms});
   ggml_tensor *v = ggml_reshape_3d(
       ctx, ggml_mul_mat(ctx, w_v, cur), g.hd, g.Hkv, 1);
   q = ggml_rope_ext(ctx, q, positions, nullptr, g.n_rot, GGML_ROPE_TYPE_NEOX,

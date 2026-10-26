@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "mtp_graph_runtime.hpp"
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
@@ -112,9 +113,24 @@ std::unique_ptr<MtpGraphRuntime> MtpGraphRuntime::create(
   }
   const size_t actual_device = ggml_backend_sched_get_buffer_size(g.sched, g.cuda);
   const size_t actual_host = ggml_backend_sched_get_buffer_size(g.sched, g.cpu);
+  // reserve_size estimates cross-backend copies slightly low (e.g. when a node
+  // is forced onto the other backend). The allocation already succeeded, so
+  // reconcile the admitted figures with what is really resident and refuse only
+  // if that exceeds the device budget or the host guard.
   if (actual_device > m.device_workspace || actual_host > m.host_workspace) {
-    error = "draft workspace exceeded measured admission";
-    return nullptr;
+    if (actual_device > device_budget - m.weights - m.state) {
+      error = "draft scheduler workspace exceeds device budget after allocation";
+      return nullptr;
+    }
+    const size_t extra_host = actual_host > m.host_workspace
+        ? actual_host - m.host_workspace : 0;
+    if (extra_host && !MemoryGuard::try_reserve_host_bytes(extra_host)) {
+      error = "host budget refused draft scheduler workspace growth";
+      return nullptr;
+    }
+    result->workspace_reservation_ += extra_host;
+    result->memory_.device_workspace = std::max(actual_device, m.device_workspace);
+    result->memory_.host_workspace = std::max(actual_host, m.host_workspace);
   }
   result->hidden_scratch_.resize(shape.hidden);
   result->logits_scratch_.resize(shape.vocab);

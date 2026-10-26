@@ -4,11 +4,13 @@
 #include <cstdio>
 #include <filesystem>
 #include <stdexcept>
+#include <string>
 
 int main(int argc, char **argv) {
-  if (argc != 7) {
+  const bool cpu_norms = argc == 8 && std::string(argv[7]) == "--reference-cpu-norms";
+  if (argc != 7 && !cpu_norms) {
     std::fprintf(stderr, "usage: %s TRUNK.gguf MTP.gguf fixture.txt dump.txt "
-                         "DEVICE DEVICE_BUDGET_MIB\n", argv[0]);
+                         "DEVICE DEVICE_BUDGET_MIB [--reference-cpu-norms]\n", argv[0]);
     return 2;
   }
   try {
@@ -49,7 +51,7 @@ int main(int argc, char **argv) {
     std::string error;
     auto runtime = qwen4exp_mtp::create(engine,
         {device, static_cast<int>(fixture.rows.size()),
-         budget_mib * (1 << 20), true}, error);
+         budget_mib * (1 << 20), true, cpu_norms}, error);
     if (!runtime) throw std::runtime_error(error);
     const auto builds = runtime->build_count();
     const int experts = engine->model_file.get_config_int("expert_count", 0);

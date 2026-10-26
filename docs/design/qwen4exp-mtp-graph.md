@@ -15,6 +15,70 @@ synthetic, so this is a runtime smoke, not numerical parity against
 llama.cpp. The MTP reference fixture and exact reference checkout remain
 required before enabling end-to-end speculative generation.
 
+## Cross-engine parity finding (2026-10-26)
+
+Against llama.cpp `6050b46` on the 32-row synthetic fixture, only logits at row
+21 failed (cosine 0.99962, NRMSE 0.0275). Rows 19, 20 and 22 are bit-identical;
+the NextN block has `compress_ratios[48] = 0`, so QSA is not involved.
+The divergence was traced as follows:
+
+- It follows the **data, not the position**: swapping the contents of rows 21
+  and 25 makes the row-21 hidden state and logits match, and the error appears
+  at an unrelated row (logits at row 23) with hidden NRMSE 1.5e-8.
+- On a 96-row Gaussian fixture (OOD inputs), 39/96 rows exceed NRMSE 0.01 and
+  some router IDs flip, yet argmax agrees on 93/96. Where the bridge is exact,
+  `hc_mixed` (the attention input) is also bit-exact, while `attn_out` differs
+  on about half of rows from position 24. The fault is therefore inside the
+  attention op (or the activation quantization it feeds), not in the HC mix.
+- Row 12 is separate: its bridge differs in one whole HC stream by ~1e-3,
+  consistent with one flipped Q8 activation rounding upstream.
+- ZeroMoE's dumps are bit-reproducible run to run.
+- norm, quantize, flash-attention, mmvq, binbcast CUDA kernels are identical
+  between ZeroMoE's ggml (8baabd5) and the reference; `rope.cu` differs only
+  by the fused rope+set_rows cache write. The HC fused-vs-unfused hypothesis was
+  tested: the CUDA backend fuses the unfused sequence the same way in both.
+
+Root cause (confirmed 2026-10-26): the llama.cpp reference runs its
+weightless `RMS_NORM` nodes (enorm, hnorm, attention Q-norm, K-norm) on the
+**CPU backend**, while ZeroMoE runs them on CUDA. `GGML_SCHED_DEBUG=2` on the
+reference shows the CPU splits (`norm-48` inputs) around each of them; the
+weights and the following MUL/ROPE are on CUDA. The CPU norm accumulates in
+double and the CUDA kernel in float with a different reduction order, so the
+normalized values differ by about one float ulp (~6e-8 NRMSE) on most rows.
+A flipped fp16 rounding of Q inside flash attention, or a flipped Q8
+activation rounding in a later Q4_K matmul, then amplifies that to the
+4e-4..8e-2 differences seen on a minority of rows, and the K/V cache carries
+it into later rows.
+
+Evidence:
+
+- Raw Q/K projections (Q4_K) and V are bit-exact between engines; only the
+  post-norm Q/K differ, so the matmul kernels are not the cause.
+- The relevant CUDA kernels (`norm.cu`, `fattn-*`, `mmvq.cu`, quantize) are
+  identical in both ggml revisions; the fused rms_norm+mul+rope kernel in the
+  reference is not reached because the norm is not on CUDA.
+- Forcing ZeroMoE's four norms onto the CPU backend (`ggml_backend_sched_
+  set_tensor_backend`, experiment only) makes every stage bit-exact against the
+  reference: all 32 rows of the smooth fixture (including row 21), all 48 rows
+  of the Gaussian fixture (including row 12, whose bridge flip is the same
+  effect in enorm/hnorm), covering attention, router weights, FFN, hidden and
+  logits.
+
+Conclusion: ZeroMoE's draft graph is numerically correct; the row-21 failure
+is reference-placement noise. Production keeps the norms on CUDA. For the
+strict parity gate, `qwen4exp_mtp::Options::reference_cpu_norms` (parity binary
+flag `--reference-cpu-norms`) places the same four norms on the CPU backend,
+as the reference does. With it the 32-row fixture passes the comparator with
+every stage bit-exact (cosine 1, zero error, identical routes); without it the
+original row-21 logits failure reproduces. Use the flag for the bit-exact gate;
+a CUDA-placement run is expected to show sporadic NRMSE spikes and should be
+judged by top-1 / router agreement with a bounded hidden error instead.
+
+The scheduler's `reserve_size` estimate was about 0.5% low when nodes are forced
+across backends (720,896 vs 717,568 device bytes). Admission now reconciles the
+live allocation against the device budget and host guard instead of requiring
+it not to exceed the estimate.
+
 ## Reference
 
 The reference is llama.cpp commit
@@ -260,7 +324,7 @@ cmake -S . -B build-mtp -DCMAKE_BUILD_TYPE=Release \
     -DZEROMOE_USE_GGML=ON -DZEROMOE_USE_GGML_CUDA=ON
 cmake --build build-mtp --target qwen4exp_mtp_parity -j
 ./build-mtp/qwen4exp_mtp_parity trunk.gguf mtp.gguf fixture.txt \
-    zeromoe.dump 0 4096
+    zeromoe.dump 0 4096 --reference-cpu-norms
 ./build-mtp-reference/llama_mtp_reference reference-with-mtp.gguf \
     fixture.txt llama.dump 48 cuda
 python3 tools/compare_mtp_graph.py llama.dump zeromoe.dump

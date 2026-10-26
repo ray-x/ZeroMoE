@@ -334,11 +334,12 @@ std::shared_ptr<MtpGraphState> build(
     ggml_set_output(tensor);
     g->diagnostics[name] = tensor;
   };
-  auto *hn = ggml_mul(ctx,
-      ggml_rms_norm(ctx, ggml_reshape_3d(ctx, g->hidden, c.D, c.HC, 1), c.eps),
-      w("nextn.hnorm.weight"));
-  auto *en = ggml_mul(ctx, ggml_rms_norm(ctx, g->embedding, c.eps),
-                      w("nextn.enorm.weight"));
+  std::vector<ggml_tensor *> cpu_norms;
+  auto *hn_rms = ggml_rms_norm(ctx, ggml_reshape_3d(ctx, g->hidden, c.D, c.HC, 1), c.eps);
+  auto *hn = ggml_mul(ctx, hn_rms, w("nextn.hnorm.weight"));
+  auto *en_rms = ggml_rms_norm(ctx, g->embedding, c.eps);
+  auto *en = ggml_mul(ctx, en_rms, w("nextn.enorm.weight"));
+  cpu_norms.insert(cpu_norms.end(), {hn_rms, en_rms});
   en = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, en, c.D, 1, 1), c.D, c.HC, 1, 1);
   auto *res = ggml_mul_mat(ctx, w("nextn.eh_proj.weight"),
                            ggml_concat(ctx, en, hn, 0));
@@ -350,7 +351,7 @@ std::shared_ptr<MtpGraphState> build(
   cur = qwen4exp_ops::attention_decode(attention, ctx, cur,
       w("attn_q.weight"), w("attn_k.weight"), w("attn_v.weight"),
       w("attn_q_norm.weight"), w("attn_k_norm.weight"), w("attn_output.weight"),
-      keys, values, g->positions, g->decode_indices, g->attn_mask);
+      keys, values, g->positions, g->decode_indices, g->attn_mask, &cpu_norms);
   res = qwen4exp_ops::hc_combine(hc, ctx, res, cur, inject);
   diagnostic("post_attention", res);
   cur = mix(res, "hc_ffn", &inject);
@@ -400,6 +401,9 @@ std::shared_ptr<MtpGraphState> build(
   // Keep the borrowed vocabulary-sized head on CPU: no implicit duplicate
   // upload competing with the target's pinned/LRU expert cache.
   ggml_backend_sched_set_tensor_backend(g->sched, g->logits, g->cpu);
+  if (opts.reference_cpu_norms)
+    for (auto *norm : cpu_norms)
+      ggml_backend_sched_set_tensor_backend(g->sched, norm, g->cpu);
   const auto *head_ptr = resident(*g->engine, "output.weight")->host_ptr;
   const auto head_meta = resident(*g->engine, "output.weight")->meta;
   auto *raw = g.get();
