@@ -129,6 +129,15 @@ cmake --build build -j$(nproc)
 
 `ZEROMOE_ENABLE_CUDA_GRAPHS` (default **ON**) enables ggml's CUDA graph capture/replay for this path. ggml's own default for `GGML_CUDA_GRAPHS` is OFF for any consumer other than llama.cpp itself, so without this, a plain `ZEROMOE_USE_GGML_CUDA=ON` build silently compiles out CUDA graph capture — every decode step then falls back to launching each graph node's kernel individually instead of replaying one captured graph per split. Measured impact on this project's Qwen4Exp full-graph decode: **~20 tok/s with graphs enabled vs. ~8 tok/s silently disabled**, on identical hardware/model/config. Opt out with `-DZEROMOE_ENABLE_CUDA_GRAPHS=OFF` if you need to A/B against the non-graph path.
 
+CUDA architecture selection defaults to automatic detection from
+`nvidia-smi` before any CUDA targets, including ggml-cuda, are configured.
+On a 3090 + 5060 Ti host, the detected list is `86;120a`. Set
+`CUDA_ARCH='86;120a'` for the build scripts or pass
+`-DCMAKE_CUDA_ARCHITECTURES='86;120a'` directly to CMake to override detection.
+For a GPU-less build host, supply the architectures explicitly. Verify that a
+5060 Ti benchmark binary contains `sm_120a`; an `sm_86`-only build is not a
+valid performance comparison.
+
 #### Runtime settings (host-node mode, CPU threads, CUDA schedule)
 
 `ZEROMOE_QWEN4EXP_HOST_NODE`, `ZEROMOE_QWEN_CPU_THREADS` and `ZEROMOE_CUDA_SCHEDULE` change how the Qwen4Exp CPU/GPU

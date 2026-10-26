@@ -20,6 +20,23 @@ directory that was deleted by accident, and how it was patched had not been writ
 3. `scripts/build_with_ggml.sh <build-dir>` refuses a `GGML_PREBUILT` that sits inside *another* worktree.
 4. The way a ggml tree is patched must be a script or a document in this repo, never a one-off command.
 
+## CUDA architecture selection
+
+When no CUDA architecture list is provided, top-level CMake and the build
+scripts query `nvidia-smi` before configuring any CUDA targets. They apply the
+same detected list to ZeroMoE's CUDA kernels and ggml-cuda. On a 3090 + 5060 Ti
+host this resolves to `86;120a`. The detection helper is
+`scripts/detect_cuda_arch.sh`; set `CUDA_ARCH` to override it. Verify that the
+resulting executable and linked ggml backend contain `sm_120a` with
+`cuobjdump --list-elf`.
+
+For a build host without an NVIDIA device, pass an explicit list such as
+`-DCMAKE_CUDA_ARCHITECTURES='86;120a'` to CMake, or set
+`CUDA_ARCH='86;120a'` when using the build scripts. A prebuilt ggml library is not
+recompiled by the top-level setting; it must already contain a native cubin
+for the target GPU. An `sm_86`-only build is not a valid 5060 Ti performance
+measurement, even if it happens to execute through a fallback path.
+
 ## The series
 
 `patches/ggml` then `patches/ggml-host-node`, in filename order, rooted at the ggml directory
@@ -76,16 +93,16 @@ checkout are not the pinned ggml.
 - MiMo dual-GPU, four prompts: decode 13.65 / 15.00 / 15.38 / 14.87 tok/s, prefill 24.9 / 41.4 / 74.7 /
   77.8 tok/s, tokens identical. So the missing `ZEROMOE_SCHED_EVENTS` (patch 0008) does not change MiMo
   prefill on this upstream.
-- **The first run after a fresh ggml build is slow**: the sm_120 GPU JIT-compiles the kernels from PTX.
-  Ling ran at 4.49 tok/s and MiMo's first prompt prefilled in 44.7 s (0.47 tok/s); the next run was normal.
-  Always do a warm-up run before taking a number from a new build.
+- **Historical JIT-only result**: builds without a native `sm_120a` cubin made the 5060 Ti JIT-compile
+  kernels from older PTX. The 2026-10-23 Ling/MiMo first-run numbers (4.49 tok/s and 44.7 s prefill)
+  are not comparable to a native `sm_120a` build. Check the cubin architecture before taking a baseline.
 
 ## Master build (2026-10-23)
 
 `GGML_REPO=/path/to/llama.cpp scripts/build_ggml.sh build_master_ggml` then
 `GGML_ROOT=build_master_ggml/ggml-src/ggml GGML_PREBUILT=build_master_ggml/ggml-build scripts/build_with_ggml.sh build_master`
 in the main checkout, from the merged series: `build_master/zeromoe` (RUNPATH inside the main checkout).
-Ling short decode on it: 10.39 tok/s warm (4.49 on the first, JIT, run), tokens identical.
+Ling short decode on that historical JIT-only build: 10.39 tok/s warm (4.49 on the first run), tokens identical.
 
 Worktree builds (`build_mimo`, `build_ggml` in the feature worktree) are disposable once the branch is merged:
 the merged series has no ggml changes beyond master's, so the master build above is the one to keep.

@@ -50,6 +50,32 @@ option(ZEROMOE_GGML_DEBUG_PATCHES
 option(ZEROMOE_USE_LLAMA_CPP "Deprecated alias for ZEROMOE_USE_GGML" OFF)
 option(ZEROMOE_METAL "Enable Apple Metal GPU backend (requires ggml)" OFF)
 
+# Resolve the architecture list before add_subdirectory(ggml): ggml-cuda
+# creates its CUDA targets during that call, so detecting architectures later
+# would affect ZeroMoE's kernels but leave ggml-cuda with a different target.
+if(NOT ZEROMOE_CPU_ONLY AND
+   (NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR
+    CMAKE_CUDA_ARCHITECTURES STREQUAL "" OR
+    CMAKE_CUDA_ARCHITECTURES STREQUAL "native"))
+    execute_process(
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/scripts/detect_cuda_arch.sh"
+        RESULT_VARIABLE _zeromoe_detect_arch_result
+        OUTPUT_VARIABLE _zeromoe_detected_archs
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_VARIABLE _zeromoe_detect_arch_error)
+    if(_zeromoe_detect_arch_result EQUAL 0 AND _zeromoe_detected_archs)
+        set(CMAKE_CUDA_ARCHITECTURES "${_zeromoe_detected_archs}")
+        message(STATUS "ZeroMoE auto-detected CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+    else()
+        set(CMAKE_CUDA_ARCHITECTURES native)
+        message(STATUS "ZeroMoE CUDA architecture detection unavailable; using CMake native")
+        if(_zeromoe_detect_arch_error)
+            string(STRIP "${_zeromoe_detect_arch_error}" _zeromoe_detect_arch_error)
+            message(STATUS "ZeroMoE CUDA architecture detection detail: ${_zeromoe_detect_arch_error}")
+        endif()
+    endif()
+endif()
+
 # On macOS the CPU-only binary is the only usable engine, and real MoE models
 # are almost always quantized.  Default ggml fetch to ON here; users can still
 # override with -DZEROMOE_USE_GGML=OFF.
@@ -323,16 +349,6 @@ include_directories(${ZEROMOE_INCLUDE_DIRS})
 # Full engine build (Linux + CUDA Toolkit)
 # ---------------------------------------------------------------------------
 if(NOT ZEROMOE_CPU_ONLY)
-    # Unless the user provides an architecture list, build for the CUDA
-    # devices visible at configure time. Keep the engine's own .cu kernels
-    # aligned with ggml-cuda's native selection (e.g. sm_86 + sm_120a on a
-    # 3090 + 5060 Ti host). For GPU-less build hosts, pass an explicit list
-    # such as -DCMAKE_CUDA_ARCHITECTURES='86;120a'.
-    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR
-       CMAKE_CUDA_ARCHITECTURES STREQUAL "")
-        set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING
-            "CUDA architectures for devices visible at configure time" FORCE)
-    endif()
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 17)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)

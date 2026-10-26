@@ -10,7 +10,8 @@
 #                  <dir>/src/ggml-cuda/libggml-cuda.so). Default: the master-level build kept in the
 #                  main checkout. Set to "" to compile ggml from GGML_ROOT and apply patches/ggml
 #                  (cmake/ZeroMoEGgmlPatches.cmake) into it.
-#   CUDA_ARCH      default 86 (PTX is embedded, which is what lets the sm_120 GPU JIT the kernels)
+#   CUDA_ARCH      optional explicit architecture list (e.g. '86;120a'); defaults to
+#                  all GPUs visible to nvidia-smi at build time.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
@@ -19,7 +20,7 @@ shift || true
 MAIN=$(git rev-parse --path-format=absolute --git-common-dir | sed 's|/\.git$||')
 GGML_ROOT=${GGML_ROOT:-$MAIN/build_ggmlcuda/ggml-src/ggml}
 GGML_PREBUILT=${GGML_PREBUILT-$MAIN/build_ggmlcuda/ggml-build}
-CUDA_ARCH=${CUDA_ARCH:-86}
+CUDA_ARCH=$(CUDA_ARCH="${CUDA_ARCH:-}" "$ROOT/scripts/detect_cuda_arch.sh")
 
 if [[ -n $GGML_PREBUILT ]]; then
   [[ -f $GGML_PREBUILT/src/ggml-cuda/libggml-cuda.so ]] || { echo "no ggml build at $GGML_PREBUILT"; exit 1; }
