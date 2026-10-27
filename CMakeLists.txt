@@ -248,6 +248,10 @@ else()
     set(GGML_METAL OFF CACHE BOOL "" FORCE)
 endif()
 
+# Revision of a ggml tree that ZeroMoE itself places in the build directory.
+# A user-supplied ZEROMOE_GGML_ROOT is left empty so the provenance stamp reads
+# that checkout instead of claiming the pinned commit.
+set(_zeromoe_ggml_provenance_base "")
 if(NOT ZEROMOE_GGML_ROOT)
     # Default: ggml/ from the pinned llama.cpp submodule (third_party/llama.cpp, commit ZEROMOE_GGML_COMMIT).
     # It is copied into the build tree before the patch series is applied, so the submodule is never modified.
@@ -256,6 +260,17 @@ if(NOT ZEROMOE_GGML_ROOT)
     if(NOT EXISTS "${_zeromoe_ggml_src}/CMakeLists.txt")
         if(EXISTS "${_zeromoe_ggml_submodule}/CMakeLists.txt")
             message(STATUS "ZeroMoE: copying ggml from third_party/llama.cpp/ggml into the build tree")
+            # The submodule can be checked out at any revision; record the one
+            # that is actually copied rather than assuming the pin. Require its
+            # own .git entry: a plain directory would otherwise resolve to the
+            # enclosing ZeroMoE repository and misattribute this commit.
+            if(EXISTS "${CMAKE_SOURCE_DIR}/third_party/llama.cpp/.git")
+                execute_process(
+                    COMMAND git -C "${CMAKE_SOURCE_DIR}/third_party/llama.cpp" rev-parse HEAD
+                    OUTPUT_VARIABLE _zeromoe_ggml_provenance_base
+                    OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_QUIET)
+            endif()
             file(COPY "${_zeromoe_ggml_submodule}/" DESTINATION "${_zeromoe_ggml_src}"
                  PATTERN ".git" EXCLUDE)
         else()
@@ -284,9 +299,15 @@ if(NOT ZEROMOE_GGML_ROOT)
                         "Run: scripts/init_ggml.sh (fetches only ggml/, about 5 MB), or set ZEROMOE_GGML_ROOT.")
                 endif()
             endforeach()
+            set(_zeromoe_ggml_provenance_base "${ZEROMOE_GGML_COMMIT}")
             file(COPY "${_zeromoe_fetch}/ggml/" DESTINATION "${_zeromoe_ggml_src}")
             endif()
         endif()
+    # Reconfiguring reuses the existing copy, so fall back to the documented
+    # pin when the creating pass did not record a revision.
+    if(NOT _zeromoe_ggml_provenance_base)
+        set(_zeromoe_ggml_provenance_base "${ZEROMOE_GGML_COMMIT}")
+    endif()
     set(ZEROMOE_GGML_ROOT "${_zeromoe_ggml_src}")
 endif()
 
@@ -1292,8 +1313,11 @@ if(TARGET zeromoe AND ZEROMOE_WRITE_BUILD_PROVENANCE)
     if(ZEROMOE_GGML_ROOT)
         list(APPEND _zeromoe_provenance_args --ggml-root "${ZEROMOE_GGML_ROOT}")
     endif()
-    if(ZEROMOE_GGML_COMMIT)
-        list(APPEND _zeromoe_provenance_args --ggml-base "${ZEROMOE_GGML_COMMIT}")
+    # Only claim a revision for the tree ZeroMoE itself placed in the build
+    # directory. A user-supplied ZEROMOE_GGML_ROOT may be any revision, so let
+    # the tool read its ggml-src.txt instead of stamping one it never built.
+    if(_zeromoe_ggml_provenance_base)
+        list(APPEND _zeromoe_provenance_args --ggml-base "${_zeromoe_ggml_provenance_base}")
     endif()
     add_custom_command(TARGET zeromoe POST_BUILD
         COMMAND "${Python3_EXECUTABLE}"

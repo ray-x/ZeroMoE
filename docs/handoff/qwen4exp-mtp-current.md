@@ -3,6 +3,28 @@
 Updated 2026-10-27. Refresh the current HEAD and worktree list before using any
 binary or citing a result.
 
+## Master status (2026-10-27)
+
+`master` is at `d2317b2`. Two changes landed after the `b78dd9b` binary that
+produced the matched raw-story numbers below, and neither is a runtime change:
+
+- `5781401` removes the always-on `ZEROMOE_USE_GGML` and
+  `ZEROMOE_BUILD_SERVER` build macros. The guards were true in every supported
+  build, so the compiled decode path is unchanged; only the option surface and
+  the dead fallback branches are gone.
+- `d2317b2` adds the build-provenance stamp and the CUDA configure repair:
+  the duplicate `graph_settings_test` target no longer breaks a non-CPU
+  configure, and `graph_settings_test` passes against the defaults snapshot.
+
+`build/zeromoe` is still stamped from `b78dd9b` and fails
+`python3 tools/build_provenance.py check --binary build/zeromoe --repo .`
+against current master. Do not quote new rates from it; rebuild first.
+
+Outstanding items: the plain-mode rerun on current master (the `658a212` plain
+run never finished because the driver stopped answering `nvidia-smi`), and the
+Qwen family dispatch change in `models/base/family_ops.cpp`, which remains
+uncommitted in its owning session.
+
 ## Exact MTP reproduction
 
 Prompt: “Write a Python function that checks whether a string is a palindrome,
