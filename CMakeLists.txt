@@ -10,6 +10,11 @@ add_executable(mtp_graph_contract_test EXCLUDE_FROM_ALL
 target_include_directories(mtp_graph_contract_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/models/graph)
 
+add_executable(expert_promotion_test EXCLUDE_FROM_ALL
+    tests/test_expert_promotion.cpp)
+target_include_directories(expert_promotion_test PRIVATE models/graph)
+add_test(NAME expert_promotion COMMAND expert_promotion_test)
+
 add_executable(mtp_speculation_test EXCLUDE_FROM_ALL
     tests/test_mtp_speculation.cpp)
 target_include_directories(mtp_speculation_test PRIVATE
