@@ -76,11 +76,14 @@ def prepare(model, model_path, directory, isolate_assist=False, gpu0_cache_gb=No
         profile = ROOT / "bench/ling/reference-audit/usage-hi-there-robust4.pin"
         text = re.sub(r"^pinned_vram_capacity = .*", "pinned_vram_capacity = 3700", text, flags=re.M)
         env.update(ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL="1",
-                   ZEROMOE_FULL_GRAPH_USAGE_FILE=str(profile), ZEROMOE_GLM5NEXT_DYNAMIC_CACHE="0",
-                   ZEROMOE_GLM5NEXT_GPU_ASSIST="3", ZEROMOE_GLM5NEXT_ASSIST2_SLOTS="1",
-                   ZEROMOE_GLM5NEXT_CPU_THREADS="10", ZEROMOE_GLM5NEXT_EARLY_READY="1",
+                   ZEROMOE_FULL_GRAPH_USAGE_FILE=str(profile),
+                   ZEROMOE_GLM5NEXT_CPU_THREADS="10",
                    ZEROMOE_GLM5NEXT_BATCHED_NEGATIVE_SKIP="1")
         graph_cli = [
+            "--graph-dynamic-cache", "0",
+            "--graph-gpu-assist", "3",
+            "--graph-gpu-assist2-slots", "1",
+            "--graph-early-ready", "1",
             "--graph-offload-first-layer", "4",
             "--graph-offload-model", str(model_path.resolve()),
             "--graph-offload-usage-file", str(profile),
@@ -94,8 +97,8 @@ def prepare(model, model_path, directory, isolate_assist=False, gpu0_cache_gb=No
         ]
         cap = 95
         if isolate_assist:
-            env["ZEROMOE_GLM5NEXT_GPU_ASSIST"] = "0"
-            env["ZEROMOE_GLM5NEXT_ASSIST2_SLOTS"] = "0"
+            graph_cli += ["--graph-gpu-assist", "0",
+                          "--graph-gpu-assist2-slots", "0"]
             text = "# phase-validation: adaptive GPU assist disabled in both reference and candidate\n" + text
     text, n_model = re.subn(
         r"^model_path = .*$",

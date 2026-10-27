@@ -51,7 +51,7 @@ OffloadState *get_offload(const StreamingEngine &engine,
   profile.store_path = st.offload_store.value;
   profile.model_path = st.offload_model.value;
   {
-    // ZEROMOE_GLM5NEXT_OFFLOAD_DDR_GIB=<n> fixes the pool; unset (or "auto") sizes it from the memory this
+    // graph_offload_ddr_gib=<n> fixes the pool; unset (or "auto") sizes it from the memory this
     // process may actually use: available RAM (or the cgroup limit if lower) minus 36 GiB for the rest of the
     // engine and the OS, at least 16 GiB (60 GiB before the Q2_K/Q3_K GSQ-RCO file, whose ~74 GiB cold set needs more than 58). The store caps it at the total expert bytes. Measured on a 125 GB
     // box: decode 5.3 / 7.3 / 8.2 tok/s at 32 / 48 / 58 GiB, flat beyond (everything resident).

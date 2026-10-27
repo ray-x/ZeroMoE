@@ -120,10 +120,6 @@ int main(int argc, char **argv) {
     q = resolve_settings(Family::Qwen, env_of({}), nullptr,
                          {{"device_expert_layers", "8"}, {"device_expert_trailing", "true"}});
     CHECK(q.tun.device_expert_layers.value == 8 && q.tun.device_expert_trailing.value == 1);
-    auto old = resolve_settings(Family::Qwen, env_of({{"ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS", "8"},
-        {"ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING", "1"}}));
-    CHECK(q.tun.device_expert_layers.value == old.tun.device_expert_layers.value);
-    CHECK(q.tun.device_expert_trailing.value == old.tun.device_expert_trailing.value);
     for (const auto &contents : {
         "graph_cpu_threads_decode = 12x", "graph_cpu_threads_decode = true",
         "graph_device_expert_layers = 49", "graph_device_expert_layers = 1",
@@ -218,10 +214,12 @@ int main(int argc, char **argv) {
     CHECK(l2.tun.prefill_chunk.value == 1024 && l2.tun.prefill_chunk.src == Source::Cli);
     auto l3 = resolve_settings(Family::Ling, env_of({}), nullptr, {{"prefill_chunk", "1024"}});
     CHECK(l3.tun.prefill_chunk.value == 1024 && l3.tun.prefill_chunk.src == Source::Toml);
-    auto a = resolve_settings(Family::Glm, env_of({{"ZEROMOE_GLM5NEXT_OFFLOAD_ASYNC", "1"}}));
+    auto a = resolve_settings(Family::Glm, env_of({}), nullptr, {},
+                              {{"offload_async", "1"}});
     CHECK(a.tun.offload_async.value == 1);
-    auto fl = resolve_settings(Family::Ling, env_of({{"ZEROMOE_GLM5NEXT_OFFLOAD_FIRST_LAYER", "9"}}));
-    CHECK(fl.tun.offload_first_layer.value == 9); // Ling inherits the shared graph name
+    auto fl = resolve_settings(Family::Ling, env_of({}), nullptr, {},
+                               {{"offload_first_layer", "9"}});
+    CHECK(fl.tun.offload_first_layer.value == 9);
     auto ddr = resolve_settings(Family::MiMo2, env_of({}), nullptr, {},
                                 {{"offload_ddr_gib", "auto"}});
     CHECK(ddr.tun.offload_ddr_gib.value < 0);
@@ -236,44 +234,45 @@ int main(int argc, char **argv) {
     CHECK(g.tun.offload_pinned_fraction.value == 0.5 && g.tun.offload_probation_fraction.value == 0.25);
     CHECK(g.tun.offload_policy.value == "lru" && g.tun.offload_pin_dma.value == -1);
     CHECK(g.tun.offload_seed_gpu1_hot.value == 1 && g.tun.offload_thp.value == 0);
-    auto e = resolve_settings(Family::Glm,
-        env_of({{"ZEROMOE_GLM5NEXT_OFFLOAD_PINNED", "0.2"},
-                {"ZEROMOE_GLM5NEXT_OFFLOAD_POLICY", "seg"}, {"ZEROMOE_GLM5NEXT_OFFLOAD_PIN", "2"},
-                {"ZEROMOE_GLM5NEXT_GPU_ASSIST", "0"}, {"ZEROMOE_GLM5NEXT_OFFLOAD_DDR_GIB", ""}}));
+    const CliValues overrides{
+        {"offload_pinned_fraction", "0.2"}, {"offload_policy", "seg"},
+        {"offload_pin_dma", "2"}, {"gpu_assist_slots", "0"},
+        {"offload_ddr_gib", "auto"}};
+    auto e = resolve_settings(Family::Glm, env_of({}), nullptr, {}, overrides);
     CHECK(e.tun.offload_pinned_fraction.value == 0.2);
     CHECK(e.tun.offload_policy.value == "seg");
     CHECK(e.tun.offload_pin_dma.value == 0);                // "== \"1\"" semantics: 2 is off
-    CHECK(e.tun.gpu_assist_slots.value == 0 && e.tun.gpu_assist_slots.src == Source::Env);
-    CHECK(e.tun.offload_ddr_gib.src == Source::Default);    // empty = unset
-    // Ling inherits the shared GLM alias values.
-    auto le = resolve_settings(Family::Ling,
-        env_of({{"ZEROMOE_GLM5NEXT_OFFLOAD_PINNED", "0.2"},
-                {"ZEROMOE_GLM5NEXT_OFFLOAD_POLICY", "seg"}, {"ZEROMOE_GLM5NEXT_OFFLOAD_PIN", "2"},
-                {"ZEROMOE_GLM5NEXT_GPU_ASSIST", "0"}, {"ZEROMOE_GLM5NEXT_OFFLOAD_DDR_GIB", ""}}));
+    CHECK(e.tun.gpu_assist_slots.value == 0 && e.tun.gpu_assist_slots.src == Source::Cli);
+    CHECK(e.tun.offload_ddr_gib.value < 0 && e.tun.offload_ddr_gib.src == Source::Cli);
+    auto le = resolve_settings(Family::Ling, env_of({}), nullptr, {}, overrides);
     CHECK(le.tun.offload_pinned_fraction.value == 0.2);
     CHECK(le.tun.offload_policy.value == "seg");
     CHECK(le.tun.offload_pin_dma.value == 0);
-    CHECK(le.tun.gpu_assist_slots.value == 0 && le.tun.gpu_assist_slots.src == Source::Env);
-    CHECK(le.tun.offload_ddr_gib.src == Source::Default);
-    // MiMo's knobs do not see the GLM names, and the GLM graph does not see MiMo's.
+    CHECK(le.tun.gpu_assist_slots.value == 0 && le.tun.gpu_assist_slots.src == Source::Cli);
+    CHECK(le.tun.offload_ddr_gib.value < 0 && le.tun.offload_ddr_gib.src == Source::Cli);
+    // Family claims still prevent GLM-only settings from changing MiMo.
     auto m = resolve_settings(Family::MiMo2, env_of({}), nullptr, {},
                               {{"gpu_assist_slots", "5"}});
     CHECK(m.tun.offload_pinned_fraction.value == 0.5 && m.tun.gpu_assist_slots.value == 5);
   }
-  // 2c. GLM lane/staging switches keep their legacy parses.
+  // 2c. GLM lane/staging controls use canonical graph CLI settings.
   {
     auto d = resolve_settings(Family::Glm, env_of({}));
     CHECK(d.tun.early_ready.value == -1 && d.tun.split_load.value == 1 && d.tun.lane_with_gpu1.value == 1);
     CHECK(d.tun.pilot_copy.value == 1 && d.tun.dynamic_cache.value == 0);
     CHECK(d.tun.gpu_assist2_slots.value == 1);
-    auto e = resolve_settings(Family::Glm, env_of({{"ZEROMOE_GLM5NEXT_EARLY_READY", "0"}, {"ZEROMOE_GLM5NEXT_SPLIT_LOAD", "0"},
-        {"ZEROMOE_GLM5NEXT_PILOT_COPY", "0"}, {"ZEROMOE_GLM5NEXT_DYNAMIC_CACHE", "1"}, {"ZEROMOE_GLM5NEXT_ASSIST2_SLOTS", "4"}}));
+    auto e = resolve_settings(
+        Family::Glm, env_of({}), nullptr, {},
+        {{"early_ready", "0"}, {"split_load", "0"}, {"pilot_copy", "0"},
+         {"dynamic_cache", "1"}, {"gpu_assist2_slots", "4"}});
     CHECK(e.tun.early_ready.value == 0 && e.tun.split_load.value == 0 && e.tun.pilot_copy.value == 0);
     CHECK(e.tun.dynamic_cache.value == 1 && e.tun.gpu_assist2_slots.value == 4);
-    auto f = resolve_settings(Family::Glm, env_of({{"ZEROMOE_GLM5NEXT_EARLY_READY", "1"}}));
+    auto f = resolve_settings(Family::Glm, env_of({}), nullptr, {},
+                              {{"early_ready", "1"}});
     CHECK(f.tun.early_ready.value == 1);
-    auto m = resolve_settings(Family::MiMo2, env_of({{"ZEROMOE_GLM5NEXT_EARLY_READY", "0"}}));
-    CHECK(m.tun.early_ready.value == -1);                   // MiMo does not see the GLM names
+    auto m = resolve_settings(Family::MiMo2, env_of({}), nullptr, {},
+                              {{"early_ready", "0"}});
+    CHECK(m.tun.early_ready.value == -1); // MiMo does not claim early_ready
   }
   // 3. Overrides: layer order and provenance.
   {
@@ -334,16 +333,20 @@ int main(int argc, char **argv) {
     CHECK(decode_miss_finding(5, 5, 32).empty() && !decode_miss_finding(9, 5, 32).empty());
     CHECK(idle_vram_finding(0, 3.9).empty() && !idle_vram_finding(1, 4.5).empty());
   }
-  // 4d. The route-survey record file: per-family alias, diagnostic (outside the defaults table).
+  // 4d. The route-survey record file: canonical CLI/TOML setting, outside defaults hash.
   {
     auto m = resolve_settings(Family::MiMo2, env_of({}), nullptr, {},
                               {{"usage_record_file", "/tmp/u"}});
     CHECK(m.diag.usage_record_file.value == "/tmp/u");
-    auto g = resolve_settings(Family::Glm, env_of({{"ZEROMOE_GLM5NEXT_USAGE_RECORD", "/g"}}));
+    auto g = resolve_settings(Family::Glm, env_of({}), nullptr, {},
+                              {{"usage_record_file", "/g"}});
     CHECK(g.diag.usage_record_file.value == "/g");
-    auto l = resolve_settings(Family::Ling, env_of({{"ZEROMOE_GLM5NEXT_USAGE_RECORD", "/g"}}));
-    CHECK(l.diag.usage_record_file.value == "/g");          // Ling inherits the shared graph name
-    CHECK(resolve_settings(Family::Other, env_of({{"ZEROMOE_GLM5NEXT_USAGE_RECORD", "/g"}})).diag.usage_record_file.value.empty());
+    auto l = resolve_settings(Family::Ling, env_of({}), nullptr, {},
+                              {{"usage_record_file", "/g"}});
+    CHECK(l.diag.usage_record_file.value == "/g");
+    CHECK(resolve_settings(Family::Other, env_of({}), nullptr, {},
+                           {{"usage_record_file", "/g"}})
+              .diag.usage_record_file.value.empty());
     CHECK(defaults_table().find("usage_record_file") == std::string::npos);   // diagnostics never enter the hash
   }
   // 4e. Capability is declared, not inferred from alias visibility.

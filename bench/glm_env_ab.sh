@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Order-balanced A/B of one GLM-5.3-Flash offload decode setup, logits + tokens compared.
-#   bench/glm_env_ab.sh <engine> <tag> "<A: VAR=val ...>" "<B: VAR=val ...>" [rounds]
-# Arm A and B are space-separated env assignments (use "" for none), e.g. a switch
-# ("ZEROMOE_GLM5NEXT_SPLIT_LOAD=0" vs "ZEROMOE_GLM5NEXT_SPLIT_LOAD=1") or a library override
+#   bench/glm_env_ab.sh <engine> <tag> "<A options>" "<B options>" [rounds]
+# Arms accept space-separated VAR=val or --graph-KEY VALUE options (use "" for none), e.g. a switch
+# ("--graph-split-load 0" vs "--graph-split-load 1") or a library override
 # ("LD_LIBRARY_PATH=/x/lib_ctrl" vs "LD_LIBRARY_PATH=/x/lib_new").
 # Output: logs/perf/<tag>_{A,B}_<n>.{engine.log,logits,tokens}; prints decode tok/s per run.
 set -uo pipefail

@@ -48,7 +48,9 @@ than from the main thread. Pinning gave host-node mode 22.70 -> 26.25 tok/s (+15
 (0/44/4 got ~4% slower with binding, 22/26 ~4% faster, both within noise-to-negative). Do not combine host-node mode with `OMP_WAIT_POLICY=active`:
 spinning workers plus a busy main thread can starve the callback thread (measured 7x slower in isolation).
 
-### `ZEROMOE_QWEN4EXP_HOST_NODE_GPU_REDUCE`
+### Host-node GPU weighted reduce (fixed on)
+
+The measured GPU reduce policy is now fixed: it improved Qwen host-node decode by 1.65%. The callback returns unweighted expert outputs, and the GPU applies router weights and sums after the marker.
 
 | | |
 |---|---|
@@ -136,7 +138,6 @@ takes ~0.1 s instead of 3+ s. This is controlled by two switches in the opt-out 
 | Variable | Effect |
 |---|---|
 | `ZEROMOE_QWEN4EXP_GRAPH_BOOTSTRAP=0` | Skip the startup preparation (lazy: the first request pays the upload). |
-| `ZEROMOE_QWEN4EXP_DECODE_RECREATE_GRAPH_ARENA=1` | Do not borrow arenas: every decode graph recreates and re-uploads its own (slow, ~3.2 s on Option-B splits). |
 
 For Option-B per-expert split configs the startup step also uploads the ~13 GiB split arena once (+~2.7 s startup) and keeps it resident while prompts
 are short; a long prompt (roughly more than ~120 tokens on a 24 GiB card) releases it before prefill and rebuilds it for that request's decode.

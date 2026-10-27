@@ -564,8 +564,9 @@ logit-parity check.
 
 The all-layer smoke used `exl3_ggml_bridge_layers = [0, ..., 47]`,
 `ram_preload_all_experts = true`, and
-`ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0` so every layer retained its DDR
-arena for EXL3 slots. Reproduce with a Qwen4Exp GGUF metadata/model config,
+`graph_device_expert_layers = 0` in TOML (or
+`--graph-device-expert-layers 0`) so every layer retained its DDR arena for
+EXL3 slots. Reproduce with a Qwen4Exp GGUF metadata/model config,
 the EXL3 Safetensors path, and a short prompt; the rest of the model's dense
 and attention weights remain GGUF in this mixed-format integration test.
 

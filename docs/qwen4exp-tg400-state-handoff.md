@@ -119,9 +119,7 @@ The ZeroMoE measured-run shape is:
   ./build-tg400/zeromoe --config configs/testing/qwen4exp_tg400_q2_0_22_26.toml
 ```
 
-Decode borrows the completed prefill graph's dense/expert arenas by default.
-Set `ZEROMOE_QWEN4EXP_DECODE_RECREATE_GRAPH_ARENA=1` to explicitly use the
-older behavior and create a separate decode arena.
+Decode borrows compatible prefill dense/expert arenas. If the decode graph cannot be built from a borrowed arena, the runtime releases retained owners and retries with fresh decode arenas.
 Full-graph decode also prepares those prompt-independent arenas during startup
 by default; set `ZEROMOE_QWEN4EXP_GRAPH_BOOTSTRAP=0` to restore lazy
 preparation for a diagnostic run.

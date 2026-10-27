@@ -32,12 +32,6 @@ bool prefill_device_state_inputs_enabled(const StreamingEngine &engine) {
          engine.qwen4exp_gpu_stage_layers.empty();
 }
 
-bool env_decode_borrow_prefill_arenas() {
-  const char *v =
-      zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_DECODE_RECREATE_GRAPH_ARENA");
-  return !(v && std::strcmp(v, "1") == 0);
-}
-
 int env_device_expert_layers() {
   const auto &s = zeromoe::graphsettings::settings_for(zeromoe::graphsettings::Family::Qwen);
   long n = std::clamp(s.tun.device_expert_layers.value, 0L, 48L);
@@ -287,27 +281,17 @@ int graph_cpu_threads() {
 // this is the fix from qwen4exp-mixed-gpu-decode-gap.md
 // (ggml_backend_sched_new's parallel=false leaves CUDA sync events NULL,
 // forcing a blocking stream-sync every CPU/GPU transition instead of a
-// cheap event wait), previously verified at ~15.7->18.5-18.9 tok/s and
-// accidentally undone by that commit. Default back to true; set
-// ZEROMOE_QWEN4EXP_GRAPH_PARALLEL=0 for the blocking-sync A/B.
-bool graph_scheduler_parallel() {
-  return zeromoe::graphcfg::flag_unless_off("ZEROMOE_QWEN4EXP_GRAPH_PARALLEL");
-}
-
 // llama.cpp gives the CPU scheduler slot the CUDA device's host buffer type. That
 // makes graph-owned CPU activations pinned host allocations, so the many
 // CPU<->CUDA boundary copies do not fall through the pageable-host staging
-// path. This is the normal full-graph mode; set the environment variable to
-// 0 for an explicit pageable-buffer A/B.
+// path. This is the fixed full-graph scheduler policy.
 bool graph_cuda_host_buffers() {
-  return zeromoe::graphcfg::flag_unless_off("ZEROMOE_QWEN4EXP_GRAPH_CUDA_HOST_BUFFERS");
+  return true;
 }
 
 bool graph_match_llama_cpp_topology(const FullGraph &graph) {
-  const char *v =
-      zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_GRAPH_MATCH_LLAMA_CPP_TOPOLOGY");
-  if (v && v[0])
-    return v[0] != '0';
+  // Match the reference scheduler topology when experts span host and device;
+  // use the native all-device graph when every expert layer is resident.
   return device_expert_resident_layer_count(graph) < graph.n_layers;
 }
 

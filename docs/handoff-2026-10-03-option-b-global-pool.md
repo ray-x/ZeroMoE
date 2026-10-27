@@ -70,7 +70,7 @@ whether to raise the default budgets.
 
 ## 5. Earlier work this session (all committed unless noted)
 
-- Host-node GPU reduce: `ZEROMOE_QWEN4EXP_HOST_NODE_GPU_REDUCE` (default on) +1.65% (commit `b5e97c9`; documented in `docs/runtime-settings.md` and howto s20).
+- Host-node GPU reduce: fixed on after the measured +1.65% result; the env opt-out has been removed. (commit `b5e97c9`; documented in `docs/runtime-settings.md` and howto s20).
 - **12 OpenMP threads collapse (3-25x) under any other CPU load** (ZeroMoE, llama.cpp, any spinning pool). With a background job use `ZEROMOE_QWEN_CPU_THREADS=10|11`.
   `PRELOAD_LAYERS=0` fails on the 5060 Ti (dense arena declined -> legacy path, 0.26 tok/s): use 1.
 - CPU kernel cost by quant (my benchmark `bench/expert_cost_by_quant_bench.cpp`; the mixed gate/up+down variant is only in the session scratchpad): codebook types

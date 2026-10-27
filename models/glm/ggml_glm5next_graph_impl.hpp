@@ -103,7 +103,7 @@ int gpu_assist2_device(int core_device);
 int gpu_assist2_slots();
 // True when every routed-expert plane of `layer` has a type worth assisting on the GPU (see settings).
 bool gpu_assist_layer_ok(const FullGraph &g, int layer);
-// Keep the CPU lane on layers that also have a GPU1 hot branch (ZEROMOE_GLM5NEXT_LANE_WITH_GPU1, default on).
+// Keep the CPU lane on layers that also have a GPU1 hot branch (graph_lane_with_gpu1, default on).
 bool lane_with_gpu1_wanted();
 OffloadState *get_offload(const StreamingEngine &engine, const std::vector<PartialExpertLayer> *partial = nullptr);
 void offload_miss_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int, void *ud);
@@ -208,7 +208,6 @@ ggml_tensor *graph_ram_weight(FullGraph &g, ggml_context *ctx, int layer, const 
 ggml_tensor *hc_affine(ggml_context *ctx, ggml_tensor *x, ggml_tensor *scale, ggml_tensor *base);
 ggml_tensor *hc_mean(FullGraph &g, ggml_context *ctx, ggml_tensor *x);
 ggml_tensor *hc_contig(ggml_context *ctx, ggml_tensor *t);
-bool fused_hc_op(char which);
 ggml_tensor *build_bailing_mla(FullGraph &g, ggml_context *ctx,
                                 ggml_tensor *cur, int layer,
                                 ggml_tensor *wqa, ggml_tensor *wqan,
@@ -430,7 +429,7 @@ struct PackedGateUpMeta {
 // ZEROMOE_GLM5NEXT_ROUTE_TAP=<file>: accumulate per-(layer,expert) decode
 // routing counts and rewrite <file> ("layer expert count" lines, the same
 // format as the .zeromoe_usage files) every 25 tokens.  Needs
-// ZEROMOE_GLM5NEXT_CACHE_STATS=1 (which creates the per-layer id snapshots).
+// DEBUG verbosity (which enables the per-layer route-id capture).
 // Existing counts in <file> are loaded first so runs accumulate.
 struct RouteTap {
   std::string path;

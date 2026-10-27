@@ -1,6 +1,5 @@
 #include "qwen_cpu_offload_ring.hpp"
 #include "graph_config.hpp"
-#include "thread_profile.hpp"
 
 #include "logger.hpp"
 #include "memory_guard.hpp"
@@ -188,21 +187,6 @@ void QwenCpuOffloadRing::abandon(int slot_index) {
 }
 
 void QwenCpuOffloadRing::completion_callback(void *user, bool success) {
-  static thread_local bool thread_configured = false;
-  if (!thread_configured) {
-    configure_current_thread({
-        .name = "QWEN-RING-CB",
-        // The callback must be schedulable on whichever core is available;
-        // pinning it to the proposed orchestration core regressed the A/B
-        // decode because the ordinary CPU backend also used that core.
-        .cpu_ids = {},
-        .use_rt = true,
-        .rt_priority = 85,
-        .nice_value = -20,
-        .apply_nice = false,
-    });
-    thread_configured = true;
-  }
   if (!user)
     return;
   auto *slot = static_cast<Slot *>(user);

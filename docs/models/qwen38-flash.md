@@ -12,9 +12,9 @@
 ZEROMOE_BIN=./build_master/zeromoe bench/qwen_decode_baselines.sh split 10 400
 ```
 
-Env (set by the script): `CUDA_VISIBLE_DEVICES=0
-ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40 ZEROMOE_BENCH_SILENT=1
-ZEROMOE_BENCH_IGNORE_STOP=1`. Full-graph prefill/decode are defaults; the
+The script sets `CUDA_VISIBLE_DEVICES=0`, passes
+`--graph-device-expert-layers 40 --graph-device-expert-trailing 1`, and uses
+`ZEROMOE_BENCH_SILENT=1` / `ZEROMOE_BENCH_IGNORE_STOP=1`. Full-graph prefill/decode are defaults; the
 old `ZEROMOE_QWEN4EXP_FULL_GRAPH*` switches are removed. Input
 `Tell a story.\n:q\n` (16 tokens). Metric: `[REQUEST-DECODE-WALL]`.
 

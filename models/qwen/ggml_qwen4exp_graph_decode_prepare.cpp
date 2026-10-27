@@ -229,9 +229,8 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
         !engine.qwen4exp_partial_layer_gpu_ids.empty()) ||
        (engine.qwen4exp_gpu_stage_enabled &&
         !engine.qwen4exp_gpu_stage_layers.empty()));
-  const bool borrow_prefill_arenas = env_decode_borrow_prefill_arenas() &&
-                                     !decode_compact_arena_needed;
-  if (env_decode_borrow_prefill_arenas() && decode_compact_arena_needed) {
+  const bool borrow_prefill_arenas = !decode_compact_arena_needed;
+  if (decode_compact_arena_needed) {
     LOG_INFO("[GGML-QWEN-FULL-DECODE] arena borrowing skipped because this "
              "decode graph needs decode-only compact expert storage\n");
   }
@@ -495,12 +494,12 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     // contract, not because decode itself is at risk.
     g->sched =
         ggml_backend_sched_new(backends, sched_bufts_ptr, 2, kGraphSize,
-                               graph_scheduler_parallel(), false);
+                               true, false);
     if (!g->sched)
       return nullptr;
     LOG_INFO(
         "[GGML-QWEN-FULL-DECODE] scheduler pipeline_parallel=%s copies=%d\n",
-        graph_scheduler_parallel() ? "true" : "false",
+        "true",
         ggml_backend_sched_get_n_copies(g->sched));
     // See the prefill graph above: GRAPH_REPLAY_TIMING is deliberately
     // non-invasive and must not enable the scheduler eval callback.

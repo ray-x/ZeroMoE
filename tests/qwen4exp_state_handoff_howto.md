@@ -38,9 +38,7 @@ libraries from `build_fork_diag`; keep that directory.
 
 ```bash
 ./build_fork_diag/gguf_tool verify /data/sda/models/qwen3.8-flash-next/GSQ-RCO-IQ2_XS_RCO50
-ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=48 \
-ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
-./build/zeromoe --config configs/testing/qwen4exp_gsq_rco_iq2xs_rco50_3090_gpu_only.toml
+./build/zeromoe --graph-device-expert-layers 48 --graph-device-expert-trailing 1 --config configs/testing/qwen4exp_gsq_rco_iq2xs_rco50_3090_gpu_only.toml
 ```
 
 For matched warm measurements, the script runs six identical 23-token requests
@@ -109,8 +107,9 @@ The standard binary is updated to the verified fast path. On RTX 3090, all
 48 expert layers and all three projections stay resident in CUDA (16.94 GiB
 of expert weights). Decode has 6,512 CUDA nodes, zero CPU nodes, one scheduler
 split, and CUDA graph replay enabled. Mixed CPU/GPU profiles preserve their
-existing staging path. `ZEROMOE_QWEN4EXP_GRAPH_MATCH_LLAMA_CPP_TOPOLOGY=1`
-restores the artificial CPU staging node for diagnostics;
+existing staging topology is selected automatically for mixed host/device
+placement. The former `ZEROMOE_QWEN4EXP_GRAPH_MATCH_LLAMA_CPP_TOPOLOGY`
+force override was removed on 2026-10-28;
 `ZEROMOE_QWEN4EXP_PREFILL_DEVICE_STATE=0` restores host zero-state inputs.
 
 Five warm repetitions, same 23 prefill IDs, identical 128 decode inputs, no

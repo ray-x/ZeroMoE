@@ -75,24 +75,6 @@ bool debug_sync_hc() {
 
 
 
-// Diagnostic only: force the S=1 HC pre graph to be rebuilt at every bracket.
-// This separates a persistent-graph retarget/replay problem from a numerical
-// difference in the HC projection itself.  The production path keeps graph
-// reuse enabled.
-bool debug_rebuild_pre_graph_each_call() {
-  static const bool enabled = [] {
-    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_HC_REBUILD_EACH_CALL");
-  }();
-  return enabled;
-}
-
-bool hc_no_external_weights() {
-  static const bool disabled = [] {
-    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_HC_NO_EXTERNAL");
-  }();
-  return disabled;
-}
-
 bool debug_external_weight_rebind() {
   return Logger::instance().would_log(LogLevel::DEBUG);
 }
@@ -540,11 +522,9 @@ bool GgmlHcRunner::ensure_pre_graph(int S, const Bracket &b, int layer,
   const ggml_tensor *bd = (const ggml_tensor *)b.down;
   const ggml_tensor *bu = (const ggml_tensor *)b.up;
   const ggml_tensor *bi = (const ggml_tensor *)b.inject;
-  if (debug_rebuild_pre_graph_each_call() ||
-      (pre_graph_cache_S_ != 0 && pre_graph_cache_S_ != S)) {
+  if (pre_graph_cache_S_ != 0 && pre_graph_cache_S_ != S) {
     // The allocator workspace is shared by the cached graphs. Drain the
-    // backend before replacing a cache for a different shape, or when the
-    // diagnostic explicitly requests a rebuild.
+    // backend before replacing a cache for a different shape.
     if (pre_graph_cache_S_ != 0 || active_pre_graph_) {
       ggml_backend_synchronize((ggml_backend_t)backend_);
       free_pre_graph();
@@ -836,12 +816,10 @@ bool GgmlHcRunner::ensure_weights(int layer, int sub_block,
                  layer, sub_block, name, old, t->data);
       }
     };
-    if (!hc_no_external_weights()) {
-      rebind_if_external(b.norm, norm, "norm");
-      rebind_if_external(b.down, down, "down");
-      rebind_if_external(b.up, up, "up");
-      rebind_if_external(b.inject, inject, "inject");
-    }
+    rebind_if_external(b.norm, norm, "norm");
+    rebind_if_external(b.down, down, "down");
+    rebind_if_external(b.up, up, "up");
+    rebind_if_external(b.inject, inject, "inject");
     return true;
   }
   if (b.ready) {
@@ -904,7 +882,6 @@ bool GgmlHcRunner::ensure_weights(int layer, int sub_block,
   const ggml_type up_ggml_type = exact_up_q8 ? GGML_TYPE_F32
                                               : (ggml_type)up.type;
   cudaSetDevice(device_);
-  const bool no_external_weights = hc_no_external_weights();
   ggml_context *ctx = nullptr;
   ggml_tensor *tn = nullptr;
   ggml_tensor *td = nullptr;
@@ -926,15 +903,15 @@ bool GgmlHcRunner::ensure_weights(int layer, int sub_block,
       ggml_free(ctx);
       return false;
     }
-    ext_n = !no_external_weights && external_buf_ && norm.device_data &&
+    ext_n = external_buf_ && norm.device_data &&
             norm.device_bytes >= ggml_nbytes(tn);
-    ext_d = (custom_mode || !exact_down_q8) && !no_external_weights && external_buf_ &&
+    ext_d = (custom_mode || !exact_down_q8) && external_buf_ &&
             down.device_data &&
             down.device_bytes >= ggml_nbytes(td);
-    ext_u = (custom_mode || !exact_up_q8) && !no_external_weights && external_buf_ &&
+    ext_u = (custom_mode || !exact_up_q8) && external_buf_ &&
             up.device_data &&
             up.device_bytes >= ggml_nbytes(tu);
-    ext_i = !no_external_weights && external_buf_ && inject.device_data &&
+    ext_i = external_buf_ && inject.device_data &&
             inject.device_bytes >= ggml_nbytes(ti);
     auto bind_external = [&](ggml_tensor *t, const void *data) {
       t->data = const_cast<void *>(data);

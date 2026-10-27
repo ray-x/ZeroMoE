@@ -376,6 +376,7 @@ checks warm prefill and matched first-to-last decode performance against Bee.
 | `-t, --threads <N>` | CPU thread limit (default: automatic). |
 | `--temp <F>` | Sampling temperature; `0.0` for greedy decode (default: 0.7). |
 | `--top-p <F>` | Nucleus sampling top-p threshold (default: 0.90). |
+| `--repeat-penalty <F>` | Repetition penalty (default: 1.0, disabled). |
 | `--main-gpu <ID>` | CUDA device ID for single-GPU mode (default: 0). |
 | `--spec-type <none|draft-mtp>` | Speculative mode supported by ZeroMoE. |
 | `--spec-draft-model <path>` | Optional external draft checkpoint. |
@@ -393,6 +394,10 @@ checks warm prefill and matched first-to-last decode performance against Bee.
 | `--log-file <file>` | Redirect logging to a file instead of stderr (llama.cpp-compatible name). |
 | `--verbosity <0..5>` | Set log threshold (llama.cpp-compatible numeric verbosity). |
 | `--help`, `-h` | Show the CLI help interface. |
+
+At DEBUG (`--verbosity 5`), numerical decode comparisons include
+`[TEACHER-FORCE-LOGITS]` fingerprints and Qwen route-hit summaries use the
+`[ROUTE-HIT]`, `[MOE-REQUIRED]`, and `[MOE-PROMPT]` headers. Filter these records from a verbose log by their header.
 
 > Most of these flags have a matching TOML key of the same name (e.g. `raw_prompt`, `system_prompt`, `pin_threshold`) for use with `--config`; a config file's values are used unless the equivalent CLI flag is also passed, in which case the CLI flag wins. Run `--gen-config` to see the full set of TOML-only options (e.g. `unpacked_expert_format`, `pin_strategy`) that have no CLI-flag equivalent.
 

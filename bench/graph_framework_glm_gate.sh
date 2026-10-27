@@ -8,7 +8,7 @@
 #   lru        offload, lru, no pilot            (miss node + store + async loads)
 #   prefetch   pilot prefetch K=4, no VRAM copy  (stage worker + store.ensure(Prefetch))
 #   stage      pilot staging K=1 + VRAM ring     (stage worker + reader_lock + ring)
-#   lane       ZEROMOE_GLM5NEXT_EARLY_READY=1  (CPU lane, only the candidate binary has it)
+#   lane       --graph-early-ready 1  (CPU lane, only the candidate binary has it)
 # ARMS="lane" selects arms.
 # For each arm the decode logits dump and generated tokens must be byte-identical
 # between the two binaries. Decode tok/s is reported from the engine log.
@@ -70,23 +70,23 @@ if model_count != 1 or log_count != 1:
     raise SystemExit("config must contain one model_path and one log_path")
 Path(sys.argv[2]).write_text(text)
 PY
-  local env=(ZEROMOE_GLM5NEXT_OFFLOAD_FIRST_LAYER=3 ZEROMOE_GLM5NEXT_OFFLOAD_DDR_GIB=32
-             ZEROMOE_GLM5NEXT_OFFLOAD_PINNED=0.5 ZEROMOE_GLM5NEXT_OFFLOAD_POLICY=lru
-             ZEROMOE_GLM5NEXT_OFFLOAD_STORE="$STORE" ZEROMOE_GLM5NEXT_OFFLOAD_MODEL="$MODEL"
-             ZEROMOE_GLM5NEXT_OFFLOAD_USAGE="$USAGE" ZEROMOE_GLM5NEXT_OFFLOAD_ASYNC=1
-             ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512 ZEROMOE_GLM5NEXT_CPU_THREADS=8
+  local env=(ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512 ZEROMOE_GLM5NEXT_CPU_THREADS=8
              CUDA_VISIBLE_DEVICES=0 ZEROMOE_BENCH_IGNORE_STOP=1
              ZEROMOE_DECODE_LOGITS_DUMP="$out/$tag.logits"
              ZEROMOE_GENERATED_TOKEN_FILE="$out/$tag.tokens")
+  local graph_args=(--graph-offload-first-layer 3 --graph-offload-ddr-gib 32
+                    --graph-offload-pinned-fraction 0.5 --graph-offload-policy lru
+                    --graph-offload-store "$STORE" --graph-offload-model "$MODEL"
+                    --graph-offload-usage-file "$USAGE" --graph-offload-async 1)
   case $arm in
     lru) ;;
-    prefetch) env+=(ZEROMOE_GLM5NEXT_PILOT_STAGE=1 ZEROMOE_GLM5NEXT_PILOT_PREFETCH=4 ZEROMOE_GLM5NEXT_PILOT_COPY=0) ;;
+    prefetch) env+=(ZEROMOE_GLM5NEXT_PILOT_STAGE=1 ZEROMOE_GLM5NEXT_PILOT_PREFETCH=4); graph_args+=(--graph-pilot-copy 0) ;;
     stage) env+=(ZEROMOE_GLM5NEXT_PILOT_STAGE=1) ;;
-    lane) env+=(ZEROMOE_GLM5NEXT_EARLY_READY=1) ;;  # CPU lane (step 4); baseline binary ignores it
+    lane) graph_args+=(--graph-early-ready 1) ;;  # CPU lane (step 4); baseline binary ignores it
   esac
   printf '%s\n:q\n' "$PROMPT" | env "${env[@]}" \
       systemd-run --user --scope -q -p MemoryMax=80G -p MemorySwapMax=0 \
-      "$bin" --config "$out/$tag.toml" --predict 48 > "$out/$tag.stdout" 2>&1
+      "$bin" --config "$out/$tag.toml" "${graph_args[@]}" --predict 48 > "$out/$tag.stdout" 2>&1
   echo "$tag exit=$?"
 }
 

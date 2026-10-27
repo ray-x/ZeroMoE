@@ -33,17 +33,17 @@ def with_keys(text, updates, drop_prefixes):
     return "\n".join(lines[:cut] + updates + [""] + lines[cut:]) + "\n"
 
 
-def run(binary, cfg_text, name, workdir, env_extra, prompt, timeout):
+def run(binary, cfg_text, name, workdir, prompt, timeout, preload_layers):
     cfg = os.path.join(workdir, name + ".toml")
     log = os.path.join(workdir, name + ".engine.log")
     out = os.path.join(workdir, name + ".out")
     with open(cfg, "w") as f:
         f.write(re.sub(r'(?m)^log_path.*', f'log_path = "{log}"', cfg_text))
-    env = dict(os.environ, ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING="1",
-               **env_extra)
+    env = os.environ.copy()
     input_text = prompt if prompt.endswith("\n:q\n") else prompt.rstrip("\n") + "\n:q\n"
     with open(out, "w") as o:
-        rc = subprocess.run([binary, "--config", cfg], input=input_text, text=True,
+        rc = subprocess.run([binary, "--graph-device-expert-layers", str(preload_layers),
+                        "--graph-device-expert-trailing", "1", "--config", cfg], input=input_text, text=True,
                             stdout=o, stderr=subprocess.STDOUT, env=env,
                             timeout=timeout).returncode
     text = open(out, errors="replace").read()
@@ -85,10 +85,9 @@ def main():
 
     workdir = a.keep or tempfile.mkdtemp(prefix="mtp-equiv-")
     os.makedirs(workdir, exist_ok=True)
-    env = {"ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS": str(a.preload_layers)}
 
     results = {}
-    rc, text, _ = run(a.binary, plain_cfg, "plain", workdir, env, a.prompt, a.timeout)
+    rc, text, _ = run(a.binary, plain_cfg, "plain", workdir, a.prompt, a.timeout, a.preload_layers)
     if rc != 0 or not text:
         sys.exit(f"plain run failed (rc={rc}); see {workdir}")
     results["plain"] = text
@@ -98,7 +97,7 @@ def main():
             'spec_type = "draft-mtp"', "mtp_graph = true",
             f"spec_draft_n_max = {k}",
             f'spec_draft_model = "{a.mtp_model}"'], drops)
-        rc, text, stats = run(a.binary, cfg, f"k{k}", workdir, env, a.prompt, a.timeout)
+        rc, text, stats = run(a.binary, cfg, f"k{k}", workdir, a.prompt, a.timeout, a.preload_layers)
         if rc != 0 or not text or not stats:
             print(f"FAIL k={k}: rc={rc}, output={'yes' if text else 'no'}, "
                   f"MTP-GRAPH stats={'yes' if stats else 'no'} ({workdir})")

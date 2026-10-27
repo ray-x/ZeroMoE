@@ -210,8 +210,7 @@ late-transfer fallback preserves the original CPU/GPU placement.
 `ZEROMOE_QWEN_EARLY_READY_STAGE_VERIFY=1` snapshots staged weighted output
 and compares it with a separate GPU graph freshly loaded from the immutable
 DDR planes for the actual staged route IDs. Verification timing is excluded.
-`ZEROMOE_QWEN_EARLY_READY_STAGE_DELAY_US` injects a bounded copy-stream delay
-for fallback/epoch/bank-reuse checks. Both controls default off.
+The bounded copy-stream delay injection used for fallback/epoch/bank-reuse checks was retired on 2026-10-28 after the stress checks; it is no longer a runtime setting.
 
 Latest build with GPU-reference verification and delayed-transfer injection
 completed: `logs/option_b_step4_stage13_verify_build.log`. Verification run is

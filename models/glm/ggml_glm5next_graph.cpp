@@ -338,10 +338,10 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
       }
   ggml_backend_t backends[] = {g->cuda, g->gpu1 ? g->gpu1 : g->cpu, g->cpu};
   // Batched prefill: let the scheduler run the host-resident (cold) expert matmuls on the GPU by copying the weights
-  // across, instead of on the CPU (ZEROMOE_GLM5NEXT_PREFILL_OP_OFFLOAD=1).
+  // across, instead of on the CPU The canonical graph setting is `prefill_op_offload`.
   const bool prefill_offload =
       g->engine->family_ops.family != ModelFamily::BailingMoE3 &&
-      zeromoe::graphcfg::flag_on("ZEROMOE_GLM5NEXT_PREFILL_OP_OFFLOAD");
+      zeromoe::graphsettings::active_settings().tun.prefill_op_offload.value == 1;
   // The scheduler needs events (ZEROMOE_SCHED_EVENTS, set below): without them every weight-input copy first
   // synchronizes the whole destination stream, which serializes the copies of the two GPUs. parallel=true is not an
   // option: it multiplies the graph inputs by the number of copies (56 GB of workspace).

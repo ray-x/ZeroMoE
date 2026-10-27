@@ -358,14 +358,11 @@ hello-world prompt, `--predict 40`, current tree, `ZEROMOE_QWEN4EXP_DECODE_RECRE
 - IQ1_M for comparison: 22/26 28.0, 0/44/4 37.0 tok/s.
 - Overlap analysis (section on #5) was on IQ1_M; with Q2_0 the CPU cost per full 10-expert layer is ~0.8 ms (53 ms - ~14 ms GPU over 48 layers), similar to IQ1_M's ~0.95 ms, so the conclusion is unchanged.
 
-WARNING (uncommitted working-tree change, not from this document's author): `src/ggml_qwen4exp_graph.cpp` currently makes arena borrow and bootstrap
-the DEFAULT (`ZEROMOE_QWEN4EXP_DECODE_RECREATE_GRAPH_ARENA=1` opts out; `ZEROMOE_QWEN4EXP_GRAPH_BOOTSTRAP=0` disables bootstrap). With that default every per-expert split config
-fails: `borrowed-arena graph build failed ... using layered decode` -> 0/44/4 drops from 36.5-37 to **1.12 tok/s with garbled output**
-("Here the was delivered a print thew..."), and an all-CPU config (graph_expert_layers=0) fails the same way (3.89 tok/s, garbled). Setting
-`ZEROMOE_QWEN4EXP_DECODE_RECREATE_GRAPH_ARENA=1` restores 36.54 tok/s coherent. Needed fix before committing that default: when the borrowed build fails,
-retry with freshly built arenas (recreate) instead of falling to layered decode, or skip borrowing when a per-expert split / zero device-expert layers is planned.
+Historical note (2026-10-02): forcing separate decode arenas avoided an early borrowed-arena failure but cost roughly 3.2 s per split decode setup. The borrowed-build failure is now handled by releasing the retained owners and retrying with fresh arenas; the force-recreate env was retired on 2026-10-28.
 
-## 18. Decode graph construction < 1 s for split configs (2026-10-02, night)
+## 18. Decode graph construction under 1 s for split configs (2026-10-02, night)
+
+Historical measurements below used the force-recreate env override, removed 2026-10-28. Current decode borrows compatible arenas and retries with fresh arenas if the borrowed build fails. < 1 s for split configs (2026-10-02, night)
 
 Target: decode graph setup (`[GGML-QWEN-FULL-DECODE-SETUP] prepare_total`, first decode token) under 1 s. Measured on the final build, default settings:
 IQ1_M 0/44/4 **100.9 ms** (was 3229 ms with `RECREATE_GRAPH_ARENA=1`, and BROKEN/garbled with the new borrow default), Q2_0 0/44/4 **96.7 ms** (was broken), IQ1_M 22/26 131.7 ms, Q2_0 22/26 129.3 ms,
@@ -378,7 +375,7 @@ Changes (all in `src/ggml_qwen4exp_graph.cpp`):
 - Prefill borrows the retained dense arena when this graph has no resident expert layers (saves a second 3.3 GiB dense arena and ~400 ms in prefill).
 - Per-prompt VRAM policy (`manage_decode_arena_for_prefill`): prefill workspace is ~0.5 GiB + 7.5 MiB/token (measured 0.69 GiB at S=20, 13.18 GiB at S=1747), which cannot coexist with the 13.3 GiB arena. Short prompts (roughly <= ~120 tokens on a 24 GiB card) keep the arena resident; a longer prompt releases it first (that request pays the old ~3.1-3.6 s decode build), and the arena is re-retained from the live decode graph when the next short prompt arrives.
 Verified sequence in one session (short, 1747 tokens, short): decode setup 97 ms, arena released + 25 s prefill OK + 3103 ms decode build, then 98 ms again; exit 0. WITHOUT the per-prompt policy the long prompt crashed (CUDA OOM, exit 134).
-Opt-outs: `ZEROMOE_QWEN4EXP_DECODE_RECREATE_GRAPH_ARENA=1` (no borrowing), `ZEROMOE_QWEN4EXP_GRAPH_BOOTSTRAP=0` (no startup preparation). Possible follow-up: prefill scheduler activation copies (workspace ~7.5 MiB/token) would raise the prompt length that keeps the arena resident.
+Current startup opt-out: `ZEROMOE_QWEN4EXP_GRAPH_BOOTSTRAP=0` skips startup preparation. The force-recreate override was removed on 2026-10-28; prompt activation-copy sizing remains a possible follow-up.
 
 ## 19. Host-node gap investigation: it was thread placement, not the signaling (2026-10-02, late)
 
@@ -397,7 +394,7 @@ Host-node mode (CPU MoE as CUDA host callbacks) ran at 22.7 tok/s vs 28.0 for pl
 
 ## 20. Host-node GPU weighted reduce (+1.65%)
 
-`ZEROMOE_QWEN4EXP_HOST_NODE_GPU_REDUCE` (default on; `=0` opts out). The callback runs the CPU graph through the down projection
+The measured GPU reduce policy is fixed on; the old `ZEROMOE_QWEN4EXP_HOST_NODE_GPU_REDUCE=0` A/B opt-out was removed on 2026-10-28. The callback runs the CPU graph through the down projection
 (`run_strided_planes_down` / `run_strided_down`, runner `output_per_expert`), H2D copies `[D, topk]`, and the GPU applies
 `mul(route_weights)` -> `permute+cont` -> `sum_rows`. Removes the CPU reduce tail and the weights D2H.
 A/B on `cond.toml`, HOST_NODE=1, 6 interleaved runs each: ON 26.58/26.28/26.38/26.58/26.55/26.40 (mean 26.46),

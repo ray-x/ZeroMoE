@@ -217,7 +217,8 @@ void CUDART_CB qwen4exp_cuda_usage_track_callback(void *user_data) {
       !ctx->host_ids)
     return;
   const auto start = std::chrono::steady_clock::now();
-  const bool hit_log = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_ROUTE_HIT_LOG") != nullptr;
+  const bool hit_log = Logger::instance().would_log(LogLevel::DEBUG);
+  const uint64_t token_idx = ctx->token_count++;
   std::string hit_line;
   static FILE *ids_dump = [] {
     const char *path = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_ROUTE_IDS_DUMP");
@@ -236,7 +237,7 @@ void CUDART_CB qwen4exp_cuda_usage_track_callback(void *user_data) {
         ++hits;
     }
     if (ids_dump) {
-      std::fprintf(ids_dump, "%llu %d", static_cast<unsigned long long>(ctx->token_count), l);
+      std::fprintf(ids_dump, "%llu %d", static_cast<unsigned long long>(token_idx), l);
       for (int k = 0; k < ctx->topk; ++k) {
         const int32_t expert = ctx->host_ids[static_cast<size_t>(l) * ctx->topk + k];
         const bool hot = has_mask && expert >= 0 && expert < ctx->n_experts && ctx->hot_mask[l][expert];
@@ -247,13 +248,11 @@ void CUDART_CB qwen4exp_cuda_usage_track_callback(void *user_data) {
     if (hit_log)
       hit_line += (has_mask ? std::to_string(hits) : std::string("-")) + ",";
   }
-  if (ids_dump) {
+  if (ids_dump)
     std::fflush(ids_dump);
-    if (!hit_log) ++ctx->token_count;
-  }
   if (hit_log)
-    LOG_INFO("[ROUTE-HIT] tok=%llu hits=%s\n",
-             static_cast<unsigned long long>(ctx->token_count++),
+    LOG_DEBUG("[ROUTE-HIT] tok=%llu hits=%s\n",
+             static_cast<unsigned long long>(token_idx),
              hit_line.c_str());
   const double ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - start)
@@ -284,13 +283,7 @@ bool qwen4exp_cuda_usage_track_node_enqueue(const ggml_tensor *node,
   return true;
 }
 
-bool env_host_node_gpu_reduce() {
-  return zeromoe::graphcfg::flag_unless_off("ZEROMOE_QWEN4EXP_HOST_NODE_GPU_REDUCE");
-}
 
-bool env_host_node_skip_cpu() {
-  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_HOST_NODE_SKIP_CPU");
-}
 
 // Experimental milestone-2 graph: one static split layer keeps its resident
 // GPU branch in the graph and sends the complement through a bounded DDR host
@@ -308,14 +301,6 @@ int env_partial_graph_layer() {
 bool env_partial_graph_enabled(int layer) {
   const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PARTIAL_GRAPH");
   return v && v[0] == '1' && env_partial_graph_layer() == layer;
-}
-
-// Diagnostic topology switch: keep the initial CPU->GPU contiguous handoff
-// on the CPU backend while retaining the CUDA-owned host-node markers.  This
-// lets A/B runs separate the prologue/backend-edge cost from host-callback
-// CPU contention without changing the default host-node topology.
-bool env_host_node_keep_cpu_prologue() {
-  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_HOST_NODE_KEEP_CPU_PROLOGUE");
 }
 
 bool qwen4exp_host_node_timing_enabled() {
@@ -420,20 +405,6 @@ bool qwen4exp_dump_f32(const char *path, const float *data,
 }
 
 void CUDART_CB qwen4exp_cuda_host_node_callback(void *user_data) {
-  static thread_local bool thread_configured = false;
-  if (!thread_configured) {
-    configure_current_thread({
-        .name = "QWEN-CUDA-CB",
-        // Leave the driver callback unpinned.  A fixed orchestration core
-        // contended with the ordinary GGML CPU pool in the first A/B run.
-        .cpu_ids = {},
-        .use_rt = true,
-        .rt_priority = 85,
-        .nice_value = -20,
-        .apply_nice = false,
-    });
-    thread_configured = true;
-  }
   auto *ctx = static_cast<Qwen4ExpCudaHostNodeContext *>(user_data);
   if (!ctx || ctx->magic != Qwen4ExpCudaHostNodeContext::kMagic)
     return;
@@ -598,9 +569,6 @@ void CUDART_CB qwen4exp_cuda_host_node_callback(void *user_data) {
   if (!routes_ready) {
     ok = false;
   } else if (skip_cpu_compute) {
-    std::fill_n(ctx->host_output, ctx->output_bytes / sizeof(float), 0.0f);
-    ok = true;
-  } else if (env_host_node_skip_cpu()) {
     std::fill_n(ctx->host_output, ctx->output_bytes / sizeof(float), 0.0f);
     ok = true;
   } else if (ctx->partial_cold_only) {

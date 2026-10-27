@@ -846,9 +846,6 @@ ggml_tensor *partial_map(FullGraph &g, ggml_context *ctx, int layer, bool hot,
     }
   }
 
-  // ZEROMOE_GLM5NEXT_PARTIAL_ZERO_SENTINEL=1 forces the valid dummy id (A/B tests).
-  static const bool force_dummy =
-      zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PARTIAL_ZERO_SENTINEL") != nullptr;
   // Batched MMQ negative-id skipping regressed Ling's short-prompt prefill
   // (13.2 s vs 1.4 s for the same two-token input). Keep batched Ling routes
   // on the valid dummy id; the single-token decode path still uses MMVQ's
@@ -864,9 +861,8 @@ ggml_tensor *partial_map(FullGraph &g, ggml_context *ctx, int layer, bool hot,
            "ZEROMOE_GLM5NEXT_BATCHED_NEGATIVE_SKIP", 0) != 0) &&
       layer_experts_take_mmq(g, layer);
   const moe_partial::SentinelPolicy policy =
-      force_dummy ? moe_partial::SentinelPolicy::ForceDummy
-      : allow_batched_negative_skip ? moe_partial::SentinelPolicy::AutoBatched
-                                    : moe_partial::SentinelPolicy::Auto;
+      allow_batched_negative_skip ? moe_partial::SentinelPolicy::AutoBatched
+                                  : moe_partial::SentinelPolicy::Auto;
   moe_partial::ExpertBranchMap branch_map;
   if (use_alias) {
     zeromoe::graph::AliasedLayerPlacement lp;
@@ -893,10 +889,9 @@ ggml_tensor *partial_map(FullGraph &g, ggml_context *ctx, int layer, bool hot,
   if (!logged_inactive) {
     logged_inactive = true;
     LOG_INFO("[GGML-GLM5NEXT-FULL] partial-layer inactive route id=%d "
-             "(mmid negative-skip %s%s)\n",
+             "(mmid negative-skip %s)\n",
              (int)branch_map.inactive_id(),
-             mmid_negative_skip_available() ? "available" : "unavailable",
-             force_dummy ? ", forced dummy by env" : "");
+             mmid_negative_skip_available() ? "available" : "unavailable");
   }
   const void *data = mask ? (const void *)branch_map.route_mask().data()
                           : (const void *)branch_map.route_ids().data();
@@ -1358,7 +1353,7 @@ void update_partial_routes(FullGraph &g, int pos_base, double compute_ms) {
       }
     }
     if (!line.empty())
-      LOG_WARN("[GLM5NEXT-PARTIAL-HIT] tokens=%d per-layer hot-route hit:%s\n",
+      LOG_DEBUG("[GLM5NEXT-PARTIAL-HIT] tokens=%d per-layer hot-route hit:%s\n",
                tap.tokens, line.c_str());
   }
 

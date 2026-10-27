@@ -60,8 +60,6 @@ def parse_env_overrides(values: list[str]) -> dict[str, str]:
         "ZEROMOE_GENERATED_TOKEN_FILE", "ZEROMOE_TEACHER_FORCE_TOKEN_FILE",
         "ZEROMOE_TEACHER_FORCE_SKIP_SAMPLING", "ZEROMOE_BENCH_IGNORE_STOP",
         "ZEROMOE_QWEN4EXP_FULL_GRAPH", "ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE",
-        "ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS",
-        "ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING",
     }
     result = {}
     for item in values:
@@ -132,7 +130,9 @@ def wait_for_idle(gpu: str, timeout: int) -> None:
 def run_engine(engine: Path, engine_repo: Path, config: Path, prompt: str,
                env: dict[str, str], stdout_path: Path, timeout: int) -> None:
     with stdout_path.open("w") as output:
-        subprocess.run([str(engine), "--config", str(config)], input=prompt + "\n:q\n",
+        subprocess.run([str(engine), "--graph-device-expert-layers", "0",
+                            "--graph-device-expert-trailing", "1",
+                            "--config", str(config)], input=prompt + "\n:q\n",
                        text=True, stdout=output, stderr=subprocess.STDOUT,
                        cwd=engine_repo, env=env, timeout=timeout, check=True)
 
@@ -271,8 +271,6 @@ def main() -> int:
             "OMP_NUM_THREADS": str(args.threads),
             "ZEROMOE_QWEN4EXP_FULL_GRAPH": "1",
             "ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE": "1",
-            "ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS": "0",
-            "ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING": "1",
             "ZEROMOE_QWEN_CPU_THREADS": str(args.threads),
             "ZEROMOE_BENCH_IGNORE_STOP": "1",
         })

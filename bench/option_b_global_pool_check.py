@@ -89,8 +89,6 @@ def main():
             del env[key]
     env.update({
         "CUDA_VISIBLE_DEVICES": args.gpu,
-        "ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS": "0",
-        "ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING": "1",
         "ZEROMOE_QWEN_CPU_THREADS": str(args.cpu_threads),
         "ZEROMOE_BENCH_IGNORE_STOP": "1",
     })
@@ -136,7 +134,7 @@ def main():
             print(f"Running {name} ({args.ngen} tokens)...", flush=True)
             started = time.monotonic()
             with (args.out_dir / f"{name}.stdout").open("w") as stdout:
-                subprocess.run([str(args.engine), "--verbosity", "5", "--config", str(cfg), "--predict", str(args.ngen)],
+                subprocess.run([str(args.engine), "--verbosity", "5", "--graph-device-expert-layers", "0", "--graph-device-expert-trailing", "1", "--config", str(cfg), "--predict", str(args.ngen)],
                                input=prompt + "\n:q\n", text=True, stdout=stdout,
                                stderr=subprocess.STDOUT, cwd=ROOT, env=run_env, check=True)
             print(f"Finished {name} in {time.monotonic() - started:.1f}s", flush=True)

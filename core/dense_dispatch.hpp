@@ -327,16 +327,6 @@ inline bool gdn_full_ggml() {
 }
 inline void set_gdn_full_ggml(bool v) { gdn_full_ggml_flag() = v; }
 
-// ZEROMOE_EXPERT_STREAM_NOSYNC=1 drops the per-expert
-// cudaStreamSynchronize when moe_gpu_accum makes it unnecessary (the
-// accumulate kernel is stream-ordered behind the down-proj, so nothing
-// crosses back to the host). MEASURED 2026-09-05 as a REGRESSION on
-// qwen4exp -- removing the sync lets the copy engine run continuously,
-// and the staging memcpy then contends with it for DRAM (`disk=` tripled,
-// 2.27s -> 6.05s, net prefill 20.44s -> 23.10s). Kept behind an env flag
-// rather than deleted: the sync IS genuinely redundant, so this becomes a
-// win the moment staging stops competing for the same bandwidth (e.g. if
-// the mmap pages are ever DMA'd without a host-side copy).
 // --- moe_expert_bf16_gemm (EngineConfig, default OFF) --------------------
 // Routes the ROUTED-EXPERT gate/up/down matmuls through
 // dequantise-to-BF16 + cuBLAS tensor-core GEMM instead of the fused
@@ -370,13 +360,6 @@ inline bool moe_expert_bf16_gemm() {
 }
 inline void set_moe_expert_bf16_gemm(bool v) { moe_expert_bf16_gemm_flag() = v; }
 
-inline bool expert_stream_no_sync() {
-  static const bool v = [] {
-    const char *e = zeromoe::graphcfg::env("ZEROMOE_EXPERT_STREAM_NOSYNC");
-    return e && *e == '1';
-  }();
-  return v;
-}
 inline void set_moe_prefill_stream_chunk(int v) {
   moe_prefill_stream_chunk_flag() = (v > 0 ? v : 1);
 }

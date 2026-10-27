@@ -14,8 +14,6 @@
 #endif
 #include "exllamav3_backend.hpp"
 #include "engine_runner.hpp"
-#include "graph_config.hpp"
-#include "thread_profile.hpp"
 #include "ggml_gdn_proj_backend.hpp"
 #include "ggml_glm5next_graph.hpp"
 #include "ggml_glm5next_proj_backend.hpp"
@@ -237,6 +235,7 @@ void print_usage(bool all = false) {
       << "  --temp <F>       Sampling temperature. 0.0 for greedy decode "
          "(default: 0.7)\n"
       << "  --top-p <F>      Nucleus sampling top-p threshold (default: 0.90)\n"
+      << "  --repeat-penalty <F> Repetition penalty (default: 1.0)\n"
       << "  --main-gpu <ID>  CUDA device ID for single-GPU mode (default: 0)\n"
       << "  --spec-type <none|draft-mtp>  Speculative decoding mode\n"
       << "  --spec-draft-model <path>     Optional external draft checkpoint\n"
@@ -296,7 +295,7 @@ void print_usage(bool all = false) {
       << "                   (--bench-prompt <file> repeatable, --bench-ngen N, --bench-reps N, --bench-warmup N,\n"
       << "                    --bench-long N, --bench-out <file>; see core/bench_mode.hpp)\n"
       << "                   llama-bench style random tokens: --bench-random-pp N, --bench-random-tg N, --bench-seed S\n"
-      << "  --stats-file <path>  Append one JSON line per finished request (also ZEROMOE_STATS_FILE)\n"
+      << "  --stats-file <path>  Append one JSON line per finished request\n"
       << "  --force-start    Bypass the startup safety checks (concurrent "
          "zeromoe\n"
       << "                   instance, real RAM headroom, free VRAM) -- only "
@@ -442,6 +441,8 @@ int main(int argc, char *argv[]) {
   bool collect_usage_stats_cli = false;
   float temp_cli = -1.0f, top_p_cli = -1.0f; // -1 sentinel = "not given" (0.0
                                              // is a valid greedy-decode value)
+  float repeat_penalty_cli = 1.0f;
+  bool repeat_penalty_cli_given = false;
   // 2026-09: real incident -- a second zeromoe instance (a separate
   // one-off smoke test) was started while this box already had another
   // zeromoe benchmark running; the two together drove the box into
@@ -572,6 +573,10 @@ int main(int argc, char *argv[]) {
       temp_cli = std::stof(argv[++i]);
     else if (arg == "--top-p" && i + 1 < argc)
       top_p_cli = std::stof(argv[++i]);
+    else if (arg == "--repeat-penalty" && i + 1 < argc) {
+      repeat_penalty_cli = std::stof(argv[++i]);
+      repeat_penalty_cli_given = true;
+    }
     else if (arg == "--bench")
       zeromoe::bench::plan().enabled = true;
     else if (arg == "--bench-prompt" && i + 1 < argc)
@@ -623,7 +628,7 @@ int main(int argc, char *argv[]) {
   config.graph_cli_settings = std::move(graph_cli_settings);
 
   // Public configs carry a placeholder model_path ("/path/to/model-or-shard-directory"). Resolve the model here:
-  // --model wins; otherwise a real model_path in the config; otherwise ZEROMOE_MODEL_PATH; otherwise stop.
+  // --model wins; otherwise use a real model_path in the config; otherwise stop.
   auto is_placeholder_model_path = [](const std::string &p) {
     return p.empty() || p.rfind("/path/to/", 0) == 0 || p.rfind("path_to_", 0) == 0;
   };
@@ -634,13 +639,7 @@ int main(int argc, char *argv[]) {
     }
     if (!is_placeholder_model_path(target))
       return true;
-    const char *env_model = zeromoe::graphcfg::env("ZEROMOE_MODEL_PATH");
-    if (env_model && *env_model) {
-      target = env_model;
-      return true;
-    }
-    std::cerr << "[CONFIG] model_path is not set. Pass --model <file>, set ZEROMOE_MODEL_PATH, "
-                 "or edit model_path in the config.\n";
+    std::cerr << "[CONFIG] model_path not set. Pass --model <file> or edit model_path in config.\n";
     return false;
   };
 
@@ -688,9 +687,8 @@ int main(int argc, char *argv[]) {
       return 1;
     if (!config.validate())
       return 1;
-  } else if (!model_path.empty() ||
-             zeromoe::graphcfg::env("ZEROMOE_MODEL_PATH")) {
-    // Build config from CLI arguments (backward compat), or from ZEROMOE_MODEL_PATH when no --model is given
+  } else if (!model_path.empty()) {
+    // Build config from CLI arguments when no TOML config is given.
     config.model_path = model_path;
     if (!resolve_model_path(config.model_path))
       return 1;
@@ -785,6 +783,8 @@ int main(int argc, char *argv[]) {
     config.temperature = temp_cli;
   if (top_p_cli >= 0.0f)
     config.top_p = top_p_cli;
+  if (repeat_penalty_cli_given)
+    config.repeat_penalty = repeat_penalty_cli;
 
   // Initialize the logger before anything else logs — empty log_path keeps
   // everything on stderr exactly as before.
@@ -827,6 +827,7 @@ int main(int argc, char *argv[]) {
         "--cuda-schedule", config.exllamav3_cuda_schedule,
         "--temp", std::to_string(config.temperature),
         "--top-p", std::to_string(config.top_p),
+        "--repeat-penalty", std::to_string(config.repeat_penalty),
         config.raw_prompt ? "--raw-prompt" : "--no-raw-prompt",
         config.enable_thinking ? "--thinking" : "--no-thinking"};
     if (!config.prompt.empty()) {

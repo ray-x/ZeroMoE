@@ -38,7 +38,6 @@ Settings are read when the process starts, and graph settings are cached per mod
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `ZEROMOE_MODEL_PATH` | unset | Model file or shard directory. Used when the config's `model_path` is a placeholder (`/path/to/…` or `path_to_…`) and no `--model` is given. Precedence: `--model`, then a real `model_path` in the config, then this variable. If none is set, the engine stops with a message. |
 
 ## API authentication
 
@@ -49,15 +48,14 @@ Settings are read when the process starts, and graph settings are cached per mod
 ## Qwen 3.8 Flash full graph
 
 The shipped Qwen recipe no longer requires full-graph launch flags. Prefill and
-decode default to the graph; placement uses `graph_device_expert_layers` and
-`graph_device_expert_trailing`. The legacy preload aliases remain.
+decode default to the graph; placement uses TOML `graph_device_expert_layers` /
+`graph_device_expert_trailing` or CLI `--graph-device-expert-layers` /
+`--graph-device-expert-trailing`. The legacy preload environment aliases were removed.
 
 | Variable | Set to | Effect |
 | --- | --- | --- |
 | ~~`ZEROMOE_QWEN4EXP_FULL_GRAPH`~~ | removed | Full-graph prefill is the default. TOML `qwen4exp_full_graph = false` is the only opt-out; set the decode key false too for a fully layered fallback. |
 | ~~`ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE`~~ | removed | Full-graph decode is the default. TOML `qwen4exp_full_graph_decode = false` keeps graph prefill and selects layered decode. |
-| `ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS` | `2` | Whole layers preloaded to VRAM. `0` explicitly disables the whole-layer block (the global-pool recipe uses this); an enabled block must be at least `2` layers, and values above 48 are capped at 48. Legacy alias for `graph_device_expert_layers`. |
-| `ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING` | `0` | Place the whole GPU-resident block at the end of the network (llama.cpp `-ncmoe` style) instead of the start. Only has an effect when `GRAPH_PRELOAD_LAYERS` is nonzero. Legacy alias for `graph_device_expert_trailing`. |
 | `ZEROMOE_QWEN4EXP_PREFILL_OP_OFFLOAD` | `1` (default) | Run host-resident experts on the GPU during prefill, by copying the batch's experts across. `0` keeps them on the CPU. |
 | `ZEROMOE_QWEN_CPU_THREADS` | all OpenMP threads | Positive integer. Caps (never raises) the threads used for Qwen CPU expert work. |
 | `ZEROMOE_QWEN4EXP_HOST_NODE` | off | Use the host-node CPU/GPU schedule (`flag_on`). Measured in [runtime-settings.md](runtime-settings.md). |
@@ -81,7 +79,7 @@ The default Qwen recipe (`configs/qwen38-flash.toml`) does not set any of these.
 | `ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT`, `ZEROMOE_QWEN_EARLY_READY_ASYNC_OUTPUT`, `ZEROMOE_QWEN_EARLY_READY_RESIDENT_TABLES`, `ZEROMOE_QWEN_EARLY_READY_LAYER13`, `ZEROMOE_QWEN_EARLY_READY_PREDICT`, `ZEROMOE_QWEN_EARLY_READY_SKIP_ALL_HOT` | Early-ready expert placement and output copy. Background and measurements: [the graph refactor worklog](option-b-graph-refactor-steps-2026-10-04.md). |
 | `ZEROMOE_QWEN_EARLY_READY_PREDICT_LAYER` | Restrict the pilot prediction to one target layer. Unset predicts for every split layer. |
 | `ZEROMOE_QWEN_EARLY_READY_RIDGE` | Path to a pilot ridge table. A missing or invalid file leaves the plain pilot. |
-| `ZEROMOE_QWEN_EARLY_READY_STAGE_LAYER`, `ZEROMOE_QWEN_EARLY_READY_STAGE_MAX`, `ZEROMOE_QWEN_EARLY_READY_STAGE_VERIFY`, `ZEROMOE_QWEN_EARLY_READY_STAGE_NO_REQUEST`, `ZEROMOE_QWEN_EARLY_READY_STAGE_DELAY_US`, `ZEROMOE_QWEN_EARLY_READY_STAGE_WORKER_DELAY_US` | Staging ring for the early-ready lane: target layer (integer or `all`), staged-entry cap (clamped to 32), verification, prediction without a staging request, and failure-injection delays in µs (test hooks). |
+| `ZEROMOE_QWEN_EARLY_READY_STAGE_LAYER`, `ZEROMOE_QWEN_EARLY_READY_STAGE_VERIFY` | Select stage layer (`all` or an integer) and enable output verification for the active staging checks. |
 | `ZEROMOE_QWEN_EARLY_READY_ROUTE_TRACE` | Log routing decisions of the early-ready lane. Diagnostic. |
 | `ZEROMOE_QWEN4EXP_PREFILL_STATE_HANDOFF` | Hand prefill recurrent state to decode without a copy. |
 
@@ -105,12 +103,10 @@ These are model-specific. The model's own document (`docs/models/<model>.md`) is
 | `ZEROMOE_GLM5NEXT_GPU1_HOT_GIB` | unset | Hot-expert budget on the second GPU, in GiB (multi-GPU runs only). Unset or empty leaves the GPU1 hot set unconfigured. |
 | `ZEROMOE_GLM5NEXT_GPU1_HOT_PRELOAD` | `1` | Preload the second-GPU hot set. `0` disables. |
 | `ZEROMOE_GLM5NEXT_PREFILL_GPU1` | `1` | Use the second GPU during prefill. `0` disables. |
-| `ZEROMOE_GLM5NEXT_PREFILL_OP_OFFLOAD` | off | Prefill op offload, as for Qwen (`flag_on`). |
+| `graph_*` settings | Typed TOML keys and generic `--graph-*` CLI flags. | Offload and scheduler settings use canonical names such as `--graph-prefill-op-offload 1`, `--graph-pilot-copy 0`, and `--graph-offload-split-reads 1`; legacy GLM5Next env aliases are retired. |
 | `ZEROMOE_GLM5NEXT_PILOT_PREFETCH` | `0` | Pilot prefetch depth, clamped to 0–8; above `0` enables the pilot. The effective depth is at least `ZEROMOE_GLM5NEXT_PILOT_STAGE`, and predicted experts that are not in host memory are read from SSD ahead of the layer that needs them. |
 | `ZEROMOE_GLM5NEXT_PILOT_STAGE` | `0` | Number of next-layer cold experts the pilot stages into the VRAM ring per layer, clamped to 0–8. `0` disables pilot staging. |
-| `ZEROMOE_GLM5NEXT_PILOT_COPY` | `1` | Set `0` for prefetch-only mode: the pilot reads predicted experts into host memory in the background, nothing is copied into the VRAM ring, and the CPU computes every cold route as without staging. |
 | `ZEROMOE_GLM5NEXT_MODEL_DIRECT` | off | Read model tensors directly (`1` enables). |
-| `ZEROMOE_GLM5NEXT_OFFLOAD_SPLIT` | off | Split expert-offload reads across tiers (`1` enables; a leading `1` only). Alias of `graph_offload_split_reads`, also inherited by Ling's shared GLM graph. Not a size or ratio. |
 
 ## Benchmark, diagnostic and test
 
@@ -118,9 +114,11 @@ These are model-specific. The model's own document (`docs/models/<model>.md`) is
 | --- | --- |
 | `ZEROMOE_BENCH_IGNORE_STOP` | Benchmark runs ignore end-of-sequence tokens, so every run generates its full token count. Set to `1` in bench scripts. |
 | `ZEROMOE_BENCH_SILENT` | Suppress per-token printing and per-token VRAM sampling in the timed path. |
-| `ZEROMOE_STATS_FILE` | Append one JSON line per finished request (same as `--stats-file PATH`): prompt and generated tokens, prefill and decode speed, time to first token, decode setup. Fields: [performance-measurement.md](performance-measurement.md). |
+| `ZEROMOE_QWEN4EXP_MTP_WINDOW=0` | Force the graph-native Qwen MTP target to verify drafted tokens stepwise instead of in a multi-token window. ZeroMoE-specific correctness comparison; default uses the window derived from `spec_draft_n_max`. |
 | `ZEROMOE_GENERATED_TOKEN_FILE` | Write each generated token id to this file, one per line (truncated at step 0). For numerical comparisons. |
 | `ZEROMOE_DECODE_LOGITS_DUMP` | Dump decode logits to this file. Diagnostic. |
+| `ZEROMOE_QWEN4EXP_DIAG_DUMP_DIR` | With `--verbosity 5`, write layer-0 Qwen CPU graph tensor snapshots into this directory. |
+| `--verbosity 5` | Emits Qwen layer-0 CPU graph diagnostics (`[QWEN4EXP-LAYER0-DIAG]`); the separate dump-directory variable controls binary snapshots. |
 | `ZEROMOE_WUV_INT8` | Attention value-projection int8 path (`1` enables). Diagnostic; read in `core/attention_layer.cpp`. |
 | `ZEROMOE_GLM5NEXT_ROUTE_TRACE` | Write routed expert IDs to a trace file. Diagnostic. Per-layer timing follows `--verbosity 5`. |
 | `ZEROMOE_TEST_EXL3_CPU_ONLY`, `ZEROMOE_TEST_EXL3_ONLY` | Stop the native test harness early: after the CPU/EXL3 checks with `_CPU_ONLY`, after the CUDA kernel checks with `_ONLY` (the form `README.md` uses for the short CUDA check). |

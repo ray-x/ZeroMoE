@@ -18,7 +18,7 @@ bool graph_enabled_for(const StreamingEngine &engine) {
   return glm5next_graph::glm_family(engine.family_ops.family);
 }
 
-// ZEROMOE_GLM5NEXT_OFFLOAD_ASYNC=1: the arena lock covers only bookkeeping; expert reads run outside it (see
+// graph_offload_async=true: the arena lock covers only bookkeeping; expert reads run outside it (see
 // ExpertResidency::begin/finish), so a background prefetch and a demand miss overlap instead of serializing on I/O.
 bool offload_async() {
   static const bool on = [] {
@@ -64,7 +64,7 @@ bool pilot_prefetch_on() {
   return on;
 }
 
-// ZEROMOE_GLM5NEXT_PILOT_COPY=0: prefetch-only mode. The pilot reads predicted experts into DDR in the background; nothing is copied to the
+// graph_pilot_copy=0: prefetch-only mode. The pilot reads predicted experts into DDR in the background; nothing is copied to the
 // VRAM ring and no layer waits for the prefetch, so the CPU computes every cold route as without staging.
 bool pilot_copy_on() {
   static const bool on = [] {
@@ -112,11 +112,8 @@ bool dynamic_cache_enabled() {
 }
 
 bool route_stats_enabled() {
-  static const bool enabled = [] {
-    const char *v = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_CACHE_STATS");
-    return (v && v[0] == '1') || dynamic_cache_enabled();
-  }();
-  return enabled;
+  return dynamic_cache_enabled() ||
+         Logger::instance().would_log(LogLevel::DEBUG);
 }
 
 int env_device_expert_layers() {
@@ -140,7 +137,7 @@ bool layer_timing_env() {
 
 // Run each layer's cold (CPU) experts on a private lane that starts as soon as the
 // routed ids reach the host, instead of after the layer's GPU work. Decode only.
-// ZEROMOE_GLM5NEXT_EARLY_READY controls execution, not which experts occupy VRAM:
+// graph_early_ready controls execution, not which experts occupy VRAM:
 //   unset: select per layer; enable for offload work or a GPU hot-expert branch
 //          to overlap, otherwise use the ordinary graph for RAM-only CPU experts.
 //   0: disable the lane; 1: force it wherever the lane is supported.
@@ -160,7 +157,7 @@ bool early_ready_wanted(bool has_overlap_work) {
 // Overlap a layer's SSD miss reads with the CPU compute of its already-resident
 // cold experts (lane only). Bit-exact: the two partial outputs are disjoint routes.
 // On by default (order-balanced A/B: 4.29 -> 4.92 tok/s, logits and tokens identical);
-// ZEROMOE_GLM5NEXT_SPLIT_LOAD=0 opts out.
+// The TOML/generic CLI graph setting remains available for explicit experiments.
 bool split_load_wanted() {
   static const bool on = zeromoe::graphsettings::active_settings().tun.split_load.value != 0;
   return on;
@@ -174,10 +171,10 @@ bool lane_with_gpu1_wanted() {
 // Up to N resident cold experts per layer run on a second CUDA stream while the CPU computes the rest. On by
 // default (3): 58 GiB pool 8.1 -> 9.4-9.8 tok/s, dual GPU 78.3 -> 65.2 ms/token. Numerics differ from the CPU
 // kernels by the same amount as moving an expert between valid placements (teacher-forced 48 tokens: top-1 92-96 %,
-// mean KL 0.03-0.05 for assist AND for plain 3090-only vs dual-GPU). ZEROMOE_GLM5NEXT_GPU_ASSIST=0 disables it
+// mean KL 0.03-0.05 for assist AND for plain 3090-only vs dual-GPU). graph_gpu_assist_slots=0 disables it
 // and gives bit-identical CPU-lane output.
 // Optional second assist device (its own ring and PCIe link): ZEROMOE_GLM5NEXT_ASSIST2_DEVICE=<cuda device> (default: device 1 on a
-// dual-GPU run with a second-GPU hot set, else off) and ZEROMOE_GLM5NEXT_ASSIST2_SLOTS=<n> (default 1).
+// dual-GPU run with a second-GPU hot set, else off) and graph_gpu_assist2_slots=<n> (default 1).
 int second_gpu_device(int core_device) { return core_device == 0 ? 1 : 0; }
 
 int gpu_assist2_device(int core_device) {

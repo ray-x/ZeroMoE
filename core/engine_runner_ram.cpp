@@ -260,17 +260,9 @@ std::expected<void, std::string> EngineRunner::init_ram_tier() {
           ram_mgr.cap_for_layer(layer) < n_experts)
         continue;
       graph_ram_full_layers.push_back(layer);
-      // Qwen's full graph can consume separate compact gate/up/down views on
-      // CPU. GPU layers keep their fused gate/up graph by gathering the two
-      // planes directly into the final VRAM tensor, so the arena itself can
-      // use the same no-duplicate layout for every Qwen graph layer. Keep an
-      // explicit opt-out for A/B comparisons; it changes only the DDR arena
-      // layout, not layer placement or graph topology.
-      const char *compact_env = zeromoe::graphcfg::env(
-          "ZEROMOE_QWEN4EXP_GRAPH_PROJECTION_COMPACT");
-      const bool projection_compact_enabled =
-          !(compact_env && compact_env[0] == '0');
-      const char *host_node_env =
+      // Qwen full-graph CPU layers use compact gate/up/down views; keep the
+// duplicate-free arena layout fixed for all supported Qwen graph layers.
+const char *host_node_env =
           zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_HOST_NODE");
       const bool host_node_enabled = host_node_env && host_node_env[0] == '1';
       // The legacy scheduler CPUOffload path still uses the single-stride
@@ -278,8 +270,7 @@ std::expected<void, std::string> EngineRunner::init_ram_tier() {
       // now supports independent projection strides and can use the compact
       // planes without creating a second copy.
       if (engine.family_ops.family == ModelFamily::Qwen4Exp &&
-          projection_compact_enabled &&
-          (!engine.qwen4exp_cpu_offload_layer_enabled(layer) ||
+            (!engine.qwen4exp_cpu_offload_layer_enabled(layer) ||
            host_node_enabled))
         graph_ram_projection_compact_layers.push_back(layer);
     }

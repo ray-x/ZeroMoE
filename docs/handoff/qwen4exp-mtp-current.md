@@ -61,8 +61,8 @@ and explain it.” The model received 29 prompt tokens and stopped at EOS after
   usage files, three draft tokens.
 - GPU: RTX 3090 only (`CUDA_VISIBLE_DEVICES=0`). CPU: Xeon W-2235. Toolkit /
   driver: CUDA 13.3.73 / 610.57.04.
-- Required environment: `ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0` (the
-  measured global-pool placement). MTP phase timing is emitted at DEBUG
+- The measured global-pool placement uses
+  `--graph-device-expert-layers 0`. MTP phase timing is emitted at DEBUG
   verbosity (`--verbosity 5`). Full-graph prefill/decode are now unconditional; the old
   `ZEROMOE_QWEN4EXP_FULL_GRAPH*` switches are removed. Keep
   `ZEROMOE_BENCH_IGNORE_STOP` and `ZP_NOCHAIN` unset.

@@ -5,15 +5,18 @@ root=$PWD
 export GLM_MODEL=${GLM_MODEL:?set GLM_MODEL to the model file or shard directory}
 export GLM_STORE=${GLM_STORE:?set GLM_STORE to the expert-store file}
 export GLM_MIRROR_GLOB=${GLM_MIRROR_GLOB:-}
-export ZEROMOE_GLM5NEXT_OFFLOAD_USAGE=${ZEROMOE_GLM5NEXT_OFFLOAD_USAGE:-$root/.zeromoe_usage_glm53_ud_iq2m}
+usage_file=${GLM_USAGE:-$root/.zeromoe_usage_glm53_ud_iq2m}
 ./bench/glm53/preflight.sh || exit 1
 P=${PROMPT_TEXT:-$(python3 -c "print(' '.join(['The history of computing spans mechanical calculators, vacuum tube machines, transistors, integrated circuits and modern GPUs; summarize the key turning points and why each mattered for software.']*12))")}
-export ZEROMOE_GLM5NEXT_PREFILL_OP_OFFLOAD=${ZEROMOE_GLM5NEXT_PREFILL_OP_OFFLOAD:-1} ZEROMOE_GLM5NEXT_PREFILL_CPU_THREADS=${ZEROMOE_GLM5NEXT_PREFILL_CPU_THREADS:-10} ZEROMOE_GLM5NEXT_CPU_THREADS=${ZEROMOE_GLM5NEXT_CPU_THREADS:-6} ZEROMOE_GLM5NEXT_OFFLOAD_SPLIT=${ZEROMOE_GLM5NEXT_OFFLOAD_SPLIT:-1} ZEROMOE_GLM5NEXT_GPU1_HOT_GIB=${ZEROMOE_GLM5NEXT_GPU1_HOT_GIB:-11}
+export ZEROMOE_GLM5NEXT_PREFILL_CPU_THREADS=${ZEROMOE_GLM5NEXT_PREFILL_CPU_THREADS:-10} ZEROMOE_GLM5NEXT_CPU_THREADS=${ZEROMOE_GLM5NEXT_CPU_THREADS:-6} ZEROMOE_GLM5NEXT_GPU1_HOT_GIB=${ZEROMOE_GLM5NEXT_GPU1_HOT_GIB:-11}
+prefill_op_offload=${GLM_PREFILL_OP_OFFLOAD:-1}
+offload_split=${GLM_OFFLOAD_SPLIT:-1}
+offload_ddr=${OFFLOAD_DDR_GIB:-45}
+offload_async=${GLM_OFFLOAD_ASYNC:-0}
+pilot_copy=${GLM_PILOT_COPY:-1}
+assist2_slots=${GLM_ASSIST2_SLOTS:-1}
 export ZEROMOE_BIN=${ZEROMOE_BIN:-./build/zeromoe}
 export ZEROMOE_DENSE_SCRATCH_RESERVE_MB=768
-export ZEROMOE_GLM5NEXT_OFFLOAD_FIRST_LAYER=3 ZEROMOE_GLM5NEXT_OFFLOAD_DDR_GIB=${OFFLOAD_DDR_GIB:-45}
-export ZEROMOE_GLM5NEXT_OFFLOAD_STORE=$GLM_STORE
-export ZEROMOE_GLM5NEXT_OFFLOAD_MODEL=$GLM_MODEL
 export ZEROMOE_GLM5NEXT_GRAPH_STRICT=1
 config=${TOML:-configs/bench/glm53/glm53_dsa_core5060_retarget.toml}
 run_config=$(mktemp "${TMPDIR:-/tmp}/zeromoe-glm53.XXXXXX.toml")
@@ -32,7 +35,15 @@ if count != 1:
     raise SystemExit("config must contain exactly one model_path")
 Path(sys.argv[2]).write_text(text)
 PY
-(printf "%s\n:q\n" "$P" | timeout 1500 "${ZEROMOE_BIN:-./build/zeromoe}" --config "$run_config" --predict "${NGEN:-48}" --temp 0 > logs/glm53_dsa_graph2gpu_tke.stdout 2>&1)
+(printf "%s\n:q\n" "$P" | timeout 1500 "${ZEROMOE_BIN:-./build/zeromoe}" \
+  --config "$run_config" \
+  --graph-offload-first-layer 3 --graph-offload-ddr-gib "$offload_ddr" \
+  --graph-offload-store "$GLM_STORE" --graph-offload-model "$GLM_MODEL" \
+  --graph-offload-usage-file "$usage_file" --graph-offload-split-reads "$offload_split" \
+  --graph-prefill-op-offload "$prefill_op_offload" \
+  --graph-offload-async "$offload_async" --graph-pilot-copy "$pilot_copy" \
+  --graph-gpu-assist2-slots "$assist2_slots" \
+  --predict "${NGEN:-48}" --temp 0 > logs/glm53_dsa_graph2gpu_tke.stdout 2>&1)
 engine_rc=$?
 grep -E "Rates:|OFFLOAD|FULL-DECODE|WARN|ERROR" logs/glm53_dsa_graph2gpu_tke.log | cut -c1-220 | head -40 || true
 # Propagate the engine status: the gate must never treat a crashed candidate as a pass

@@ -119,19 +119,7 @@ static bool expert_ffn_cpu_qwen_grouped_quantized(
   // The persistent graph currently models plain SwiGLU.  Do not route a
   // clamped Qwen variant through it until its clamp semantics are represented
   // in the graph; the established CPU path remains the safe fallback.
-  static const int cpu_graph_mode = [] {
-    const char *env = zeromoe::graphcfg::env("ZEROMOE_QWEN_CPU_GRAPH");
-    if (env && env[0] == '0')
-      return 0; // force the established path
-    if (env && env[0] == '2')
-      return 2; // validate, then use established path
-    return 1;   // graph, unless it cannot represent it
-  }();
-  std::vector<float> graph_reference;
-  std::vector<float> output_before;
-  if (cpu_graph_mode == 2)
-    output_before.assign(output, output + D);
-  if (cpu_graph_mode != 0 && GgmlQwenCpuMoeRunner::compiled_in() &&
+  if (GgmlQwenCpuMoeRunner::compiled_in() &&
       swiglu_clamp <= 0.0f) {
     std::vector<GgmlQwenCpuExpertRef> refs((size_t)n);
     for (int i = 0; i < n; ++i) {
@@ -147,10 +135,8 @@ static bool expert_ffn_cpu_qwen_grouped_quantized(
                          static_cast<uint32_t>(e->down_proj.meta.type)};
     }
     std::vector<float> graph_output((size_t)D, 0.0f);
-    const bool cpu_diag = [] {
-      const char *env = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_DIAG_LAYER0_IQ2");
-      return env && env[0] == '1';
-    }();
+    const bool cpu_diag =
+        Logger::instance().would_log(LogLevel::DEBUG);
     if (cpu_diag)
       qwen_cpu_moe_diag_set_layer(layer_idx);
     const bool graph_ok = GgmlQwenCpuMoeRunner::instance().run(
@@ -164,7 +150,7 @@ static bool expert_ffn_cpu_qwen_grouped_quantized(
             << "[CPU-MOE] Qwen persistent GGML MUL_MAT_ID CPU graph active "
                "(topk="
             << n << ", threads=" << omp_get_max_threads() << ")\n";
-      if (cpu_graph_mode == 1) {
+      {
         for (int d = 0; d < D; ++d)
           output[d] += graph_output[(size_t)d];
         PERF_END(qwen_cpu_group, t_cpu_expert);
@@ -173,8 +159,7 @@ static bool expert_ffn_cpu_qwen_grouped_quantized(
         (void)layer_idx;
         return true;
       }
-      graph_reference = std::move(graph_output);
-    }
+        }
   }
 
   auto grouped_gate_up = [&](float *const *dst, const uint8_t *const *weights,
@@ -212,29 +197,11 @@ static bool expert_ffn_cpu_qwen_grouped_quantized(
       swiglu_clamp_inplace(gate[(size_t)i], moe_inter, swiglu_clamp);
     }
   }
-  bool down_grouped = false;
-  // The IQ4_NL q8_0 kernel is kept behind an explicit diagnostic switch until
-  // its numerical output is checked against cpu_quant_matmul on this model's
-  // exact GGUF rows.  The validated default remains the old down projection;
-  // gate/up grouping is independent and remains enabled below.
-  static const bool enable_grouped_iq4_nl = [] {
-    const char *env = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_GROUPED_IQ4_NL");
-    return env && env[0] == '1';
-  }();
-  if (enable_grouped_iq4_nl && down_type == GGUFType::IQ4_NL) {
-    std::vector<const float *> act((size_t)n);
-    for (int i = 0; i < n; ++i)
-      act[(size_t)i] = gate[(size_t)i];
-    down_grouped = matmul_iq4_nl_ggml_q8_0_grouped_inputs(
-        down.data(), act.data(), down_w.data(), n, 1, moe_inter, D);
-  }
-  if (!down_grouped) {
-    for (int i = 0; i < n; ++i) {
-      if (!cpu_quant_matmul(down_type, down_w[(size_t)i], gate[(size_t)i],
-                            down[(size_t)i], 1, moe_inter, D)) {
-        PERF_END(qwen_cpu_group, t_cpu_expert);
-        return false;
-      }
+  for (int i = 0; i < n; ++i) {
+    if (!cpu_quant_matmul(down_type, down_w[(size_t)i], gate[(size_t)i],
+                          down[(size_t)i], 1, moe_inter, D)) {
+      PERF_END(qwen_cpu_group, t_cpu_expert);
+      return false;
     }
   }
   for (int d = 0; d < D; ++d) {
@@ -243,24 +210,7 @@ static bool expert_ffn_cpu_qwen_grouped_quantized(
       sum += weights[i] * down[(size_t)i][d];
     output[d] += sum;
   }
-  if (!graph_reference.empty()) {
-    float max_abs = 0.0f;
-    float max_rel = 0.0f;
-    for (int d = 0; d < D; ++d) {
-      const float legacy = output[d] - output_before[(size_t)d];
-      const float graph = graph_reference[(size_t)d];
-      max_abs = std::max(max_abs, std::abs(legacy - graph));
-      max_rel = std::max(max_rel, std::abs(legacy - graph) /
-                                      std::max(1.0f, std::abs(legacy)));
-    }
-    static std::atomic<bool> logged_graph_compare{false};
-    if (!logged_graph_compare.exchange(true, std::memory_order_relaxed))
-      LOG_STREAM_INFO()
-          << "[CPU-MOE-COMPARE] Qwen persistent GGML graph vs established "
-             "CPU path: layer="
-          << layer_idx << " topk=" << n << " max_abs=" << max_abs
-          << " max_rel=" << max_rel << " (graph result not used)\n";
-  }
+
   PERF_END(qwen_cpu_group, t_cpu_expert);
   perf().n_expert_cpu_calls.fetch_add((uint64_t)n, std::memory_order_relaxed);
   (void)layer_idx;
@@ -344,88 +294,14 @@ bool qwen4exp_ram_cpu_moe_layer(const StreamingEngine &engine,
   return true;
 }
 
-static bool qwen_cpu_compact_graph_enabled() {
-  static const bool enabled = [] {
-    const char *env = zeromoe::graphcfg::env("ZEROMOE_QWEN_CPU_COMPACT_GRAPH");
-    return env && env[0] == '1';
-  }();
-  return enabled;
-}
-
-static bool qwen_cpu_direct_gpu_overlap_probe() {
-  static const bool enabled = [] {
-    const char *env = zeromoe::graphcfg::env("ZEROMOE_QWEN_CPU_DIRECT_GPU_OVERLAP");
-    return env && env[0] == '1';
-  }();
-  return enabled;
-}
-
 static bool qwen_cpu_strided_grouped_enabled(const StreamingEngine &engine) {
-  static const int env_override = [] {
-    const char *env = zeromoe::graphcfg::env("ZEROMOE_QWEN_CPU_STRIDED_GROUPED");
-    if (!env || !env[0])
-      return -1;
-    return env[0] == '0' ? 0 : (env[0] == '1' ? 1 : -1);
-  }();
-  if (env_override == 0)
-    return false;
-  if (env_override == 1)
-    return true;
   return engine.qwen4exp_cpu_strided_grouped;
 }
-
-static bool qwen_cpu_gpu_combine_enabled() {
-  static const bool enabled = [] {
-    const char *env = zeromoe::graphcfg::env("ZEROMOE_QWEN_CPU_GPU_COMBINE");
-    return env && env[0] == '1';
-  }();
-  return enabled;
+static bool qwen_cpu_fused_grouped_enabled(const StreamingEngine &engine) {
+  return engine.qwen4exp_cpu_fused_grouped;
 }
-
-// Qwen-only direct strided CPU path.  The persistent MUL_MAT_ID graph above
-// is the safe default, but its per-layer graph submission still carries
-// generic GGML scheduling overhead.  For the common UD-IQ1_M layout, the
-// selected experts can be addressed directly in the already-populated DDR
-// arena and grouped into one activation-quantization/dot pass per
-// projection. No other model family can reach this helper; timing follows
-// DEBUG verbosity so it remains off in normal inference.
 static bool qwen_cpu_stage_timing_enabled() {
   return Logger::instance().would_log(LogLevel::DEBUG);
-}
-
-static bool qwen_cpu_fused_iq1_iq4_enabled() {
-  static const bool enabled = [] {
-    const char *env = zeromoe::graphcfg::env("ZEROMOE_QWEN_CPU_FUSED_IQ1_IQ4");
-    return env && env[0] == '1';
-  }();
-  return enabled;
-}
-
-static bool qwen_cpu_fused_grouped_enabled(const StreamingEngine &engine) {
-  static const int env_override = [] {
-    const char *env = zeromoe::graphcfg::env("ZEROMOE_QWEN_CPU_FUSED_GROUPED");
-    if (!env || !env[0])
-      return -1;
-    return env[0] == '0' ? 0 : (env[0] == '1' ? 1 : -1);
-  }();
-  return env_override >= 0 ? env_override == 1
-                           : engine.qwen4exp_cpu_fused_grouped;
-}
-
-static bool qwen_cpu_fused_iq2_iq4_enabled() {
-  static const bool enabled = [] {
-    const char *env = zeromoe::graphcfg::env("ZEROMOE_QWEN_CPU_FUSED_IQ2_IQ4");
-    return env && env[0] == '1';
-  }();
-  return enabled;
-}
-
-static bool qwen_cpu_fused_q4_0_enabled() {
-  static const bool enabled = [] {
-    const char *env = zeromoe::graphcfg::env("ZEROMOE_QWEN_CPU_FUSED_Q4_0");
-    return env && env[0] == '1';
-  }();
-  return enabled;
 }
 
 static bool qwen4exp_cpu_strided_grouped_quantized(
@@ -508,13 +384,11 @@ static bool qwen4exp_cpu_strided_grouped_quantized(
   }
 
   const bool fused_iq1_iq4 =
-      (qwen_cpu_fused_grouped_enabled(engine) ||
-       qwen_cpu_fused_iq1_iq4_enabled()) &&
+      qwen_cpu_fused_grouped_enabled(engine) &&
       gate_type == GGUFType::IQ1_M &&
       up_type == GGUFType::IQ1_M;
   const bool fused_iq2_iq4 =
-      (qwen_cpu_fused_grouped_enabled(engine) ||
-       qwen_cpu_fused_iq2_iq4_enabled()) &&
+      qwen_cpu_fused_grouped_enabled(engine) &&
       gate_type == GGUFType::IQ2_XXS &&
       up_type == GGUFType::IQ2_XXS;
   bool fused_done = false;
@@ -541,8 +415,7 @@ static bool qwen4exp_cpu_strided_grouped_quantized(
                "down probe active (one OpenMP team)\n");
   }
   const bool fused_q4_0 =
-      (qwen_cpu_fused_grouped_enabled(engine) ||
-       qwen_cpu_fused_q4_0_enabled()) &&
+      qwen_cpu_fused_grouped_enabled(engine) &&
       is_q4_0_combo;
   if (!fused_done && fused_q4_0) {
     fused_done = matmul_qwen_q4_0_q4_0_fused(
@@ -712,7 +585,7 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
       // used by the proven compact A/B replay); keep the strided runner for
       // legacy interleaved arenas.
       const bool use_compact_refs =
-          qwen_cpu_compact_graph_enabled() || ram_layer.projection_compact;
+          ram_layer.projection_compact;
       GgmlQwenCpuMoeRunner &cpu_runner = use_compact_refs
                                               ? GgmlQwenCpuMoeRunner::instance()
                                               : GgmlQwenCpuMoeRunner::instance_for_strided(
@@ -744,18 +617,17 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
       // the GPU with one pinned H2D and no host shared projections, without
       // regressing this model-specific optimization.
       const bool qwen_direct_grouped_cpu =
-          !qwen_cpu_compact_graph_enabled() &&
+          !ram_layer.projection_compact &&
           qwen_cpu_strided_grouped_enabled(engine);
       const bool try_device_shared =
           engine.qwen4exp_cpu_gpu_overlap && shared_available &&
           qwen4exp_hc_device_live() && engine.qwen4exp_device_hc_ffn_input &&
           moe_ggml_shared_expert() &&
-          (!qwen_direct_grouped_cpu || qwen_cpu_direct_gpu_overlap_probe()) &&
+          !qwen_direct_grouped_cpu &&
           (engine.qwen4exp_cpu_gpu_overlap_max_layers <= 0 ||
            cpu_affinity_count <= engine.qwen4exp_cpu_gpu_overlap_max_layers);
       static std::atomic<bool> logged_direct_overlap_guard{false};
       if (engine.qwen4exp_cpu_gpu_overlap && qwen_direct_grouped_cpu &&
-          !qwen_cpu_direct_gpu_overlap_probe() &&
           !logged_direct_overlap_guard.exchange(true,
                                                  std::memory_order_relaxed)) {
         LOG_INFO("[CPU-MOE] Qwen CPU/GPU overlap worker bypassed: direct "
@@ -846,11 +718,8 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
         // value into a much less useful all-layer failure report.
         check_finite("Qwen CPU route input", layer_idx, -1,
                      scratch.normed.data(), static_cast<size_t>(D));
-        const bool cpu_diag = [] {
-          const char *env =
-              zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_DIAG_LAYER0_IQ2");
-          return env && env[0] == '1';
-        }();
+        const bool cpu_diag =
+            Logger::instance().would_log(LogLevel::DEBUG);
         if (cpu_diag)
           qwen_cpu_moe_diag_set_layer(layer_idx);
         const bool ok = run_qwen_cpu_graph(result);
@@ -865,18 +734,6 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
                   std::chrono::high_resolution_clock::now() - start)
                   .count());
         return ok;
-      };
-
-      auto run_qwen_cpu_down_graph = [&](float *result) {
-        GgmlQwenCpuMoeRunner &down_runner =
-            GgmlQwenCpuMoeRunner::instance_for_strided(
-                ram_layer.meta, n_experts, D, moe_inter, topk,
-                ram_layer.expert_stride, true);
-        return down_runner.run_strided_down(
-            scratch.normed.data(), result, ram_layer.meta,
-            ram_layer.gate_plane, ram_layer.up_plane, ram_layer.down_plane,
-            scratch.tok_topk_ids.data(), n_experts, D, moe_inter, topk,
-            ram_layer.expert_stride);
       };
 
       bool handled = false;
@@ -927,7 +784,7 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
         // CPU worker here: the previous worker experiment made GGML's CPU
         // graph contend with its own threadpool and was substantially slower
         // on the real Qwen IQ1_M/IQ2_XXS checkpoint.
-        if (!qwen_cpu_compact_graph_enabled() &&
+        if (!ram_layer.projection_compact &&
             scratch.qwen_cpu_moe_out.resize((size_t)D,
                                             "qwen_cpu_moe_out")) {
           const void *shared_only = nullptr;
@@ -981,34 +838,6 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
           }
         }
 
-        if (!handled && qwen_cpu_gpu_combine_enabled() &&
-            scratch.qwen_cpu_moe_out.resize(
-                (size_t)D * (size_t)topk, "qwen_cpu_moe_down_out")) {
-          handled = run_qwen_cpu_down_graph(scratch.qwen_cpu_moe_out.data());
-          if (handled) {
-            const int combine_device =
-                moe_ggml_device() >= 0 ? moe_ggml_device() : 0;
-            const void *device_routed = nullptr;
-            auto &combine = GgmlQwenDeviceCombineRunner::instance();
-            if (combine.ensure(combine_device, D, topk) &&
-                combine.run(scratch.qwen_cpu_moe_out.data(),
-                            scratch.tok_topk_weights.data(),
-                            &device_routed) &&
-                device_routed) {
-              const void *combined = nullptr;
-              device_shared_handled = run_qwen4exp_shared_device(
-                  engine, layer_idx, S, D, moe_inter,
-                  engine.qwen4exp_device_hc_ffn_input, device_routed, c,
-                  &combined, nullptr);
-              if (device_shared_handled && combined) {
-                scratch.moe_device_output = combined;
-                scratch.moe_shared_device_output = true;
-                scratch.moe_device_output_ready = true;
-              }
-            }
-          }
-        }
-
         if (!device_shared_handled) {
           // Safe numerical fallback: retain the established CPU weighted
           // result and host/device shared-expert behavior if the new
@@ -1054,7 +883,7 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
               << "[CPU-MOE] Qwen DDR-RAM-strided CPU graph active "
                  "(source=preloaded-DDR-arena, file-mmap=not-used, full expert "
                  "layer resident, layout="
-              << (qwen_cpu_compact_graph_enabled() ? "compact-routed" :
+              << (ram_layer.projection_compact ? "compact-routed" :
                   (qwen_cpu_direct_grouped ? "strided-grouped-quantized"
                                            : "strided-slab"))
               << ", post-down-combine="

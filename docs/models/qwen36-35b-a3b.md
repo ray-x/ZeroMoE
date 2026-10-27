@@ -74,10 +74,10 @@ mkdir -p build_qwen36_sm120/results build_llama_qwen36_sm120a_ref/results
 
 ```sh
 CUDA_VISIBLE_DEVICES=0,1 \
-ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0 \
 ZEROMOE_QWEN_CPU_THREADS=10 \
 ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT=1 \
 build_qwen36_sm120/zeromoe \
+  --graph-device-expert-layers 0 --graph-device-expert-trailing 1 \
   --config configs/bench/qwen36_35b_a3b_iq2m_5060_tg400.toml --bench \
   --bench-random-pp 16 --bench-random-tg 400 --bench-reps 3 \
   --bench-warmup 1 --bench-seed 1 \

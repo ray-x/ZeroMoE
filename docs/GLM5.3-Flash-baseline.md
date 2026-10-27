@@ -174,8 +174,8 @@ the most concentrated layers in the fresh routing profile).
   `pin_file = .zeromoe_usage_glm53flash_aj_tap`).
 - Result (quiet-machine ABBA, median ms/token): 8 whole layers 139.4 / 140.4 (7.15 tok/s) vs 7 whole + 2 half **136.75 / 136.79 (7.31 tok/s), 2.2% faster**.
 - Requires the `-1` sentinel fix in `partial_map` (`src/ggml_glm5next_graph.cpp`): routes a branch does not own used to map to expert 0 (computed then masked), so the CPU cold
-  branch always did full work and the same layout measured 1.0% SLOWER. Output is bit-identical with the fix. `ZEROMOE_GLM5NEXT_PARTIAL_ZERO_SENTINEL=1` restores the old behavior.
-- Hit rates on unseen prompts: about 76% (essay) to 83-89% (code review) per route. Usage tap tooling: `ZEROMOE_GLM5NEXT_ROUTE_TAP=<file>` with `ZEROMOE_GLM5NEXT_CACHE_STATS=1`
+  branch always did full work and the same layout measured 1.0% SLOWER. Output is bit-identical with the fix. The `ZEROMOE_GLM5NEXT_PARTIAL_ZERO_SENTINEL` A/B override was removed on 2026-10-28; the measured, bit-identical faster policy is fixed.
+- Hit rates on unseen prompts: about 76% (essay) to 83-89% (code review) per route. Usage tap tooling: `ZEROMOE_GLM5NEXT_ROUTE_TAP=<file>` with `--verbosity 5` for route capture and hit summaries
   writes per-layer expert counts (usage-file format) and logs `[GLM5NEXT-PARTIAL-HIT]`. The old `.zeromoe_usage_glm53flash` was far too optimistic (predicted 99% for layer 18, real ~60%).
 - CPU model (standalone, no model load): a `MUL_MAT_ID` node costs about 0.16 ms fixed (if any id is valid) plus 0.122 ms per valid id on 6 threads with cold experts.
 

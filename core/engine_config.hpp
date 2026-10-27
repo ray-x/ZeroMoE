@@ -116,6 +116,7 @@ struct EngineConfig {
   int max_new_tokens = 1024; // Max tokens to generate per response
   float temperature = 0.7f;
   float top_p = 0.90f;
+  float repeat_penalty = 1.0f;
   bool drop_pages = false; // fadvise DONTNEED after expert read
   bool cpu_only = false;   // force ALL compute to CPU (no GPU dispatch)
 
@@ -2582,6 +2583,7 @@ inline bool EngineConfig::load(const std::string &path) {
   max_new_tokens = doc.root.get_int("max_new_tokens", max_new_tokens);
   temperature = doc.root.get_float("temperature", temperature);
   top_p = doc.root.get_float("top_p", top_p);
+  repeat_penalty = doc.root.get_float("repeat_penalty", repeat_penalty);
   drop_pages = doc.root.get_bool("drop_pages", drop_pages);
   cpu_only = doc.root.get_bool("cpu_only", cpu_only);
   cpu_affinity_layers = doc.root.get_int_array("cpu_affinity_layers");
@@ -3182,6 +3184,10 @@ gdn_proj_ggml = doc.root.get_bool("gdn_proj_ggml", gdn_proj_ggml);
 }
 
 inline bool EngineConfig::validate() {
+  if (!std::isfinite(repeat_penalty) || repeat_penalty <= 0.0f) {
+    std::cerr << "[CONFIG] repeat_penalty must be finite and positive\n";
+    return false;
+  }
   if (!zeromoe::memory::valid_embedding_device(embedding_device)) {
     std::cerr << "[CONFIG] embedding_device must be auto, cpu or gpu\n";
     return false;
@@ -3469,7 +3475,7 @@ inline void EngineConfig::print() const {
   LOG_STREAM_INFO() << "[CONFIG] Context: " << context_size
                     << " tokens | Max gen: " << max_new_tokens << "\n";
   LOG_STREAM_INFO() << "[CONFIG] Temperature: " << temperature
-                    << " | Top-p: " << top_p << "\n";
+                    << " | Top-p: " << top_p << " | Repeat penalty: " << repeat_penalty << "\n";
   LOG_STREAM_INFO() << "[CONFIG] Drop pages: " << (drop_pages ? "yes" : "no")
                     << "\n";
   LOG_STREAM_INFO() << "[CONFIG] Direct I/O (O_DIRECT expert reads): "
@@ -3966,6 +3972,7 @@ context_size   = 131072   # max context window (tokens)
 max_new_tokens = 4096
 temperature    = 0.7
 top_p          = 0.95
+repeat_penalty = 1.0
 drop_pages     = false    # true = evict expert pages from OS cache after use
 
 # cpu_affinity_layers: MoE layer indices that should NEVER dispatch on GPU

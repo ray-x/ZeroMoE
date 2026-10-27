@@ -369,7 +369,7 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
       (engine.qwen4exp_gpu_stage_enabled &&
        !engine.qwen4exp_gpu_stage_layers.empty());
   const bool reuse_prefill_weight_arenas =
-      env_decode_borrow_prefill_arenas() && !prefill_compact_arena_needed;
+      !prefill_compact_arena_needed;
   if (engine.qwen_ram_preload_all_experts) {
     for (int layer = 0; layer < c.n_layers; ++layer) {
       if (engine.qwen_ram_vram_only_layer(layer))
@@ -642,11 +642,11 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
       ggml_backend_sched_new(backends, sched_bufts_ptr, 2, kGraphSize,
                              // one copy with op-offload: the four pipeline copies multiplied the expert input buffers
                              // (measured reserve at 1611 tokens: 44 GiB with four copies, 4.7 GiB with one)
-                             prefill_op_offload ? false : graph_scheduler_parallel(), prefill_op_offload);
+                             !prefill_op_offload, prefill_op_offload);
   if (!g->sched)
     return false;
   LOG_INFO("[GGML-QWEN-FULL] scheduler pipeline_parallel=%s copies=%d\n",
-           graph_scheduler_parallel() ? "true" : "false",
+           prefill_op_offload ? "false" : "true",
            ggml_backend_sched_get_n_copies(g->sched));
   // Replay timing must not install ggml's eval callback.  The callback path
   // decomposes CUDA graph work into per-node submissions and therefore
@@ -694,8 +694,7 @@ bool qwen4exp_full_graph_bootstrap(StreamingEngine &engine) {
   // decode explicitly borrows them. In all other modes bootstrapping would
   // add startup work without avoiding a later device-weight upload.
   if (engine.family_ops.family != ModelFamily::Qwen4Exp ||
-      !qwen4exp_full_graph_decode_enabled() ||
-      !env_decode_borrow_prefill_arenas())
+      !qwen4exp_full_graph_decode_enabled())
     return true;
 
   if (g_graph_prefill_arena_owner &&
@@ -716,20 +715,7 @@ bool qwen4exp_full_graph_bootstrap(StreamingEngine &engine) {
              "prefill graph warmup; keeping lazy graph preparation\n");
     return false;
   }
-  int bootstrap_tokens = std::min(16, engine.max_t);
-  if (const char *value =
-          zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_GRAPH_BOOTSTRAP_TOKENS")) {
-    char *end = nullptr;
-    const long parsed = std::strtol(value, &end, 10);
-    if (end == value || *end != '\0' || parsed < 2 ||
-        parsed > engine.max_t) {
-      LOG_WARN("[GGML-QWEN-FULL-BOOTSTRAP] invalid token count '%s' "
-               "(expected 2..%d); keeping lazy graph preparation\n",
-               value, engine.max_t);
-      return false;
-    }
-    bootstrap_tokens = static_cast<int>(parsed);
-  }
+  const int bootstrap_tokens = std::min(16, engine.max_t);
   std::vector<int> bootstrap_token_ids(
       static_cast<size_t>(bootstrap_tokens), 0);
   const auto started = std::chrono::steady_clock::now();

@@ -408,14 +408,13 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     g.topology_cpu_prologue = res;
     if (g.sched) {
       // In host-node mode every CPU MoE boundary is represented by a
-      // CUDA-owned CPY marker.  Keep the initial contiguous handoff on the
-      // same CUDA split as those markers; otherwise this otherwise harmless
-      // topology node leaves a second scheduler split in the graph.  The
-      // default path remains llama.cpp's original CPU prologue assignment.
+      // CUDA-owned CPY marker. Keep the initial contiguous handoff on the
+      // same CUDA split as those markers; otherwise this topology node leaves
+      // a second scheduler split in the graph. Host-node mode uses the fixed
+      // CUDA prologue assignment; ordinary mode keeps the CPU assignment.
       ggml_backend_sched_set_tensor_backend(
           g.sched, res,
-          env_qwen4exp_host_node_enabled() &&
-                  !env_host_node_keep_cpu_prologue()
+          env_qwen4exp_host_node_enabled()
               ? g.cuda
               : g.cpu);
     }

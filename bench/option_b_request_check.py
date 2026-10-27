@@ -32,7 +32,6 @@ def main():
     for name in ('OMP_WAIT_POLICY', 'GOMP_SPINCOUNT', 'OMP_PROC_BIND', 'OMP_PLACES'):
         env.pop(name, None)
     env.update(CUDA_VISIBLE_DEVICES='0', GGML_CUDA_BF16_MMVF_CUBLAS='0',
-        ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS='0', ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING='1',
         ZEROMOE_QWEN_CPU_THREADS='10', ZEROMOE_BENCH_IGNORE_STOP='0',
         ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT='1', ZEROMOE_QWEN_EARLY_READY_RESIDENT_TABLES='1',
         ZEROMOE_QWEN_EARLY_READY_PREDICT='1')
@@ -52,7 +51,7 @@ def main():
                            ZEROMOE_QWEN_EARLY_READY_STAGE_VERIFY='1')
         print(f'Running {arm}: three natural-stop requests', flush=True)
         with (out / f'{arm}.stdout').open('w') as output:
-            subprocess.run([str(engine), '--config', str(config), '--predict', str(args.ngen)],
+            subprocess.run([str(engine), '--graph-device-expert-layers', '0', '--graph-device-expert-trailing', '1', '--config', str(config), '--predict', str(args.ngen)],
                 input=(out / 'requests.txt').read_text(), text=True, cwd=ROOT, env=runtime,
                 stdout=output, stderr=subprocess.STDOUT, check=True)
         contents = log.read_text()

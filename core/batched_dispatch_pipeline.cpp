@@ -445,10 +445,8 @@ static bool run_ggml_moe_layer(
     return false;
   if (!topo)
     return false;
-  static const bool trace_set = [] {
-    const char *env = zeromoe::graphcfg::env("ZEROMOE_MOE_SET_TRACE");
-    return env != nullptr && env[0] != '0';
-  }();
+  static const bool trace_set =
+      Logger::instance().would_log(LogLevel::DEBUG);
 
   // A single 3-D weight tensor per projection can only describe experts that
   // share a quant type AND a byte size. Packed layers satisfy this by
@@ -749,35 +747,21 @@ static bool run_ggml_moe_layer(
   trace_resident_any.reserve((size_t)n_used);
   trace_resident_gpu.reserve((size_t)n_used);
 
-  static const bool no_d2d = [] {
-    const char *ev = zeromoe::graphcfg::env("ZEROMOE_GGML_NO_D2D");
-    return ev && ev[0] == '1';
-  }();
-  // Diagnostic/optimization switch for the packed transfer design. The
-  // normal path sends persistently pinned RAM slabs directly, one packed
-  // record at a time. Forcing those slabs through h_stage_ lets push_chunk()
-  // combine the whole 32-expert batch into one H2D plus one unpack-scatter,
-  // which tests whether launch/submission overhead is larger than the extra
-  // DDR->pinned-DDR memcpy.
-  static const bool env_force_batch_stage = [] {
-    const char *ev = zeromoe::graphcfg::env("ZEROMOE_GGML_FORCE_BATCH_STAGE");
-    return ev && ev[0] == '1';
-  }();
+  // Qwen's measured decode setting selects packed batch staging. Other
+  // families keep the direct pinned-RAM transfer path.
   const bool qwen_decode_batch_stage =
       engine.family_ops.family == ModelFamily::Qwen4Exp && S == 1 &&
       engine.qwen4exp_decode_batch_stage;
-  const bool force_batch_stage =
-      env_force_batch_stage || qwen_decode_batch_stage;
+  const bool force_batch_stage = qwen_decode_batch_stage;
   static bool logged_batch_stage = false;
   if (force_batch_stage && !logged_batch_stage) {
     LOG_INFO("[GGML-MOE] RAM sources use packed batch staging (%s)\n",
-             qwen_decode_batch_stage ? "Qwen decode config" : "environment");
+             "Qwen decode config");
     logged_batch_stage = true;
   }
   // D2D cache copies use a separate raw stream. The sync point below drains
   // only that stream in backend mode; H2D staging and graph work remain
   // continuously queued on GGML's shared stream.
-  const bool use_d2d = !no_d2d;
   const auto *ram_arena = engine.graph_ram_arena(layer_idx);
 
   for (int c = 0; c < n_chunks; ++c) {
@@ -811,25 +795,21 @@ static bool run_ggml_moe_layer(
     // Only THIS device's residents qualify: a slab on the other GPU would be
     // a peer copy, which is not obviously cheaper than the H2D it replaces
     // and is not what this was measured against.
-    if (use_d2d) {
-      topo->find_expert_batch(layer_idx, used.data() + c0, c1 - c0,
-                              resident_locations.data() + c0);
-    }
+    topo->find_expert_batch(layer_idx, used.data() + c0, c1 - c0,
+                            resident_locations.data() + c0);
     for (int i = c0; i < c1; ++i) {
       const int e = used[(size_t)i];
       staged_flag[(size_t)(i - c0)] = 1;
-      // D2D reuse costs a find_expert (cache_mutex) per expert and only pays
-      // off if enough of them are resident. ZEROMOE_GGML_NO_D2D=1 measures
-      // whether that trade is actually positive at the current hit rate.
-      const ExpertLocation *rl =
-          use_d2d ? resident_locations[(size_t)i] : nullptr;
+      // The residency lookup is shared across the compact batch, and the
+      // per-expert hold below remains the race-safe ownership check.
+      const ExpertLocation *rl = resident_locations[(size_t)i];
       if (trace_set && rl && rl->device_ptr && rl->upload_ready) {
         trace_resident_any.push_back(e);
         if (rl->gpu_id == chosen_device)
           trace_resident_gpu.push_back(e);
       }
       bool from_active_layer = false;
-      if (!rl && use_d2d && allow_active_layer_sources) {
+      if (!rl && allow_active_layer_sources) {
         bool promoted_to_main = false;
         rl = topo->find_active_expert_wait(
             layer_idx, e, [&](int, int) { promoted_to_main = true; });
@@ -1022,13 +1002,7 @@ static bool run_ggml_moe_layer(
     // madvise(WILLNEED) ahead of the staging memcpy. Worth it only when the
     // pages are genuinely cold: at ~3 syscalls per expert this is ~22k calls
     // per prefill, which is pure overhead once the file is in page cache.
-    // ZEROMOE_GGML_NO_WILLNEED=1 measures that.
-    static const bool skip_willneed = [] {
-      const char *e = zeromoe::graphcfg::env("ZEROMOE_GGML_NO_WILLNEED");
-      return e && e[0] == '1';
-    }();
-    if (!qwen_ddr_only_source && !skip_willneed &&
-        engine.model_file.mmap_active()) {
+    if (!qwen_ddr_only_source && engine.model_file.mmap_active()) {
       for (int i = c0; i < c1; ++i) {
         if (!staged_flag[(size_t)(i - c0)] ||
             ram_stage_sources[(size_t)(i - c0)])
@@ -1436,10 +1410,8 @@ BatchedDispatchResult BatchedDispatchPipeline::run(
     for (int e = 0; e < n_experts; ++e)
       if (scratch.expert_freq[(size_t)e] > 0)
         used.push_back(e);
-    static const bool trace_required_set = [] {
-      const char *env = zeromoe::graphcfg::env("ZEROMOE_MOE_SET_TRACE");
-      return env && env[0] != '0';
-    }();
+    static const bool trace_required_set =
+        Logger::instance().would_log(LogLevel::DEBUG);
     if (trace_required_set && gpu_route_device && device_router) {
       // Device routing deliberately leaves IDs/weights on CUDA in normal
       // execution. Export them only for the explicit set trace so its
@@ -1473,7 +1445,7 @@ BatchedDispatchResult BatchedDispatchPipeline::run(
           required_ids.push_back(',');
         required_ids += std::to_string(used[i]);
       }
-      LOG_INFO("[MOE-REQUIRED] layer=%d required=%zu route=%s ids=%s\n",
+      LOG_DEBUG("[MOE-REQUIRED] layer=%d required=%zu route=%s ids=%s\n",
                layer_idx, used.size(), gpu_route_device ? "device" : "host",
                required_ids.c_str());
     }
@@ -1661,10 +1633,8 @@ BatchedDispatchResult BatchedDispatchPipeline::run(
         if (offs[(size_t)e + 1] > offs[(size_t)e])
           used.push_back(e);
       const int n_used = (int)used.size();
-      static const bool trace_required_set = [] {
-        const char *env = zeromoe::graphcfg::env("ZEROMOE_MOE_SET_TRACE");
-        return env && env[0] != '0';
-      }();
+      static const bool trace_required_set =
+          Logger::instance().would_log(LogLevel::DEBUG);
       if (trace_required_set) {
         std::string required_ids;
         required_ids.reserve(used.size() * 4);
@@ -1673,7 +1643,7 @@ BatchedDispatchResult BatchedDispatchPipeline::run(
             required_ids.push_back(',');
           required_ids += std::to_string(used[i]);
         }
-        LOG_INFO("[MOE-REQUIRED] layer=%d required=%zu route=host ids=%s\n",
+        LOG_DEBUG("[MOE-REQUIRED] layer=%d required=%zu route=host ids=%s\n",
                  layer_idx, used.size(), required_ids.c_str());
       }
 
@@ -2254,14 +2224,9 @@ BatchedDispatchResult BatchedDispatchPipeline::run(
               // upload (compute_stream) and the kernels (default stream)
               // implicitly synchronize with each other, so reuse is ordered
               // by the streams rather than by this call.
-              // Skip the sync ONLY when explicitly opted in: it is provably
-              // redundant under moe_gpu_accum, but removing it measured
-              // WORSE (see expert_stream_no_sync()'s own comment).
               if (grouped_async && gid >= 0 && gid < 8)
                 async_gpu_used[(size_t)gid] = true;
-              const bool skip_sync =
-                  grouped_async ||
-                  (accum_gpu && gid >= 0 && gid < 8 && expert_stream_no_sync());
+              const bool skip_sync = grouped_async;
               if (!skip_sync) {
                 PERF_START(bsync);
                 cudaStreamSynchronize(0);

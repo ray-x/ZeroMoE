@@ -68,12 +68,11 @@ def run_decode(engine, config, out_dir, label, prompt, tokens, extra_env,
         "ZEROMOE_GENERATED_TOKEN_FILE",
     ):
         env.pop(key, None)
-    env["ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS"] = "0"
     env.update(extra_env)
     log_path = out_dir / f"{label}.log"
     stdout_path = out_dir / f"{label}.stdout"
     command = [
-        str(engine), "--config", str(config), "--predict", str(tokens),
+        str(engine), "--graph-device-expert-layers", "0", "--graph-device-expert-trailing", "1", "--config", str(config), "--predict", str(tokens),
         "--raw-prompt", "--log-file", str(log_path),
     ]
     try:

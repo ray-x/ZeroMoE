@@ -54,8 +54,7 @@ Environment (all set by the script):
 CUDA_VISIBLE_DEVICES=0
 ZEROMOE_QWEN4EXP_FULL_GRAPH=1
 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1
-ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40      # "as many layers as fit"; the 22 non-affinity layers become the 17.74 GiB device arena
-ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1
+--graph-device-expert-layers 40 --graph-device-expert-trailing 1 # "as many layers as fit"; the 22 non-affinity layers become the 17.74 GiB device arena
 ZEROMOE_BENCH_SILENT=1                         # no token printing / per-token VRAM sampling in the timed path
 ZEROMOE_BENCH_IGNORE_STOP=1                    # generate all 400 tokens
 ```
@@ -99,8 +98,7 @@ Environment (all set by the script):
 CUDA_VISIBLE_DEVICES=0
 ZEROMOE_QWEN4EXP_FULL_GRAPH=1
 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1
-ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0        # expert residency comes from the global pool, not from a layer count
-ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1
+--graph-device-expert-layers 0 --graph-device-expert-trailing 1 # expert residency comes from the global pool, not from a layer count
 --verbosity 5                                  # current equivalent of the per-step iter_total diagnostic used then
 ZEROMOE_BENCH_IGNORE_STOP=1
 ```

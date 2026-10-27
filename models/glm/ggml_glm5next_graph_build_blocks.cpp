@@ -31,19 +31,6 @@ ggml_tensor *hc_contig(ggml_context *ctx, ggml_tensor *t) {
   return t && !ggml_is_contiguous(t) ? ggml_cont(ctx, t) : t;
 }
 
-// ZEROMOE_GLM5NEXT_FUSED_HC: unset/"1" = all fused ops; otherwise any of
-// the letters c (hc_comb), p (hc_pre sum), o (hc_post) enables just those.
-bool fused_hc_op(char which) {
-  // Default ON. ZEROMOE_GLM5NEXT_UNFUSED_HC=1 restores the composed-op path.
-  static const bool off = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_UNFUSED_HC") != nullptr;
-  if (off)
-    return false;
-  static const char *e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_FUSED_HC");
-  if (!e || e[0] == '1')
-    return true;
-  return std::strchr(e, which) != nullptr;
-}
-
 ggml_tensor *hc_pre(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
                     ggml_tensor *fn, ggml_tensor *scale, ggml_tensor *base,
                     ggml_tensor **post, ggml_tensor **comb,
@@ -64,11 +51,8 @@ ggml_tensor *hc_pre(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
 
   ggml_tensor *scale_pre = ggml_view_1d(ctx, scale, 1, 0);
   ggml_tensor *scale_post = ggml_view_1d(ctx, scale, 1, sizeof(float));
-  ggml_tensor *scale_comb = ggml_view_1d(ctx, scale, 1, 2 * sizeof(float));
   ggml_tensor *base_pre = ggml_view_1d(ctx, base, g.HC, 0);
   ggml_tensor *base_post = ggml_view_1d(ctx, base, g.HC, g.HC * sizeof(float));
-  ggml_tensor *base_comb =
-      ggml_view_1d(ctx, base, g.HC * g.HC, 2 * g.HC * sizeof(float));
 
   ggml_tensor *pre = ggml_view_2d(ctx, mixes, g.HC, g.S, mixes->nb[1], 0);
   pre = ggml_scale_bias(
@@ -82,49 +66,10 @@ ggml_tensor *hc_pre(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
   *post = ggml_scale(
       ctx, ggml_sigmoid(ctx, hc_affine(ctx, *post, scale_post, base_post)),
       2.0f);
-  const bool f_comb = fused_hc_op('c'), f_pre = fused_hc_op('p');
-  if (f_comb) {
-    *comb = ggml_dsv4_hc_comb(ctx, hc_contig(ctx, mixes), hc_contig(ctx, scale),
-                              hc_contig(ctx, base), c.hc_eps,
-                              (int32_t)c.hc_sinkhorn_iters);
-  } else {
-    *comb = ggml_view_2d(ctx, mixes, g.HC * g.HC, g.S, mixes->nb[1],
-                         (size_t)2 * g.HC * mixes->nb[0]);
-    *comb = hc_affine(ctx, *comb, scale_comb, base_comb);
-    *comb = ggml_reshape_3d(ctx, *comb, g.HC, g.HC, g.S);
-    ggml_tensor *eps = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
-    eps = ggml_fill(ctx, eps, c.hc_eps);
-    *comb = ggml_add(ctx, ggml_soft_max(ctx, *comb), eps);
-    auto norm_cols = [&]() {
-      ggml_tensor *p = ggml_cont(ctx, ggml_permute(ctx, *comb, 1, 0, 2, 3));
-      ggml_tensor *sum = ggml_add(ctx, ggml_sum_rows(ctx, p), eps);
-      sum = ggml_permute(ctx, sum, 1, 0, 2, 3);
-      *comb = ggml_div(ctx, *comb, sum);
-    };
-    auto norm_rows = [&]() {
-      ggml_tensor *sum = ggml_add(ctx, ggml_sum_rows(ctx, *comb), eps);
-      *comb = ggml_div(ctx, *comb, sum);
-    };
-    norm_cols();
-    for (int i = 1; i < c.hc_sinkhorn_iters; ++i) {
-      norm_rows();
-      norm_cols();
-    }
-  }
-  if (f_pre)
-    return ggml_dsv4_hc_pre(ctx, hc_contig(ctx, x), hc_contig(ctx, collapse));
-
-  ggml_tensor *result = nullptr;
-  for (int h = 0; h < g.HC; ++h) {
-    ggml_tensor *xh =
-        ggml_view_2d(ctx, x, g.D, g.S, x->nb[2], (size_t)h * x->nb[1]);
-    ggml_tensor *ph =
-        ggml_view_2d(ctx, collapse, 1, g.S, collapse->nb[1],
-                     (size_t)h * collapse->nb[0]);
-    ggml_tensor *term = ggml_mul(ctx, xh, ph);
-    result = result ? ggml_add(ctx, result, term) : term;
-  }
-  return result;
+  *comb = ggml_dsv4_hc_comb(ctx, hc_contig(ctx, mixes), hc_contig(ctx, scale),
+                            hc_contig(ctx, base), c.hc_eps,
+                            (int32_t)c.hc_sinkhorn_iters);
+  return ggml_dsv4_hc_pre(ctx, hc_contig(ctx, x), hc_contig(ctx, collapse));
 }
 
 ggml_tensor *hc_post(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
@@ -132,26 +77,8 @@ ggml_tensor *hc_post(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
                      ggml_tensor *comb) {
   if (g.HC == 1)
     return ggml_add(ctx, residual, ggml_reshape_3d(ctx, x, g.D, 1, g.S));
-  if (fused_hc_op('o'))
-    return ggml_dsv4_hc_post(ctx, hc_contig(ctx, x), hc_contig(ctx, residual),
-                             hc_contig(ctx, post), hc_contig(ctx, comb));
-  ggml_tensor *out = nullptr;
-  for (int dst = 0; dst < g.HC; ++dst) {
-    ggml_tensor *pd =
-        ggml_view_2d(ctx, post, 1, g.S, post->nb[1], (size_t)dst * post->nb[0]);
-    ggml_tensor *cur = ggml_mul(ctx, x, pd);
-    for (int src = 0; src < g.HC; ++src) {
-      ggml_tensor *rs = ggml_view_2d(ctx, residual, g.D, g.S, residual->nb[2],
-                                     (size_t)src * residual->nb[1]);
-      ggml_tensor *cw =
-          ggml_view_2d(ctx, comb, 1, g.S, comb->nb[2],
-                       (size_t)dst * comb->nb[0] + (size_t)src * comb->nb[1]);
-      cur = ggml_add(ctx, cur, ggml_mul(ctx, rs, cw));
-    }
-    ggml_tensor *stream = ggml_reshape_3d(ctx, cur, g.D, 1, g.S);
-    out = out ? ggml_concat(ctx, out, stream, 1) : stream;
-  }
-  return out;
+  return ggml_dsv4_hc_post(ctx, hc_contig(ctx, x), hc_contig(ctx, residual),
+                           hc_contig(ctx, post), hc_contig(ctx, comb));
 }
 
 ggml_tensor *build_kda(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,

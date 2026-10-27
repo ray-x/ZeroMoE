@@ -138,7 +138,7 @@ ggml_tensor *build_qwen4exp_host_node(
   node_ctx->up_stride = arena->up_stride;
   node_ctx->down_stride = arena->down_stride;
   node_ctx->input_bytes = static_cast<size_t>(g.D) * sizeof(float);
-  node_ctx->gpu_reduce = partial_cold_only ? true : env_host_node_gpu_reduce();
+  node_ctx->gpu_reduce = true;
   node_ctx->output_bytes =
       node_ctx->input_bytes *
       (node_ctx->gpu_reduce ? static_cast<size_t>(c.topk) : 1);

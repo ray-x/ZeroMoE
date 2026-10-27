@@ -43,14 +43,6 @@ __global__ void qwen_stage_map_kernel(const int *actual_ids,
     stage_mask[k] = found >= 0 ? 1.0f : 0.0f;
 }
 
-__global__ void qwen_stage_delay_kernel(unsigned int microseconds) {
-    unsigned long long remaining = static_cast<unsigned long long>(microseconds) * 1000;
-    while (remaining) {
-        const unsigned int chunk = remaining > 1000000 ? 1000000 : remaining;
-        __nanosleep(chunk);
-        remaining -= chunk;
-    }
-}
 
 } // namespace
 
@@ -75,11 +67,5 @@ extern "C" cudaError_t zeromoe_qwen_stage_map(const int *actual_ids,
     int topk, int slots, cudaStream_t stream) {
     qwen_stage_map_kernel<<<1, 32, 0, stream>>>(actual_ids, epoch, slot_ids,
         slot_epochs, dispatch_ids, stage_slots, stage_mask, topk, slots);
-    return cudaPeekAtLastError();
-}
-
-extern "C" cudaError_t zeromoe_qwen_stage_delay(unsigned int microseconds,
-                                                cudaStream_t stream) {
-    qwen_stage_delay_kernel<<<1, 1, 0, stream>>>(microseconds);
     return cudaPeekAtLastError();
 }

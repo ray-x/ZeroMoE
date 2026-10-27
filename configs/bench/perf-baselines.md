@@ -203,7 +203,7 @@ the KV state, otherwise the seed fails and the decode graph is declined.
 |---|---|---|---|
 | baseline (2 GPU, 6 CPU threads) | 5.12 | 1160 ms | |
 | + sparse mid-tier mirror on KIOXIA (1,246 experts, 13.3 GiB) | 5.00 | 1377 ms | WORSE: KIOXIA already served ~78% of reads (store 17.9k + mirror 2.0k vs Samsung ~5.6k) |
-| + split reads (`ZEROMOE_GLM5NEXT_OFFLOAD_SPLIT=1`: store experts read gate/up-down across both drives, 3.5 ms vs 7.5 ms per read in isolation, bytes identical) | 4.89 | 1164 ms | no change: the SSDs are NOT the bottleneck |
+| + split reads (historical env `ZEROMOE_GLM5NEXT_OFFLOAD_SPLIT=1`; canonical CLI is `--graph-offload-split-reads 1`: store experts read gate/up-down across both drives, 3.5 ms vs 7.5 ms per read in isolation, bytes identical) | 4.89 | 1164 ms | no change: the SSDs are NOT the bottleneck |
 | + 14 CPU threads (`ZEROMOE_GLM5NEXT_CPU_THREADS=14`) | 6.18 | 1311 ms | prefill +21%, decode worse: cold-expert MUL_MAT_ID (225 nodes) runs on the CPU |
 | + `PREFILL_OP_OFFLOAD=1` | crash | | `CUDA error: invalid argument` in ggml_backend_cuda_set_tensor_async during prefill |
 
@@ -214,7 +214,7 @@ prefill only, getting op-offload to work with the offload arena, and a larger VR
 ### GLM_DSA graph prefill: 12.2 tok/s with GPU op-offload (2026-10-19)
 
 Per-op profile of the 6.2 tok/s prefill: 61 of 69 s were `MUL_MAT_ID` on the CPU (iq2_xxs 41.2 s, iq3_xxs 18.8 s); everything on the GPUs was under 1 s. Letting the
-scheduler run the host-resident expert matmuls on the GPU (`ZEROMOE_GLM5NEXT_PREFILL_OP_OFFLOAD=1`) removes that:
+scheduler run the host-resident expert matmuls on the GPU (historical env `ZEROMOE_GLM5NEXT_PREFILL_OP_OFFLOAD=1`; canonical CLI is `--graph-prefill-op-offload 1`) removes that:
 
 | Prefill, 426 tokens, both GPUs, 45 GiB pool | tok/s | Wall |
 |---|---|---|

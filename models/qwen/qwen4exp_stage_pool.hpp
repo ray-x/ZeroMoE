@@ -26,7 +26,6 @@ extern "C" cudaError_t zeromoe_qwen_stage_publish(int *, unsigned long long *, i
                                                     int, unsigned long long, cudaStream_t);
 extern "C" cudaError_t zeromoe_qwen_stage_map(const int *, const unsigned long long *,
     const int *, unsigned long long *, int *, int *, float *, int, int, cudaStream_t);
-extern "C" cudaError_t zeromoe_qwen_stage_delay(unsigned int, cudaStream_t);
 
 // Shared host worker service for all staged layers. A single queue avoids one
 // sleeping/waking thread per layer; each submitted closure still owns the
@@ -183,10 +182,6 @@ struct Qwen4ExpStagePool {
   std::vector<uint8_t> cold_mask;
   size_t plane_bytes[3] = {}, plane_offsets[3] = {}, bytes = 0, reservation = 0;
   int device = -1, topk = 0, slots = 0;
-  unsigned int delay_us = 0;
-  unsigned int worker_delay_us = 0;
-  // Cap on predicted cold experts staged per layer (0 = no cap).
-  unsigned int stage_max = 0;
   zeromoe::cuda::CudaStream copy_stream;
   Qwen4ExpStageWorkService *service = nullptr;
   std::mutex mutex;
@@ -235,13 +230,6 @@ struct Qwen4ExpStagePool {
     if (!service) return false;
     const char *verify = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_STAGE_VERIFY");
     verify_enabled = verify && verify[0] == '1';
-    const char *delay = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_STAGE_DELAY_US");
-    if (delay) delay_us = std::min<unsigned long>(1000000, std::strtoul(delay, nullptr, 10));
-    const char *worker_delay = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_STAGE_WORKER_DELAY_US");
-    const char *stage_cap = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_STAGE_MAX");
-    if (stage_cap) stage_max = std::min<unsigned long>(32, std::strtoul(stage_cap, nullptr, 10));
-    if (worker_delay)
-      worker_delay_us = std::min<unsigned long>(1000000, std::strtoul(worker_delay, nullptr, 10));
     if (k <= 0 || k > 32) return false;
     source[0] = gate; source[1] = up; source[2] = down;
     for (int p = 0; p < 3; ++p) {
@@ -465,16 +453,9 @@ struct Qwen4ExpStagePool {
             std::find(candidates.begin(), candidates.end(), e) == candidates.end())
           candidates.push_back(e);
       }
-      if (stage_max && candidates.size() > stage_max) candidates.resize(stage_max);
-      finish_prediction_read(bank);
+          finish_prediction_read(bank);
       predicted += candidates.size();
-      // Debug-only late-publication test without occupying GPU resources.
       // Prediction reads are finished before sleeping, so the mailbox lifetime
-      // guard can make progress while DMA and bank ownership remain pending.
-      if (worker_delay_us && !candidates.empty())
-        std::this_thread::sleep_for(std::chrono::microseconds(worker_delay_us));
-      if (delay_us && !candidates.empty())
-        GGML_ASSERT(zeromoe_qwen_stage_delay(delay_us, copy_stream) == cudaSuccess);
       for (size_t slot = 0; slot < candidates.size(); ++slot) {
         const int e = candidates[slot];
         const int gpu_slot = index * topk + slot;

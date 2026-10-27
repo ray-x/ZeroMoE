@@ -29,9 +29,8 @@ case "$MODE" in
     # "Tell a story." is 4 tokens; with the chat template the prompt is 16 tokens ([PREFILL-DONE] must say 16)
     rc=0
     printf 'Tell a story.\n:q\n' | env CUDA_VISIBLE_DEVICES=0 \
-      ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
       ZEROMOE_BENCH_SILENT=1 ZEROMOE_BENCH_IGNORE_STOP=1 \
-      timeout 900 "$BIN" --verbosity 5 --config "$TMP/cfg.toml" > "$LOG.log" 2>&1 || rc=$?
+      timeout 900 "$BIN" --verbosity 5 --model "$ZEROMOE_MODEL_PATH" --config "$TMP/cfg.toml" > "$LOG.log" 2>&1 || rc=$?
     grep -E "PREFILL-DONE\] 16|REQUEST-DECODE-WALL" "$LOG.engine.log" | cut -c1-170 || true
     # Emit teardown evidence so the gate can recognize a benign teardown crash (§3.7) rather
     # than treat any nonzero exit as benign.
@@ -49,9 +48,8 @@ case "$MODE" in
     nvidia-smi --id=0 --query-gpu=timestamp,memory.used,memory.total --format=csv,noheader,nounits -lms 250 > "$LOG.csv" &
     SP=$!
     echo "Explain briefly the key concepts of neural networks and gradient descent in plain English." | env CUDA_VISIBLE_DEVICES=0 \
-      ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
       ZEROMOE_BENCH_IGNORE_STOP=1 \
-      "$BIN" --verbosity 5 --config "$TMP/cfg.toml" --predict "$NGEN" > "$LOG.log" 2>&1 || true
+      "$BIN" --verbosity 5 --model "$ZEROMOE_MODEL_PATH" --config "$TMP/cfg.toml" --predict "$NGEN" > "$LOG.log" 2>&1 || true
     kill $SP 2>/dev/null || true
     python3 - "$LOG" <<'EOF'
 import re, statistics as st, sys

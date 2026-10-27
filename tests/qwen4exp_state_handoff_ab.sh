@@ -30,9 +30,6 @@ for phase in prefill decode; do
         done
         printf '%s\n' "${prompts[@]}" |
             env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
-                ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=48 \
-                ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
-                ZEROMOE_QWEN4EXP_GRAPH_PARALLEL=1 \
                 ZEROMOE_QWEN4EXP_PREFILL_STATE_HANDOFF="$mode" \
                 ZEROMOE_PROMPT_TOKEN_INPUT_FILE="$prompt_tokens" \
                 ZEROMOE_BENCH_IGNORE_STOP=1 \

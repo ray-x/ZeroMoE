@@ -6,7 +6,7 @@
 //
 // Where it goes:
 //   * the log, as one "[STATS] {json}" line (always);
-//   * a file, one JSON object per line (JSONL), when --stats-file PATH or ZEROMOE_STATS_FILE=PATH is set;
+//   * a file, one JSON object per line (JSONL), when --stats-file PATH is set;
 //   * in memory, via Sink::last(), for in-process callers (the bench mode).
 //
 // Field meanings follow llama.cpp's llama_perf_context / server "timings" so numbers are comparable:
@@ -25,7 +25,6 @@
 #pragma once
 
 #include <algorithm>
-#include "graph_config.hpp"
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -232,7 +231,7 @@ class Sink {
     std::lock_guard<std::mutex> g(mu_);
     last_ = r;
     have_last_ = true;
-    const std::string path = !path_.empty() ? path_ : env_path();
+    const std::string path = path_;
     if (!path.empty()) {
       std::ofstream f(path, std::ios::app);
       if (f) f << json << '\n';
@@ -247,10 +246,6 @@ class Sink {
   }
 
  private:
-  static std::string env_path() {
-    const char *e = zeromoe::graphcfg::env("ZEROMOE_STATS_FILE");
-    return e ? e : "";
-  }
   std::mutex mu_;
   std::string path_, model_;
   std::map<std::string, double> notes_;

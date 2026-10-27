@@ -135,19 +135,6 @@ static bool score_prefill_legacy_forced() {
 }
 
 
-// Diagnostic A/B only.  The normal Qwen4Exp prefill path keeps HC -> GDN on
-// the CUDA backend.  This switch recovers the HC result and uses the existing
-// synchronous full-GDN implementation, allowing a bad device handoff or
-// allocator lifetime to be separated from a bad GDN graph/math path without
-// changing model weights or routing.
-static bool force_gdn_full_host() {
-  static const bool enabled = [] {
-    const char *v = zeromoe::graphcfg::env("ZEROMOE_GGML_FORCE_GDN_FULL_HOST");
-    return v && v[0] == '1';
-  }();
-  return enabled;
-}
-
 static bool gdn_full_stats_enabled() {
   return Logger::instance().would_log(LogLevel::DEBUG);
 }
@@ -2320,14 +2307,12 @@ static void qwen4exp_gdn_gguf(StreamingEngine &engine, int layer_idx,
     bool host_input_ready = true;
     bool device_state_attempted = false;
     if (engine.qwen4exp_device_hc_input) {
-      if (!force_gdn_full_host()) {
-        device_state_attempted = true;
-        device_full_ok = GgmlGdnProjRunner::instance().run_full_device_tensor(
-            layer_idx, engine.qwen4exp_device_hc_input, S, &device_output,
-            conv_hist.data(), d_conv, recur_state.data(), c.eps,
-            /*device_state_resident=*/S == 1);
-        full_ok = device_full_ok;
-      }
+      device_state_attempted = true;
+      device_full_ok = GgmlGdnProjRunner::instance().run_full_device_tensor(
+          layer_idx, engine.qwen4exp_device_hc_input, S, &device_output,
+          conv_hist.data(), d_conv, recur_state.data(), c.eps,
+          /*device_state_resident=*/S == 1);
+      full_ok = device_full_ok;
       if (full_ok) {
         engine.qwen4exp_device_attn_output = device_output;
         engine.qwen4exp_device_attn_output_ready = true;
@@ -2336,8 +2321,7 @@ static void qwen4exp_gdn_gguf(StreamingEngine &engine, int layer_idx,
         // that pre_mix intentionally left on the device before
         // trying it; hidden_states is not authoritative in this
         // device-input form.  The same recovery is deliberately
-        // used by ZEROMOE_GGML_FORCE_GDN_FULL_HOST=1 so this
-        // diagnostic changes only the GDN execution side.
+        // fallback changes only the GDN execution side.
         if (!GgmlHcRunner::instance().copy_pre_mix_to_host(
                 engine.qwen4exp_device_hc_input,
                 const_cast<float *>(hidden_states), S)) {
@@ -2349,9 +2333,6 @@ static void qwen4exp_gdn_gguf(StreamingEngine &engine, int layer_idx,
       if (device_state_attempted)
         GgmlGdnProjRunner::instance().sync_full_device_states_to_host();
       log_gdn_full_stats("input", layer_idx, hidden_states, S, D);
-      if (force_gdn_full_host())
-        check_finite_attn("GDN full graph input", layer_idx, hidden_states,
-                          (size_t)S * D, D);
       full_ok = GgmlGdnProjRunner::instance().run_full(
           layer_idx, hidden_states, S, out_context, conv_hist.data(), d_conv,
           recur_state.data(), c.eps);

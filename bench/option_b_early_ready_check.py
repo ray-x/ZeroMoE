@@ -100,8 +100,6 @@ def main():
     for key in ('OMP_WAIT_POLICY', 'GOMP_SPINCOUNT', 'OMP_PROC_BIND', 'OMP_PLACES'):
         env.pop(key, None)
     env.update(CUDA_VISIBLE_DEVICES='0', GGML_CUDA_BF16_MMVF_CUBLAS='0',
-               ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS='0',
-               ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING='1',
                ZEROMOE_QWEN_CPU_THREADS=str(args.threads),
                ZEROMOE_BENCH_IGNORE_STOP='1',
                ZEROMOE_PROMPT_TOKEN_INPUT_FILE=str(args.prompt_ids.resolve()))
@@ -201,7 +199,7 @@ def main():
             print(f'Running {tag}', flush=True)
             with (out / f'{tag}.stdout').open('w') as output:
                 run_engine = baseline_engine if arm == 'baseline' else engine
-                process = subprocess.Popen([str(run_engine), '--verbosity', '5', '--config', str(cfg), '--predict', str(ngen)],
+                process = subprocess.Popen([str(run_engine), '--verbosity', '5', '--graph-device-expert-layers', '0', '--graph-device-expert-trailing', '1', '--config', str(cfg), '--predict', str(ngen)],
                                stdin=subprocess.PIPE, text=True, cwd=ROOT, env=runtime,
                                stdout=output, stderr=subprocess.STDOUT)
                 prompt = 'Explain briefly the key concepts of neural networks and gradient descent in plain English.\n:q\n'

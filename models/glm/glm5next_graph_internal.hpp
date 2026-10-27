@@ -364,7 +364,7 @@ struct FullGraph : zeromoe::graph::GraphCore {
   std::vector<int> dsa_layers;
   std::vector<std::pair<int, ggml_tensor *>> moe_route_ids;
   std::vector<std::pair<int, ggml_tensor *>> prefill_route_ids;
-  // CPU lanes (ZEROMOE_GLM5NEXT_EARLY_READY): one per layer whose cold experts
+  // CPU lanes (graph_early_ready): one per layer whose cold experts
   // run concurrently with that layer's GPU work.
   struct VramExpertHold {
     int layer = -1;

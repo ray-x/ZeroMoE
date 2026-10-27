@@ -38,7 +38,7 @@ ZeroMoE/model-specific.
 | Model, prompt | `--model`, `--prompt` | same |
 | Context, output length | `-c/--ctx-size`, `-n/--predict` | same |
 | CPU threads | `-t/--threads` | same; caps ZeroMoE's process-wide OpenMP team |
-| Temperature, nucleus sampling | `--temp`, `--top-p` | same |
+| Sampling | `--temp`, `--top-p`, `--repeat-penalty`; TOML `temperature`, `top_p`, `repeat_penalty` | same llama.cpp option names |
 | System prompt | `--system-prompt` | same |
 | Single main GPU | `--main-gpu` | same for single-device recipes |
 | Log file and verbosity | `--log-file`, `--verbosity` | same |

@@ -544,11 +544,7 @@ struct EarlyReadyLane {
       std::fputc('\n', route_trace);
       std::fflush(route_trace);
     }
-    const char *stage_no_request_env =
-        zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_STAGE_NO_REQUEST");
-    const bool stage_no_request =
-        stage_no_request_env && stage_no_request_env[0] == '1';
-    if (stage_source && !stage_no_request)
+    if (stage_source)
       stage_source->request(calls + 1, prediction_ids, prediction_epoch, prediction_ready);
     if (stage_target) {
       std::copy(original_remap.begin(), original_remap.end(), cpu_remap);

@@ -637,8 +637,7 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
 
   g.prefill_host_state_deferred =
       env_prefill_state_handoff_enabled() &&
-      qwen4exp_full_graph_decode_enabled() &&
-      env_decode_borrow_prefill_arenas() && !engine.prompt_cache &&
+      qwen4exp_full_graph_decode_enabled() && !engine.prompt_cache &&
       !engine.mtp_enabled && engine.qwen4exp_partial_layer < 0 &&
       engine.qwen4exp_gpu_stage_layers.empty() &&
       prepare_prefill_state_handoff(g);

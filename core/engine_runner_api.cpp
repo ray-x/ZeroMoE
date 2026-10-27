@@ -59,7 +59,8 @@ public:
         control.cancelled = [&] { return cancel.load(std::memory_order_relaxed); };
         control.emit = emit;
         generate_text(engine, ram, tokenizer, prefetcher, prepared.tokens, request.max_tokens,
-                      tokenizer.eos_token_id, request.temperature, request.top_p, &control);
+                      tokenizer.eos_token_id, request.temperature, request.top_p,
+                      config.repeat_penalty, &control);
         if (!engine.qwen4exp_full_graph_failure.empty())
             throw std::runtime_error("full-graph generation failed: " + engine.qwen4exp_full_graph_failure);
         if (!control.completed && !control.interrupted)

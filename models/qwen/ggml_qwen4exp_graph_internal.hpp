@@ -27,7 +27,6 @@
 #include "mmid_route_skip.hpp"
 #include "moe_partial_route.hpp"
 #include "ple_hash.hpp"
-#include "thread_profile.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -116,11 +115,8 @@ void CUDART_CB qwen4exp_cuda_gpu_stage_callback(void *user_data);
 bool qwen4exp_cuda_gpu_stage_node_enqueue(const ggml_tensor *node, cudaStream_t stream);
 void CUDART_CB qwen4exp_cuda_usage_track_callback(void *user_data);
 bool qwen4exp_cuda_usage_track_node_enqueue(const ggml_tensor *node, cudaStream_t stream);
-bool env_host_node_gpu_reduce();
-bool env_host_node_skip_cpu();
 int env_partial_graph_layer();
 bool env_partial_graph_enabled(int layer);
-bool env_host_node_keep_cpu_prologue();
 bool qwen4exp_host_node_timing_enabled();
 double qwen4exp_host_node_ordinary_cpu_wait_ms_since_last();
 double qwen4exp_host_node_gate_wait_ms_since_last();
@@ -131,7 +127,6 @@ void CUDART_CB qwen4exp_cuda_host_node_callback(void *user_data);
 void CUDART_CB qwen4exp_cuda_host_node_arm_direct_workers( void *user_data);
 bool env_prefill_state_handoff_enabled();
 bool prefill_device_state_inputs_enabled(const StreamingEngine &engine);
-bool env_decode_borrow_prefill_arenas();
 int env_device_expert_layers();
 bool env_device_expert_trailing();
 bool env_layer_timing_enabled();
@@ -149,7 +144,6 @@ bool env_adaptive_completion_policy_enabled();
 int env_decode_kv_capacity(int max_t, int required);
 void pin_host_node_threads(ggml_threadpool_params &p, int n_threads);
 int graph_cpu_threads();
-bool graph_scheduler_parallel();
 bool graph_cuda_host_buffers();
 bool graph_match_llama_cpp_topology(const FullGraph &graph);
 bool graph_layout_debug();

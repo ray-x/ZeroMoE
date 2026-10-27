@@ -83,22 +83,7 @@ std::expected<void, std::string> EngineRunner::start_workers() {
   std::cout << "  ZeroMoE engine online and ready. Enter prompt below.\n";
   std::cout << "Use ':q' to exit execution loop cleanly.\n\n";
 
-  // Configure only after all startup worker pools have been created.  New
-  // threads inherit the creator's affinity mask, so doing this at the top of
-  // run_engine() would accidentally constrain prefetch/GGML workers too.
-  configure_current_thread({
-      .name = "MAIN-DECODE",
-      // Main decode and CUDA callbacks intentionally float.  Priority and
-      // the ring's wait policy are the variables under test; a fixed core
-      // was measured to create a static contention point.
-      .cpu_ids = {},
-      .use_rt = true,
-      .rt_priority = 80,
-      .nice_value = -20,
-      .apply_nice = false,
-  });
-
-  return {};
+    return {};
 }
 
 std::expected<void, std::string> EngineRunner::run_repl() {
@@ -441,7 +426,7 @@ std::expected<void, std::string> EngineRunner::run_repl() {
                           << " exact token IDs from " << token_input << "\n";
       }
     }
-    if (zeromoe::graphcfg::env("ZEROMOE_MOE_SET_TRACE") != nullptr) {
+    if (Logger::instance().would_log(LogLevel::DEBUG)) {
       uint64_t hash = 1469598103934665603ULL;
       for (int token : prompt_tokens) {
         uint32_t value = (uint32_t)token;
@@ -450,8 +435,8 @@ std::expected<void, std::string> EngineRunner::run_repl() {
           hash *= 1099511628211ULL;
         }
       }
-      LOG_STREAM_INFO() << "[MOE-PROMPT] tokens=" << prompt_tokens.size()
-                        << " fnv64=0x" << std::hex << hash << std::dec << "\n";
+      LOG_DEBUG("[MOE-PROMPT] tokens=%zu fnv64=0x%llx\n",
+                prompt_tokens.size(), static_cast<unsigned long long>(hash));
     }
     if (const char *token_path = zeromoe::graphcfg::env("ZEROMOE_PROMPT_TOKEN_FILE")) {
       std::ofstream output(token_path);
@@ -470,7 +455,7 @@ std::expected<void, std::string> EngineRunner::run_repl() {
     std::cout << "\n  ZeroMoE * ";
     generate_text(engine, ram_mgr, tokenizer, prefetcher, prompt_tokens,
                   max_new_tokens, tokenizer.eos_token_id, config.temperature,
-                  config.top_p);
+                  config.top_p, config.repeat_penalty);
     if (bench.enabled())
       bench.record();
     if (!engine.qwen4exp_full_graph_failure.empty()) {

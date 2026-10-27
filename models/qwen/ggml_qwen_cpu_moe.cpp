@@ -12,7 +12,6 @@
 
 #include "kernels_cpu.hpp"
 #include "logger.hpp"
-#include "thread_profile.hpp"
 
 #include <algorithm>
 #include <array>
@@ -28,9 +27,7 @@
 #include <immintrin.h>
 #endif
 #if defined(__linux__)
-#include <pthread.h>
 #include <sys/resource.h>
-#include <sched.h>
 #endif
 #include <new>
 #include <sstream>
@@ -69,8 +66,8 @@ namespace {
 thread_local int qwen_cpu_diag_layer = -1;
 
 bool qwen_cpu_diag_enabled() {
-  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_DIAG_LAYER0_IQ2");
-  return v && v[0] == '1' && qwen_cpu_diag_layer == 0;
+  return Logger::instance().would_log(LogLevel::DEBUG) &&
+         qwen_cpu_diag_layer == 0;
 }
 
 void dump_qwen_cpu_diag_tensor(const char *role, const ggml_tensor *tensor) {
@@ -92,7 +89,7 @@ void dump_qwen_cpu_diag_tensor(const char *role, const ggml_tensor *tensor) {
     if (i < 8)
       first << (i ? "," : "") << std::setprecision(9) << values[i];
   }
-  LOG_INFO("[QWEN4EXP-LAYER0-DIAG] %s CPU ne=[%lld,%lld,%lld,%lld] "
+  LOG_DEBUG("[QWEN4EXP-LAYER0-DIAG] %s CPU ne=[%lld,%lld,%lld,%lld] "
            "nb=[%zu,%zu,%zu,%zu] values=%zu first=[%s] min=%.9g "
            "max=%.9g sum=%.9g data=%p\n",
            role, static_cast<long long>(tensor->ne[0]),
@@ -124,7 +121,7 @@ void dump_qwen_cpu_diag_tensor(const char *role, const ggml_tensor *tensor) {
       if (out)
         out.write(reinterpret_cast<const char *>(values.data()),
                   static_cast<std::streamsize>(values.size() * sizeof(float)));
-      LOG_INFO("[QWEN4EXP-LAYER0-DIAG] %s snapshot=%s bytes=%zu\n", role,
+      LOG_DEBUG("[QWEN4EXP-LAYER0-DIAG] %s snapshot=%s bytes=%zu\n", role,
                path.c_str(), values.size() * sizeof(float));
     }
   }
@@ -192,10 +189,6 @@ bool qwen_cpu_direct_pool_env_enabled() {
   return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN_CPU_DIRECT_POOL");
 }
 
-bool qwen_cpu_direct_ephemeral_env_enabled() {
-  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN_CPU_DIRECT_EPHEMERAL");
-}
-
 bool qwen_cpu_direct_timing_enabled() {
   return Logger::instance().would_log(LogLevel::DEBUG);
 }
@@ -209,14 +202,6 @@ bool qwen_cpu_direct_fused_enabled() {
 // splits during the rest of the token.  Park only the idle state; the active
 // input/gate-up/down/reduce phases still use the generation counter and
 // _mm_pause() exclusively.
-bool qwen_cpu_direct_idle_wait_enabled() {
-  return zeromoe::graphcfg::flag_unless_off("ZEROMOE_QWEN_CPU_DIRECT_IDLE_WAIT");
-}
-
-bool qwen_cpu_direct_caller_worker_enabled() {
-  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN_CPU_DIRECT_CALLER_WORKER");
-}
-
 int qwen_cpu_direct_worker_count() {
   const int grouped = std::max(1, qwen_cpu_grouped_threads());
   // Direct workers are parked while idle, and the host-node callback is
@@ -227,26 +212,11 @@ int qwen_cpu_direct_worker_count() {
   // thread may still run on an SMT sibling, but it no longer competes with a
   // permanently runnable worker while the pool is idle.
   const int max_workers = grouped;
-  const char *env = zeromoe::graphcfg::env("ZEROMOE_QWEN_CPU_DIRECT_THREADS");
-  if (env && env[0]) {
-    char *end = nullptr;
-    const long requested = std::strtol(env, &end, 10);
-    if (end != env && *end == '\0' && requested > 0)
-      return std::min(max_workers, static_cast<int>(requested));
-  }
-
-  // This machine has six physical cores / twelve logical CPUs.  The direct
-  // team is idle-waiting between requests, so use all physical cores during
-  // the callback instead of preserving the old five-worker reservation.
   const unsigned logical = std::thread::hardware_concurrency();
   const int physical_guess = logical >= 2 ? static_cast<int>((logical + 1) / 2)
                                          : static_cast<int>(logical);
   const int default_workers = physical_guess > 1 ? physical_guess - 1 : 1;
   return std::min(max_workers, std::max(1, default_workers));
-}
-
-bool qwen_cpu_direct_prefetch_enabled() {
-  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN_CPU_DIRECT_PREFETCH");
 }
 
 bool qwen_cpu_direct_diag_enabled() {
@@ -335,21 +305,6 @@ inline void qwen_cpu_direct_pause() {
 #endif
 }
 
-inline void qwen_cpu_direct_prefetch_row(const uint8_t *row,
-                                         size_t row_bytes) {
-#if defined(__x86_64__) || defined(__i386__)
-  // Seed only the first cache line of the next quantized row.  The production
-  // IQ kernels still own all decoding and remain nrc=1; this is deliberately
-  // a light-touch experiment because prefetching several lines per row was
-  // slower in the first A/B run.
-  _mm_prefetch(reinterpret_cast<const char *>(row), _MM_HINT_T0);
-  (void)row_bytes;
-#else
-  (void)row;
-  (void)row_bytes;
-#endif
-}
-
 bool qwen_cpu_direct_thread_diag_enabled() {
   return qwen_cpu_direct_diag_enabled();
 }
@@ -398,51 +353,6 @@ void qwen_cpu_direct_sample_end(GgmlQwenDirectWorkerSample &sample,
   }
 #endif
 }
-
-void qwen_cpu_direct_pin_thread(int worker_index) {
-#if defined(__linux__)
-  if (zeromoe_thread_profile_enabled()) {
-    configure_current_thread({
-        .name = "MOE-WORKER-" + std::to_string(worker_index),
-        .cpu_ids = zeromoe_thread_profile_physical_core(worker_index),
-        .use_rt = false,
-        .rt_priority = 0,
-        .nice_value = -15,
-        .apply_nice = false,
-    });
-    return;
-  }
-  const char *env = zeromoe::graphcfg::env("ZEROMOE_QWEN_CPU_DIRECT_PIN");
-  if (!env || env[0] != '1')
-    return;
-
-  cpu_set_t allowed;
-  CPU_ZERO(&allowed);
-  if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0)
-    return;
-  int target = -1;
-  for (int cpu = 0, seen = 0; cpu < CPU_SETSIZE; ++cpu) {
-    if (!CPU_ISSET(cpu, &allowed))
-      continue;
-    if (seen++ == worker_index) {
-      target = cpu;
-      break;
-    }
-  }
-  if (target < 0)
-    return;
-  cpu_set_t selected;
-  CPU_ZERO(&selected);
-  CPU_SET(target, &selected);
-  (void)pthread_setaffinity_np(pthread_self(), sizeof(selected), &selected);
-#else
-  (void)worker_index;
-#endif
-}
-
-} // namespace
-
-void qwen_cpu_moe_diag_set_layer(int layer) { qwen_cpu_diag_layer = layer; }
 
 GgmlQwenCpuMoeRunner &GgmlQwenCpuMoeRunner::instance() {
   static GgmlQwenCpuMoeRunner runner;
@@ -1071,7 +981,6 @@ void GgmlQwenCpuMoeRunner::run_direct_caller_phases(
   auto *down_q = reinterpret_cast<block_q8_0 *>(direct_down_q8_0_.data());
   const bool report_timing = qwen_cpu_direct_timing_enabled();
   const bool report_phase_diag = qwen_cpu_direct_diag_enabled();
-  const bool prefetch_rows = qwen_cpu_direct_prefetch_enabled();
   const auto now_ns = [] {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
@@ -1169,12 +1078,6 @@ void GgmlQwenCpuMoeRunner::run_direct_caller_phases(
       const size_t row_index = static_cast<size_t>(m) * request.d_ff + o;
       const uint8_t *gate_row = direct_gate_rows_[row_index];
       const uint8_t *up_row = direct_up_rows_[row_index];
-      if (prefetch_rows && row_index + 2 < direct_gate_rows_.size()) {
-        qwen_cpu_direct_prefetch_row(direct_gate_rows_[row_index + 2],
-                                     gate_row_bytes);
-        qwen_cpu_direct_prefetch_row(direct_up_rows_[row_index + 2],
-                                     up_row_bytes);
-      }
       float *gate_out = direct_gate_output_.data() + row_index;
       float *up_out = direct_up_output_.data() + row_index;
       switch (request.layer.gate_type) {
@@ -1245,10 +1148,6 @@ void GgmlQwenCpuMoeRunner::run_direct_caller_phases(
     const auto *expert_hidden =
         down_q + static_cast<size_t>(m) * (request.d_ff / 32);
     for (int d = first_down; d < last_down; ++d) {
-      if (prefetch_rows && d + 3 < last_down)
-        qwen_cpu_direct_prefetch_row(
-            direct_down_rows_[row_base + static_cast<size_t>(d + 3)],
-            down_row_bytes);
       const uint8_t *down_row =
           direct_down_rows_[row_base + static_cast<size_t>(d)];
       float down_val = 0.0f;
@@ -1296,7 +1195,7 @@ bool GgmlQwenCpuMoeRunner::run_direct_request(
       return true;
   }
   const auto wall_start = std::chrono::steady_clock::now();
-  const bool caller_worker = qwen_cpu_direct_caller_worker_enabled();
+  constexpr bool caller_worker = false;
   if (!submit_direct_request(request))
     return false;
   const auto submit_end = std::chrono::steady_clock::now();
@@ -1312,8 +1211,6 @@ bool GgmlQwenCpuMoeRunner::run_direct_request(
   // would keep workers spinning and would contaminate the teardown timing.
   direct_armed_.store(false, std::memory_order_release);
   direct_phase_.notify_all();
-  if (qwen_cpu_direct_ephemeral_env_enabled())
-    stop_direct_pool();
   const auto teardown_end = std::chrono::steady_clock::now();
 
   if (qwen_cpu_direct_thread_diag_enabled()) {
@@ -1408,7 +1305,6 @@ bool GgmlQwenCpuMoeRunner::run_direct_request(
 }
 
 void GgmlQwenCpuMoeRunner::direct_worker_loop(int worker_index) {
-  qwen_cpu_direct_pin_thread(worker_index);
   uint64_t seen_phase = 0;
   for (;;) {
     while (!direct_stop_.load(std::memory_order_acquire)) {
@@ -1422,7 +1318,7 @@ void GgmlQwenCpuMoeRunner::direct_worker_loop(int worker_index) {
       // missing milliseconds in the host callback.  Active phases therefore
       // remain a pure pause loop; the idle state can still use an efficient
       // atomic wait so the team does not steal cores between tokens.
-      if (qwen_cpu_direct_idle_wait_enabled() &&
+      if (
           !direct_armed_.load(std::memory_order_acquire) &&
           direct_phase_command(phase) == QWEN_DIRECT_IDLE) {
         direct_phase_.wait(seen_phase, std::memory_order_acquire);
@@ -1444,7 +1340,7 @@ void GgmlQwenCpuMoeRunner::direct_worker_loop(int worker_index) {
     // derive nth=direct_threads_ instead of nth=direct_threads_+1 and advance
     // the phase early.  The callback would subsequently wait forever for a
     // participant that no longer exists.
-    const bool caller_worker = qwen_cpu_direct_caller_worker_enabled();
+    constexpr bool caller_worker = false;
     const int nth = direct_threads_ + (caller_worker ? 1 : 0);
     const int participant = worker_index + (caller_worker ? 1 : 0);
     const size_t gate_row_bytes =
@@ -1461,8 +1357,7 @@ void GgmlQwenCpuMoeRunner::direct_worker_loop(int worker_index) {
     auto *down_q = reinterpret_cast<block_q8_0 *>(direct_down_q8_0_.data());
     const bool report_timing = qwen_cpu_direct_timing_enabled();
     const bool report_worker_diag = qwen_cpu_direct_thread_diag_enabled();
-    const bool prefetch_rows = qwen_cpu_direct_prefetch_enabled();
-    const auto now_ns = [] {
+      const auto now_ns = [] {
       return std::chrono::duration_cast<std::chrono::nanoseconds>(
                  std::chrono::steady_clock::now().time_since_epoch())
           .count();
@@ -1509,12 +1404,6 @@ void GgmlQwenCpuMoeRunner::direct_worker_loop(int worker_index) {
           const size_t row_index = static_cast<size_t>(m) * request.d_ff + o;
           const uint8_t *gate_row = direct_gate_rows_[row_index];
           const uint8_t *up_row = direct_up_rows_[row_index];
-          if (prefetch_rows && row_index + 2 < direct_gate_rows_.size()) {
-            qwen_cpu_direct_prefetch_row(direct_gate_rows_[row_index + 2],
-                                         gate_row_bytes);
-            qwen_cpu_direct_prefetch_row(direct_up_rows_[row_index + 2],
-                                         up_row_bytes);
-          }
           float *gate_out = direct_gate_output_.data() + row_index;
           float *up_out = direct_up_output_.data() + row_index;
           switch (request.layer.gate_type) {
@@ -1612,10 +1501,6 @@ void GgmlQwenCpuMoeRunner::direct_worker_loop(int worker_index) {
         const auto *expert_hidden =
             down_q + static_cast<size_t>(m) * (request.d_ff / 32);
         for (int d = first_down; d < last_down; ++d) {
-          if (prefetch_rows && d + 3 < last_down)
-            qwen_cpu_direct_prefetch_row(
-                direct_down_rows_[row_base + static_cast<size_t>(d + 3)],
-                down_row_bytes);
           const uint8_t *down_row =
               direct_down_rows_[row_base + static_cast<size_t>(d)];
           float down_val = 0.0f;

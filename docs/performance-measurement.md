@@ -10,7 +10,7 @@ Three layers, each using the one below it:
 
 `core/request_stats.hpp`. Every request produces one record when it ends (also when it fails: `status` is then `error`).
 It is written to the log as a single `[STATS] {json}` line, appended to a file as one JSON object per line when you pass
-`--stats-file PATH` (or set `ZEROMOE_STATS_FILE=PATH`), and kept in memory for in-process callers.
+`--stats-file PATH`, and kept in memory for in-process callers.
 
 | Field | Meaning |
 | --- | --- |
@@ -101,4 +101,4 @@ the interface.
   a busy machine.
 - **Greedy decoding on a fixed prompt** produces the same text each time, so differences between parts of a long decode reflect
   what is generated as well as context length.
-- **Set the model path** with `--model` or `ZEROMOE_MODEL_PATH`; the shipped configs carry a placeholder.
+- **Set the model path** with `--model` or a real `model_path` in TOML; the shipped configs carry a placeholder.

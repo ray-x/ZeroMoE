@@ -40,25 +40,6 @@
 
 namespace {
 
-// Diagnostic A/B only.  Keep the HC graph and its persistent streams active,
-// but return the GDN pre-mix result through the existing host tensor_get.  This
-// isolates the HC pre-mix device output from the post-combine graph.
-static bool force_hc_gdn_pre_host() {
-    static const bool enabled = [] {
-        const char *v = zeromoe::graphcfg::env("ZEROMOE_GGML_FORCE_HC_GDN_PRE_HOST");
-        return v && v[0] == '1';
-    }();
-    return enabled;
-}
-
-static bool dual_hc_gdn_pre_output() {
-    static const bool enabled = [] {
-        const char *v = zeromoe::graphcfg::env("ZEROMOE_GGML_HC_DUAL_GDN_PRE_OUTPUT");
-        return v && v[0] == '1';
-    }();
-    return enabled;
-}
-
 static void dump_hc_compare_vector(const char *base, const char *label,
                                    int layer, int sub,
                                    int call,
@@ -831,10 +812,7 @@ void qwen4exp_hc_pre_mix(StreamingEngine &engine, int layer_idx,
     const bool device_gdn_input =
         gdn_full_ggml() && gdn_proj_ggml() && sub_block == 0 &&
         qwen4exp_is_gdn_layer(c, layer_idx) &&
-        GgmlGdnProjRunner::instance().full_weights_ready(layer_idx) &&
-        !force_hc_gdn_pre_host();
-    const bool dual_gdn_pre_output =
-        device_gdn_input && dual_hc_gdn_pre_output();
+      GgmlGdnProjRunner::instance().full_weights_ready(layer_idx);
     // Keep the Qwen decode MoE input on the device independently of where
     // routing is performed.  The host-router A/B path still needs a host
     // copy of the mixed [D] row for the AVX-512 projection, but the grouped
@@ -870,12 +848,10 @@ void qwen4exp_hc_pre_mix(StreamingEngine &engine, int layer_idx,
     const void *device_input = nullptr;
     if (hc_ggml_register(engine, layer_idx, sub_block, D, S) &&
         GgmlHcRunner::instance().pre_mix(layer_idx, sub_block, S,
-                                         dual_gdn_pre_output
-                                             ? hidden_states
-                                             : ((device_gdn_input ||
-                                                 keep_moe_input_on_device)
-                                         ? nullptr
-                                         : hidden_states),
+                                       (device_gdn_input ||
+                                        keep_moe_input_on_device)
+                                           ? nullptr
+                                           : hidden_states,
                                          need_device_input ? &device_input
                                                             : nullptr)) {
       GgmlHcRunner::instance().queue_pre_mix_dependency();

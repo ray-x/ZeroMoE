@@ -13,7 +13,7 @@
 # moe_router_service.cpp path even when full-graph prefill is on):
 #   ZEROMOE_SURVEY_BINARY=build_ggmlcuda/zeromoe
 #   CUDA_VISIBLE_DEVICES=0 ZEROMOE_CUDA_SCHEDULE=auto
-#   ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=22
+#   --graph-device-expert-trailing 1 --graph-device-expert-layers 22
 #   ZEROMOE_BENCH_IGNORE_STOP=1
 
 model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf"

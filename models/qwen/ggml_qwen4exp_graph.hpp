@@ -23,8 +23,7 @@ bool qwen4exp_full_graph_sync_state_to_host(StreamingEngine &engine);
 // Startup warmup that loads prompt-independent static weight arenas before the
 // first request. Enabled by default for full-graph decode; set
 // ZEROMOE_QWEN4EXP_GRAPH_BOOTSTRAP=0 to keep lazy preparation. The prompt
-// shape defaults to 16 and can be set with
-// ZEROMOE_QWEN4EXP_GRAPH_BOOTSTRAP_TOKENS.
+// shape is fixed at up to 16 tokens.
 bool qwen4exp_full_graph_bootstrap(StreamingEngine &engine);
 
 // Number of complete early MoE layers whose expert tensors should be placed

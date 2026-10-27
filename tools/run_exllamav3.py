@@ -3,6 +3,7 @@ from collections import Counter
 import contextlib
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -87,6 +88,9 @@ def read_settings(config_path, prompt=None, new_tokens=None, overrides=None, use
     settings.setdefault("omp_max_threads", 12)
     settings.setdefault("temperature", 0.0)
     settings.setdefault("top_p", 0.9)
+    settings.setdefault("repeat_penalty", 1.0)
+    if not math.isfinite(settings["repeat_penalty"]) or settings["repeat_penalty"] <= 0:
+        raise ValueError("repeat_penalty must be finite and positive")
     settings.setdefault("raw_prompt", False)
     settings.setdefault("enable_thinking", False)
     settings.setdefault("exllamav3_max_chunk_size", 256)
@@ -249,7 +253,7 @@ def run_runtime(settings, view, benchmark, warmup_tokens, output_path):
     source = settings["exllamav3_source_dir"]
     sys.path.insert(0, str(source))
     import torch
-    from exllamav3 import Config, Model, Cache, Tokenizer, Generator, Job, GreedySampler, TopPSampler
+    from exllamav3 import Config, Model, Cache, Tokenizer, Generator, Job, GreedySampler, TopPSampler, ComboSampler
 
     if not torch.cuda.is_available():
         raise RuntimeError("ExLlamaV3 requires CUDA-enabled PyTorch and a visible GPU")
@@ -302,8 +306,14 @@ def run_runtime(settings, view, benchmark, warmup_tokens, output_path):
                               draft_model=draft_model, draft_cache=draft_cache)
 
         def generate(input_ids, count, stream, fixed_tokens):
-            sampler = GreedySampler() if settings["temperature"] == 0 else TopPSampler(
-                temperature=settings["temperature"], top_p=settings["top_p"])
+            if settings["repeat_penalty"] != 1.0:
+                sampler = ComboSampler(rep_p=settings["repeat_penalty"],
+                                       temperature=settings["temperature"],
+                                       top_p=settings["top_p"])
+            else:
+                sampler = (GreedySampler() if settings["temperature"] == 0 else
+                           TopPSampler(temperature=settings["temperature"],
+                                       top_p=settings["top_p"]))
             job = Job(input_ids=input_ids, max_new_tokens=count, sampler=sampler,
                       stop_conditions=[] if fixed_tokens else config.eos_token_id_list)
             generator.enqueue(job)
@@ -397,6 +407,7 @@ def main():
     parser.add_argument("--mtp", action="store_true", help="Enable the checkpoint's Qwen3.8 MTP draft head")
     parser.add_argument("--temp", type=float)
     parser.add_argument("--top-p", type=float)
+    parser.add_argument("--repeat-penalty", type=float)
     parser.add_argument("--raw-prompt", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--benchmark", action="store_true", help="Generate a fixed number of tokens without EOS stopping")
@@ -411,6 +422,7 @@ def main():
             "context_size": arguments.ctx_size, "omp_max_threads": arguments.threads,
             "exllamav3_cuda_schedule": arguments.cuda_schedule,
             "temperature": arguments.temp, "top_p": arguments.top_p,
+            "repeat_penalty": arguments.repeat_penalty,
             "raw_prompt": arguments.raw_prompt, "enable_thinking": arguments.thinking,
         }.items() if value is not None}
         settings = read_settings(arguments.config, arguments.prompt, arguments.predict, overrides,

@@ -5,6 +5,17 @@
 # Output: logs/perf/<tag>.{engine.log,stdout}. Extra VAR=val pairs are exported to the run.
 set -uo pipefail
 bin=$(readlink -f "${1:?engine}"); tag=${2:?tag}; shift 2
+runtime_env=()
+graph_args=()
+while (($#)); do
+  case "$1" in
+    --graph-*)
+      (($# >= 2)) || { echo "$1 requires a value" >&2; exit 2; }
+      graph_args+=("$1" "$2"); shift 2 ;;
+    *=*) runtime_env+=("$1"); shift ;;
+    *) echo "unsupported run option: $1" >&2; exit 2 ;;
+  esac
+done
 root=$(cd "$(dirname "$0")/.." && pwd); out=$root/logs/perf; mkdir -p "$out"
 MODEL=${GLM_MODEL:?set GLM_MODEL to the model file or first shard}
 STORE=${GLM_STORE:?set GLM_STORE to the expert-store file}
@@ -36,12 +47,13 @@ if model_count != 1 or log_count != 1:
 Path(sys.argv[2]).write_text(text)
 PY
 printf '%s\n:q\n' "$PROMPT" | env \
-  ZEROMOE_GLM5NEXT_OFFLOAD_FIRST_LAYER=3 ZEROMOE_GLM5NEXT_OFFLOAD_DDR_GIB=32 \
-  ZEROMOE_GLM5NEXT_OFFLOAD_PINNED=0.5 ZEROMOE_GLM5NEXT_OFFLOAD_POLICY=lru \
-  ZEROMOE_GLM5NEXT_OFFLOAD_STORE="$STORE" ZEROMOE_GLM5NEXT_OFFLOAD_MODEL="$MODEL" \
-  ZEROMOE_GLM5NEXT_OFFLOAD_USAGE="$USAGE" ZEROMOE_GLM5NEXT_OFFLOAD_ASYNC=1 \
   ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512 ZEROMOE_GLM5NEXT_CPU_THREADS=8 \
-  CUDA_VISIBLE_DEVICES=0 ZEROMOE_BENCH_IGNORE_STOP=1 "$@" \
+  CUDA_VISIBLE_DEVICES=0 ZEROMOE_BENCH_IGNORE_STOP=1 "${runtime_env[@]}" \
   systemd-run --user --scope -q -p MemoryMax=${GLM_MEMMAX:-80G} -p MemorySwapMax=0 \
-  "$bin" --config "$out/$tag.toml" --predict "${NGEN:-48}" > "$out/$tag.stdout" 2>&1
+  "$bin" --config "$out/$tag.toml" \
+  --graph-offload-first-layer 3 --graph-offload-ddr-gib 32 \
+  --graph-offload-pinned-fraction 0.5 --graph-offload-policy lru \
+  --graph-offload-store "$STORE" --graph-offload-model "$MODEL" \
+  --graph-offload-usage-file "$USAGE" --graph-offload-async 1 \
+  "${graph_args[@]}" --predict "${NGEN:-48}" > "$out/$tag.stdout" 2>&1
 echo "exit=$?"; grep -h 'decode=' "$out/$tag.engine.log" | tail -1 | sed -E 's/.*(decode=[0-9.]+ tok\/s).*/\1/'

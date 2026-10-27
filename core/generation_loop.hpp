@@ -28,6 +28,7 @@
 #include <fstream>
 #include <limits>
 #include "request_stats.hpp"
+#include "logger.hpp"
 #include "generation_control.hpp"
 
 extern void matmul(float* y, const float* x, const float* W, int S, int I, int O);
@@ -108,11 +109,7 @@ inline uint64_t decode_logits_fnv64(const float *logits, size_t n) {
 }
 
 inline bool decode_logits_hash_enabled() {
-    static const bool enabled = [] {
-        const char *value = zeromoe::graphcfg::env("ZEROMOE_DECODE_LOGITS_HASH");
-        return value && value[0] == '1';
-    }();
-    return enabled;
+    return Logger::instance().would_log(LogLevel::DEBUG);
 }
 
 // Diagnostic-only prefill parity switch.  When enabled, process the prompt
@@ -131,12 +128,9 @@ inline bool prefill_unbatched_enabled() {
 
 inline void log_decode_logits_hash(int step, uint64_t hash, int sampled_token,
                                    int forced_token) {
-    if (!decode_logits_hash_enabled())
-        return;
-    LOG_STREAM_INFO() << "[TEACHER-FORCE-LOGITS] step=" << step
-                      << " sampled_token=" << sampled_token
-                      << " forced_token=" << forced_token
-                      << " fnv64=0x" << std::hex << hash << std::dec << "\n";
+    if (!decode_logits_hash_enabled()) return;
+    LOG_DEBUG("[TEACHER-FORCE-LOGITS] step=%d sampled_token=%d forced_token=%d fnv64=0x%llx\n",
+              step, sampled_token, forced_token, static_cast<unsigned long long>(hash));
 }
 
 // Diagnostic-only teacher-forcing support.  A baseline run can write the
@@ -445,55 +439,6 @@ public:
 // token, so it must not be silently mixed into a llama.cpp parity comparison.
 // This is intentionally an environment override rather than a model-wide
 // default/config change: existing models retain exactly the old behavior.
-inline float zeromoe_repetition_penalty() {
-    static const float penalty = [] {
-        // Default matches llama.cpp's official `repeat_penalty` behavior.
-        // default (1.0 == disabled). The prior default (1.3) does not exist
-        // upstream and was confirmed as the root cause of a real, reproducible
-        // switch-to-non-English defect on Qwen4Exp/UD-IQ1_M: the penalty
-        // window (see its call site below) included the PROMPT's own
-        // tokens, so a common word merely appearing once in the user's own
-        // question (e.g. "and") got its logit suppressed in later decode
-        // steps -- confirmed via raw pre-penalty logit dumps
-        // (ZEROMOE_DECODE_LOGITS_DUMP) showing the correct English
-        // continuation winning by a clear margin pre-penalty, then losing to
-        // a non-English token post-penalty, and via llama.cpp itself
-        // (same weights, same quant, same prompt, temp=0) staying coherent
-        // throughout where ZeroMoE did not. Still available and
-        // configurable via ZEROMOE_REPETITION_PENALTY for anyone who wants
-        // the old anti-loop behavior back.
-        constexpr float default_penalty = 1.0f;
-        const char* text = zeromoe::graphcfg::env("ZEROMOE_REPETITION_PENALTY");
-        if (!text || !*text) return default_penalty;
-
-        char* end = nullptr;
-        const float value = std::strtof(text, &end);
-        if (end == text || *end != '\0' || !std::isfinite(value) || value <= 0.0f) {
-            LOG_WARN("[GEN] ignoring invalid ZEROMOE_REPETITION_PENALTY='%s'\n", text);
-            return default_penalty;
-        }
-        LOG_INFO("[GEN] ZEROMOE_REPETITION_PENALTY=%.6g (default=%.6g)\n",
-                 value, default_penalty);
-        return value;
-    }();
-    return penalty;
-}
-
-// `prefetcher` is caller-owned (main.cpp starts it ONCE for the whole
-// session with the real VRAM topology and a pointer back to ram_mgr --
-// prefetcher.ram_mgr, set right after prefetcher.start() -- see main.cpp's
-// own comment on that assignment) instead of generate_text creating and
-// starting its OWN local, topology-less instance per request. That local
-// instance was a real structural bug (an earlier investigation): it
-// received pilot-prefetch hints and did real disk I/O, but with
-// gpu_topo=nullptr its (since-removed) finish_prefetch() could never fire
-// an async VRAM promotion -- and meanwhile main.cpp's OWN topology-enabled
-// prefetcher instance sat idle, receiving zero hints. Net effect:
-// speculative disk reads whose result was consumed by no one. Passing the
-// SAME instance everywhere (this function, and prefetcher.ram_mgr for
-// LockFreePrefetcher::active_prefetch's own claim_or_wait calls into the
-// RAM tier) makes hints and claims all flow through one prefetcher talking
-// to one RAM tier.
 // Fills one zeromoe::stats::RequestStats for the request and publishes it when the request leaves generate_text(),
 // by any path. A request that returns early (error, refused graph) is published with status "error".
 struct RequestStatsScope {
@@ -524,6 +469,7 @@ inline void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GG
                    LockFreePrefetcher& prefetcher,
                    const std::vector<int>& prompt_ids, int max_new_tokens, int eos_id,
                    float temperature = 0.7f, float top_p = 0.90f,
+                   float repeat_penalty = 1.0f,
                    GenerationControl *control = nullptr) {
     auto cancelled = [&] {
         const bool stop = g_shutdown_requested.load(std::memory_order_relaxed) ||
@@ -1223,7 +1169,7 @@ const bool token_loop_diag_enabled =
                     const std::vector<int> &context, std::vector<float> &probs) {
                     ZE_NVTX("mtp.sampling");
                     std::vector<float> work(step_logits.begin(), step_logits.end());
-                    if (const float penalty = zeromoe_repetition_penalty();
+                    if (const float penalty = repeat_penalty;
                         penalty != 1.0f) {
                         constexpr int REPETITION_WINDOW = 64;
                         const int start =
@@ -1247,7 +1193,7 @@ const bool token_loop_diag_enabled =
                                  const std::vector<int> &context, int &token) {
                     token = zeromoe::graph::detail::greedy_argmax_with_repetition_penalty(
                         step_logits, context, prompt_ids.size(),
-                        zeromoe_repetition_penalty());
+                        repeat_penalty);
                     return token >= 0;
                 };
             }
@@ -1410,9 +1356,9 @@ const bool token_loop_diag_enabled =
         // the model for wanting to reuse a word the USER's own question
         // happened to contain -- confirmed as the real mechanism behind a
         // reproducible switch-to-non-English defect (see
-        // zeromoe_repetition_penalty's own comment). Only tokens the
+        // repeat_penalty defaults to 1.0, matching llama.cpp. Only tokens the
         // model itself generated should ever be penalized.
-        if (const float repetition_penalty = zeromoe_repetition_penalty();
+        if (const float repetition_penalty = repeat_penalty;
             repetition_penalty != 1.0f) {
             constexpr int REPETITION_WINDOW = 64;
             int start = std::max((int)prompt_ids.size(),

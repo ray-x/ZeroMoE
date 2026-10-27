@@ -33,15 +33,14 @@ wait_for_gpu() {
 }
 
 ./build_fork_diag/gguf_tool verify "$(dirname "$model")" > "$output_dir/verify.log" 2>&1
-runtime=(CUDA_VISIBLE_DEVICES=0 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=48
-         ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1
-         ZEROMOE_QWEN4EXP_GRAPH_PARALLEL=1
+runtime=(CUDA_VISIBLE_DEVICES=0
          ZEROMOE_PROMPT_TOKEN_INPUT_FILE="$prompt_tokens"
          ZEROMOE_BENCH_IGNORE_STOP=1 ZEROMOE_BENCH_SILENT=1)
 wait_for_gpu
 printf '%s\n' 'What is 2 plus 2? Explain briefly.' |
     env "${runtime[@]}" ZEROMOE_GENERATED_TOKEN_FILE="$output_dir/decode.tokens" \
-        "$engine" --config "$config" --raw-prompt --ctx-size 151 --predict 129 \
+        "$engine" --graph-device-expert-layers 48 --graph-device-expert-trailing 1 \
+        --config "$config" --raw-prompt --ctx-size 151 --predict 129 \
         --log-file "$output_dir/capture.log" > "$output_dir/capture.stdout" 2>&1
 wait_for_gpu
 env CUDA_VISIBLE_DEVICES=0 LD_LIBRARY_PATH="$bee_libraries" \
