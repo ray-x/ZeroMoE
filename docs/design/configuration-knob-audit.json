@@ -54754,7 +54754,7 @@
       ],
       "affected_if_removed": "full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner.cpp, core/engine_runner_cache.cpp, models/glm/ggml_glm5next_graph.cpp, models/glm/ggml_glm5next_graph_arena.cpp (+11 other files).",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
+      "review_decision": "KEPT 2026-10-27: default is now 2 whole expert layers. 0 is the explicit no-whole-layer/global-pool sentinel; an enabled block must be 2..48, so TOML 1 is rejected and env 1 is raised to 2 with a warning.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0494"
@@ -55144,7 +55144,7 @@
       ],
       "affected_if_removed": "Ling: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner.cpp, core/engine_runner_cache.cpp, models/graph/full_graph_models.cpp, models/graph/graph_settings.hpp (+5 other files).",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
+      "review_decision": "KEPT 2026-10-27: default false (leading block). true matches llama.cpp's -ncmoe trailing placement; it has no effect while graph_device_expert_layers is 0.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0495"
