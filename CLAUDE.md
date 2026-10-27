@@ -194,3 +194,11 @@ previous run still needs a captured gate log for verification.
 ### Git workflow
 * Work in a worktree, not in the main checkout. Master's history was rewritten during the source refactor, so `git rev-list master..branch` counts are meaningless for old branches; judge "merged" with `git cherry master <branch>` (patch content) and by checking that the code exists in master under the new paths.
 * The project was renamed MoEStream -> ZeroMoE: the engine binary is `zeromoe`, env vars are `ZEROMOE_*`, usage files are `.zeromoe_usage*` (gitignored). Do not add new `moestream`/`MOESTREAM_*` names or absolute `/home/ray/Projects/MoEStream` paths. Remaining legacy references are deliberate: `patches/obsolete`, dated `docs/` handoffs, `glm_runs/`, `logs/`, and `bench/`/`configs/`/`tests/` scripts that point at real external directories still named `moestream-*` on disk (e.g. `~/Projects/moestream-build-upstream-master`, `~/work/moestream-graph`, `/data/moestream-offload`). Rename those references only together with the directories.
+
+## Cross-session feature handoff
+
+For shared model work, follow the source-tree, build-provenance, and artifact
+rules in `AGENTS.md`. The current Qwen4Exp MTP record lives at
+`docs/handoff/qwen4exp-mtp-current.md`; update it after each merge or measured
+run. Before quoting a rate, verify the binary manifest against the source HEAD
+and keep the prompt, config, timing boundary, and raw logs with the result.

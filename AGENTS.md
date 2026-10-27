@@ -65,3 +65,28 @@ continue profiling; do not stop at coherent output or graph-gate success.
 
 The authoritative design and memory-fallback contract is in
 [`docs/design/full-graph-model-onboarding.md`](docs/design/full-graph-model-onboarding.md).
+
+## Cross-session work and benchmark provenance
+
+- Before selecting a source tree or binary, record `git status --short
+  --branch`, `git rev-parse HEAD`, and `git worktree list --porcelain`. A user
+  report that work was merged makes current master authoritative; a detached
+  worktree or an executable with matching MTP files is not proof that the full
+  runtime/configuration is current.
+- Before a performance run, validate the executable's build manifest with
+  `python3 tools/build_provenance.py check --binary build/zeromoe --repo .`.
+  If the manifest is absent or its source commit/hash differs, rebuild from the
+  selected worktree or label the run exploratory. Never report a stale binary
+  as a current-master result.
+- Save each run's exact TOML, prompt/token count, command/environment, stdout,
+  engine log, binary manifest, and raw timing boundary under a persistent
+  `build_mtp_results/<date>-<source>-<workload>/` directory. Do not leave the
+  only copy in `/tmp` or another tmpfs.
+- Update the versioned shared handoff at
+  `docs/handoff/qwen4exp-mtp-current.md` after a merge or benchmark. Separate
+  locally measured results from user/report/source-only figures; include the
+  source/worktree owner, next action, and artifact paths.
+- Treat other worktrees' uncommitted files as owned by their session. Inspect
+  them read-only and preserve them; do not reset, overwrite, or silently mix
+  their changes into a benchmark build. If such changes affect the target
+  family, snapshot their exact diff hash and label the build as that snapshot.

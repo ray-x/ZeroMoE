@@ -5,6 +5,9 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+option(ZEROMOE_WRITE_BUILD_PROVENANCE
+       "Write a source/binary provenance manifest after building zeromoe" ON)
+
 # Resolver/default/binding tests need neither CUDA nor model weights.
 enable_testing()
 add_executable(graph_settings_test tests/test_graph_settings.cpp)
@@ -368,6 +371,22 @@ if(NOT ZEROMOE_CPU_ONLY)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
     find_package(CUDAToolkit REQUIRED)
+    if(ZEROMOE_WRITE_BUILD_PROVENANCE)
+        find_package(Python3 COMPONENTS Interpreter REQUIRED)
+        execute_process(
+            COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_provenance.py"
+                    snapshot --repo "${CMAKE_CURRENT_SOURCE_DIR}"
+            RESULT_VARIABLE _zeromoe_snapshot_result
+            OUTPUT_VARIABLE _zeromoe_source_snapshot
+            ERROR_VARIABLE _zeromoe_snapshot_error
+            OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if(NOT _zeromoe_snapshot_result EQUAL 0)
+            message(FATAL_ERROR "Could not snapshot source for build provenance: ${_zeromoe_snapshot_error}")
+        endif()
+        string(JSON ZEROMOE_CONFIGURED_SOURCE_COMMIT GET "${_zeromoe_source_snapshot}" source_commit)
+        string(JSON ZEROMOE_CONFIGURED_SOURCE_SNAPSHOT_SHA256 GET "${_zeromoe_source_snapshot}" source_snapshot_sha256)
+    endif()
 
     # Engine executable
     # CUDA kernel sources (cuda/*.cu) and the GPU Qwen MoE backend
@@ -751,7 +770,6 @@ if(NOT ZEROMOE_CPU_ONLY)
     target_include_directories(quant_table_test PRIVATE ${ZEROMOE_INCLUDE_DIRS}
         ${ZEROMOE_GGML_SRC_DIR})
     target_link_libraries(quant_table_test PRIVATE ggml)
-    add_executable(graph_settings_test EXCLUDE_FROM_ALL tests/test_graph_settings.cpp)
     target_include_directories(graph_settings_test PRIVATE ${ZEROMOE_INCLUDE_DIRS})
     add_executable(resident_memory_policy_test EXCLUDE_FROM_ALL tests/test_resident_memory_policy.cpp)
     target_include_directories(resident_memory_policy_test PRIVATE ${ZEROMOE_INCLUDE_DIRS})
@@ -1261,4 +1279,28 @@ if(TARGET zeromoe_exl3_upstream)
             target_link_libraries(${_exl3_target} PRIVATE zeromoe_exl3_upstream)
         endif()
     endforeach()
+endif()
+
+if(TARGET zeromoe AND ZEROMOE_WRITE_BUILD_PROVENANCE)
+    set(_zeromoe_provenance_args
+        stamp
+        --binary "$<TARGET_FILE:zeromoe>"
+        --repo "${CMAKE_CURRENT_SOURCE_DIR}"
+        --build-dir "${CMAKE_BINARY_DIR}"
+        --expected-commit "${ZEROMOE_CONFIGURED_SOURCE_COMMIT}"
+        --expected-source-snapshot-sha256 "${ZEROMOE_CONFIGURED_SOURCE_SNAPSHOT_SHA256}")
+    if(ZEROMOE_GGML_ROOT)
+        list(APPEND _zeromoe_provenance_args --ggml-root "${ZEROMOE_GGML_ROOT}")
+    endif()
+    if(ZEROMOE_GGML_COMMIT)
+        list(APPEND _zeromoe_provenance_args --ggml-base "${ZEROMOE_GGML_COMMIT}")
+    endif()
+    add_custom_command(TARGET zeromoe POST_BUILD
+        COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_provenance.py"
+                ${_zeromoe_provenance_args}
+        COMMENT "Stamping source and GGML provenance for zeromoe"
+        VERBATIM COMMAND_EXPAND_LISTS)
+    set_property(TARGET zeromoe APPEND PROPERTY LINK_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_provenance.py")
 endif()

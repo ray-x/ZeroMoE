@@ -22,20 +22,21 @@ OUT=$(realpath -m "${1:?usage: build_ggml.sh <out-dir>}")
 GGML_REPO=${GGML_REPO:-$ROOT/third_party/llama.cpp}
 [[ -d "$GGML_REPO/.git" || -f "$GGML_REPO/.git" ]] || { echo "GGML_REPO is not a git checkout: $GGML_REPO" >&2; exit 1; }
 GGML_COMMIT=${GGML_COMMIT:-HEAD}
+GGML_COMMIT_RESOLVED=$(git -C "$GGML_REPO" rev-parse --verify "${GGML_COMMIT}^{commit}")
 CUDA_ARCH=$(CUDA_ARCH="${CUDA_ARCH:-}" "$ROOT/scripts/detect_cuda_arch.sh")
 SRC=$OUT/ggml-src
 
 if [[ -e $SRC ]]; then echo "$SRC exists; remove it first (the patches are applied once)"; exit 1; fi
 mkdir -p "$SRC"
-if git -C "$GGML_REPO" cat-file -e "$GGML_COMMIT:ggml/CMakeLists.txt" 2>/dev/null; then
+if git -C "$GGML_REPO" cat-file -e "$GGML_COMMIT_RESOLVED:ggml/CMakeLists.txt" 2>/dev/null; then
   # llama.cpp checkout: ggml lives in its ggml/ subdirectory.
-  git -C "$GGML_REPO" archive "$GGML_COMMIT" ggml | tar -x -C "$SRC"
+  git -C "$GGML_REPO" archive "$GGML_COMMIT_RESOLVED" ggml | tar -x -C "$SRC"
 else
   # Standalone ggml repository: the ggml root is the repository root.
   mkdir -p "$SRC/ggml"
-  git -C "$GGML_REPO" archive "$GGML_COMMIT" | tar -x -C "$SRC/ggml"
+  git -C "$GGML_REPO" archive "$GGML_COMMIT_RESOLVED" | tar -x -C "$SRC/ggml"
 fi
-echo "ggml source: $GGML_REPO @ $GGML_COMMIT" > "$OUT/ggml-src.txt"
+echo "ggml source: $GGML_REPO @ $GGML_COMMIT_RESOLVED" > "$OUT/ggml-src.txt"
 
 # The series (patches/ggml, then patches/ggml-host-node) is written for the upstream commit above. GNU patch
 # applies it with fuzz 0: hunks may move (offset) but their context must match exactly, so a hunk that
@@ -67,9 +68,15 @@ grep -q zeromoe_ggml_backend_cuda_get_stream "$SRC/ggml/src/ggml-cuda/ggml-cuda.
 cmake -S "$SRC/ggml" -B "$OUT/ggml-build" \
   -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
   -DGGML_CUDA=ON -DGGML_CUDA_GRAPHS=ON -DGGML_AVX512=ON -DGGML_AVX512_VNNI=ON -DGGML_OPENMP=ON \
-  -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" -DCMAKE_CUDA_COMPILER=/opt/cuda/bin/nvcc \
+-DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" -DCMAKE_CUDA_COMPILER=/opt/cuda/bin/nvcc \
+-DGGML_BUILD_COMMIT="$GGML_COMMIT_RESOLVED" \
   -DGGML_BUILD_TESTS=OFF -DGGML_BUILD_EXAMPLES=OFF
 cmake --build "$OUT/ggml-build" -j"$(nproc)"
+
+if ! grep -Fq "#define GGML_COMMIT  \"$GGML_COMMIT_RESOLVED\"" "$OUT/ggml-build/src/ggml-version.h"; then
+    echo "generated GGML_COMMIT does not match upstream revision $GGML_COMMIT_RESOLVED" >&2
+    exit 1
+fi
 
 echo "ggml built: $OUT/ggml-build"
 echo "PTX images in libggml-cuda: $(cuobjdump --list-ptx "$OUT/ggml-build/src/ggml-cuda/libggml-cuda.so" 2>/dev/null | grep -c 'PTX file')"
