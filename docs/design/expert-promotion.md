@@ -96,6 +96,28 @@ Wall decode rate (tok/s, includes one-time decode-graph/draft setup), promotion 
   only matter once the resident set carries over between requests or topics, which this implementation does not
   do yet (the decode graph, and so the policy, is rebuilt per request).
 
+## Output check under promotion (teacher-forced, `tools/check_adaptive_placement_accuracy.py`)
+
+Static hot set (K=13,000) generates 256 tokens per prompt; the same tokens are forced through the same binary with
+`qwen4exp_expert_promotion=on` (cap 12, burst 20) and the per-step logits are compared. Binary `6751f3c`, 3090,
+six prompts of `bench/prompts/mtp_suite`; raw per-token data in
+`~/Projects/ZeroMoE-results/promotion-study/gate-promotion/`.
+
+| prompt | top-1 agreement | logit cosine | mean KL |
+|---|---|---|---|
+| btree | 99.61% | 0.999499 | 0.00065 |
+| leetcode | 100.00% | 0.999122 | 0.00024 |
+| math | 98.44% | 0.999167 | 0.00026 |
+| palindrome | 100.00% | 0.999376 | 0.00040 |
+| code review | 99.22% | 0.998943 | 0.00067 |
+| story | 98.44% | 0.999520 | 0.00110 |
+| **macro** | **99.28%** | **0.999271** | **0.00055** |
+
+For scale, the side session measured static K=13,000 vs K=11,000 at 99.09% top-1, cosine 0.999392, KL 0.00059:
+promotion moves experts between CPU and GPU (different activation rounding) by about as much as changing the hot-set
+size, and so it can change the sampled text on near-ties. It does not change which experts are routed.
+MTP output stays exact against the same placement (verified with promotion off).
+
 ## Decision
 
 The gap between A and B is within a point of miss rate, so build **B**: promote a missed expert
