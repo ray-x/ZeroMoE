@@ -7,6 +7,7 @@
 #include "ggml_qwen4exp_graph.hpp"
 #include "mtp_graph_draft.hpp"
 #include "mtp_graph_report.hpp"
+#include "nvtx_range.hpp"
 #include "mtp_graph_runtime.hpp"
 #include "mtp_speculation.hpp"
 #include "qwen4exp_mtp_graph.hpp"
@@ -134,6 +135,7 @@ class TimedDraft final : public SpecDraft {
   bool step(int token, int position, std::span<const float> hidden,
             std::span<float> next_hidden, std::span<float> logits,
             std::string &error) override {
+    ZE_NVTX("mtp.draft_step");
     const auto t0 = std::chrono::steady_clock::now();
     const bool ok = inner_.step(token, position, hidden, next_hidden, logits, error);
     g_profile.draft_ms += since_ms(t0);
@@ -170,6 +172,7 @@ class GraphWindowTarget final : public SpecTarget {
 
   bool step_batch(std::span<const int> tokens, int position, std::span<float> wide,
                   std::span<float> logits, std::string &error) override {
+    ZE_NVTX("mtp.verify_window");
     const auto &c = engine_.model_file.architecture_config;
     const size_t D = size_t(c.hidden), W = D * size_t(c.hc_mult), V = size_t(c.vocab);
     const size_t n = tokens.size();
@@ -220,6 +223,7 @@ class GraphWindowTarget final : public SpecTarget {
   }
 
   bool commit_prefix(int m, std::string &error) override {
+    ZE_NVTX("mtp.commit_prefix");
     const auto t0 = std::chrono::steady_clock::now();
     const bool ok = qwen4exp_full_graph_window_commit(engine_, m);
     g_profile.commit_ms += since_ms(t0);

@@ -2,6 +2,7 @@
 #include "engine.hpp"
 #include "full_graph_model.hpp"
 #include "tensor_trace.hpp"
+#include "nvtx_range.hpp"
 #include "ram_manager.hpp"
 #include "kernels_cpu.hpp"
 #include "dense_dispatch.hpp"
@@ -1216,6 +1217,7 @@ inline void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GG
             const zeromoe::graph::SpecDistribution mtp_distribution =
                 [&](std::span<const float> step_logits,
                     const std::vector<int> &context, std::vector<float> &probs) {
+                    ZE_NVTX("mtp.sampling");
                     std::vector<float> work(step_logits.begin(), step_logits.end());
                     if (const float penalty = zeromoe_repetition_penalty();
                         penalty != 1.0f) {

@@ -5,6 +5,7 @@
 
 #include "ggml_qwen4exp_graph_internal.hpp"
 #include "tensor_trace.hpp"
+#include "nvtx_range.hpp"
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
 
@@ -134,9 +135,12 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
   }
   const auto start = std::chrono::steady_clock::now();
   const auto replay_start = std::chrono::steady_clock::now();
-  if (ggml_backend_sched_graph_compute_async(g.sched, g.graph) !=
-      GGML_STATUS_SUCCESS)
-    return false;
+  {
+    ZE_NVTX("dec.submit");
+    if (ggml_backend_sched_graph_compute_async(g.sched, g.graph) !=
+        GGML_STATUS_SUCCESS)
+      return false;
+  }
   const auto replay_submit_end = std::chrono::steady_clock::now();
   if (g.stage_enabled && g.stage_compute_end_event) {
     cudaStream_t graph_stream =
@@ -146,7 +150,10 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
             cudaSuccess)
       return false;
   }
-  ggml_backend_sched_synchronize(g.sched);
+  {
+    ZE_NVTX("dec.sync");
+    ggml_backend_sched_synchronize(g.sched);
+  }
   if (g.engine && g.engine->exl3_gpu_executor)
     (void)g.engine->exl3_gpu_executor->stats();
   qwen_probe_dump(g);

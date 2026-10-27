@@ -30,7 +30,7 @@ namespace zeromoe::graph {
 struct PromotionConfig {
   bool enabled = true;
   int min_misses = 2;          // misses before an expert is a candidate
-  int cap = 6;                 // promotions per committed token
+  int cap = 12;                // promotions per committed token (engine sweep: 6 -> 12 gives +11% on a high-miss prompt)
   int burst_extra = 20;        // extra promotions per step while bursting
   int burst_tokens = 40;       // tokens at the start of a request that burst
   // eviction score = last_used + freq_weight * hits. With real evictions the old constants (64, halve

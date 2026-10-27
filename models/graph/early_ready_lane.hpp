@@ -13,6 +13,7 @@
 // GLM5NEXT SSD offload). Optional extras (next-layer prediction, VRAM staging)
 // are Qwen-only and left null elsewhere.
 #include "cuda_raii.hpp"
+#include "nvtx_range.hpp"
 #include "graph_config.hpp"
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -516,8 +517,13 @@ struct EarlyReadyLane {
 
   void run() {
     GGML_ASSERT(!completed);
+    ZE_NVTX("lane.run");
     const int64_t start = ggml_time_us();
-    const cudaError_t status = cudaEventSynchronize(ready);
+    cudaError_t status;
+    {
+      ZE_NVTX("lane.wait_ready");
+      status = cudaEventSynchronize(ready);
+    }
     if (status != cudaSuccess)
       GGML_ABORT("early-ready input event: %s", cudaGetErrorString(status));
     GGML_ASSERT(expected_pos < 0 || *position == expected_pos);

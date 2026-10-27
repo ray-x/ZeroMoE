@@ -8,6 +8,7 @@
 // (ggml_qwen4exp_graph_checkpoint.cpp) and replays the prefix.
 
 #include "ggml_qwen4exp_graph_internal.hpp"
+#include "nvtx_range.hpp"
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
 
@@ -34,6 +35,7 @@ bool qwen4exp_full_graph_window_run(StreamingEngine &engine, int S, int pos_base
   if (has_ple_layer(engine.model_file.architecture_config) && !g.ple_embedding)
     return false;
 
+  ZE_NVTX("win.run");
   std::memcpy(g.input->data, engine.hc_stream_buf.data(),
               W * static_cast<size_t>(S) * sizeof(float));
   auto *positions = static_cast<int32_t *>(g.positions->data);
@@ -58,13 +60,22 @@ bool qwen4exp_full_graph_window_run(StreamingEngine &engine, int S, int pos_base
     entry.second->completed = false;
   }
   const auto start = std::chrono::steady_clock::now();
-  if (ggml_backend_sched_graph_compute_async(g.sched, g.graph) != GGML_STATUS_SUCCESS)
-    return false;
-  ggml_backend_sched_synchronize(g.sched);
+  {
+    ZE_NVTX("win.submit");  // includes every CPU-split compute the scheduler runs inline
+    if (ggml_backend_sched_graph_compute_async(g.sched, g.graph) != GGML_STATUS_SUCCESS)
+      return false;
+  }
+  {
+    ZE_NVTX("win.sync");
+    ggml_backend_sched_synchronize(g.sched);
+  }
   const int vocab = engine.model_file.architecture_config.vocab;
-  ggml_backend_tensor_get(g.logits, logits, 0,
-                          static_cast<size_t>(S) * vocab * sizeof(float));
-  ggml_backend_tensor_get(g.final_streams, wide, 0, W * static_cast<size_t>(S) * sizeof(float));
+  {
+    ZE_NVTX("win.readback");
+    ggml_backend_tensor_get(g.logits, logits, 0,
+                            static_cast<size_t>(S) * vocab * sizeof(float));
+    ggml_backend_tensor_get(g.final_streams, wide, 0, W * static_cast<size_t>(S) * sizeof(float));
+  }
 
   // The graph has advanced the device state past the whole window. Host
   // metadata (PLE token window, positions) is applied by the commit below, so
@@ -83,6 +94,7 @@ bool qwen4exp_full_graph_window_run(StreamingEngine &engine, int S, int pos_base
 // state after exactly those tokens and advance the host metadata to match.
 // m == S is free (the graph already left the full-window state live).
 bool qwen4exp_full_graph_window_commit(StreamingEngine &engine, int m) {
+  ZE_NVTX("win.commit");
   if (!g_graph || !g_graph->ready || !g_graph->decode_mode ||
       g_graph->engine != &engine)
     return false;

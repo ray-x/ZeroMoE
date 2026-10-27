@@ -8,6 +8,7 @@
 
 #include "ggml_qwen4exp_graph_internal.hpp"
 #include "moe_partial_route.hpp"
+#include "nvtx_range.hpp"
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
 
@@ -96,6 +97,7 @@ void write_tables(FullGraph &g, int layer) {
 // Call after a run has completed (device idle) and `tokens` of its tokens are committed.
 void qwen4exp_promotion_step(FullGraph &g, int tokens) {
   if (g.engine->qwen4exp_expert_promotion <= 0 || !g.decode_mode || tokens < 1) return;
+  ZE_NVTX("promo.step");
   if (!g.promo && !promotion_init(g)) {
     static bool warned = false;
     if (!warned) { warned = true; LOG_WARN("[EXPERT-PROMOTION] unavailable for this graph; static hot set\n"); }
@@ -117,6 +119,7 @@ void qwen4exp_promotion_step(FullGraph &g, int tokens) {
   }
 
   // 2. routed ids of the committed tokens
+  ZE_NVTX("promo.ids");
   const size_t row = static_cast<size_t>(c.topk) * g.n_layers;
   g.promo_ids_host.resize(row * static_cast<size_t>(g.S));
   ggml_backend_tensor_get(g.usage_track_ids, g.promo_ids_host.data(), 0,
