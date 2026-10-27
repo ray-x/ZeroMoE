@@ -7,8 +7,9 @@ Legacy aliases still work and override TOML, but now log migration warnings.
 Many experimental controls remain environment-only; this is a staged migration.
 
 This page lists the `ZEROMOE_*` settings a user is expected to see: the ones the README and the shipped configs
-refer to, plus the model-path fallback. Internal benchmark and diagnostic knobs that no public config uses are not
-listed here; they live in the source (`grep -rn ZEROMOE_ core models memory backends`).
+refer to, the model-path fallback, and the model-specific and diagnostic knobs that the model guides name. Deep
+experiment knobs that no guide or public config mentions are not listed here; they live in the source
+(`grep -rn ZEROMOE_ core models memory backends`).
 
 Legacy readers differ; do not treat environment values as TOML:
 
@@ -27,6 +28,8 @@ Settings are read when the process starts, and graph settings are cached per mod
 | Option | Default | Effect |
 | --- | --- | --- |
 | `ZEROMOE_USE_GGML` | OFF | Use ggml for the quantized CPU kernels. Required for the Qwen full graph. |
+| `ZEROMOE_CPU_ONLY` | OFF | Build without CUDA. Forced ON on macOS. |
+| `ZEROMOE_BUILD_SERVER` | OFF | Build the optional OpenAI/Anthropic API server into `zeromoe` (`--serve`) and `zeromoe_cpu` (`cpu_api_*` tests). |
 | `ZEROMOE_USE_GGML_CUDA` | OFF | Build the ggml CUDA backend for the MUL_MAT_ID prefill path (experimental). |
 | `ZEROMOE_ENABLE_CUDA_GRAPHS` | ON | Enable ggml CUDA graph capture and replay. |
 | `ZEROMOE_ENABLE_AVX512_VNNI` | ON | Compile with AVX-512 VNNI. Set OFF on a CPU without VNNI, or the binary fails with an illegal instruction. |
@@ -64,7 +67,7 @@ existing scripts.
 | `ZEROMOE_QWEN_GRAPH_REGISTER` | on for Qwen | Pin (register) the host expert arenas. Pinned copies run at about 10.6 GB/s against about 4.9 GB/s pageable, which cuts the per-request decode setup from about 3.9 s to 2.0 s. Set `0` to keep the arenas pageable, for machines where the pinned budget is too small. `ZEROMOE_QWEN_GRAPH_NO_REGISTER=1` also disables it. |
 | `ZEROMOE_QWEN_SOFT_PIN_GIB` | `6` | Size, in GiB, of the expert tier that a prefill can release. Only that tier is re-uploaded after the prefill, so a second request's setup is about 0.4–0.7 s for 700–1,700-token prompts. `0` disables the tier. The tier is capped at half the split payload. |
 | `ZEROMOE_MEM_GUARD_FLOOR_MB` | 20480 | Lower the MemAvailable stop floor (in MB) during long prefills. Used by the 74 GiB pool configurations. |
-| `ZEROMOE_DENSE_SCRATCH_RESERVE_MB` | (see source) | Reserve, in MB, for dense-layer scratch memory. Read in `core/attention_layer.cpp`. |
+| `ZEROMOE_DENSE_SCRATCH_RESERVE_MB` | `256` | Reserve, in MB, for dense-layer scratch memory before the VRAM budget checks run. Non-positive or malformed values fall back to 256. Read in `core/attention_layer.cpp`. |
 
 ### Qwen early-ready lane (experimental)
 
@@ -72,8 +75,10 @@ The default Qwen recipe (`configs/qwen38-flash.toml`) does not set any of these.
 
 | Variable | Used for |
 | --- | --- |
-| `ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT`, `_ASYNC_OUTPUT`, `_RESIDENT_TABLES`, `_LAYER13`, `_PREDICT`, `_SKIP_ALL_HOT` | Early-ready expert placement and output copy. Background and measurements: [the graph refactor worklog](docs/option-b-graph-refactor-steps-2026-10-04.md). |
-| `ZEROMOE_QWEN_EARLY_READY_STAGE_LAYER`, `_STAGE_VERIFY`, `_STAGE_DELAY_US`, `_STAGE_WORKER_DELAY_US` | Staging ring for the early-ready lane (test hooks). |
+| `ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT`, `ZEROMOE_QWEN_EARLY_READY_ASYNC_OUTPUT`, `ZEROMOE_QWEN_EARLY_READY_RESIDENT_TABLES`, `ZEROMOE_QWEN_EARLY_READY_LAYER13`, `ZEROMOE_QWEN_EARLY_READY_PREDICT`, `ZEROMOE_QWEN_EARLY_READY_SKIP_ALL_HOT` | Early-ready expert placement and output copy. Background and measurements: [the graph refactor worklog](option-b-graph-refactor-steps-2026-10-04.md). |
+| `ZEROMOE_QWEN_EARLY_READY_PREDICT_LAYER` | Restrict the pilot prediction to one target layer. Unset predicts for every split layer. |
+| `ZEROMOE_QWEN_EARLY_READY_RIDGE` | Path to a pilot ridge table. A missing or invalid file leaves the plain pilot. |
+| `ZEROMOE_QWEN_EARLY_READY_STAGE_LAYER`, `ZEROMOE_QWEN_EARLY_READY_STAGE_MAX`, `ZEROMOE_QWEN_EARLY_READY_STAGE_VERIFY`, `ZEROMOE_QWEN_EARLY_READY_STAGE_NO_REQUEST`, `ZEROMOE_QWEN_EARLY_READY_STAGE_DELAY_US`, `ZEROMOE_QWEN_EARLY_READY_STAGE_WORKER_DELAY_US` | Staging ring for the early-ready lane: target layer (integer or `all`), staged-entry cap (clamped to 32), verification, prediction without a staging request, and failure-injection delays in µs (test hooks). |
 | `ZEROMOE_QWEN_EARLY_READY_ROUTE_TRACE` | Log routing decisions of the early-ready lane. Diagnostic. |
 | `ZEROMOE_QWEN4EXP_PREFILL_STATE_HANDOFF` | Hand prefill recurrent state to decode without a copy. |
 
@@ -81,8 +86,8 @@ The default Qwen recipe (`configs/qwen38-flash.toml`) does not set any of these.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `ZEROMOE_OFFLOAD_RETARGET` | on | Retarget offloaded expert reads when SSD offload is active. `0` disables. See [offload-retarget.md](docs/offload-retarget.md). |
-| `ZEROMOE_OFFLOAD_EVICT` | (see source) | `none` never returns pages to the OS. Experiment only: memory grows without bound. |
+| `ZEROMOE_OFFLOAD_RETARGET` | on | Retarget offloaded expert reads when SSD offload is active. `0` disables. See [offload-retarget.md](offload-retarget.md). |
+| `ZEROMOE_OFFLOAD_EVICT` | `MADV_DONTNEED` | Set to `free` to evict with `MADV_FREE` instead: pages stay mapped until the kernel reclaims them, so the next read skips the page fault, at the price of a soft memory budget. Any other value (or unset) uses `MADV_DONTNEED`. |
 
 ## GLM-5 / Ling / MiMo / DeepSeek families
 
@@ -90,21 +95,22 @@ These are model-specific. The model's own document (`docs/models/<model>.md`) is
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `ZEROMOE_GLM_DSA_FULL_GRAPH`, `ZEROMOE_LING_FULL_GRAPH`, `ZEROMOE_DEEPSEEK_V41_FULL_GRAPH` | (see source) | Enable the full graph for that family (`flag_on`). |
-| `ZEROMOE_GLM_DSA_CPU_LANE` | (see source) | CPU lane for GLM DSA. |
-| `ZEROMOE_GLM5NEXT_CPU_THREADS` | (see source) | ggml CPU threads for GLM-5 Next. |
-| `ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB` | (see source) | GPU allocation floor for GLM-5 Next. |
-| `ZEROMOE_GLM5NEXT_GPU1_HOT_GIB` | (see source) | Hot-expert budget on the second GPU (multi-GPU runs only). |
+| `ZEROMOE_GLM_DSA_FULL_GRAPH`, `ZEROMOE_LING_FULL_GRAPH`, `ZEROMOE_DEEPSEEK_V41_FULL_GRAPH` | off | Enable the full graph for that family (`flag_on`, so only a leading `1` enables). GLM DSA uses `ZEROMOE_GLM_DSA_FULL_GRAPH_PREFILL` for the batched prefill graph and `ZEROMOE_DEEPSEEK_V41_FULL_GRAPH_DECODE` to split DeepSeek decode from prefill. |
+| `ZEROMOE_GLM_DSA_CPU_LANE` | off | Advertise the GLM DSA CPU lane: cold experts may run on a private CPU lane concurrently with the layer's GPU work (the early-ready/gpu-assist capability). Only a leading `1` enables it; without it, a mixed VRAM+DDR placement logs a `PLACEMENT-WARN`. |
+| `ZEROMOE_GLM5NEXT_CPU_THREADS` | `6` | ggml CPU threads for GLM-5 Next. Prefill prefers `ZEROMOE_GLM5NEXT_PREFILL_CPU_THREADS` when that is set. |
+| `ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB` | `2048` | Free-VRAM floor the graph allocator must leave before it builds GLM-5 Next graphs, in MiB. `0` removes the floor; it also gates pilot staging. |
+| `ZEROMOE_GLM5NEXT_GPU1_HOT_GIB` | unset | Hot-expert budget on the second GPU, in GiB (multi-GPU runs only). Unset or empty leaves the GPU1 hot set unconfigured. |
 | `ZEROMOE_GLM5NEXT_GPU1_HOT_PRELOAD` | `1` | Preload the second-GPU hot set. `0` disables. |
 | `ZEROMOE_GLM5NEXT_PREFILL_GPU1` | `1` | Use the second GPU during prefill. `0` disables. |
 | `ZEROMOE_GLM5NEXT_PREFILL_OP_OFFLOAD` | off | Prefill op offload, as for Qwen (`flag_on`). |
-| `ZEROMOE_GLM5NEXT_PILOT_PREFETCH` | `0` | Pilot-driven prefetch depth. `0` disables. |
-| `ZEROMOE_GLM5NEXT_PILOT_STAGE` | (see source) | In-graph pilot and VRAM staging ring depth. |
+| `ZEROMOE_GLM5NEXT_PILOT_PREFETCH` | `0` | Pilot prefetch depth, clamped to 0–8; above `0` enables the pilot. The effective depth is at least `ZEROMOE_GLM5NEXT_PILOT_STAGE`, and predicted experts that are not in host memory are read from SSD ahead of the layer that needs them. |
+| `ZEROMOE_GLM5NEXT_PILOT_STAGE` | `0` | Number of next-layer cold experts the pilot stages into the VRAM ring per layer, clamped to 0–8. `0` disables pilot staging. |
+| `ZEROMOE_GLM5NEXT_PILOT_COPY` | `1` | Set `0` for prefetch-only mode: the pilot reads predicted experts into host memory in the background, nothing is copied into the VRAM ring, and the CPU computes every cold route as without staging. |
 | `ZEROMOE_GLM5NEXT_MODEL_DIRECT` | off | Read model tensors directly (`1` enables). |
-| `ZEROMOE_GLM5NEXT_OFFLOAD_SPLIT` | (see source) | Split of expert offload between tiers (same name also as `ZEROMOE_LING_OFFLOAD_SPLIT`). |
-| `ZEROMOE_MIMO2_OFFLOAD_DDR_GIB` | (see source) | DDR budget for MiMo expert offload, in GiB. |
+| `ZEROMOE_GLM5NEXT_OFFLOAD_SPLIT` | off | Split expert-offload reads across tiers (`1` enables; a leading `1` only). Alias of `graph_offload_split_reads`; the same switch is also `ZEROMOE_LING_OFFLOAD_SPLIT` for Ling. Not a size or ratio. |
+| `ZEROMOE_MIMO2_OFFLOAD_DDR_GIB` | `auto` | Host DDR budget for MiMo expert offload, in GiB, or `auto`. Alias of `graph_offload_ddr_gib`; a negative or `auto` value keeps the family default. The DSP/GLM equivalent is `ZEROMOE_LING_OFFLOAD_DDR_GIB` / `ZEROMOE_GLM5NEXT_OFFLOAD_DDR_GIB`. |
 
-## Benchmark and diagnostic
+## Benchmark, diagnostic and test
 
 | Variable | Effect |
 | --- | --- |
@@ -115,8 +121,4 @@ These are model-specific. The model's own document (`docs/models/<model>.md`) is
 | `ZEROMOE_DECODE_LOGITS_DUMP` | Dump decode logits to this file. Diagnostic. |
 | `ZEROMOE_WUV_INT8` | Attention value-projection int8 path (`1` enables). Diagnostic; read in `core/attention_layer.cpp`. |
 | `ZEROMOE_GLM5NEXT_GRAPH_LAYER_TIMING`, `ZEROMOE_MIMO2_NODE_TRACE`, `ZEROMOE_GLM5NEXT_ROUTE_TRACE` | Per-layer or per-node timing and traces. Diagnostic. |
-
-## Not yet documented
-
-Entries marked "(see source)" have a read site but I have not yet confirmed their default or full effect against
-the code. They should be completed before this page is used as a reference.
+| `ZEROMOE_TEST_EXL3_CPU_ONLY`, `ZEROMOE_TEST_EXL3_ONLY` | Stop the native test harness early: after the CPU/EXL3 checks with `_CPU_ONLY`, after the CUDA kernel checks with `_ONLY` (the form `README.md` uses for the short CUDA check). |
