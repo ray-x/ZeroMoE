@@ -60,13 +60,22 @@ for d in ${EXTRA_PATCH_DIRS:-}; do apply_dir "$d"; done
 # Guard against a silent no-op: the series must have left its marks.
 grep -q zeromoe_mmid_negative_skip "$SRC/ggml/src/ggml-cuda/mmvq.cu" || { echo "patches were not applied"; exit 1; }
 grep -q zeromoe_ggml_backend_cuda_get_stream "$SRC/ggml/src/ggml-cuda/ggml-cuda.cu" || { echo "bridge patch missing"; exit 1; }
+grep -q ZM_HC_MAGIC "$SRC/ggml/src/ggml-cuda/zm-hc.cuh" || { echo "hyper-connection fusion patch missing"; exit 1; }
 
 # ggml's CMakeLists configures ggml.pc.in, which a plain `git archive` of llama.cpp's ggml/ does not contain.
 [[ -f $SRC/ggml/ggml.pc.in ]] || printf 'Name: ggml\nDescription: ggml\nVersion: @GGML_VERSION@\n' > "$SRC/ggml/ggml.pc.in"
 
+# CUDA graphs are required by the full-graph decode path and are always on. The AVX-512 CPU kernels (including the
+# Q2_0 VNNI dot) are enabled when this host's CPU reports them; GGML_AVX512=ON on a CPU without them would crash.
+cpu_flag() { grep -m1 -q -w "$1" /proc/cpuinfo && echo ON || echo OFF; }
+GGML_AVX512_SETTING=$(cpu_flag avx512f)
+GGML_AVX512_VNNI_SETTING=OFF
+[[ $GGML_AVX512_SETTING == ON ]] && GGML_AVX512_VNNI_SETTING=$(cpu_flag avx512_vnni)
+echo "ggml CPU kernels: GGML_AVX512=$GGML_AVX512_SETTING GGML_AVX512_VNNI=$GGML_AVX512_VNNI_SETTING (from /proc/cpuinfo), GGML_CUDA_GRAPHS=ON"
+
 cmake -S "$SRC/ggml" -B "$OUT/ggml-build" \
   -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
-  -DGGML_CUDA=ON -DGGML_CUDA_GRAPHS=ON -DGGML_AVX512=ON -DGGML_AVX512_VNNI=ON -DGGML_OPENMP=ON \
+  -DGGML_CUDA=ON -DGGML_CUDA_GRAPHS=ON -DGGML_AVX512="$GGML_AVX512_SETTING" -DGGML_AVX512_VNNI="$GGML_AVX512_VNNI_SETTING" -DGGML_OPENMP=ON \
   -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" -DCMAKE_CUDA_COMPILER=/opt/cuda/bin/nvcc \
   -DGGML_BUILD_TESTS=OFF -DGGML_BUILD_EXAMPLES=OFF
 cmake --build "$OUT/ggml-build" -j"$(nproc)"

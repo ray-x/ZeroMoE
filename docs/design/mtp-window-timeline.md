@@ -96,3 +96,20 @@ a draft-KV rollback path. Not worth the complexity.
   The graph's CPU thread count now defaults to the physical core count (sysfs sibling groups) instead of
   `hardware_concurrency() - 2`; `ZEROMOE_QWEN_CPU_THREADS` still overrides. Six prompts, 6 vs 10 threads: palindrome
   +1.4, leet +1.5, math +1.0, review 0, btree -0.7, story -0.4 tok/s.
+
+## Fused hyper-connection ops (patches/ggml/0015)
+
+`hc_combine` (SCALE, SIGMOID, SCALE, REPEAT, MUL, ADD) and the tail of `hc_mix` (SIGMOID, MUL, CONT, ADD x3, SCALE) were
+about 1,200 of the ~5,400 compute nodes in a window graph. Each now runs as one CUDA kernel (`zm-hc.cu`, carried on a
+tagged `GGML_OP_ADD` node; `models/graph/zm_hc.hpp` builds it only when the linked ggml exports
+`zeromoe_ggml_cuda_hc_fused_version`). The kernels copy ggml's float sequence (same sigmoid, `scale*x+bias`, separate
+multiply and add roundings).
+
+* **Exactness:** row-0 logits are bit-identical (`cmp`) between the unfused chain and the fused kernels on the math and
+  story prompts, at S=1 and S=4.
+* **Speed, MTP + promotion, 3 drafts, 3090, warm second pass (tok/s, unfused -> fused):** palindrome 67.0 -> 69.2,
+  review 67.3 -> 68.3, btree 64.1 -> 67.1, math 61.3 -> 58.1 (noise: first pass 53.7 -> 64.9), leet 58.6 -> 59.3,
+  story 47.3 -> 50.7. Palindrome alone, three alternating pairs on a correctly built library: 66.6 -> 68.1 mean. The
+  gain is real but small, about +1 to +3 tok/s; first-pass numbers are dominated by cold page cache and are not used.
+* **Measurement note:** an earlier private ggml build was configured without GGML_CUDA_GRAPHS/GGML_AVX512 and ran 4-5
+  tok/s slower; build the private copy with `scripts/build_ggml.sh` flags.

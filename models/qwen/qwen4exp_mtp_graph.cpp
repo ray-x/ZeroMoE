@@ -155,6 +155,7 @@ bool read_config(const StreamingEngine &e, int capacity, Config &c,
 std::shared_ptr<MtpGraphState> build(
     std::shared_ptr<StreamingEngine> owner, const Options &opts, const Config &c,
     std::string &error) {
+  zeromoe::graph::ZmHcScope zm_hc_scope(true);  // the draft head runs entirely on the GPU
   const auto build_started = std::chrono::steady_clock::now();
   auto g = std::make_shared<MtpGraphState>();
   g->owner = std::move(owner);

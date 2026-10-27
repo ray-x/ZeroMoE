@@ -5,6 +5,7 @@
 #include <functional>
 
 #include "ggml.h"
+#include "zm_hc.hpp"
 
 #include <cmath>
 
@@ -24,10 +25,19 @@ inline ggml_tensor *hc_mix(const HcShape &g, ggml_context *ctx, ggml_tensor *x,
   ggml_tensor *lo = ggml_mul_mat(ctx, down, xn);
   lo = ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f / static_cast<float>(g.HC)));
   ggml_tensor *gate_logits = ggml_mul_mat(ctx, up, lo);
+  ggml_tensor *mixed;
+  if (zeromoe::graph::zm_hc_enabled() && ggml_is_contiguous(xn) && ggml_is_contiguous(gate_logits) &&
+      xn->type == GGML_TYPE_F32 && gate_logits->type == GGML_TYPE_F32 && xn->ne[0] == (int64_t)g.D * g.HC &&
+      gate_logits->ne[0] == xn->ne[0] && xn->ne[1] == g.S && gate_logits->ne[1] == g.S && xn->ne[2] == 1 &&
+      xn->ne[3] == 1) {
+    const int64_t ne[GGML_MAX_DIMS] = {g.D, g.S, 1, 1};
+    mixed = zeromoe::graph::zm_hc_node(ctx, 1, ne, g.D, g.HC, 1.0f / static_cast<float>(g.HC), xn, gate_logits,
+                                       nullptr);
+  } else {
   ggml_tensor *gate = ggml_sigmoid(ctx, gate_logits);
   ggml_tensor *gated = ggml_mul(ctx, xn, gate);
   ggml_tensor *g3 = ggml_reshape_3d(ctx, gated, g.D, g.HC, g.S);
-  ggml_tensor *mixed = ggml_cont(
+  mixed = ggml_cont(
       ctx, ggml_view_2d(ctx, g3, g.D, g.S,
                        ggml_row_size(g3->type, g.D) * g.HC, 0));
   for (int h = 1; h < g.HC; ++h) {
@@ -37,6 +47,7 @@ inline ggml_tensor *hc_mix(const HcShape &g, ggml_context *ctx, ggml_tensor *x,
     mixed = ggml_add(ctx, mixed, s);
   }
   mixed = ggml_scale(ctx, mixed, 1.0f / static_cast<float>(g.HC));
+  }
   if (inject_out)
     *inject_out = inject ? ggml_mul_mat(ctx, inject, xn) : nullptr;
   return mixed;
@@ -45,6 +56,12 @@ inline ggml_tensor *hc_mix(const HcShape &g, ggml_context *ctx, ggml_tensor *x,
 inline ggml_tensor *hc_combine(const HcShape &g, ggml_context *ctx,
                               ggml_tensor *residual, ggml_tensor *block,
                               ggml_tensor *inject) {
+  if (zeromoe::graph::zm_hc_enabled() && ggml_is_contiguous(residual) && ggml_is_contiguous(block) &&
+      ggml_is_contiguous(inject) && residual->type == GGML_TYPE_F32 && block->type == GGML_TYPE_F32 &&
+      inject->type == GGML_TYPE_F32 && residual->ne[0] == g.D && residual->ne[1] == g.HC && residual->ne[2] == g.S &&
+      residual->ne[3] == 1 && ggml_nelements(block) == (int64_t)g.D * g.S &&
+      ggml_nelements(inject) == (int64_t)g.HC * g.S)
+    return zeromoe::graph::zm_hc_node(ctx, 0, residual->ne, g.D, g.HC, 1.0f / g.HC, residual, block, inject);
   ggml_tensor *w = ggml_scale(
       ctx, ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / g.HC)), 2.0f);
   w = ggml_reshape_3d(ctx, w, 1, g.HC, g.S);

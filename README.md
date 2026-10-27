@@ -127,7 +127,7 @@ cmake -S . -B build -DZEROMOE_USE_GGML=ON -DZEROMOE_USE_GGML_CUDA=ON
 cmake --build build -j$(nproc)
 ```
 
-`ZEROMOE_ENABLE_CUDA_GRAPHS` (default **ON**) enables ggml's CUDA graph capture/replay for this path. ggml's own default for `GGML_CUDA_GRAPHS` is OFF for any consumer other than llama.cpp itself, so without this, a plain `ZEROMOE_USE_GGML_CUDA=ON` build silently compiles out CUDA graph capture — every decode step then falls back to launching each graph node's kernel individually instead of replaying one captured graph per split. Measured impact on this project's Qwen4Exp full-graph decode: **~20 tok/s with graphs enabled vs. ~8 tok/s silently disabled**, on identical hardware/model/config. Opt out with `-DZEROMOE_ENABLE_CUDA_GRAPHS=OFF` if you need to A/B against the non-graph path.
+CUDA graph capture/replay (`GGML_CUDA_GRAPHS`) is always **ON** in CUDA builds (not an option); it enables ggml's CUDA graph capture/replay for this path. ggml's own default for `GGML_CUDA_GRAPHS` is OFF for any consumer other than llama.cpp itself, so without this, a plain `ZEROMOE_USE_GGML_CUDA=ON` build silently compiles out CUDA graph capture — every decode step then falls back to launching each graph node's kernel individually instead of replaying one captured graph per split. Measured impact on this project's Qwen4Exp full-graph decode: **~20 tok/s with graphs enabled vs. ~8 tok/s silently disabled**, on identical hardware/model/config.  AVX-512 VNNI (`ZEROMOE_ENABLE_AVX512_VNNI`) defaults to what the build host's CPU reports and is passed to ggml too.
 
 CUDA architecture selection defaults to automatic detection from
 `nvidia-smi` before any CUDA targets, including ggml-cuda, are configured.

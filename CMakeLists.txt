@@ -42,12 +42,21 @@ option(ZEROMOE_USE_GGML_CUDA
 # investigation before the missing compile define was found. Default ON here
 # so any ZEROMOE_USE_GGML_CUDA build gets it without the caller having to
 # know this ggml-specific gotcha; still overridable with -DGGML_CUDA_GRAPHS=OFF.
-option(ZEROMOE_ENABLE_CUDA_GRAPHS
-       "Enable ggml CUDA graph capture/replay (GGML_CUDA_GRAPHS) for full-graph decode/prefill"
-       ON)
+# CUDA graphs are mandatory for the CUDA build (not an option): see the comment above.
+set(ZEROMOE_ENABLE_CUDA_GRAPHS ON)
+# AVX-512 VNNI: on by default exactly when the build host's CPU reports avx512_vnni (so the ggml Q2_0 VNNI dot and
+# ZeroMoE's CPU kernels match the machine); pass -DZEROMOE_ENABLE_AVX512_VNNI=ON/OFF to override, e.g. when
+# cross-compiling for another host.
+set(_zm_vnni_default OFF)
+if(EXISTS /proc/cpuinfo)
+    file(STRINGS /proc/cpuinfo _zm_cpu_flags REGEX "^flags" LIMIT_COUNT 1)
+    if(_zm_cpu_flags MATCHES "avx512_vnni")
+        set(_zm_vnni_default ON)
+    endif()
+endif()
 option(ZEROMOE_ENABLE_AVX512_VNNI
-       "Compile ZeroMoE and ggml CPU kernels with AVX-512 VNNI (set OFF on CPUs without VNNI)"
-       ON)
+       "Compile ZeroMoE and ggml CPU kernels with AVX-512 VNNI (default: detected from the build host's CPU)"
+       ${_zm_vnni_default})
 option(ZEROMOE_GGML_OPENMP
        "Build ggml's CPU backend with OpenMP (OFF uses its persistent threadpool)"
        ON)
@@ -206,20 +215,7 @@ if(ZEROMOE_USE_GGML)
     # above). A default is not a guarantee -- print the resolved value on
     # every configure, and fail outright if CUDA is on but graphs got
     # turned off without an explicit, informed override.
-    if(ZEROMOE_USE_GGML_CUDA AND NOT ZEROMOE_ENABLE_CUDA_GRAPHS)
-        message(WARNING
-            "ZEROMOE_USE_GGML_CUDA=ON but ZEROMOE_ENABLE_CUDA_GRAPHS=OFF: "
-            "full-graph decode will silently run WITHOUT CUDA graph capture/"
-            "replay (every node becomes an individual cudaLaunchKernel). "
-            "This previously cost ~20 tok/s -> ~8 tok/s and was mistaken for "
-            "a correctness/scheduling bug for an entire investigation. Only "
-            "disable this deliberately for a real A/B; the runtime "
-            "[CUDA-GRAPHS-CHECK] log line will also confirm this at every "
-            "process start regardless of this setting.")
-    else()
-        message(STATUS "ZeroMoE: GGML_CUDA_GRAPHS=${GGML_CUDA_GRAPHS} "
-                       "(verified again at runtime via [CUDA-GRAPHS-CHECK])")
-    endif()
+    message(STATUS "ZeroMoE: GGML_CUDA_GRAPHS=${GGML_CUDA_GRAPHS} (always on; verified again at runtime via [CUDA-GRAPHS-CHECK])")
     set(GGML_HIPBLAS     OFF CACHE BOOL "" FORCE)
     set(GGML_VULKAN      OFF CACHE BOOL "" FORCE)
     set(GGML_SYCL        OFF CACHE BOOL "" FORCE)
