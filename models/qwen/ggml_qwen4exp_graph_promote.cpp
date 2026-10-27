@@ -45,6 +45,8 @@ bool promotion_init(FullGraph &g) {
   if (const char *v = std::getenv("ZEROMOE_PROMO_CAP")) cfg.cap = std::atoi(v);
   if (const char *v = std::getenv("ZEROMOE_PROMO_BURST")) cfg.burst_extra = std::atoi(v);
   if (const char *v = std::getenv("ZEROMOE_PROMO_MIN_MISSES")) cfg.min_misses = std::atoi(v);
+  if (const char *v = std::getenv("ZEROMOE_PROMO_FREQ_WEIGHT")) cfg.freq_weight = std::strtoull(v, nullptr, 10);
+  if (const char *v = std::getenv("ZEROMOE_PROMO_DECAY_EVERY")) cfg.decay_every = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
   g.promo = std::make_unique<ExpertPromotionPolicy>(cfg, c.n_experts, slots);
   if (cudaSetDevice(g.device) != cudaSuccess ||
       cudaStreamCreateWithFlags(&g.promo_stream, cudaStreamNonBlocking) != cudaSuccess ||

@@ -63,6 +63,39 @@ constants change (`PromotionConfig`). Step size matters little (1 token 64%, 3 t
 Recorded traces, prompts and the simulators live in `~/Projects/ZeroMoE-results/promotion-study/`;
 the six prompts are also in `bench/prompts/mtp_suite/`.
 
+## Engine results (swap-b `e87076e` + env overrides; 3090 only, 13,000 hot experts, Q2_0)
+
+Source: `docs/design/expert-promotion.md` tools; raw logs, configs and run scripts in
+`~/Projects/ZeroMoE-results/promotion-study/engine-matrix/`. Binary: `ZeroMoE-wt-swap-b/build/zeromoe`
+(Release, sm_86, patched ggml 8baabd53b from `build_recovery_ggml`). Each cell is one run of 246-500 tokens,
+greedy, taken with the machine idle (a wrapper waits for load < 2.5 and MemAvailable >= 108 GB); repeated
+identical runs differ by about +-3 tok/s, so differences below ~10% are noise. The first pass of this matrix was
+taken while another session was reading the 62 GB model and showed fake regressions (-42%); those numbers were
+discarded.
+
+Wall decode rate (tok/s, includes one-time decode-graph/draft setup), promotion `off` -> `on`:
+
+| prompt | static miss | plain | MTP (3 drafts) | MTP accept | MTP on / plain off |
+|---|---|---|---|---|---|
+| story | 51% | 24.2 -> 42.1 | 18.9 -> 35.7 | 45% | 1.48x |
+| math | 42% | 27.4 -> 43.9 | 32.6 -> 52.8 | 83% | 1.93x |
+| btree | 11% | 42.2 -> 47.6 | 43.3 -> 51.7 | 64-66% | 1.22x |
+| leetcode | 15% | 42.3 -> 40.0 | 47.5 -> 49.1 | 87-89% | 1.16x |
+| code review | 8% | 44.6 -> 48.5 | 48.2 -> 52.8 | 68-72% | 1.18x |
+| palindrome | 10% | 42.7 -> 48.6 | 52.8 -> 56.2 | 81% | 1.32x |
+
+* MTP gains from promotion: +89% story, +62% math, +19% btree, +10% review, +6% palindrome, +3% leetcode
+  (the last two are inside the noise). The more the static set misses, the more promotion helps; where the
+  static set already fits (code prompts) it is roughly neutral to +10%.
+* Promotion removes 70-90% of the misses within a reply (e.g. story 51% -> 10%, math 42% -> 12%).
+* With promotion on, MTP beats plain on math (+20%), btree (+9%), review (+9%), palindrome (+16%), leetcode
+  (+12-23%), but not on story: acceptance is only 45% there, so a 4-token window costs more than it returns
+  (35.7 vs 42.1).
+* Eviction constants (old 64 / halve every 4,096 hits vs new 4096 / no decay) give identical miss rates and
+  acceptance within one request (story 9.84%, math 11.84%) and only noise-level speed differences. They can
+  only matter once the resident set carries over between requests or topics, which this implementation does not
+  do yet (the decode graph, and so the policy, is rebuilt per request).
+
 ## Decision
 
 The gap between A and B is within a point of miss rate, so build **B**: promote a missed expert
