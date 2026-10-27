@@ -122,7 +122,6 @@ private:
     std::mutex mutex_;
 };
 
-#define LOG_VERBOSE(...) Logger::instance().log(LogLevel::VERBOSE, __VA_ARGS__)
 #define LOG_DEBUG(...) Logger::instance().log(LogLevel::DEBUG, __VA_ARGS__)
 #define LOG_INFO(...)  Logger::instance().log(LogLevel::INFO,  __VA_ARGS__)
 #define LOG_WARN(...)  Logger::instance().log(LogLevel::WARN,  __VA_ARGS__)

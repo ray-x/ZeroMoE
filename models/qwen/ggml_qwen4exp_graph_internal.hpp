@@ -539,13 +539,6 @@ struct FullGraph : zeromoe::graph::GraphCore {
   // FFN residual combine.  These are intentionally limited to layers 0/1.
   ggml_tensor *hidden01_snapshot[2] = {nullptr, nullptr};
   bool hidden01_dumped = false;
-  // Generalizes hidden01_snapshot above to ALL layers, dumped every decode
-  // step (not one-shot) -- for a full layer-by-layer, token-by-token parity
-  // trace against llama.cpp when hidden01's 2-layer window isn't enough
-  // to localize where two engines' outputs first diverge. Gated by
-  // ZEROMOE_QWEN4EXP_ALLLAYERS_DUMP; same semantic boundary (after each
-  // layer's attention+FFN residual combine) as hidden01_snapshot.
-  std::vector<ggml_tensor *> all_layers_snapshot;
   // Optional one-shot raw routed-MoE output dump for Layer 13. This is
   // deliberately before the shared expert and residual combine so the
   // ordinary GGML CPU path and the host-node callback are compared at the

@@ -127745,8 +127745,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "MiMo: expert storage, I/O and CPU/GPU transfer pipeline. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "2026-10-27: removed the unused benchmark environment assignment; no engine reader existed.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K1080"
     },
@@ -127904,8 +127904,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "2026-10-27: removed the never-read diagnostic name, its never-populated snapshot field and the stale comments.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K1083"
     },

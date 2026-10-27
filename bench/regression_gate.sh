@@ -348,7 +348,6 @@ Path(sys.argv[2]).write_text(text)
 PY
   echo "Explain what DNS is and how a domain name gets resolved to an IP address." \
     | env CUDA_VISIBLE_DEVICES=0,1 ZEROMOE_DISABLE_ROUTER_BF16=1 ZEROMOE_MIMO2_OFFLOAD_DDR_GIB=100 \
-        ZEROMOE_MIMO2_OFFLOAD_MODEL="$model" \
         ZEROMOE_MIMO2_OFFLOAD_USAGE="$PWD/bench/profiles/mimo26_combined.usage" \
         scripts/run_capped.sh --limit-gb 110 -- "$BIN" \
         --config "$config" \

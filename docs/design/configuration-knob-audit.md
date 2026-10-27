@@ -71,20 +71,27 @@ Verification for this batch:
   CMake files and shipped configs; only dated historical design/handoff notes
   still mention the retired feature.
 
+### 2026-10-27 — dead diagnostic, unused macro, dead bench write
+
+| Control | Surface | Evidence | Change |
+| --- | --- | --- | --- |
+| `ZEROMOE_QWEN4EXP_ALLLAYERS_DUMP` (K1083) | environment (diagnostic) | No reader: every source match was a comment. The field it gated, `all_layers_snapshot` in `models/qwen/ggml_qwen4exp_graph_internal.hpp`, was never populated or dumped, and the prefill comment in `ggml_qwen4exp_graph_run.cpp` claimed `build_graph()` filled it, which was false. | Deleted the dead field and both comments. `bench/compare_hidden_state_dumps.py` and `bench/check_prefill_identical.py` still parse existing dump directories and never read the variable. |
+| `LOG_VERBOSE` | compile-time macro | Defined once in `core/logger.hpp` and referenced nowhere; call sites use `LogStream(LogLevel::VERBOSE)` / `would_log()`. | Deleted the macro. `LogLevel::VERBOSE` and stream logging are untouched. |
+| `ZEROMOE_MIMO2_OFFLOAD_MODEL` (K1080) | benchmark environment | Set by `bench/regression_gate.sh` but read by no engine path; sibling `MIMO2_OFFLOAD_DDR_GIB`/`_USAGE`/`_PIN`/`_PINNED_PCT` all have real readers. | Deleted the assignment; the MiMo26 regression command is otherwise unchanged. |
+
+Verification for this batch:
+
+- `zeromoe_cpu`, `graph_settings_test` and `graph_settings_binding_test` build
+  with `-DZEROMOE_CPU_ONLY=ON -DZEROMOE_USE_GGML=ON`.
+- `ctest -R '^graph_settings'` passes 2/2 and
+  `python3 tools/config_inventory.py --check` passes.
+- `bash -n bench/regression_gate.sh` accepts the edited harness.
+
 ### Findings deliberately left in place
 
 These look dead but changing them would either alter a supported feature or
 require a product decision, so they are not safe deletions for this batch:
 
-- **`ZEROMOE_QWEN4EXP_ALLLAYERS_DUMP` has no reader.** The name survives only
-  in a comment above `all_layers_snapshot` in
-  `models/qwen/ggml_qwen4exp_graph_internal.hpp`, a field that is never
-  written or read, plus the `bench/` dump-diff tools that expect its output.
-  This is an abandoned diagnostic, not a user-visible knob; removing the field
-  and the tool expectations should be its own diagnostics cleanup.
-- **`LOG_VERBOSE` is defined but unused.** Call sites use
-  `LogStream(LogLevel::VERBOSE)`/`would_log()`. Keeping the macro preserves a
-  symmetric logging API; it is unrelated to configuration onboarding.
 - **`ZEROMOE_USE_LLAMA_CPP` / `ZEROMOE_LLAMA_CPP_ROOT`** are deprecated but
   live CMake aliases: they are still parsed and remapped. Deleting them is a
   compatibility break, not a dead-code removal.
@@ -1330,10 +1337,10 @@ The reference column gives a primary path/line. Use the JSON for exact worktree 
 | K1077 `ZEROMOE_HC_OUTPUT_DUMP` | api, mtp, original, settings | Only when the referenced developer/build/test/benchmark tool is invoked; near BF16() (lexical context). Exact predicates are in linked evidence. | KEEP TOOL-LOCAL if maintained; remove only with an unreferenced/retired tool | model graph equations/operator implementation and routing. Preserve behavior in replacement; full impact/owner in JSON. | MEDIUM | `bench/quant_hc_cost.cpp:17` |
 | K1078 `ZEROMOE_LING_CPU_COLD_MISSES` | api, mtp, original, settings | Only when the referenced developer/build/test/benchmark tool is invoked. Exact predicates are in linked evidence. | KEEP TOOL-LOCAL if maintained; remove only with an unreferenced/retired tool | Ling: developer tools/scripts execution/configuration. Preserve behavior in replacement; full impact/owner in JSON. | MEDIUM | `bench/ling/reference-audit/run.sh:148` |
 | K1079 `ZEROMOE_LING_FULL_GRAPH_DDR_PREFETCH_GIB` | api, mtp, original, settings | Only when the referenced developer/build/test/benchmark tool is invoked. Exact predicates are in linked evidence. | KEEP TOOL-LOCAL if maintained; remove only with an unreferenced/retired tool | Ling: expert prefetch prediction, admission and I/O overlap. Preserve behavior in replacement; full impact/owner in JSON. | MEDIUM | `bench/ling/reference-audit/run.sh:148` |
-| K1080 `ZEROMOE_MIMO2_OFFLOAD_MODEL` | api, mtp, original, settings | Only when the referenced developer/build/test/benchmark tool is invoked; near run_mimo26() (lexical context). Exact predicates are in linked evidence. | KEEP TOOL-LOCAL if maintained; remove only with an unreferenced/retired tool | MiMo: expert storage, I/O and CPU/GPU transfer pipeline. Preserve behavior in replacement; full impact/owner in JSON. | MEDIUM | `bench/regression_gate.sh:351` |
+| K1080 `ZEROMOE_MIMO2_OFFLOAD_MODEL` | api, mtp, original, settings | Only when the referenced developer/build/test/benchmark tool is invoked; near run_mimo26() (lexical context). Exact predicates are in linked evidence. | **REMOVED 2026-10-27** — was: no engine reader; the benchmark assignment was deleted. | MiMo: expert storage, I/O and CPU/GPU transfer pipeline. Preserve behavior in replacement; full impact/owner in JSON. | MEDIUM | `bench/regression_gate.sh:351` |
 | K1081 `ZEROMOE_MTP_DUMP_V1` | mtp | Only when the referenced developer/build/test/benchmark tool is invoked. Exact predicates are in linked evidence. | KEEP TOOL-LOCAL if maintained; remove only with an unreferenced/retired tool | speculative decoding/MTP and acceptance state. Preserve behavior in replacement; full impact/owner in JSON. | MEDIUM | `tests/test_mtp_parity.py:15` |
 | K1082 `ZEROMOE_MTP_FIXTURE_V1` | mtp | Only when the referenced developer/build/test/benchmark tool is invoked; near Fixture() (lexical context). Exact predicates are in linked evidence. | KEEP TOOL-LOCAL if maintained; remove only with an unreferenced/retired tool | speculative decoding/MTP and acceptance state. Preserve behavior in replacement; full impact/owner in JSON. | MEDIUM | `tests/mtp/fixture.hpp:38` |
-| K1083 `ZEROMOE_QWEN4EXP_ALLLAYERS_DUMP` | api, mtp, original, settings | Only when the referenced developer/build/test/benchmark tool is invoked. Exact predicates are in linked evidence. | KEEP TOOL-LOCAL if maintained; remove only with an unreferenced/retired tool | Qwen: diagnostics, numerical inspection and performance reporting. Preserve behavior in replacement; full impact/owner in JSON. | MEDIUM | `bench/check_prefill_identical.py:2` |
+| K1083 `ZEROMOE_QWEN4EXP_ALLLAYERS_DUMP` | api, mtp, original, settings | Only when the referenced developer/build/test/benchmark tool is invoked. Exact predicates are in linked evidence. | **REMOVED 2026-10-27** — was: no reader and the gated field was never populated; dump-diff tools keep reading existing dumps. | Qwen: diagnostics, numerical inspection and performance reporting. Preserve behavior in replacement; full impact/owner in JSON. | MEDIUM | `bench/check_prefill_identical.py:2` |
 | K1084 `ZEROMOE_QWEN4EXP_MASTER_GRAPH_STAGED` | api, mtp, original, settings | Only when the referenced developer/build/test/benchmark tool is invoked. Exact predicates are in linked evidence. | KEEP TOOL-LOCAL if maintained; remove only with an unreferenced/retired tool | Qwen: full-graph construction/replay, scheduler bindings and state handoff. Preserve behavior in replacement; full impact/owner in JSON. | MEDIUM | `bench/option_b_early_ready_check.py:240` |
 | K1085 `ZEROMOE_QWEN_CPU_BENCH_AVX512` | api, mtp, original, settings | Only when the referenced developer/build/test/benchmark tool is invoked. Exact predicates are in linked evidence. | KEEP TOOL-LOCAL if maintained; remove only with an unreferenced/retired tool | Qwen: diagnostics, numerical inspection and performance reporting. Preserve behavior in replacement; full impact/owner in JSON. | MEDIUM | `tests/native/tests_cpu_moe.cpp:637` |
 | K1086 `ZEROMOE_QWEN_CPU_BENCH_DIRECT_GROUPED` | api, mtp, original, settings | Only when the referenced developer/build/test/benchmark tool is invoked. Exact predicates are in linked evidence. | KEEP TOOL-LOCAL if maintained; remove only with an unreferenced/retired tool | Qwen: diagnostics, numerical inspection and performance reporting. Preserve behavior in replacement; full impact/owner in JSON. | MEDIUM | `tests/native/tests_cpu_moe.cpp:699` |

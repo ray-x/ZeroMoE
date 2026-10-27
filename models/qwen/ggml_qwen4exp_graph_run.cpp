@@ -658,12 +658,6 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
                             static_cast<size_t>(g.logits->ne[0]) * sizeof(float));
     engine.qwen4exp_full_graph_logits_ready = true;
   }
-  // Prefill's own all-layers dump: build_graph() populates
-  // g.all_layers_snapshot identically for prefill and decode (same shared
-  // per-layer loop), but this compute call -- unlike the two decode call
-  // sites above -- never wrote it out. Without this, a llama.cpp parity
-  // trace could only compare the single-token decode step, never any of
-  // the S>1 prompt-token positions llama.cpp's own nt=S batch covers.
   const auto t_output_end = std::chrono::steady_clock::now();
 
 
