@@ -5,6 +5,7 @@
 #include "logger.hpp"
 #include "memory_guard.hpp"
 #include "perf_timer.hpp"
+#include "graph_config.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1610,7 +1611,7 @@ bool GgmlMoeRunner::run_layer_device_impl(const float *host_x,
   // unbatched Qwen replay is layer 0; export the native GGML intermediates so
   // the routed FFN can be compared against llama.cpp's ffn_moe_down dump.  This is
   // intentionally synchronizing and never runs without the diagnostic flag.
-  if (const char *dump_base = std::getenv("ZEROMOE_GGML_MOE_DUMP")) {
+  if (const char *dump_base = zeromoe::graphcfg::env("ZEROMOE_GGML_MOE_DUMP")) {
     static std::atomic<bool> dumped_first_runner{false};
     bool expected = false;
     if (dumped_first_runner.compare_exchange_strong(
@@ -1648,8 +1649,7 @@ bool GgmlMoeRunner::run_layer_device_impl(const float *host_x,
   // discover CUDA failures at a later API call; this opt-in sync pins the
   // error to the first MoE graph that produced it.
   static const bool debug_sync = [] {
-    const char *env = std::getenv("ZEROMOE_GGML_DEBUG_SYNC");
-    return env && env[0] == '1';
+    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_DEBUG_SYNC");
   }();
   if (debug_sync || debug_device_sync() || (backend_stream_copies_ &&
                      !use_async_moe_graph_reuse())) {

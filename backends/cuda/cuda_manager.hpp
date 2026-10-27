@@ -5,6 +5,7 @@
 #pragma once
 #include "engine.hpp"
 #include "engine_config.hpp"
+#include "graph_config.hpp"
 #include "perf_timer.hpp"
 #include "gpu_topology.hpp"
 #include "cublas_matmul.hpp"
@@ -2510,7 +2511,7 @@ public:
         // Keep command-line A/B runs independent of a temporary config edit.
         // An explicit environment override is useful for regression checks;
         // absent the variable, the config remains authoritative.
-        if (const char *override_value = std::getenv("ZEROMOE_DENSE_ASYNC_COPIES")) {
+        if (const char *override_value = zeromoe::graphcfg::env("ZEROMOE_DENSE_ASYNC_COPIES")) {
             dense_async_copies_enabled = (override_value[0] == '1' ||
                                           override_value[0] == 'y' ||
                                           override_value[0] == 'Y' ||

@@ -4,6 +4,7 @@
 #include "ggml_gdn_proj_backend.hpp"
 
 #include "ggml_moe_backend.hpp" // ggml_shared_backend()
+#include "graph_config.hpp"
 #include "logger.hpp"
 
 #include <algorithm>
@@ -35,23 +36,21 @@ bool type_ok(uint32_t t) {
 // runtime behaviour.
 bool debug_sync_full_gdn() {
   static const bool enabled = [] {
-    const char *v = std::getenv("ZEROMOE_GGML_DEBUG_SYNC_FULL_GDN");
-    return v && v[0] == '1';
+    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_DEBUG_SYNC_FULL_GDN");
   }();
   return enabled;
 }
 
 bool debug_device_sync_full_gdn() {
   static const bool enabled = [] {
-    const char *v = std::getenv("ZEROMOE_GGML_DEBUG_DEVICE_SYNC_FULL_GDN");
-    return v && v[0] == '1';
+    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_DEBUG_DEVICE_SYNC_FULL_GDN");
   }();
   return enabled;
 }
 
 bool gdn_diag_enabled() {
   static const bool enabled = [] {
-    const char *v = std::getenv("ZEROMOE_GDN_DIAG_DUMP");
+    const char *v = zeromoe::graphcfg::env("ZEROMOE_GDN_DIAG_DUMP");
     return v && v[0] != '\0' && v[0] != '0';
   }();
   return enabled;
@@ -67,14 +66,14 @@ int &gdn_diag_call_counter() {
 // a rebuild every time; unset env vars keep the original hardcoded 10/11.
 int gdn_diag_first_pos() {
   static const int v = [] {
-    const char *e = std::getenv("ZEROMOE_GDN_DIAG_FIRST_POS");
+    const char *e = zeromoe::graphcfg::env("ZEROMOE_GDN_DIAG_FIRST_POS");
     return e ? std::atoi(e) : 10;
   }();
   return v;
 }
 int gdn_diag_last_pos() {
   static const int v = [] {
-    const char *e = std::getenv("ZEROMOE_GDN_DIAG_LAST_POS");
+    const char *e = zeromoe::graphcfg::env("ZEROMOE_GDN_DIAG_LAST_POS");
     return e ? std::atoi(e) : 11;
   }();
   return v;
@@ -1215,7 +1214,7 @@ bool GgmlGdnProjRunner::run_full(int layer, const float *hidden_states, int S,
     // These graph inputs alias caller-owned recurrent state/history. Snapshot
     // them before the graph's in-place state/history stores can overwrite them.
     ggml_backend_synchronize((ggml_backend_t)backend_);
-    const char *base = std::getenv("ZEROMOE_GDN_DIAG_DUMP");
+    const char *base = zeromoe::graphcfg::env("ZEROMOE_GDN_DIAG_DUMP");
     const int position = gdn_diag_call_counter() + 1;
     gdn_diag_dump_at(base, "gdn_input", layer, S, position, x);
     gdn_diag_dump_at(base, "conv_history_in", layer, S, position, hist_in);
@@ -1240,7 +1239,7 @@ bool GgmlGdnProjRunner::run_full(int layer, const float *hidden_states, int S,
                                 history_bytes);
   ggml_backend_synchronize((ggml_backend_t)backend_);
   if (diag) {
-    const char *base = std::getenv("ZEROMOE_GDN_DIAG_DUMP");
+    const char *base = zeromoe::graphcfg::env("ZEROMOE_GDN_DIAG_DUMP");
     gdn_diag_dump(base, "qkv", layer, S, qkv);
     gdn_diag_dump(base, "z", layer, S, z);
     gdn_diag_dump(base, "conv_silu", layer, S, conv_silu);
@@ -1528,7 +1527,7 @@ bool GgmlGdnProjRunner::run_full_device_impl(
     // true incoming state before replay rather than after their storage has
     // become the outgoing state.
     ggml_backend_synchronize((ggml_backend_t)backend_);
-    const char *base = std::getenv("ZEROMOE_GDN_DIAG_DUMP");
+    const char *base = zeromoe::graphcfg::env("ZEROMOE_GDN_DIAG_DUMP");
     const int position = gdn_diag_call_counter() + 1;
     gdn_diag_dump_at(base, "gdn_input", layer, S, position, x);
     gdn_diag_dump_at(base, "conv_history_in", layer, S, position, hist_in);
@@ -1563,7 +1562,7 @@ bool GgmlGdnProjRunner::run_full_device_impl(
     // The extra roots make these reads valid even though the ordinary path
     // keeps the graph asynchronous and returns the device output immediately.
     ggml_backend_synchronize((ggml_backend_t)backend_);
-    const char *base = std::getenv("ZEROMOE_GDN_DIAG_DUMP");
+    const char *base = zeromoe::graphcfg::env("ZEROMOE_GDN_DIAG_DUMP");
     gdn_diag_dump(base, "qkv", layer, S, qkv);
     gdn_diag_dump(base, "z", layer, S, z);
     gdn_diag_dump(base, "conv_silu", layer, S, conv_silu);

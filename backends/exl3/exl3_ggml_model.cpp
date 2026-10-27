@@ -8,6 +8,7 @@
 #include "exl3_gpu.hpp"
 #include "ggml_moe_backend.hpp"
 #include "gpu_topology.hpp"
+#include "graph_config.hpp"
 #include "exl3_format.hpp"
 #include "engine.hpp"
 
@@ -259,8 +260,8 @@ bool Exl3GgmlBridgeLayer::initialize(
     return decline("cached routed-FFN node state initialization failed");
   ffn_state->model_layer = model_layer;
   const char *verify_layer_text =
-      std::getenv("ZEROMOE_EXL3_GGML_VERIFY_CPU_LAYER");
-  if (verify_layer_text && verify_layer_text[0]) {
+      zeromoe::graphcfg::path("ZEROMOE_EXL3_GGML_VERIFY_CPU_LAYER");
+  if (verify_layer_text) {
     if (std::strcmp(verify_layer_text, "all") == 0) {
       ffn_state->verify_cpu_reference = true;
     } else {

@@ -19,6 +19,7 @@
 #endif
 #include "quant_table.hpp"
 #include "expert_cache.hpp"
+#include "graph_config.hpp"
 
 #include <array>
 #include <filesystem>
@@ -409,7 +410,7 @@ class ModelReader final : public ExpertSource {
 public:
   bool drop_page_cache = true;
   std::atomic<uint64_t> reads{0}; // experts served from the main model (buffered per-plane preads)
-  ModelReader() { if (const char *e = std::getenv("ZEROMOE_GLM5NEXT_MODEL_DIRECT")) use_direct = e[0] == '1'; }
+  ModelReader() { use_direct = graphcfg::flag_on("ZEROMOE_GLM5NEXT_MODEL_DIRECT"); }
   ~ModelReader() override {
     for (int fd : fds_) if (fd >= 0) ::close(fd);
     for (int fd : fds_dir_) if (fd >= 0) ::close(fd);
@@ -654,7 +655,7 @@ public:
     // read into the slot skips the page fault and zero-fill (measured ~0.5 ms of CPU and ~20% of the read time per 7 MB expert), at
     // the price of a soft memory budget: freed slots are reclaimed under pressure, not immediately.
     static const int advice = [] {
-      const char *v = std::getenv("ZEROMOE_OFFLOAD_EVICT");
+      const char *v = graphcfg::env("ZEROMOE_OFFLOAD_EVICT");
 #ifdef MADV_FREE
       if (v && std::strcmp(v, "free") == 0) return static_cast<int>(MADV_FREE);
 #endif
@@ -740,7 +741,7 @@ public:
 
   // Page-reusing eviction (see docs/offload-retarget.md). Default on: this class only exists when SSD offload is active.
   // ZEROMOE_OFFLOAD_RETARGET=0 restores madvise(DONTNEED) eviction.
-  bool retarget_ = [] { const char *e = std::getenv("ZEROMOE_OFFLOAD_RETARGET"); return !(e && e[0] == '0'); }();
+  bool retarget_ = graphcfg::flag_unless_off("ZEROMOE_OFFLOAD_RETARGET");
 
   // Phase 1. The caller holds the arena lock exclusively. Bookkeeping only, no I/O.
   Plan begin(int layer, const int32_t *ids, int n, ExpertCache::Kind kind = ExpertCache::Kind::Demand) {
@@ -914,7 +915,7 @@ public:
     Ensure r;
     const auto t0 = std::chrono::steady_clock::now();
     load_transient(layer, to_load, r);
-    if (std::getenv("ZEROMOE_OFFLOAD_DEBUG_PREFETCH"))
+    if (graphcfg::present("ZEROMOE_OFFLOAD_DEBUG_PREFETCH"))
       std::fprintf(stderr, "[PREFETCH] layer=%d experts=%zu errors=%d %.1f ms\n", layer, to_load.size(), r.errors,
                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     return r.errors;
@@ -924,7 +925,7 @@ public:
   // over several drives is read by all of them at once.
   void load_transient(int layer, const std::vector<int> &to_load, Ensure &r) {
     static const size_t par = [] {
-      const char *e = std::getenv("ZEROMOE_OFFLOAD_TRANSIENT_PAR");
+      const char *e = graphcfg::env("ZEROMOE_OFFLOAD_TRANSIENT_PAR");
       return static_cast<size_t>(e ? std::max(1, std::atoi(e)) : 8);
     }();
     for (size_t i = 0; i < to_load.size(); i += par) {
@@ -969,7 +970,7 @@ public:
   size_t populate_resident() {
     size_t failed = 0;
     int par = 8;
-    if (const char *e = std::getenv("ZEROMOE_OFFLOAD_SEED_PAR")) par = std::max(1, std::atoi(e));
+    if (const char *e = graphcfg::env("ZEROMOE_OFFLOAD_SEED_PAR")) par = std::max(1, std::atoi(e));
     const ExpertCache::Config &c = cache_.config();
     std::vector<int> batch;
     for (int L = c.first_layer; L < c.first_layer + c.n_layers; ++L) {

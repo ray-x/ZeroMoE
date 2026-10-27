@@ -1,4 +1,5 @@
 #include "kernels_cpu.hpp"
+#include "graph_config.hpp"
 #include "logger.hpp"
 #include "perf_timer.hpp"
 #include <algorithm>
@@ -70,14 +71,8 @@ static void ensure_ggml_cpu_initialized() {
 int qwen_cpu_grouped_threads() {
 #if defined(_OPENMP)
   static const int requested = [] {
-    const char *env = std::getenv("ZEROMOE_QWEN_CPU_THREADS");
-    if (!env || !env[0])
-      return 0;
-    char *end = nullptr;
-    const long value = std::strtol(env, &end, 10);
-    return end != env && *end == '\0' && value > 0
-               ? static_cast<int>(value)
-               : 0;
+    const long value = zeromoe::graphcfg::integer("ZEROMOE_QWEN_CPU_THREADS", 0);
+    return value > 0 ? static_cast<int>(value) : 0;
   }();
   const int available = std::max(1, omp_get_max_threads());
   return requested > 0 ? std::min(requested, available) : available;
@@ -92,8 +87,7 @@ int qwen_cpu_grouped_threads() {
 // than adding a process-wide timing cost to every CPU kernel.
 static bool qwen_cpu_stage_timing_enabled_local() {
   static const bool enabled = [] {
-    const char *env = std::getenv("ZEROMOE_QWEN_CPU_STAGE_TIMING");
-    return env && env[0] == '1';
+    return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN_CPU_STAGE_TIMING");
   }();
   return enabled;
 }
@@ -3274,8 +3268,7 @@ bool cpu_has_avx512_vbmi() {
 }
 
 bool force_q2_0_fallback() {
-  const char *disable = std::getenv("ZEROMOE_Q2_0_DISABLE_VNNI");
-  return disable && disable[0] == '1';
+  return zeromoe::graphcfg::flag_on("ZEROMOE_Q2_0_DISABLE_VNNI");
 }
 
 } // namespace

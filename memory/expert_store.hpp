@@ -16,6 +16,7 @@
 // miss overlap instead of serializing on I/O.
 
 #include "expert_cache.hpp"
+#include "graph_config.hpp"
 #include "logger.hpp"
 #include "offload_store.hpp"
 
@@ -278,7 +279,7 @@ class ExpertStore {
       // Prefill-transient experts are registered by the read-ahead thread (off the critical path) so their host-to-device
       // copy skips the driver's pageable bounce buffer; unregistered on evict. Opt-in (ZEROMOE_OFFLOAD_PIN_TRANSIENT=1):
       // measured 87.5 tok/s with vs 99.0 without on the 805-token prompt (registration cost outweighs the faster copy).
-      if (const char *e = std::getenv("ZEROMOE_OFFLOAD_PIN_TRANSIENT"); e && e[0] == '1')
+      if (graphcfg::flag_on("ZEROMOE_OFFLOAD_PIN_TRANSIENT"))
         arena_->after_transient = [this](int l, int x) { pin_expert(l, x); };
     }
     return true;

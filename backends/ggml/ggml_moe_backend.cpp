@@ -10,6 +10,7 @@
 #include "logger.hpp"
 #include "memory_guard.hpp"
 #include "perf_timer.hpp"
+#include "graph_config.hpp"
 
 #include <algorithm>
 #include <array>
@@ -99,8 +100,7 @@ bool type_supported(uint32_t t) {
 
 bool qwen_decode_sched_debug() {
   static const bool enabled = [] {
-    const char *e = std::getenv("ZEROMOE_QWEN_DECODE_SCHED_DEBUG");
-    return e && e[0] == '1';
+    return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN_DECODE_SCHED_DEBUG");
   }();
   return enabled;
 }
@@ -213,8 +213,7 @@ bool use_backend_stream_copies() {
 // Qwen prefill.
 bool use_direct_router_input() {
   static const bool enabled = [] {
-    const char *env = std::getenv("ZEROMOE_GGML_ROUTER_DIRECT_INPUT");
-    return env && env[0] == '1';
+    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_ROUTER_DIRECT_INPUT");
   }();
   return enabled;
 }
@@ -226,16 +225,14 @@ bool moe_ggml_planar_copies_override = false;
 // be bisected without rebuilding the engine or changing the GGML graph.
 bool use_packed_transfer() {
   static const bool enabled = [] {
-    const char *env = std::getenv("ZEROMOE_GGML_PLANAR_COPIES");
-    return !(env && env[0] == '1');
+    return !zeromoe::graphcfg::flag_on("ZEROMOE_GGML_PLANAR_COPIES");
   }();
   return enabled && !moe_ggml_planar_copies_override;
 }
 
 bool trace_pure_h2d() {
   static const bool enabled = [] {
-    const char *env = std::getenv("ZEROMOE_TRACE_PURE_H2D");
-    return env && env[0] == '1';
+    return zeromoe::graphcfg::flag_on("ZEROMOE_TRACE_PURE_H2D");
   }();
   return enabled;
 }
@@ -252,8 +249,7 @@ bool async_moe_graph_reuse_override = false;
 // real Qwen prompt; the default remains the established conservative path.
 bool use_async_moe_graph_reuse() {
   static const bool enabled = [] {
-    const char *env = std::getenv("ZEROMOE_GGML_MOE_ASYNC_GRAPH_REUSE");
-    return env && env[0] == '1';
+    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_MOE_ASYNC_GRAPH_REUSE");
   }();
   return enabled || async_moe_graph_reuse_override;
 }
@@ -268,7 +264,7 @@ bool use_async_moe_graph_reuse() {
 // the default follows the already opt-in async graph-reuse setting.
 bool use_direct_shared_inputs() {
   static const bool enabled = [] {
-    const char *env = std::getenv("ZEROMOE_GGML_SHARED_DIRECT_INPUT");
+    const char *env = zeromoe::graphcfg::env("ZEROMOE_GGML_SHARED_DIRECT_INPUT");
     if (env) return env[0] == '1';
     return use_async_moe_graph_reuse();
   }();
@@ -284,7 +280,7 @@ bool use_direct_shared_inputs() {
 // Qwen device-HC handoff; raw-pointer callers retain their existing path.
 bool use_direct_moe_input() {
   static const bool enabled = [] {
-    const char *env = std::getenv("ZEROMOE_GGML_MOE_DIRECT_INPUT");
+    const char *env = zeromoe::graphcfg::env("ZEROMOE_GGML_MOE_DIRECT_INPUT");
     if (env) return env[0] == '1';
     return use_async_moe_graph_reuse();
   }();
@@ -293,40 +289,35 @@ bool use_direct_moe_input() {
 
 bool debug_sync_route_inputs() {
   static const bool enabled = [] {
-    const char *env = std::getenv("ZEROMOE_GGML_DEBUG_SYNC_ROUTE");
-    return env && env[0] == '1';
+    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_DEBUG_SYNC_ROUTE");
   }();
   return enabled;
 }
 
 bool debug_device_sync() {
   static const bool enabled = [] {
-    const char *env = std::getenv("ZEROMOE_GGML_DEBUG_DEVICE_SYNC");
-    return env && env[0] == '1';
+    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_DEBUG_DEVICE_SYNC");
   }();
   return enabled;
 }
 
 bool debug_copy_sync() {
   static const bool enabled = [] {
-    const char *env = std::getenv("ZEROMOE_GGML_DEBUG_COPY_SYNC");
-    return env && env[0] == '1';
+    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_DEBUG_COPY_SYNC");
   }();
   return enabled;
 }
 
 bool trace_backend_calls() {
   static const bool enabled = [] {
-    const char *env = std::getenv("ZEROMOE_GGML_TRACE_BACKEND_CALLS");
-    return env && env[0] == '1';
+    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_TRACE_BACKEND_CALLS");
   }();
   return enabled;
 }
 
 bool debug_check_device_output() {
   static const bool enabled = [] {
-    const char *env = std::getenv("ZEROMOE_GGML_DEBUG_CHECK_DEVICE_OUTPUT");
-    return env && env[0] == '1';
+    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_DEBUG_CHECK_DEVICE_OUTPUT");
   }();
   return enabled;
 }

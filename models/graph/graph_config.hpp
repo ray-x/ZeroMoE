@@ -114,6 +114,10 @@ inline int atoi_or(const char *name, int dflt) {
   const char *v = env(name);
   return v && v[0] ? std::atoi(v) : dflt;
 }
+inline long atol_or(const char *name, long dflt) {
+  const char *v = env(name);
+  return v && v[0] ? std::atol(v) : dflt;
+}
 inline double atof_or(const char *name, double dflt) {
   const char *v = env(name);
   return v && v[0] ? std::atof(v) : dflt;

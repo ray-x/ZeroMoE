@@ -6,6 +6,7 @@
 #include "logger.hpp"
 #include "memory_guard.hpp"
 #include "perf_timer.hpp"
+#include "graph_config.hpp"
 
 #include <algorithm>
 #include <array>
@@ -199,8 +200,7 @@ bool GgmlRouterRunner::build_graph(int layer) {
   ggml_set_output(route.ids);
   ggml_set_output(route.weights);
   static const bool compare_logits = [] {
-    const char *e = std::getenv("ZEROMOE_QWEN_ROUTER_COMPARE");
-    return e && e[0] == '1';
+    return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN_ROUTER_COMPARE");
   }();
   if (compare_logits) ggml_set_output(route.logits);
   ggml_set_name(route.ids, "qwen4exp_router_ids");

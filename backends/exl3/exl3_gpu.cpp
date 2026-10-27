@@ -3,6 +3,7 @@
 #include "exl3_cpu.hpp"
 #include "exl3_cuda.hpp"
 #include "exl3_format.hpp"
+#include "graph_config.hpp"
 #include "logger.hpp"
 
 #include <cublas_v2.h>
@@ -142,7 +143,7 @@ struct Exl3GpuExecutor::Impl {
     pending_routed.reserve(256);
     external_routed_graphs.reserve(kMaxExternalRoutedGraphs);
     DeviceGuard guard(device);
-    const char *schedule_env = std::getenv("ZEROMOE_CUDA_SCHEDULE");
+    const char *schedule_env = zeromoe::graphcfg::env("ZEROMOE_CUDA_SCHEDULE");
     if (schedule_env && schedule_env[0]) {
       unsigned schedule = cudaDeviceScheduleAuto;
       const char *name = "auto";
@@ -1092,7 +1093,7 @@ void Exl3GpuExecutor::routed_ffn_device_external(
   uint64_t graph_id = 0;
   bool graph_use_registered = false;
   const bool trace_graph_capture =
-      std::getenv("ZEROMOE_EXL3_GRAPH_TRACE") != nullptr;
+      zeromoe::graphcfg::present("ZEROMOE_EXL3_GRAPH_TRACE");
   const auto capture_and_launch = [&] {
     cudaGraph_t captured_graph = nullptr;
     cudaGraphExec_t executable = nullptr;

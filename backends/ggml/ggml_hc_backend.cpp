@@ -3,6 +3,7 @@
 #include "ggml_hc_backend.hpp"
 
 #include "ggml_moe_backend.hpp"  // ggml_shared_backend()
+#include "graph_config.hpp"
 #include "logger.hpp"
 
 #include <algorithm>
@@ -73,16 +74,14 @@ bool dequant_q8_0_rows(const GgmlHcWeightRef &src,
 // a missing dependency/lifetime edge from a numerical problem in the HC math.
 bool debug_sync_hc() {
   static const bool enabled = [] {
-    const char *v = std::getenv("ZEROMOE_GGML_DEBUG_SYNC_HC");
-    return v && v[0] == '1';
+    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_DEBUG_SYNC_HC");
   }();
   return qwen_hc_async_readback_override || enabled;
 }
 
 bool debug_check_hc_state() {
   static const bool enabled = [] {
-    const char *v = std::getenv("ZEROMOE_GGML_DEBUG_CHECK_HC_STATE");
-    return v && v[0] == '1';
+    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_DEBUG_CHECK_HC_STATE");
   }();
   return enabled;
 }
@@ -93,24 +92,21 @@ bool debug_check_hc_state() {
 // reuse enabled.
 bool debug_rebuild_pre_graph_each_call() {
   static const bool enabled = [] {
-    const char *v = std::getenv("ZEROMOE_GGML_HC_REBUILD_EACH_CALL");
-    return v && v[0] == '1';
+    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_HC_REBUILD_EACH_CALL");
   }();
   return enabled;
 }
 
 bool hc_no_external_weights() {
   static const bool disabled = [] {
-    const char *e = std::getenv("ZEROMOE_GGML_HC_NO_EXTERNAL");
-    return e && e[0] == '1';
+    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_HC_NO_EXTERNAL");
   }();
   return disabled;
 }
 
 bool debug_external_weight_rebind() {
   static const bool enabled = [] {
-    const char *e = std::getenv("ZEROMOE_GGML_HC_DIAG_EXTERNAL");
-    return e && e[0] == '1';
+    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_HC_DIAG_EXTERNAL");
   }();
   return enabled;
 }
@@ -131,8 +127,7 @@ uint64_t fnv64_bytes(const void *data, size_t bytes) {
 // their existing synchronization behavior even if they reuse this class.
 bool qwen_hc_async_readback() {
   static const bool enabled = [] {
-    const char *v = std::getenv("ZEROMOE_QWEN_HC_ASYNC_READBACK");
-    return v && v[0] == '1';
+    return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN_HC_ASYNC_READBACK");
   }();
   return enabled;
 }
@@ -642,8 +637,7 @@ bool GgmlHcRunner::ensure_pre_graph(int S, const Bracket &b, int layer,
       return false;
     }
     static const bool keep_internal_dump_outputs = [] {
-      const char *env = std::getenv("ZEROMOE_GGML_HC_INTERNAL_DUMP");
-      return env && env[0] != '\0';
+      return zeromoe::graphcfg::path("ZEROMOE_GGML_HC_INTERNAL_DUMP") != nullptr;
     }();
     if (keep_internal_dump_outputs && S == 1 && layer < 2) {
       // The allocator normally reuses these temporaries immediately after
@@ -1052,8 +1046,7 @@ bool GgmlHcRunner::ensure_weights(int layer, int sub_block,
   const size_t weight_bytes = ggml_nbytes(tn) + ggml_nbytes(td) +
                               ggml_nbytes(tu) + ggml_nbytes(ti);
   static const bool log_types = [] {
-    const char *e = std::getenv("ZEROMOE_GGML_HC_DEBUG_TYPES");
-    return e && e[0] == '1';
+    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_HC_DEBUG_TYPES");
   }();
   if (log_types) {
     LOG_INFO("[GGML-HC-MEM] types: layer=%d sub=%d norm=%u down=%u up=%u "
@@ -1232,7 +1225,7 @@ bool GgmlHcRunner::pre_mix(int layer, int sub_block, int S, float *out_hidden,
   // upstream state delta. They intentionally synchronize and are restricted
   // to S=1 / Layers 0-1; the normal path is unchanged when the env var is unset.
   static const char *internal_dump_base = [] {
-    return std::getenv("ZEROMOE_GGML_HC_INTERNAL_DUMP");
+    return zeromoe::graphcfg::env("ZEROMOE_GGML_HC_INTERNAL_DUMP");
   }();
   if (internal_dump_base && S == 1 && layer < 2 && !b.custom_q8 &&
       active_pre_graph_) {
