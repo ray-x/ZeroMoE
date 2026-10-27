@@ -6,7 +6,10 @@
 - `refactor/env-surface` is fast-forwarded to the same history.
 - Validation build: `build_verify_master/` (CUDA, arch 86). The provenance
   manifest records `models/base/family_ops.cpp` as an existing uncommitted
-  file owned by another session; it is not part of this change.
+  file owned by another session; it is not part of this change. Its diff
+  snapshot is
+  `sha256:4529977cca6ef2912956955fa52e0b09a7c6d2f62515ba50d2b7294d48d50e28`
+  (1 insertion, 2 deletions). The build is labelled with that snapshot.
 - No files in `ZeroMoE-wt-mtp`, `ZeroMoE-wt-mtp2` or
   `build_mtp_results/worktree_qwen_mtp` were modified.
 
@@ -89,7 +92,12 @@ python3 tools/config_inventory.py --check
 
 Results:
 
-- CUDA `zeromoe` build: success.
+- CUDA `zeromoe` build: success. `python3 tools/build_provenance.py check
+  --binary build_verify_master/zeromoe --repo .` passes with
+  `source=837ffc1a614e8cb7c98ac8ef4e4b07e998ccc12e dirty=True
+  binary_sha256=5ebdc2638c8310c52adf10820adcfac12cfe4c046c312b0273c709c2e42f98e3`
+  and `ggml_base=8baabd53b77d1c48c6ef8d3b620436292f3f6231`. The dirty flag
+  is the `family_ops.cpp` snapshot above.
 - `graph_settings` and `graph_settings_binding`: 2/2 pass.
 - Defaults snapshot now contains `device_expert_layers=2`; explicit `0` is
   still accepted and TOML `1` is rejected.
