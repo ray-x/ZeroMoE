@@ -7,6 +7,7 @@
 // type). `partials` arguments of the legacy API are unused here.
 #include "exl3_cuda.hpp"
 #include "exl3_stub.hpp"
+#include "graph_config.hpp"
 #include "quant/exl3_gemm.cuh"
 #include "quant/exl3_moe_coop.cuh"
 
@@ -126,7 +127,7 @@ cudaError_t gemm(Workspace &w, const Exl3CudaMatrixView &m, const float *input,
 // ZEROMOE_EXL3_MOE_COOP=0 uses one upstream exl3_gemm sequence per expert.
 bool exl3_upstream_moe_coop_enabled() {
   static const bool active = [] {
-    const char *v = std::getenv("ZEROMOE_EXL3_MOE_COOP");
+    const char *v = zeromoe::graphcfg::env("ZEROMOE_EXL3_MOE_COOP");
     return !v || v[0] != '0';
   }();
   return active;

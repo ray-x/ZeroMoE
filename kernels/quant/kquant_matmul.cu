@@ -24,6 +24,8 @@
 // matches that pattern -- DEQUANT returns a float by value instead of
 // writing through a pointer.
 
+#include "graph_config.hpp"
+
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
@@ -483,7 +485,7 @@ KQUANT_MATMUL_KERNEL_LANE8(q6_K, block_q6_K_cu, dequant_q6_K_lane8)
 // comparing against a previously-recorded baseline from another session can
 // chase drift rather than the change under test.
 static inline bool kquant_legacy_forced() {
-    static const bool forced = [](){ const char* e = getenv("ZEROMOE_KQUANT_LEGACY");
+    static const bool forced = [](){ const char* e = zeromoe::graphcfg::env("ZEROMOE_KQUANT_LEGACY");
                                      return e && e[0] == '1'; }();
     return forced;
 }
