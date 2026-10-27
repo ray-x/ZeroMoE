@@ -2,7 +2,8 @@
 
 ## Status
 
-- Code commit: `a8a1c7d` on `master`; this report is the follow-up docs commit.
+- Code commit: `a8a1c7d` on `master`; the handoff/audit commits after it are
+  documentation-only.
 - `refactor/env-surface` is fast-forwarded to the same history.
 - Validation build: `build_verify_master/` (CUDA, arch 86). The provenance
   manifest records `models/base/family_ops.cpp` as an existing uncommitted
@@ -94,8 +95,9 @@ Results:
 
 - CUDA `zeromoe` build: success. `python3 tools/build_provenance.py check
   --binary build_verify_master/zeromoe --repo .` passes with
-  `source=837ffc1a614e8cb7c98ac8ef4e4b07e998ccc12e dirty=True
-  binary_sha256=5ebdc2638c8310c52adf10820adcfac12cfe4c046c312b0273c709c2e42f98e3`
+  a manifest whose `source` is the handoff HEAD and `dirty=True`
+  (family_ops snapshot), with
+  `binary_sha256=5ebdc2638c8310c52adf10820adcfac12cfe4c046c312b0273c709c2e42f98e3`
   and `ggml_base=8baabd53b77d1c48c6ef8d3b620436292f3f6231`. The dirty flag
   is the `family_ops.cpp` snapshot above.
 - `graph_settings` and `graph_settings_binding`: 2/2 pass.
