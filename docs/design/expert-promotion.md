@@ -44,9 +44,26 @@ The gap between A and B is within a point of miss rate, so build **B**: promote 
 after 2 misses, at most 6-8 promotions per token spread fairly across layers, victim by the existing
 eviction score, with a switch that freezes the hot set for validation.
 
+## Measured costs (3090, PCIe 3.0 x16, Xeon W-2235)
+
+* The host expert arena is pinned: Qwen4Exp registers it with `cudaHostRegister` by default (startup log
+  `[GRAPH-RAM] layer N arena: ... pinned`); the code records pageable 4.9 GB/s vs pinned 10.6 GB/s.
+* One expert is gate+up+down = 3 x 460,800 B = **1.38 MB** (24,576 experts = 34 GB, matching Strata's Q2_0 figure).
+* Copy interference (`ZEROMOE_PROMO_PROBE_N`, story prompt = 51% static misses, plain S=1 decode, 500 tokens,
+  N experts copied host->device on a side stream after every token, no late waits in any run):
+
+  | promotions/token | MB/token | decode tok/s | vs baseline |
+  |---|---|---|---|
+  | 0 | 0 | 26.47, 26.75 | - |
+  | 6 | 8.3 | 26.32 | -0.6% (noise) |
+  | 26 | 36 | 24.65 | -7% |
+  | 60 | 83 | 22.00 | -17% |
+
+  A steady budget of 6 per token is free; a start-of-reply burst of ~26 costs ~7% only while it lasts;
+  interference comes from sharing host RAM bandwidth with the CPU experts.
+
 ## Not covered
 
 The simulation assumes a promoted expert is resident immediately and ignores the cost of the copies
 (host RAM bandwidth is shared with the CPU experts) and the numerics of moving an expert between CPU
-and GPU (Q8_K vs Q8_1 activation rounding), so output depends on cache history. Whether the host
-arena is pinned for full-speed async copies is unchecked.
+and GPU (Q8_K vs Q8_1 activation rounding), so output depends on cache history. 
