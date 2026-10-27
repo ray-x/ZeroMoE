@@ -5,8 +5,8 @@ binary or citing a result.
 
 ## Master status (2026-10-27)
 
-`master` is at `d2317b2`. Two changes landed after the `b78dd9b` binary that
-produced the matched raw-story numbers below, and neither is a runtime change:
+`master` is at `0bd23c1`. Four changes landed after the `b78dd9b` binary that
+produced the matched raw-story numbers below, and none is a runtime change:
 
 - `5781401` removes the always-on `ZEROMOE_USE_GGML` and
   `ZEROMOE_BUILD_SERVER` build macros. The guards were true in every supported
@@ -15,10 +15,20 @@ produced the matched raw-story numbers below, and neither is a runtime change:
 - `d2317b2` adds the build-provenance stamp and the CUDA configure repair:
   the duplicate `graph_settings_test` target no longer breaks a non-CPU
   configure, and `graph_settings_test` passes against the defaults snapshot.
+- `7f86269` stops the stamp from claiming the pinned ggml commit when a local
+  `ZEROMOE_GGML_ROOT` is used.
+- `0bd23c1` removes the `ZEROMOE_USE_GGML_CUDA` option. The macro is now
+  derived from `ZEROMOE_CPU_ONLY`, so every CUDA build links ggml-cuda; the
+  previous default `OFF` failed to link. Build commands no longer pass the
+  flag. `982dedd` keeps `test_components` assertions live in Release builds.
 
 `build/zeromoe` is still stamped from `b78dd9b` and fails
 `python3 tools/build_provenance.py check --binary build/zeromoe --repo .`
-against current master. Do not quote new rates from it; rebuild first.
+against current master. Do not quote new rates from it; rebuild first. The
+validation build in `build_verify_master/` is current (CPU_ONLY=OFF, arch 86,
+no `ZEROMOE_USE_GGML_CUDA` input); its manifest reports `source=7f86269
+dirty=True` because the tree carried uncommitted edits during configure, and
+that dirty diff is now commit `0bd23c1`.
 
 Outstanding items: the plain-mode rerun on current master (the `658a212` plain
 run never finished because the driver stopped answering `nvidia-smi`), and the
