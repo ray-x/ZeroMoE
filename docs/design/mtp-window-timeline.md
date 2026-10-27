@@ -81,3 +81,18 @@ produce (the bonus token), so it can only start early on a guess: the draft's ow
 often as the draft accepts (~80% on easy prompts) and only when the whole window was accepted (~50% of cycles for
 3 drafts). Expected saving ~0.4 x 7 ms = ~3 ms of a 56 ms cycle (<=5%), minus GPU contention with the window and
 a draft-KV rollback path. Not worth the complexity.
+
+## Cold-expert CPU time: what was measured (2026-10-28)
+
+* **Overlap:** with an NVTX range around the fused cold op (48 per window), 0% of its 11-12 ms per window overlaps a GPU
+  kernel or copy: layer by layer the window is GPU split -> CPU cold op -> GPU split, strictly serial.
+* **Rate:** the op streams weights at about 15 GB/s (one thread of this box reads 16.6 GB/s, six read 64 GB/s), so it
+  is limited by the Q2_0 dot, about 45 vector ops per 18-byte block.
+* **Faster dot, no gain:** an unpack that needs 6 ops instead of 28, bit-identical on 16,384 outputs and 2.2x faster
+  on one thread, cut the cold op from 12.5 to 7.4 ms per window but MTP decode went from 69.7 +- 0.3 to
+  68.5 +- 0.5 tok/s (5 alternating runs each). Not adopted.
+* **Threads:** the CPU team size matters more. Palindrome, 4 alternating runs per setting: 5 threads 68.6, 6 threads
+  69.8 (+-0.3), 7 threads 63.8, 10 threads 67.9. Seven threads puts a worker on an SMT sibling of another and loses 8%.
+  The graph's CPU thread count now defaults to the physical core count (sysfs sibling groups) instead of
+  `hardware_concurrency() - 2`; `ZEROMOE_QWEN_CPU_THREADS` still overrides. Six prompts, 6 vs 10 threads: palindrome
+  +1.4, leet +1.5, math +1.0, review 0, btree -0.7, story -0.4 tok/s.

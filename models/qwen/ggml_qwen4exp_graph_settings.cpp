@@ -5,6 +5,11 @@
 // declarations live in ggml_qwen4exp_graph_internal.hpp.
 
 #include "ggml_qwen4exp_graph_internal.hpp"
+#include <sched.h>
+#include <vector>
+#include <string>
+#include <fstream>
+#include <algorithm>
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
 
@@ -278,6 +283,29 @@ void pin_host_node_threads(ggml_threadpool_params &p, int n_threads) {
            n_threads);
 }
 
+// Physical cores usable by this process: distinct hardware threads' sibling groups in sysfs, 0 when unknown.
+// The CPU side of the graph (cold experts, host-node ops) is a spin-synchronised team; a worker on an SMT sibling
+// of another worker only competes for the same core's vector ports, and a seventh thread on a 6-core part cost
+// 8% in the MTP window while 6 gained 3% over hardware_concurrency()-2 (Xeon W-2235, 6C/12T).
+static int physical_core_count() {
+  cpu_set_t allowed;
+  CPU_ZERO(&allowed);
+  if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0)
+    return 0;
+  std::vector<std::string> groups;
+  for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+    if (!CPU_ISSET(cpu, &allowed))
+      continue;
+    std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/thread_siblings_list");
+    std::string list;
+    if (!std::getline(f, list))
+      return 0;
+    if (std::find(groups.begin(), groups.end(), list) == groups.end())
+      groups.push_back(list);
+  }
+  return static_cast<int>(groups.size());
+}
+
 int graph_cpu_threads() {
 #if defined(_OPENMP)
   const int available = std::max(1, omp_get_max_threads());
@@ -297,7 +325,8 @@ int graph_cpu_threads() {
     if (end != v && *end == '\0' && parsed > 0)
       return std::min(available, static_cast<int>(parsed));
   }
-  return available;
+  const int physical = physical_core_count();
+  return physical > 0 ? std::min(available, physical) : available;
 }
 
 // REVERTED (2026-09-17): a prior commit defaulted this to false, reasoning
