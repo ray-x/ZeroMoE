@@ -29,7 +29,17 @@ Analyzer: `tools/nsys_window_breakdown.py <export.sqlite>`. The raw trace is in
 * Waiting in synchronization calls while the GPU is idle is small (1.9 ms): the host spends its idle time
   launching graphs and computing cold experts, not polling.
 
-## Reading
+## Correction: most of the launch cost is the profiler
+
+`--cuda-graph-trace=node` makes every `cudaGraphLaunch` cost 174-630 us (median 246) because nsys tracks each
+node; plain decode and the window have a similar node count (about 5,000 compute nodes; see
+`ZEROMOE_GRAPH_OP_HISTOGRAM`). The unprofiled window is 41.9 ms against 55.7 ms under nsys, a difference of
+13.8 ms that matches the 14.6 ms attributed to "other CUDA calls". Without the artifact the window is about
+GPU kernels 19.7 + copies 3.7 + sync waits 1.9 + host-only 17 ms. Launch overhead is therefore a small lever;
+the 17 ms of host-only time (cold-expert compute and scheduling, GPU idle) is the largest non-GPU part. With the
+early-ready lane on in windows the picture barely changes (window 52.5 ms under nsys, host-only 15.9 ms).
+
+## Reading (superseded in part by the correction above)
 
 Only a third of the window is GPU compute. The rest is per-layer overhead: launching ~4,600 small kernels
 through 49 graph launches, and the serialized CPU split for the cold experts. Faster GPU kernels would not move

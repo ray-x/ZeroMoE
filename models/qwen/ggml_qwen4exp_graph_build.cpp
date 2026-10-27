@@ -1431,6 +1431,24 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
                         : 0) /
                (1024.0 * 1024.0),
            (double)g.graph_bytes / (1024.0 * 1024.0 * 1024.0));
+  if (zeromoe::graphcfg::env("ZEROMOE_GRAPH_OP_HISTOGRAM")) {
+    // Which operations make up the graph (kernel launches dominate a window's host time).
+    std::map<std::string, int> ops;
+    const int nn = ggml_graph_n_nodes(g.graph);
+    int views = 0;
+    for (int i = 0; i < nn; ++i) {
+      ggml_tensor *n = ggml_graph_node(g.graph, i);
+      if (n->op == GGML_OP_NONE || n->op == GGML_OP_RESHAPE || n->op == GGML_OP_VIEW ||
+          n->op == GGML_OP_PERMUTE || n->op == GGML_OP_TRANSPOSE) { ++views; continue; }
+      ++ops[std::string(ggml_op_name(n->op)) + (n->op == GGML_OP_UNARY ? std::string("/") + ggml_unary_op_name(ggml_get_unary_op(n)) : std::string())];
+    }
+    std::vector<std::pair<int, std::string>> sorted;
+    for (const auto &kv : ops) sorted.emplace_back(kv.second, kv.first);
+    std::sort(sorted.rbegin(), sorted.rend());
+    std::string line;
+    for (size_t i = 0; i < sorted.size() && i < 16; ++i) line += " " + sorted[i].second + "=" + std::to_string(sorted[i].first);
+    LOG_INFO("[GRAPH-OPS] %s S=%d: %d nodes (%d view-only):%s\n", g.decode_mode ? "decode" : "prefill", g.S, nn, views, line.c_str());
+  }
   g.ready = true;
   return true;
 }
