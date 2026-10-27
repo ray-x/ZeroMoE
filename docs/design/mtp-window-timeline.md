@@ -128,7 +128,14 @@ Window under nsys, palindrome, fused: 48.6 ms = GPU kernels 18.6 + copies 3.7 + 
    3.2 ms + part of the shared expert per window, about 110 us per layer) is smaller than the CPU step (about 155 us),
    an upper bound of about 5 ms per window; the CPU step has to move into a callback inside the CUDA stream
    (early-ready lane / host-node), whose copies and callback cost took most of the gain when measured before (about
-   2 ms). Estimate +2 to +4 tok/s, a multi-day change that alters the output text. Not built.
+   2 ms). Estimate +2 to +4 tok/s, a multi-day change that alters the output text.
+   **Prototyped and rejected (2026-10-28):** the fused cold op as a CUDA host callback inside the GPU stream
+   (GPU-resident CPY marker -> pinned D2H of x/ids/w -> `cudaLaunchHostFunc` running the same op on a spin-waiting
+   worker team -> H2D; ordered `add(cold, hot)` so the ggml-cuda parallel-branch gate could run hot experts alongside).
+   One window's logits were bit-identical to the scheduler-split path, but the serial callback ran 57.4 tok/s against
+   67-68 (the D2H/callback/H2D round trip per layer costs more than the at-most-5 ms the overlap can recover), and with
+   the parallel branch on the real run produced a non-finite window (only layer 0 passed the gate; the allocator
+   reuses buffers the second stream still reads). Code and toggles removed.
 3. **Draft count per prompt.** K=4 vs 3 (tok/s): palindrome +1.0, math +1.4, leet +1.4, review -4, btree -5. A per-prompt
    oracle gains about +0.6 on average and would need two window graphs resident (VRAM is full). Not worth building.
 
