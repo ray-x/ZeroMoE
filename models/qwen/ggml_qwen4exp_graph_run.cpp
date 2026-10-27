@@ -5,10 +5,66 @@
 
 #include "ggml_qwen4exp_graph_internal.hpp"
 #include "tensor_trace.hpp"
+#include "nvtx_range.hpp"
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
 
 using namespace qwen4exp_graph;
+
+
+// ---- temporary measurement: cost of background expert-promotion copies ----
+// ZEROMOE_PROMO_PROBE_N=N: after every decode token copy N experts' worth of
+// real arena bytes (gate+up+down planes of arbitrary experts) host->device on a
+// side stream, and wait for the previous token's copies before issuing more.
+// Measures PCIe/RAM interference with decode; no model state is touched.
+static void promo_copy_probe(StreamingEngine &engine, int pos_base) {
+  static const int N = [] { const char *v = std::getenv("ZEROMOE_PROMO_PROBE_N"); return v ? std::atoi(v) : 0; }();
+  if (N <= 0) return;
+  static void *dev = nullptr;
+  static cudaStream_t st = nullptr;
+  static cudaEvent_t ev = nullptr;
+  static bool pending = false;
+  static uint64_t calls = 0, late = 0, bytes_total = 0;
+  static size_t per_expert = 0;
+  if (!dev) {
+    const auto &a0 = engine.graph_ram_arenas[0];
+    per_expert = a0.gate_bytes + a0.up_bytes + a0.down_bytes;
+    if (cudaMalloc(&dev, per_expert * static_cast<size_t>(N)) != cudaSuccess ||
+        cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
+      LOG_ERROR("[PROMO-PROBE] setup failed\n");
+      return;
+    }
+    LOG_INFO("[PROMO-PROBE] N=%d per_expert=%zu bytes (%.2f MB per token)\n", N, per_expert,
+             N * per_expert / 1.0e6);
+  }
+  if (pending) {
+    if (cudaEventQuery(ev) != cudaSuccess) ++late;
+    cudaEventSynchronize(ev);
+    pending = false;
+  }
+  const int layers = static_cast<int>(engine.graph_ram_arenas.size());
+  for (int i = 0; i < N; ++i) {
+    const int layer = (pos_base * 7 + i * 5) % layers;
+    const auto &a = engine.graph_ram_arenas[layer];
+    if (!a.base) continue;
+    const int e = (pos_base * 131 + i * 37) % std::max(1, a.n_experts);
+    char *d = static_cast<char *>(dev) + static_cast<size_t>(i) * per_expert;
+    cudaMemcpyAsync(d, a.base + a.gate_offset + static_cast<size_t>(e) * a.gate_stride, a.gate_bytes,
+                    cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(d + a.gate_bytes, a.base + a.up_offset + static_cast<size_t>(e) * a.up_stride, a.up_bytes,
+                    cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(d + a.gate_bytes + a.up_bytes,
+                    a.base + a.down_offset + static_cast<size_t>(e) * a.down_stride, a.down_bytes,
+                    cudaMemcpyHostToDevice, st);
+    bytes_total += per_expert;
+  }
+  cudaEventRecord(ev, st);
+  pending = true;
+  if (++calls % 100 == 0)
+    LOG_INFO("[PROMO-PROBE] tokens=%llu late_waits=%llu copied=%.1f MB\n",
+             (unsigned long long)calls, (unsigned long long)late, bytes_total / 1.0e6);
+}
 
 bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
                                     float *hidden_states, int pos_base,
@@ -79,9 +135,12 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
   }
   const auto start = std::chrono::steady_clock::now();
   const auto replay_start = std::chrono::steady_clock::now();
-  if (ggml_backend_sched_graph_compute_async(g.sched, g.graph) !=
-      GGML_STATUS_SUCCESS)
-    return false;
+  {
+    ZE_NVTX("dec.submit");
+    if (ggml_backend_sched_graph_compute_async(g.sched, g.graph) !=
+        GGML_STATUS_SUCCESS)
+      return false;
+  }
   const auto replay_submit_end = std::chrono::steady_clock::now();
   if (g.stage_enabled && g.stage_compute_end_event) {
     cudaStream_t graph_stream =
@@ -91,7 +150,10 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
             cudaSuccess)
       return false;
   }
-  ggml_backend_sched_synchronize(g.sched);
+  {
+    ZE_NVTX("dec.sync");
+    ggml_backend_sched_synchronize(g.sched);
+  }
   if (g.engine && g.engine->exl3_gpu_executor)
     (void)g.engine->exl3_gpu_executor->stats();
   qwen_probe_dump(g);
@@ -415,6 +477,8 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
       hist.erase(hist.begin(), hist.end() - keep);
     engine.qwen4exp_ple_next_pos = pos_base + 1;
   }
+  promo_copy_probe(engine, pos_base);
+  qwen4exp_promotion_step(g, 1);
   engine.qwen4exp_full_graph_output_ready = true;
   engine.qwen4exp_full_graph_logits_ready = logits != nullptr;
   const double ms = std::chrono::duration<double, std::milli>(

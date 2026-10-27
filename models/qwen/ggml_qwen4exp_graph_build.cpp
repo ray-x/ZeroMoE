@@ -28,7 +28,8 @@ static ggml_tensor *build_qwen35moe_graph_layer(FullGraph &g,
   const std::string p = "blk." + std::to_string(layer) + ".";
   auto probe = [&](const char *label, ggml_tensor *value) {
     if (!value || !g.graph ||
-        !zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP"))
+        !zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP") ||
+        zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_ROUTER_ONLY"))
       return;
     const std::string name = "qwen35_" + std::string(label) + "_" +
                              std::to_string(layer);
@@ -425,6 +426,10 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
   // a single flush marker after the loop reads the whole buffer once.
   const bool usage_track_enabled =
       g.decode_mode && g.engine->qwen4exp_track_router_usage;
+  // Expert promotion reads the same ids tap, but straight from the device after each run (no host
+  // callback): it needs the routed ids of every layer and token, nothing else.
+  const bool promo_tap = g.decode_mode && g.engine->qwen4exp_expert_promotion > 0;
+  const bool ids_tap = usage_track_enabled || promo_tap;
   for (int l = 0; l < g.n_layers; ++l) {
     const std::string p = "blk." + std::to_string(l) + ".";
     if (g.engine->family_ops.family == ModelFamily::Qwen) {
@@ -751,7 +756,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     // collide.
     ggml_tensor *layer_ids_for_usage = nullptr;
     ggml_tensor **ids_out_param =
-        usage_track_enabled ? &layer_ids_for_usage : partial_ids_out;
+        ids_tap ? &layer_ids_for_usage : partial_ids_out;
     if (!moe && !split_planned && env_merged_gate_up_enabled()) {
       const auto t_wlookup_start = std::chrono::steady_clock::now();
       const bool gate_up_device =
@@ -808,7 +813,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     }
     if (g.exl3_bridge_failed)
       return false;
-    if (usage_track_enabled && layer_ids_for_usage) {
+    if (ids_tap && layer_ids_for_usage) {
       // Ordinary device-side accumulation -- ggml_concat inherits CUDA
       // placement from layer_ids_for_usage's argsort_top_k ancestor, no
       // manual backend pin needed (unlike the host-node CPY markers, this
@@ -853,6 +858,11 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
   // Qwen4ExpUsageTrackContext's own comment). A construction failure here
   // is non-fatal -- it just means this session's usage histogram stays
   // incomplete, never that decode itself should fail.
+  if (promo_tap && !usage_track_enabled && g.usage_track_ids) {
+    // Promotion telemetry only: keep the concatenated ids as a graph output and read them after the run.
+    ggml_set_output(g.usage_track_ids);
+    ggml_build_forward_expand(g.graph, g.usage_track_ids);
+  }
   if (usage_track_enabled && g.usage_track_ids) {
     const int total_ids = c.topk * g.n_layers;
     auto usage_ctx = std::make_unique<Qwen4ExpUsageTrackContext>();
@@ -1422,6 +1432,24 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
                         : 0) /
                (1024.0 * 1024.0),
            (double)g.graph_bytes / (1024.0 * 1024.0 * 1024.0));
+  if (zeromoe::graphcfg::env("ZEROMOE_GRAPH_OP_HISTOGRAM")) {
+    // Which operations make up the graph (kernel launches dominate a window's host time).
+    std::map<std::string, int> ops;
+    const int nn = ggml_graph_n_nodes(g.graph);
+    int views = 0;
+    for (int i = 0; i < nn; ++i) {
+      ggml_tensor *n = ggml_graph_node(g.graph, i);
+      if (n->op == GGML_OP_NONE || n->op == GGML_OP_RESHAPE || n->op == GGML_OP_VIEW ||
+          n->op == GGML_OP_PERMUTE || n->op == GGML_OP_TRANSPOSE) { ++views; continue; }
+      ++ops[std::string(ggml_op_name(n->op)) + (n->op == GGML_OP_UNARY ? std::string("/") + ggml_unary_op_name(ggml_get_unary_op(n)) : std::string())];
+    }
+    std::vector<std::pair<int, std::string>> sorted;
+    for (const auto &kv : ops) sorted.emplace_back(kv.second, kv.first);
+    std::sort(sorted.rbegin(), sorted.rend());
+    std::string line;
+    for (size_t i = 0; i < sorted.size() && i < 16; ++i) line += " " + sorted[i].second + "=" + std::to_string(sorted[i].first);
+    LOG_INFO("[GRAPH-OPS] %s S=%d: %d nodes (%d view-only):%s\n", g.decode_mode ? "decode" : "prefill", g.S, nn, views, line.c_str());
+  }
   g.ready = true;
   return true;
 }

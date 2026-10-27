@@ -15,6 +15,7 @@
 #include "ggml_hc_backend.hpp"
 #include "ggml_moe_backend.hpp"
 #include "ggml_qwen4exp_graph.hpp"
+#include "qwen4exp_graph_mtp.hpp"
 #include "kernels_cpu.hpp"
 #include "kquant_dequant.hpp"
 #include "logger.hpp"
@@ -1081,6 +1082,7 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       fail_graph("required full-graph prefill construction failed");
       return;
     }
+    qwen4exp_graph_mtp_prefill_begin(engine);
     if (!graph_model->run(engine, prefill_graph_request)) {
       fail_graph("required full-graph prefill execution failed");
       return;

@@ -28,6 +28,7 @@ class LockFreePrefetcher;
 // owned generation to completion (including a stop requested by `emit`).
 // Returns false with `error` set on any failure; the target/draft state is
 // then unspecified and the request must be failed, not retried on another path.
+void qwen4exp_graph_mtp_prefill_begin(StreamingEngine &engine);
 bool qwen4exp_graph_mtp_run(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
                             LockFreePrefetcher &prefetcher,
                             const std::vector<int> &prompt_ids,
@@ -35,4 +36,5 @@ bool qwen4exp_graph_mtp_run(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
                             int max_new_tokens, int eos_id,
                             const zeromoe::graph::SpecDistribution &distribution,
                             std::vector<int> &sequence, std::mt19937 &rng,
-                            const MtpEmitFn &emit, std::string &error);
+                            const MtpEmitFn &emit, std::string &error,
+                            const zeromoe::graph::SpecGreedy &greedy = {});

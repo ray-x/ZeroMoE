@@ -517,6 +517,8 @@ public:
     // beats a per-layer host-node tap. Off by default: real per-token
     // overhead, only worth paying during a usage survey.
     bool qwen4exp_track_router_usage = false;
+    // 0 = static hot set, 1 = observe (count misses only), 2 = promote (see EngineConfig).
+    int qwen4exp_expert_promotion = 0;
 
     bool qwen4exp_option_b_layer_enabled(int layer) const {
       if (!qwen4exp_option_b_committed)
@@ -914,7 +916,11 @@ public:
     int mtp_draft_tokens = 3;
     // Graph-native Qwen4Exp MTP (EngineConfig::mtp_graph). Implies
     // qwen4exp_wide_export so the full graph publishes the draft's inputs.
-    bool mtp_graph_native = false;
+ bool mtp_graph_native = false;
+ // Request-scoped hook for preparing the Qwen4Exp draft graph after the target
+ // decode graph is admitted but before full-graph prefill executes.
+ bool qwen4exp_mtp_prefetch_requested = false;
+ std::shared_ptr<void> qwen4exp_mtp_prefetch_state;
 
     // Set from EngineConfig::cpu_offload_max_experts at startup (main.cpp).
     // 0 = off (default). See that field's own extensive comment

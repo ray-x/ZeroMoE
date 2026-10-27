@@ -340,6 +340,11 @@ std::expected<void, std::string> EngineRunner::apply_engine_config() {
                   engine.qwen4exp_gpu_stage_layers.end()),
       engine.qwen4exp_gpu_stage_layers.end());
   engine.qwen4exp_track_router_usage = config.qwen4exp_track_router_usage;
+  {
+    std::string mode = config.qwen4exp_expert_promotion;
+    if (const char *env = std::getenv("ZEROMOE_QWEN4EXP_EXPERT_PROMOTION")) mode = env;
+    engine.qwen4exp_expert_promotion = mode == "on" ? 2 : mode == "observe" ? 1 : 0;
+  }
   engine.glm5next_kda_gpu = config.glm5next_kda_gpu;
   engine.glm5next_router_gpu = config.glm5next_router_gpu;
   engine.glm5next_moe_prefill_gpu = config.glm5next_moe_prefill_gpu;

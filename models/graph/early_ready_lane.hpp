@@ -13,6 +13,7 @@
 // GLM5NEXT SSD offload). Optional extras (next-layer prediction, VRAM staging)
 // are Qwen-only and left null elsewhere.
 #include "cuda_raii.hpp"
+#include "nvtx_range.hpp"
 #include "graph_config.hpp"
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -111,6 +112,9 @@ struct EarlyReadyLane {
   zeromoe::cuda::CudaStream output_stream;
   zeromoe::cuda::CudaEvent output_done;
   int device = -1, d = 0, k = 0, n_experts = 0, expected_pos = -1;
+  // Tokens per call: 1 for ordinary decode, S for an MTP verification window
+  // (ids/weights are token-major [k, n_tok], the input is [d, n_tok]).
+  int n_tok = 1;
   int trace_layer = -1;  // layer index for ZEROMOE_GLM5NEXT_ROUTE_TRACE lines
   bool completed = false;
   bool residency_ready = false;  // residency complete (owned experts resident, safe to compute) —
@@ -155,12 +159,20 @@ struct EarlyReadyLane {
   // Separate gate/up/down expert tensors (Qwen4Exp).
   bool prepare(ggml_backend_t backend, int dev, int dim, int topk,
                ggml_tensor *gate, ggml_tensor *up, ggml_tensor *down,
-               ggml_tensor *remap, ggml_tensor *mask) {
+               ggml_tensor *remap, ggml_tensor *mask, int ntok = 1) {
     moe_routed::ExpertWeights w;
     w.gate = gate;
     w.up = up;
     w.down = down;
-    return prepare(backend, dev, dim, topk, w, remap, mask);
+    return prepare(backend, dev, dim, topk, w, remap, mask, ntok);
+  }
+
+  // The host route tables (cpu_remap/cpu_mask, shared with the owner) changed between graph runs
+  // (expert promotion): re-read the cached copies. Never call while the lane's graph is running.
+  void refresh_routes() {
+    original_remap.assign(cpu_remap, cpu_remap + n_experts);
+    original_mask.assign(cpu_mask, cpu_mask + n_experts);
+    for (int e = 0; e < n_experts; ++e) cold_mask[e] = cpu_mask[e] != 0.0f;
   }
 
   // Called on the CPU lane right before its graph runs with the routed experts
@@ -212,7 +224,8 @@ struct EarlyReadyLane {
 
   bool prepare(ggml_backend_t backend, int dev, int dim, int topk,
                const moe_routed::ExpertWeights &w,
-               ggml_tensor *remap, ggml_tensor *mask) {
+               ggml_tensor *remap, ggml_tensor *mask, int ntok = 1) {
+    n_tok = ntok < 1 ? 1 : ntok;
     ggml_tensor *gate = w.gate_up ? w.gate_up : w.gate;
     ggml_tensor *up = w.gate_up ? nullptr : w.up;
     ggml_tensor *down = w.down;
@@ -245,11 +258,12 @@ struct EarlyReadyLane {
     ctx = ggml_init({meta, nullptr, true});
     if (!ctx) return false;
     const auto align = [](size_t n) { return (n + 63) & ~size_t(63); };
-    const size_t id_off = align(d * sizeof(float));
-    const size_t weight_off = id_off + align(k * sizeof(int32_t));
-    const size_t pos_off = weight_off + align(k * sizeof(float));
+    const size_t rows = static_cast<size_t>(k) * n_tok;
+    const size_t id_off = align(static_cast<size_t>(d) * n_tok * sizeof(float));
+    const size_t weight_off = id_off + align(rows * sizeof(int32_t));
+    const size_t pos_off = weight_off + align(rows * sizeof(float));
     const size_t out_off = pos_off + 64;
-    const size_t pin_bytes = out_off + align(d * k * sizeof(float));
+    const size_t pin_bytes = out_off + align(static_cast<size_t>(d) * rows * sizeof(float));
     cudaSetDevice(device);
     if (pinned.allocate(pin_bytes, device) != cudaSuccess ||
         ready.create(cudaEventDisableTiming | cudaEventBlockingSync, device) !=
@@ -263,16 +277,20 @@ struct EarlyReadyLane {
     position = reinterpret_cast<int32_t *>(base + pos_off);
     pinned_buffer = ggml_backend_cpu_buffer_from_ptr(pinned.get(), pin_bytes);
     if (!pinned_buffer) return false;
-    auto *x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, 1, 1);
-    auto *route = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, k, 1);
-    auto *prob = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, k, 1);
+    auto *x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, 1, n_tok);
+    auto *route = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, k, n_tok);
+    auto *prob = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, k, n_tok);
     x->data = input; x->buffer = pinned_buffer;
     route->data = ids; route->buffer = pinned_buffer;
     prob->data = weights; prob->buffer = pinned_buffer;
+    // The route tables are [1, n_experts, 1]: ggml_get_rows wants one index per
+    // element, so look up the flattened ids and restore the [k, n_tok] layout.
+    auto *route_flat = n_tok == 1 ? route : ggml_reshape_1d(ctx, route, static_cast<int64_t>(k) * n_tok);
     auto *cold_ids = ggml_reshape_2d(ctx,
-        ggml_get_rows(ctx, alias(ctx, remap), route), k, 1);
+        ggml_get_rows(ctx, alias(ctx, remap), route_flat), k, n_tok);
+    auto *cold_mask_rows = ggml_get_rows(ctx, alias(ctx, mask), route_flat);
     auto *cold_weights = ggml_mul(ctx, prob,
-        ggml_get_rows(ctx, alias(ctx, mask), route));
+        n_tok == 1 ? cold_mask_rows : ggml_reshape_3d(ctx, cold_mask_rows, 1, k, n_tok));
     moe_routed::ExpertWeights private_w;
     if (w.gate_up) {
       private_w.gate_up = alias(ctx, w.gate_up);
@@ -473,13 +491,14 @@ struct EarlyReadyLane {
       checked(cudaMemcpyAsync(stage_ids, stage_gpu_slots->data, k * sizeof(int32_t),
                                cudaMemcpyDeviceToHost, stream), "stage route readback");
     }
-    checked(cudaMemcpyAsync(node->data, node->src[0]->data, d * sizeof(float),
+    const size_t rows = static_cast<size_t>(k) * n_tok;
+    checked(cudaMemcpyAsync(node->data, node->src[0]->data, d * n_tok * sizeof(float),
                             cudaMemcpyDeviceToDevice, stream), "input snapshot");
-    checked(cudaMemcpyAsync(input, node->data, d * sizeof(float),
+    checked(cudaMemcpyAsync(input, node->data, d * n_tok * sizeof(float),
                             cudaMemcpyDeviceToHost, stream), "input readback");
-    checked(cudaMemcpyAsync(ids, node->src[2]->data, k * sizeof(int32_t),
+    checked(cudaMemcpyAsync(ids, node->src[2]->data, rows * sizeof(int32_t),
                             cudaMemcpyDeviceToHost, stream), "route readback");
-    checked(cudaMemcpyAsync(weights, node->src[3]->data, k * sizeof(float),
+    checked(cudaMemcpyAsync(weights, node->src[3]->data, rows * sizeof(float),
                             cudaMemcpyDeviceToHost, stream), "weight readback");
     if (node->src[4])
       checked(cudaMemcpyAsync(position, node->src[4]->data, sizeof(int32_t),
@@ -508,8 +527,13 @@ struct EarlyReadyLane {
 
   void run() {
     GGML_ASSERT(!completed);
+    ZE_NVTX("lane.run");
     const int64_t start = ggml_time_us();
-    const cudaError_t status = cudaEventSynchronize(ready);
+    cudaError_t status;
+    {
+      ZE_NVTX("lane.wait_ready");
+      status = cudaEventSynchronize(ready);
+    }
     if (status != cudaSuccess)
       GGML_ABORT("early-ready input event: %s", cudaGetErrorString(status));
     GGML_ASSERT(expected_pos < 0 || *position == expected_pos);
@@ -545,7 +569,8 @@ struct EarlyReadyLane {
         GGML_ASSERT(stage_target->wait_for_epoch(calls + 1, producer_stream));
     }
     int cold_count = 0;
-    for (int i = 0; i < k; ++i) {
+    const int n_rows = k * n_tok;
+    for (int i = 0; i < n_rows; ++i) {
       GGML_ASSERT(ids[i] >= 0 && ids[i] < n_experts);
       GGML_ASSERT(std::isfinite(weights[i]));
       cold_count += cpu_mask[ids[i]] != 0.0f;
@@ -556,7 +581,7 @@ struct EarlyReadyLane {
     int32_t owned[64];
     int n_owned = 0;
     if ((before_compute || begin_load) && cold_count > 0) {
-      for (int i = 0; i < k && n_owned < 64; ++i) {
+      for (int i = 0; i < n_rows && n_owned < 64; ++i) {
         if (cpu_mask[ids[i]] == 0.0f) continue;
         bool seen = false;
         for (int j = 0; j < n_owned; ++j) seen = seen || owned[j] == ids[i];
@@ -584,7 +609,7 @@ struct EarlyReadyLane {
     // min(slots, ready/2); a second device (own ring and link) takes more, as long as one expert stays on the CPU.
     int32_t assisted[2][8];
     int n_assisted[2] = {0, 0};
-    if (expert_planes && n_owned > 1 && (assists[0].graph || assists[1].graph)) {
+    if (n_tok == 1 && expert_planes && n_owned > 1 && (assists[0].graph || assists[1].graph)) {
       const auto is_pending = [&](int32_t e) {
         for (int32_t p : pending) if (p == e) return true;
         return false;
@@ -654,7 +679,7 @@ struct EarlyReadyLane {
       GGML_ASSERT(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS);
       p1_us += ggml_time_us() - g1;
       phase1_output.assign(static_cast<float *>(output->data),
-                           static_cast<float *>(output->data) + static_cast<size_t>(d) * k);
+                           static_cast<float *>(output->data) + static_cast<size_t>(d) * n_rows);
       const int64_t wait0 = ggml_time_us();
       GGML_ASSERT(finish_load());
       residency_ready = true;  // all owned experts resident after the second-phase load
@@ -711,7 +736,7 @@ struct EarlyReadyLane {
       }
     }
     const int64_t done = ggml_time_us();
-    for (int i = 0; i < d * k; ++i)
+    for (size_t i = 0; i < static_cast<size_t>(d) * n_rows; ++i)
       GGML_ASSERT(std::isfinite(static_cast<float *>(output->data)[i]));
     if (async_output_copy) {
       GGML_ASSERT(cudaMemcpyAsync(gpu_output->data, output->data, ggml_nbytes(output),

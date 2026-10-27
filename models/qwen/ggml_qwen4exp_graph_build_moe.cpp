@@ -672,6 +672,22 @@ bool exl3_ggml_bridge_requested(const FullGraph &g, int layer,
   return true;
 }
 
+// The early-ready CPU lane for multi-token decode windows is opt-in
+// (ZEROMOE_QWEN4EXP_WINDOW_LANE=1): with it on, the text of a window run diverged from plain
+// decoding on the test prompt (investigation open), and it saved only ~2 ms per window.
+// The cold branch's ggml node chain is replaced by one fused CPU node (qwen4exp_cold::build) whenever the
+// expert tensors are Q2_0; ZEROMOE_QWEN4EXP_COLD_FUSED=0 turns it off. Bit-identical to the chain
+// (tests/test_cold_ffn_fused.cpp); 5-23% faster MTP windows (docs/design/mtp-window-timeline.md).
+static bool cold_fused_enabled() {
+  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_COLD_FUSED");
+  return !(v && v[0] == '0');
+}
+
+static bool window_lane_enabled() {
+  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_WINDOW_LANE");
+  return v && v[0] == '1';
+}
+
 ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                        int layer, ggml_tensor *router,
                        ggml_tensor *selection_bias, ggml_tensor *gate_exps,
@@ -935,12 +951,18 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         g, ctx, c.n_experts, *split_gpu_ids,
         /*safe_dummy_fill=*/g.S != 1 && !g.decode_mode);
     if (tab.remap_gpu && tab.remap_cpu && tab.mask_gpu && tab.mask_cpu) {
+      if (g.decode_mode) {
+        auto &pl = g.promo_layers[layer];
+        pl.remap_gpu = tab.remap_gpu; pl.remap_cpu = tab.remap_cpu;
+        pl.mask_gpu = tab.mask_gpu;   pl.mask_cpu = tab.mask_cpu;
+      }
       const char *early_env = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_LAYER13");
       const char *all_early_env = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT");
       const bool early_requested =
           ((early_env && early_env[0] == '1' && layer == 13) ||
            (!all_early_env || all_early_env[0] != '0')) &&
-          g.decode_mode && g.S == 1;
+          g.decode_mode && g.S >= 1 &&
+          (g.S == 1 || window_lane_enabled());
       const bool partial_requested =
           g.decode_mode && g.S == 1 && env_partial_graph_enabled(layer);
       if (partial_requested && early_requested) {
@@ -957,7 +979,7 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         GGML_ASSERT(!g.layer_timing_enabled && g.early_ready.count(layer) == 0);
         early = std::make_unique<EarlyReadyLane>();
         GGML_ASSERT(early->prepare(g.cpu, g.device, g.D, c.topk,
-                    gate_exps, up_exps, down_exps, tab.remap_cpu, tab.mask_cpu));
+                    gate_exps, up_exps, down_exps, tab.remap_cpu, tab.mask_cpu, g.S));
         if (early->resident_tables) {
           GGML_ASSERT(early->prepare_gpu_tables(g.cuda, ctx,
                       tab.remap_gpu, tab.remap_cpu, tab.mask_gpu, tab.mask_cpu));
@@ -966,7 +988,7 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
           for (auto *table : early->gpu_tables)
             ggml_backend_sched_set_tensor_backend(g.sched, table, g.cuda);
         }
-        const char *stage = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_STAGE_LAYER");
+        const char *stage = g.S == 1 ? zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_STAGE_LAYER") : nullptr;
         if (stage && g.split_gpu_expert_ids.count(layer - 1) &&
             (std::strcmp(stage, "all") == 0 || std::atoi(stage) == layer)) {
           if (!g.early_stage_shapes)
@@ -1051,11 +1073,11 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         ggml_backend_sched_set_tensor_backend(g.sched, dst, g.cuda);
         ggml_backend_sched_set_tensor_backend(g.sched, fork, g.cuda);
         early->gpu_input = fork;
-        input3 = ggml_reshape_3d(ctx, fork, g.D, 1, 1);
+        input3 = ggml_reshape_3d(ctx, fork, g.D, 1, g.S);
         ggml_build_forward_expand(g.graph, fork);
-        const char *predict = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_PREDICT");
+        const char *predict = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_PREDICT");  // also for windows (lane on)
         const char *target = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_PREDICT_LAYER");
-        const char *stage = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_STAGE_LAYER");
+        const char *stage = g.S == 1 ? zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_STAGE_LAYER") : nullptr;
         const bool stage_next = stage &&
             (std::strcmp(stage, "all") == 0 || std::atoi(stage) == layer + 1);
         const bool predict_this_layer = !target || std::atoi(target) == layer + 1;
@@ -1124,14 +1146,32 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         // Submit hot work before the independent private CPU marker.
         ggml_build_forward_expand(g.graph, hot_weighted);
       } else {
-        moe_routed::ExpertWeights cold_w;
-        cold_w.gate = gate_exps;
-        cold_w.up = up_exps;
-        cold_w.down = down_exps;
-        const moe_routed::FfnNodes cold_ffn =
-            moe_routed::expert_ffn(ctx, cold_w, input3, ids_cpu);
-        ggml_tensor *experts_cpu = cold_ffn.down;
-        cold_weighted = ggml_mul(ctx, experts_cpu, weights_cpu);
+        // Opt-in fused cold branch (ZEROMOE_QWEN4EXP_COLD_FUSED=1): one CPU node for the whole branch.
+        // Resident-expert routes and the recorded masks are read from the same host tables as below.
+        ggml_tensor *fused = nullptr;
+        if (cold_fused_enabled() && g.decode_mode && !g.stage_route_ids &&
+            qwen4exp_cold::supported(gate_exps, up_exps, down_exps, c.topk, g.S)) {
+          std::shared_ptr<qwen4exp_cold::Context> owner;
+          fused = qwen4exp_cold::build(
+              ctx, owner, input3, ggml_cont(ctx, ids),
+              ggml_cont(ctx, weights), tab.remap_cpu, tab.mask_cpu, gate_exps, up_exps,
+              down_exps, g.cpu_threads);
+          if (fused) {
+            g.cold_fused.push_back(std::move(owner));
+            ggml_backend_sched_set_tensor_backend(g.sched, fused, g.cpu);
+            cold_weighted = fused;
+          }
+        }
+        if (!fused) {
+          moe_routed::ExpertWeights cold_w;
+          cold_w.gate = gate_exps;
+          cold_w.up = up_exps;
+          cold_w.down = down_exps;
+          const moe_routed::FfnNodes cold_ffn =
+              moe_routed::expert_ffn(ctx, cold_w, input3, ids_cpu);
+          ggml_tensor *experts_cpu = cold_ffn.down;
+          cold_weighted = ggml_mul(ctx, experts_cpu, weights_cpu);
+        }
       }
       experts = ggml_add(ctx, hot_weighted, cold_weighted);
     }

@@ -1,0 +1,1 @@
+Explain how a B-tree differs from a binary search tree, why databases use B-trees, and describe the steps of inserting a key when a node is full.

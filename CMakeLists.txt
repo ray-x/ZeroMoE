@@ -27,6 +27,11 @@ add_executable(mtp_graph_contract_test EXCLUDE_FROM_ALL
 target_include_directories(mtp_graph_contract_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/models/graph)
 
+add_executable(expert_promotion_test EXCLUDE_FROM_ALL
+    tests/test_expert_promotion.cpp)
+target_include_directories(expert_promotion_test PRIVATE models/graph)
+add_test(NAME expert_promotion COMMAND expert_promotion_test)
+
 add_executable(mtp_speculation_test EXCLUDE_FROM_ALL
     tests/test_mtp_speculation.cpp)
 target_include_directories(mtp_speculation_test PRIVATE
@@ -558,6 +563,8 @@ if(NOT ZEROMOE_CPU_ONLY)
         models/qwen/ggml_qwen4exp_graph_placement.cpp
         models/qwen/ggml_qwen4exp_graph_run.cpp
         models/qwen/ggml_qwen4exp_graph_window.cpp
+        models/qwen/ggml_qwen4exp_graph_promote.cpp
+        models/qwen/cold_ffn_fused.cpp
         models/qwen/ggml_qwen4exp_graph_settings.cpp
         models/glm/ggml_glm5next_graph.cpp
         models/glm/ggml_glm5next_graph_arena.cpp
@@ -694,6 +701,8 @@ if(NOT ZEROMOE_CPU_ONLY)
         models/qwen/ggml_qwen4exp_graph_placement.cpp
         models/qwen/ggml_qwen4exp_graph_run.cpp
         models/qwen/ggml_qwen4exp_graph_window.cpp
+        models/qwen/ggml_qwen4exp_graph_promote.cpp
+        models/qwen/cold_ffn_fused.cpp
         models/qwen/ggml_qwen4exp_graph_settings.cpp
         models/glm/ggml_glm5next_graph.cpp
         models/glm/ggml_glm5next_graph_arena.cpp
@@ -807,6 +816,11 @@ if(NOT ZEROMOE_CPU_ONLY)
     target_include_directories(quant_table_test PRIVATE ${ZEROMOE_INCLUDE_DIRS}
         ${ZEROMOE_GGML_SRC_DIR})
     target_link_libraries(quant_table_test PRIVATE ggml)
+    add_executable(cold_ffn_fused_test EXCLUDE_FROM_ALL tests/test_cold_ffn_fused.cpp
+        models/qwen/cold_ffn_fused.cpp)
+    target_include_directories(cold_ffn_fused_test PRIVATE models/qwen ${ZEROMOE_GGML_SRC_DIR}
+        ${ZEROMOE_GGML_SRC_DIR}/../include)
+    target_link_libraries(cold_ffn_fused_test PRIVATE ggml)
     target_include_directories(graph_settings_test PRIVATE ${ZEROMOE_INCLUDE_DIRS})
     add_executable(resident_memory_policy_test EXCLUDE_FROM_ALL tests/test_resident_memory_policy.cpp)
     target_include_directories(resident_memory_policy_test PRIVATE ${ZEROMOE_INCLUDE_DIRS})

@@ -3,6 +3,7 @@
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
 #include <climits>
+#include <chrono>
 #include <limits>
 
 namespace zeromoe::graph {
@@ -43,8 +44,12 @@ std::unique_ptr<MtpGraphRuntime> MtpGraphRuntime::create(
     error = "invalid draft graph shape or memory budget";
     return nullptr;
   }
+  const auto setup_started = std::chrono::steady_clock::now();
   auto result = std::unique_ptr<MtpGraphRuntime>(new MtpGraphRuntime(shape));
+  const auto measure_build_started = std::chrono::steady_clock::now();
   auto measured = build(error);
+  const double measure_build_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - measure_build_started).count();
   if (!measured) {
     if (error.empty()) error = "draft measurement graph construction failed";
     return nullptr;
@@ -57,6 +62,62 @@ std::unique_ptr<MtpGraphRuntime> MtpGraphRuntime::create(
   if (!complete(*measured)) {
     error = "draft graph builder returned incomplete bindings";
     return nullptr;
+  }
+  if (measured->allocate_to_measure) {
+    // One build: allocate the scheduler workspace on this build and admit by the sizes it really took. (After
+    // ggml_backend_sched_reserve_size neither the scheduler nor the graph can be reused, ggml aborts in
+    // ggml_backend_sched_alloc_graph, so measuring first meant discarding the build and uploading the weights again.)
+    result->state_ = std::move(measured);
+    auto &g = *result->state_;
+    if (g.kv_capacity < shape.capacity || g.embedding->type != GGML_TYPE_F32 ||
+        g.hidden->type != GGML_TYPE_F32 || g.final_streams->type != GGML_TYPE_F32 ||
+        g.logits->type != GGML_TYPE_F32 || !ggml_is_contiguous(g.final_streams) ||
+        !ggml_is_contiguous(g.logits) ||
+        ggml_nelements(g.embedding) != static_cast<int64_t>(shape.embedding) ||
+        ggml_nelements(g.hidden) != static_cast<int64_t>(shape.hidden) ||
+        ggml_nelements(g.final_streams) != static_cast<int64_t>(shape.hidden) ||
+        ggml_nelements(g.logits) != static_cast<int64_t>(shape.vocab)) {
+      error = "draft graph shape or placement does not match the requested shape";
+      return nullptr;
+    }
+    if (g.device_weight_bytes > device_budget || g.device_state_bytes > device_budget - g.device_weight_bytes) {
+      error = "draft weights and KV exceed device budget";
+      return nullptr;
+    }
+    const size_t scratch_bytes = (shape.hidden + shape.vocab) * sizeof(float);
+    const auto scheduler_alloc_started = std::chrono::steady_clock::now();
+    if (!ggml_backend_sched_alloc_graph(g.sched, g.graph)) {
+      error = "draft scheduler graph allocation failed";
+      return nullptr;
+    }
+    const double scheduler_alloc_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - scheduler_alloc_started).count();
+    const size_t actual_device = ggml_backend_sched_get_buffer_size(g.sched, g.cuda);
+    const size_t actual_host = ggml_backend_sched_get_buffer_size(g.sched, g.cpu);
+    if (actual_device > device_budget - g.device_weight_bytes - g.device_state_bytes) {
+      error = "draft scheduler workspace exceeds device budget after allocation";
+      return nullptr;
+    }
+    if (actual_host > std::numeric_limits<size_t>::max() - scratch_bytes ||
+        !MemoryGuard::try_reserve_host_bytes(actual_host + scratch_bytes)) {
+      error = "host budget refused draft scheduler workspace";
+      return nullptr;
+    }
+    result->workspace_reservation_ = actual_host + scratch_bytes;
+    result->memory_ = {g.device_weight_bytes, g.device_state_bytes, actual_device, actual_host};
+    result->memory_.scheduler_alloc_ms = scheduler_alloc_ms;
+    result->hidden_scratch_.resize(shape.hidden);
+    result->logits_scratch_.resize(shape.vocab);
+    g.ready = true;
+    const auto reset_started = std::chrono::steady_clock::now();
+    if (!result->reset(error)) return nullptr;
+    result->memory_.measure_build_ms = measure_build_ms;
+    result->memory_.execution_build_ms = 0.0;
+    result->memory_.reset_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - reset_started).count();
+    result->memory_.total_setup_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - setup_started).count();
+    return result;
   }
   size_t workspace[2] = {};
   ggml_backend_sched_reserve_size(measured->sched, measured->graph, workspace);
@@ -71,7 +132,10 @@ std::unique_ptr<MtpGraphRuntime> MtpGraphRuntime::create(
   // reserve_size mutates scheduler graph splitting. Neither that scheduler
   // nor its graph is reused for execution (see the Qwen target incident).
   measured.reset();
+  const auto execution_build_started = std::chrono::steady_clock::now();
   result->state_ = build(error);
+  const double execution_build_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - execution_build_started).count();
   if (!result->state_) {
     if (error.empty()) error = "draft execution graph construction failed";
     return nullptr;
@@ -107,10 +171,13 @@ std::unique_ptr<MtpGraphRuntime> MtpGraphRuntime::create(
     return nullptr;
   }
   result->workspace_reservation_ = m.host_workspace + scratch_bytes;
+  const auto scheduler_alloc_started = std::chrono::steady_clock::now();
   if (!ggml_backend_sched_alloc_graph(g.sched, g.graph)) {
     error = "draft scheduler graph allocation failed";
     return nullptr;
   }
+  result->memory_.scheduler_alloc_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - scheduler_alloc_started).count();
   const size_t actual_device = ggml_backend_sched_get_buffer_size(g.sched, g.cuda);
   const size_t actual_host = ggml_backend_sched_get_buffer_size(g.sched, g.cpu);
   // reserve_size estimates cross-backend copies slightly low (e.g. when a node
@@ -135,7 +202,14 @@ std::unique_ptr<MtpGraphRuntime> MtpGraphRuntime::create(
   result->hidden_scratch_.resize(shape.hidden);
   result->logits_scratch_.resize(shape.vocab);
   g.ready = true;
+  const auto reset_started = std::chrono::steady_clock::now();
   if (!result->reset(error)) return nullptr;
+  result->memory_.measure_build_ms = measure_build_ms;
+  result->memory_.execution_build_ms = execution_build_ms;
+  result->memory_.reset_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - reset_started).count();
+  result->memory_.total_setup_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - setup_started).count();
   return result;
 }
 

@@ -7,6 +7,7 @@
 #include "ggml_qwen4exp_graph.hpp"
 #include "mtp_graph_draft.hpp"
 #include "mtp_graph_report.hpp"
+#include "nvtx_range.hpp"
 #include "mtp_graph_runtime.hpp"
 #include "mtp_speculation.hpp"
 #include "qwen4exp_mtp_graph.hpp"
@@ -14,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <future>
 #include <chrono>
 #include <memory>
 
@@ -30,6 +32,17 @@ namespace {
 using namespace zeromoe::graph;
 
 constexpr size_t kDraftBudgetBytes = size_t{3} << 30;  // NextN weights + K/V + workspace
+
+struct MtpGraphPrefetchResult {
+  std::unique_ptr<MtpGraphRuntime> runtime;
+  std::string error;
+  double factory_ms = 0.0;
+};
+
+struct MtpGraphPrefetchState {
+  std::chrono::steady_clock::time_point started;
+  std::future<MtpGraphPrefetchResult> future;
+};
 
 // Optional per-phase accounting (ZEROMOE_MTP_PROFILE=1): milliseconds spent in
 // each phase of graph-native MTP, reported with the [MTP-GRAPH] line.
@@ -134,6 +147,7 @@ class TimedDraft final : public SpecDraft {
   bool step(int token, int position, std::span<const float> hidden,
             std::span<float> next_hidden, std::span<float> logits,
             std::string &error) override {
+    ZE_NVTX("mtp.draft_step");
     const auto t0 = std::chrono::steady_clock::now();
     const bool ok = inner_.step(token, position, hidden, next_hidden, logits, error);
     g_profile.draft_ms += since_ms(t0);
@@ -170,6 +184,7 @@ class GraphWindowTarget final : public SpecTarget {
 
   bool step_batch(std::span<const int> tokens, int position, std::span<float> wide,
                   std::span<float> logits, std::string &error) override {
+    ZE_NVTX("mtp.verify_window");
     const auto &c = engine_.model_file.architecture_config;
     const size_t D = size_t(c.hidden), W = D * size_t(c.hc_mult), V = size_t(c.vocab);
     const size_t n = tokens.size();
@@ -220,6 +235,7 @@ class GraphWindowTarget final : public SpecTarget {
   }
 
   bool commit_prefix(int m, std::string &error) override {
+    ZE_NVTX("mtp.commit_prefix");
     const auto t0 = std::chrono::steady_clock::now();
     const bool ok = qwen4exp_full_graph_window_commit(engine_, m);
     g_profile.commit_ms += since_ms(t0);
@@ -252,6 +268,54 @@ class GraphWindowTarget final : public SpecTarget {
 
 }  // namespace
 
+void qwen4exp_graph_mtp_prefill_begin(StreamingEngine &engine) {
+  if (!engine.qwen4exp_mtp_prefetch_requested) return;
+  engine.qwen4exp_mtp_prefetch_requested = false;
+  const char *overlap_env = std::getenv("ZEROMOE_MTP_PREFILL_OVERLAP");
+  if (!overlap_env || overlap_env[0] != '1') {
+    if (overlap_env)
+      LOG_INFO("[MTP-GRAPH-PREFETCH] disabled by ZEROMOE_MTP_PREFILL_OVERLAP=0\n");
+    return;
+  }
+  if (engine.qwen4exp_mtp_prefetch_state ||
+      engine.family_ops.family != ModelFamily::Qwen4Exp ||
+      !engine.mtp_enabled || !engine.mtp_graph_native || !engine.has_mtp_model ||
+      engine.max_t <= 0) {
+    return;
+  }
+
+  qwen4exp_mtp::Options options;
+  options.device = engine.gpu_device_id >= 0 ? engine.gpu_device_id : 0;
+  options.capacity = engine.max_t;
+  options.device_budget = kDraftBudgetBytes;
+  constexpr size_t kDecodeAdmissionHeadroom = size_t{1} << 30;
+  size_t free_bytes = 0, total_bytes = 0;
+  if (cudaSetDevice(options.device) != cudaSuccess ||
+      cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess ||
+      free_bytes < options.device_budget + kDecodeAdmissionHeadroom) {
+    LOG_INFO("[MTP-GRAPH-PREFETCH] skipped: free=%.2f GiB, need at least %.2f GiB "
+             "for draft budget plus decode-graph headroom; build will run after prefill\n",
+             static_cast<double>(free_bytes) / (1024.0 * 1024.0 * 1024.0),
+             static_cast<double>(options.device_budget + kDecodeAdmissionHeadroom) /
+                 (1024.0 * 1024.0 * 1024.0));
+    return;
+  }
+  std::shared_ptr<StreamingEngine> borrowed(std::shared_ptr<void>(), &engine);
+  auto state = std::make_shared<MtpGraphPrefetchState>();
+  state->started = std::chrono::steady_clock::now();
+  state->future = std::async(std::launch::async, [borrowed, options] {
+    const auto factory_started = std::chrono::steady_clock::now();
+    std::string error;
+    auto runtime = qwen4exp_mtp::create(borrowed, options, error);
+    const double factory_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - factory_started).count();
+    return MtpGraphPrefetchResult{std::move(runtime), std::move(error), factory_ms};
+  });
+  engine.qwen4exp_mtp_prefetch_state = state;
+  LOG_INFO("[MTP-GRAPH-PREFETCH] started after target graph admission, capacity=%d\n",
+           options.capacity);
+}
+
 bool qwen4exp_graph_mtp_run(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
                             LockFreePrefetcher &prefetcher,
                             const std::vector<int> &prompt_ids,
@@ -259,7 +323,8 @@ bool qwen4exp_graph_mtp_run(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
                             int max_new_tokens, int eos_id,
                             const zeromoe::graph::SpecDistribution &distribution,
                             std::vector<int> &sequence, std::mt19937 &rng,
-                            const MtpEmitFn &emit, std::string &error) {
+                            const MtpEmitFn &emit, std::string &error,
+                            const zeromoe::graph::SpecGreedy &greedy) {
   error.clear();
   const auto &c = engine.model_file.architecture_config;
   const size_t D = size_t(c.hidden), W = D * size_t(c.hc_mult), V = size_t(c.vocab);
@@ -362,14 +427,63 @@ bool qwen4exp_graph_mtp_run(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     }
   }
 
-  qwen4exp_mtp::Options options;
-  options.device = engine.gpu_device_id >= 0 ? engine.gpu_device_id : 0;
-  options.capacity = max_position;
-  options.device_budget = kDraftBudgetBytes;
-  // The engine outlives this call; the draft only borrows it.
-  std::shared_ptr<StreamingEngine> borrowed(std::shared_ptr<void>(), &engine);
-  auto runtime = qwen4exp_mtp::create(borrowed, options, error);
-  if (!runtime) return false;
+  std::unique_ptr<MtpGraphRuntime> runtime;
+  double factory_ms = 0.0, runtime_ms = 0.0, post_prefill_wait_ms = 0.0;
+  double hidden_setup_ms = 0.0, measure_build_ms = 0.0, execution_build_ms = 0.0;
+  double scheduler_alloc_ms = 0.0, reset_ms = 0.0;
+  const char *setup_source = "sync";
+  if (engine.qwen4exp_mtp_prefetch_state) {
+    auto prefetch = std::static_pointer_cast<MtpGraphPrefetchState>(
+        engine.qwen4exp_mtp_prefetch_state);
+    engine.qwen4exp_mtp_prefetch_state.reset();
+    const auto wait_started = std::chrono::steady_clock::now();
+    MtpGraphPrefetchResult result;
+    try {
+      result = prefetch->future.get();
+    } catch (const std::exception &exception) {
+      error = std::string("prefill-overlapped MTP graph build threw: ") + exception.what();
+      return false;
+    }
+    post_prefill_wait_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - wait_started).count();
+    runtime = std::move(result.runtime);
+    error = std::move(result.error);
+    if (!runtime) {
+      if (error.empty()) error = "prefill-overlapped MTP graph build failed";
+      return false;
+    }
+    factory_ms = post_prefill_wait_ms;
+    runtime_ms = result.factory_ms;
+    hidden_setup_ms = std::max(0.0, runtime_ms - post_prefill_wait_ms);
+    setup_source = "prefill-overlap";
+  } else {
+    qwen4exp_mtp::Options options;
+    options.device = engine.gpu_device_id >= 0 ? engine.gpu_device_id : 0;
+    options.capacity = max_position;
+    options.device_budget = kDraftBudgetBytes;
+    // The engine outlives this call; the draft only borrows it.
+    std::shared_ptr<StreamingEngine> borrowed(std::shared_ptr<void>(), &engine);
+    const auto draft_setup_started = std::chrono::steady_clock::now();
+    runtime = qwen4exp_mtp::create(borrowed, options, error);
+    factory_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - draft_setup_started).count();
+    if (!runtime) return false;
+    runtime_ms = runtime->memory().total_setup_ms;
+  }
+  const auto &draft_memory = runtime->memory();
+  measure_build_ms = draft_memory.measure_build_ms;
+  execution_build_ms = draft_memory.execution_build_ms;
+  scheduler_alloc_ms = draft_memory.scheduler_alloc_ms;
+  reset_ms = draft_memory.reset_ms;
+  LOG_INFO("[MTP-GRAPH-SETUP] factory_ms=%.2f runtime_ms=%.2f measure_build_ms=%.2f "
+           "execution_build_ms=%.2f scheduler_alloc_ms=%.2f reset_ms=%.2f "
+           "weights=%zu state=%zu device_workspace=%zu host_workspace=%zu "
+           "post_prefill_wait_ms=%.2f hidden_ms=%.2f source=%s\n",
+           factory_ms, runtime_ms, measure_build_ms, execution_build_ms,
+           scheduler_alloc_ms, reset_ms,
+           draft_memory.weights, draft_memory.state,
+           draft_memory.device_workspace, draft_memory.host_workspace,
+           post_prefill_wait_ms, hidden_setup_ms, setup_source);
 
   GraphTarget stepwise_target(engine, ram_mgr, prefetcher, base);
   GraphWindowTarget window_target(engine, ram_mgr, prefetcher, base, window);
@@ -391,7 +505,7 @@ bool qwen4exp_graph_mtp_run(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
   const bool ok = speculate(
       target, timed_draft, config, prompt, distribution, rng,
       [&](int token) { return base.emit_token(sequence, token, eos_id, emit); },
-      stats, error);
+      stats, error, greedy);
 
   if (profile_enabled()) {
     const double total = since_ms(speculate_begin);
@@ -409,10 +523,13 @@ bool qwen4exp_graph_mtp_run(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
 
 #else  // !ZEROMOE_USE_GGML_CUDA
 
+void qwen4exp_graph_mtp_prefill_begin(StreamingEngine &) {}
+
 bool qwen4exp_graph_mtp_run(StreamingEngine &, RAMSafetyManager &, LockFreePrefetcher &,
                             const std::vector<int> &, const std::vector<float> &, int, int,
                             const zeromoe::graph::SpecDistribution &, std::vector<int> &,
-                            std::mt19937 &, const MtpEmitFn &, std::string &error) {
+                            std::mt19937 &, const MtpEmitFn &, std::string &error,
+                            const zeromoe::graph::SpecGreedy &) {
   error = "graph-native MTP requires the CUDA build";
   return false;
 }

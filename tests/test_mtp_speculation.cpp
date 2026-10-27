@@ -470,6 +470,55 @@ int run_all(int mode) {
           "rejects a draft that was not reset");
   }
 
+  {
+    constexpr size_t vocab = 24;
+    constexpr size_t width = 4;
+    const std::vector<int> tokens{1, 2, 3, 4, 5};
+    constexpr float penalty = 1.15f;
+    const SpecDistribution penalized_greedy = [&](std::span<const float> logits,
+                                                  const std::vector<int> &context,
+                                                  std::vector<float> &probs) {
+      std::vector<float> work(logits.begin(), logits.end());
+      const size_t start = std::max(tokens.size(), context.size() > 64 ? context.size() - 64 : 0);
+      for (size_t i = start; i < context.size(); ++i) {
+        const int token = context[i];
+        if (token < 0 || size_t(token) >= work.size()) continue;
+        float &value = work[size_t(token)];
+        value = value > 0.0f ? value / penalty : value * penalty;
+      }
+      probs.assign(work.size(), 0.0f);
+      probs[size_t(std::max_element(work.begin(), work.end()) - work.begin())] = 1.0f;
+      return true;
+    };
+    const SpecGreedy direct_greedy = [&](std::span<const float> logits,
+                                         const std::vector<int> &context,
+                                         int &token) {
+      token = detail::greedy_argmax_with_repetition_penalty(
+          logits, context, tokens.size(), penalty);
+      return token >= 0;
+    };
+    FakeTarget ref_target(vocab), fast_target(vocab);
+    FakeDraft ref_draft(vocab, 0.35f, 7), fast_draft(vocab, 0.35f, 7);
+    SpecPrompt ref_prompt = make_prompt(ref_target, tokens);
+    SpecPrompt fast_prompt = make_prompt(fast_target, tokens);
+    SpecConfig cfg{vocab, width, 3, 40, -1, 200};
+    SpecStats ref_stats, fast_stats;
+    std::string ref_error, fast_error;
+    std::vector<int> ref_output, fast_output;
+    std::mt19937 ref_rng(7), fast_rng(7);
+    const bool ref_ok = speculate(ref_target, ref_draft, cfg, ref_prompt,
+                                  penalized_greedy, ref_rng,
+                                  [&](int t) { ref_output.push_back(t); return true; },
+                                  ref_stats, ref_error);
+    const bool fast_ok = speculate(fast_target, fast_draft, cfg, fast_prompt,
+                                   penalized_greedy, fast_rng,
+                                   [&](int t) { fast_output.push_back(t); return true; },
+                                   fast_stats, fast_error, direct_greedy);
+    check(ref_ok && fast_ok && ref_error.empty() && fast_error.empty() &&
+              ref_output == fast_output,
+          "greedy argmax path matches one-hot sampling with repetition penalty");
+  }
+
   return failures;
 }
 

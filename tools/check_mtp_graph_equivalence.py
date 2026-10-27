@@ -41,8 +41,9 @@ def run(binary, cfg_text, name, workdir, env_extra, prompt, timeout):
         f.write(re.sub(r'(?m)^log_path.*', f'log_path = "{log}"', cfg_text))
     env = dict(os.environ, ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING="1",
                **env_extra)
+    input_text = prompt if prompt.endswith("\n:q\n") else prompt.rstrip("\n") + "\n:q\n"
     with open(out, "w") as o:
-        rc = subprocess.run([binary, "--config", cfg], input=prompt, text=True,
+        rc = subprocess.run([binary, "--config", cfg], input=input_text, text=True,
                             stdout=o, stderr=subprocess.STDOUT, env=env,
                             timeout=timeout).returncode
     text = open(out, errors="replace").read()

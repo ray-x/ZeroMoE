@@ -18,6 +18,9 @@ struct MtpGraphState : GraphCore {
   ggml_tensor *hidden = nullptr;
   std::map<std::string, ggml_tensor *> diagnostics;
   std::function<std::string(int)> prepare_position;
+  // Builders that can be admitted by allocating once set this: create() then allocates the scheduler
+  // workspace on the first build and checks the real sizes, instead of measuring on a throwaway build.
+  bool allocate_to_measure = false;
   std::function<bool()> bindings_valid;
   size_t device_weight_bytes = 0;
   size_t device_state_bytes = 0;
@@ -31,6 +34,11 @@ struct MtpGraphMemory {
   size_t state = 0;
   size_t device_workspace = 0;
   size_t host_workspace = 0;
+  double measure_build_ms = 0.0;
+  double execution_build_ms = 0.0;
+  double scheduler_alloc_ms = 0.0;
+  double reset_ms = 0.0;
+  double total_setup_ms = 0.0;
 };
 
 class MtpGraphRuntime {

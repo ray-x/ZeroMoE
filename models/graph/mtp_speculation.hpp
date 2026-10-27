@@ -34,6 +34,7 @@
 // must reset both; checkpoints are always released.
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -99,6 +100,11 @@ class SpecDraft {
 using SpecDistribution = std::function<bool(
     std::span<const float> logits, const std::vector<int> &context,
     std::vector<float> &probs)>;
+// Optional deterministic path for temperature-zero decoding. It returns the
+// token selected by the same policy without materializing a one-hot vector.
+using SpecGreedy = std::function<bool(
+    std::span<const float> logits, const std::vector<int> &context,
+    int &token)>;
 
 struct SpecConfig {
   size_t vocab = 0;
@@ -128,6 +134,45 @@ struct SpecStats {
 };
 
 namespace detail {
+
+inline int greedy_argmax_with_repetition_penalty(
+    std::span<const float> logits, const std::vector<int> &context,
+    size_t prompt_tokens, float penalty) {
+  if (logits.empty()) return -1;
+  std::array<int, 64> repeated{};
+  size_t repeated_count = 0;
+  if (penalty != 1.0f) {
+    const size_t window_start = context.size() > repeated.size()
+                                    ? context.size() - repeated.size()
+                                    : 0;
+    const size_t start = std::max(prompt_tokens, window_start);
+    for (size_t i = start; i < context.size(); ++i) {
+      const int token = context[i];
+      if (token >= 0 && size_t(token) < logits.size())
+        repeated[repeated_count++] = token;
+    }
+    std::sort(repeated.begin(), repeated.begin() + repeated_count);
+  }
+  size_t repeated_i = 0;
+  const auto adjusted = [&](size_t i) {
+    float value = logits[i];
+    while (repeated_i < repeated_count && size_t(repeated[repeated_i]) == i) {
+      value = value > 0.0f ? value / penalty : value * penalty;
+      ++repeated_i;
+    }
+    return value;
+  };
+  int best = 0;
+  float best_value = adjusted(0);
+  for (size_t i = 1; i < logits.size(); ++i) {
+    const float value = adjusted(i);
+    if (best_value < value) {
+      best = static_cast<int>(i);
+      best_value = value;
+    }
+  }
+  return best;
+}
 
 inline int sample_probs(const std::vector<float> &probs, std::mt19937 &rng) {
   double total = 0.0;
@@ -163,7 +208,7 @@ inline bool speculate(SpecTarget &target, SpecDraft &draft,
                       const SpecConfig &cfg, const SpecPrompt &prompt,
                       const SpecDistribution &distribution, std::mt19937 &rng,
                       const std::function<bool(int)> &emit, SpecStats &stats,
-                      std::string &error) {
+                      std::string &error, const SpecGreedy &greedy = {}) {
   error.clear();
   const size_t V = cfg.vocab, W = cfg.wide;
   const int n = static_cast<int>(prompt.tokens.size());
@@ -202,6 +247,30 @@ inline bool speculate(SpecTarget &target, SpecDraft &draft,
   };
 
   // Catch the draft up on the prompt: x[p] pairs with the target hidden of p-1.
+  const bool greedy_mode = static_cast<bool>(greedy);
+  const auto select_token = [&](std::span<const float> logits,
+                                const std::vector<int> &context, int &token,
+                                std::vector<float> *probs) {
+    if (greedy_mode) {
+      if (!greedy(logits, context, token)) {
+        error = "greedy selector failed";
+        return false;
+      }
+      if (token < 0 || size_t(token) >= V) {
+        error = "greedy selector returned an invalid token";
+        return false;
+      }
+      return true;
+    }
+    if (!probs || !make_probs(logits, context, *probs)) return false;
+    token = detail::sample_probs(*probs, rng);
+    if (token < 0) {
+      error = "sampling distribution has no mass";
+      return false;
+    }
+    return true;
+  };
+
   for (int p = 0; p < n; ++p) {
     const std::span<const float> hidden =
         p == 0 ? std::span<const float>(zeros)
@@ -223,10 +292,9 @@ inline bool speculate(SpecTarget &target, SpecDraft &draft,
 
   {  // The first token is sampled by the target from the prompt's logits.
     std::vector<float> probs;
-    if (!make_probs(prompt.last_logits, seq, probs)) return false;
-    const int y = detail::sample_probs(probs, rng);
-    if (y < 0) { error = "target distribution has no mass"; return false; }
-    if (!commit(y)) return true;
+  int y = -1;
+  if (!select_token(prompt.last_logits, seq, y, &probs)) return false;
+  if (!commit(y)) return true;
   }
 
   std::vector<float> hidden_prev(prompt.wide.end() - W, prompt.wide.end());
@@ -252,11 +320,10 @@ inline bool speculate(SpecTarget &target, SpecDraft &draft,
       std::vector<int> context = seq;
       context.insert(context.end(), drafts.begin(), drafts.end());
       std::vector<float> probs;
-      if (!make_probs(logits, context, probs)) return false;
-      const int d = detail::sample_probs(probs, rng);
-      if (d < 0) { error = "draft distribution has no mass"; return false; }
+      int d = -1;
+      if (!select_token(logits, context, d, &probs)) return false;
       drafts.push_back(d);
-      q.push_back(std::move(probs));
+      if (!greedy_mode) q.push_back(std::move(probs));
       cur_tok = d;
       cur_h = next_h;
     }
@@ -269,19 +336,39 @@ inline bool speculate(SpecTarget &target, SpecDraft &draft,
     detail::CheckpointSet checkpoints(target);
     std::vector<float> wides(size_t(k + 1) * W);
     std::vector<std::vector<float>> p(size_t(k + 1));
+  std::vector<int> greedy_p(size_t(k + 1), -1);
     int accepted = 0, correction = -1;
     std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
     const auto distribution_after = [&](int j, std::span<const float> logits) {
       std::vector<int> context = seq;
       context.insert(context.end(), drafts.begin(), drafts.begin() + j);
+      if (greedy_mode) {
+        int &token = greedy_p[size_t(j)];
+        if (!greedy(logits, context, token)) {
+          error = "greedy selector failed on target logits";
+          return false;
+        }
+        if (token < 0 || size_t(token) >= V) {
+          error = "greedy selector returned an invalid target token";
+          return false;
+        }
+        return true;
+      }
       return make_probs(logits, context, p[size_t(j)]);
     };
     // Exact speculative sampling for draft d_{j+1}: true when accepted,
     // otherwise `correction` holds the resampled token.
     const auto judge = [&](int j) {
+      if (greedy_mode) {
+        const int target_token = greedy_p[size_t(j)];
+        if (drafts[size_t(j)] == target_token) return true;
+        correction = target_token;
+        return false;
+      }
       const size_t d = size_t(drafts[size_t(j)]);
       const float qp = q[size_t(j)][d], pp = p[size_t(j)][d];
-      const float accept = qp > 0.0f ? std::min(1.0f, pp / qp) : (pp > 0.0f ? 1.0f : 0.0f);
+      const float accept = qp > 0.0f ? std::min(1.0f, pp / qp)
+                                     : (pp > 0.0f ? 1.0f : 0.0f);
       if (uniform(rng) <= accept) return true;
       std::vector<float> residual(V);
       double sum = 0.0;
@@ -289,8 +376,10 @@ inline bool speculate(SpecTarget &target, SpecDraft &draft,
         residual[v] = std::max(0.0f, p[size_t(j)][v] - q[size_t(j)][v]);
         sum += residual[v];
       }
-      if (sum > 0.0) for (float &r : residual) r = static_cast<float>(r / sum);
-      else residual = p[size_t(j)];
+      if (sum > 0.0)
+        for (float &r : residual) r = static_cast<float>(r / sum);
+      else
+        residual = p[size_t(j)];
       correction = detail::sample_probs(residual, rng);
       return false;
     };
@@ -318,7 +407,8 @@ inline bool speculate(SpecTarget &target, SpecDraft &draft,
       for (int j = 0; j < k && !rejected; ++j) {
         if (judge(j)) ++accepted; else rejected = true;
       }
-      if (!rejected) correction = detail::sample_probs(p[size_t(k)], rng);
+      if (!rejected) correction = greedy_mode ? greedy_p[size_t(k)]
+                                                    : detail::sample_probs(p[size_t(k)], rng);
       if (correction < 0) { error = "correction distribution has no mass"; return false; }
 
       if (prefix_commit) {
@@ -365,7 +455,8 @@ inline bool speculate(SpecTarget &target, SpecDraft &draft,
         if (j == k) break;
         if (judge(j)) ++accepted; else rejected = true;
       }
-      if (!rejected) correction = detail::sample_probs(p[size_t(k)], rng);
+      if (!rejected) correction = greedy_mode ? greedy_p[size_t(k)]
+                                                    : detail::sample_probs(p[size_t(k)], rng);
       if (correction < 0) { error = "correction distribution has no mass"; return false; }
     }
     stats.accepted += accepted;

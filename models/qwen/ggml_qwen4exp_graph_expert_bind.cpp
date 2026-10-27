@@ -781,6 +781,18 @@ ggml_tensor *build_split_gpu_tensor(FullGraph &g, ggml_context *ctx,
   }
   if (!bind_device_expert_gather(g, t, src_ptrs, plane_bytes))
     return nullptr;
+  if (g.decode_mode && g.expert_alloc_layer >= 0) {
+    const int idx = name.find("ffn_gate_exps") != std::string::npos ? 0
+                  : name.find("ffn_up_exps") != std::string::npos   ? 1
+                  : name.find("ffn_down_exps") != std::string::npos ? 2 : -1;
+    if (idx >= 0) {
+      auto &plane = g.promo_layers[g.expert_alloc_layer].plane[idx];
+      plane.dst = t;
+      plane.src = static_cast<const uint8_t *>(ptr);
+      plane.stride = stride;
+      plane.bytes = plane_bytes;
+    }
+  }
 
   const int stage_layer = g.engine->qwen4exp_option_b_layer;
   if (g.decode_mode && !g.stage_experts.empty() && stage_layer >= 0) {
