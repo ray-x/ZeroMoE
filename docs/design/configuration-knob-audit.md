@@ -71,6 +71,29 @@ Verification for this batch:
   CMake files and shipped configs; only dated historical design/handoff notes
   still mention the retired feature.
 
+### 2026-10-27 — settings family scoping (no env names removed)
+
+This pass changes how resolved settings are attributed, not the inventory. Every
+`ZEROMOE_*` name stays valid, so no JSON row changes status.
+
+| Change | Effect |
+| --- | --- |
+| `Family::GlmGraph` → `Family::Glm` | The settings enum now names concrete model families. GLM-5.x and GLM-DSA use the Glm row; the shared graph implementation is no longer a family. |
+| `ZEROMOE_LING_*` aliases scoped to Ling | A Glm run no longer reads Ling's names, and a Ling run inherits `ZEROMOE_GLM5NEXT_*` one way (Ling spelling first). Ling also inherits Glm's `gpu_assist_slots=3` family default. |
+| `Field::claims` | TOML capability is declared per field instead of inferred from alias scope. Native Ling mode does not claim the GLM offload knobs; shared-graph Ling mode lists the Glm adapter. |
+
+Verification for this pass:
+
+- `zeromoe_cpu`, `graph_settings_test` and `graph_settings_binding_test` build
+  with `-DZEROMOE_CPU_ONLY=ON -DZEROMOE_USE_GGML=ON`.
+- `ctest -R '^graph_settings'` passes 2/2; the resolver tests cover Ling/Glm
+  inheritance, reverse-inheritance rejection, TOML capability, and the
+  `claims != 0` / `claims implies reads` invariants.
+- The six touched CUDA-only translation units were host-syntax-checked with the
+  CUDA include path and `-DZEROMOE_USE_GGML=1 -DZEROMOE_USE_GGML_CUDA=1`.
+- `python3 tools/config_inventory.py --check` passes; all inventory rows keep
+  their previous status because no environment name was added or removed.
+
 ### 2026-10-27 — dead diagnostic, unused macro, dead bench write
 
 | Control | Surface | Evidence | Change |

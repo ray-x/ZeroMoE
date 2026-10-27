@@ -44,7 +44,7 @@ OffloadState *get_offload(const StreamingEngine &engine,
   profile.first_layer = o->first;
   profile.log_tag = "[GGML-GLM5NEXT-OFFLOAD]";
   // Every tunable below comes from the settings resolver (graph_settings.hpp); the env names are its aliases.
-  const auto &st = zeromoe::graphsettings::settings_for(zeromoe::graphsettings::Family::GlmGraph).tun;
+  const auto &st = zeromoe::graphsettings::active_settings().tun;
   profile.huge_pages = st.offload_thp.value == 1;
   profile.mirror_dir = st.offload_mirror.value;
   profile.split_reads = st.offload_split_reads.value == 1;
@@ -144,7 +144,7 @@ OffloadState *get_offload(const StreamingEngine &engine,
     LOG_INFO("[MOE-COVERAGE] glm-graph %s; DDR capacity=%zu\n",
              zeromoe::graph::coverage_summary(coverage).c_str(), o->store->capacity());
     zeromoe::graphsettings::report_preflight(
-        "glm-graph", zeromoe::graphsettings::Family::GlmGraph,
+        "glm-graph", zeromoe::graphsettings::active_family(),
         zeromoe::graph::coverage_finding(coverage));
   }
   g_offload = std::move(o);

@@ -193,9 +193,16 @@ a rebase pass over all profiles.
 
 * Migrated: MiMo (CPU threads, prefill chunk and min batch, op-offload mode and threshold, DDR GiB,
   pinned %, pin, assist slots, usage file, second GPU, verify/trace diagnostics) and Ling (prefill
-  chunk, min batch, offload first layer and async). Ling's offload knobs are shared with GLM
-  (`ZEROMOE_LING_*` before `ZEROMOE_GLM5NEXT_*`, same order as before), so they resolve for
-  `Family::Other` and apply to both.
+  chunk, min batch, offload first layer and async).
+* `Family` names the model, not the graph implementation. `Family::Glm` covers GLM-5.x and
+  GLM-DSA; `Family::Ling` inherits the Glm row (aliases and family defaults) because Ling's
+  default and hybrid modes run the GLM graph. `ZEROMOE_LING_*` is tried first when that spelling
+  exists, then `ZEROMOE_GLM5NEXT_*`. The link is one-directional: a Glm run never reads Ling names
+  or Ling defaults.
+* Capability is declared per field (`Field::claims`), not inferred from aliases. TOML acceptance
+  uses the model's active adapter list: a Ling run that uses the shared graph lists `Family::Glm`,
+  while the native Ling graph does not claim the GLM offload knobs. Alias visibility for
+  TOML/env resolution is tracked separately (`detail::reads`).
 * Env knobs keep their old parse (strict strtol, atoi, on-unless-0). Env names are scoped per family:
   a `ZEROMOE_MIMO2_*` variable cannot change Ling.
 * Not migrated: the `ZEROMOE_MIMO2_INGRAPH_MOE` / `_FULL_GRAPH` gates (feature gates, not tunables),
@@ -213,7 +220,8 @@ a rebase pass over all profiles.
 ### Added after step 1
 
 * `usage_record_file` (diagnostic, outside the defaults hash): `ZEROMOE_MIMO2_USAGE_RECORD`, or
-  `ZEROMOE_LING_USAGE_RECORD` / `ZEROMOE_GLM5NEXT_USAGE_RECORD` for the GLM graph. Turns on the shared route survey
+  `ZEROMOE_LING_USAGE_RECORD` (`ZEROMOE_GLM5NEXT_USAGE_RECORD` for Glm, inherited by Ling's shared
+  graph). Turns on the shared route survey
   (`models/graph/graph_route_survey.hpp`). Only the in-graph MoE path is tapped; MiMo's synchronous fallback
   (`ZEROMOE_MIMO2_INGRAPH_MOE=0`) and the layered path record nothing, so the file stays empty there.
 * One prefill-chunk model for graph families: env (`prefill_chunk` aliases) > the TOML's `prefill_batch_tokens` >

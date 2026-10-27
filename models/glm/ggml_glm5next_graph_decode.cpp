@@ -228,7 +228,7 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   const auto phase_options = zeromoe::graph::phase_cache_options();
   if (phase_options.bytes && !g->native_moe_cache && g_offload && g_offload->store) {
     if (!g_phase_cache) g_phase_cache = std::make_unique<zeromoe::graph::PhaseExpertCache>();
-    const auto &st = zeromoe::graphsettings::settings_for(zeromoe::graphsettings::Family::GlmGraph);
+    const auto &st = zeromoe::graphsettings::active_settings();
     g_phase_cache->prepare_decode(engine, *g_offload->store, g->cuda, g->device,
         phase_options.bytes, phase_options.reserve_bytes, st.tun.offload_usage_file.value,
         [&](int l, int expert) {

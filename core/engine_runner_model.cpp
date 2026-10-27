@@ -46,18 +46,24 @@ std::expected<void, std::string> EngineRunner::load_model() {
   {
     using namespace zeromoe::graphsettings;
     std::vector<Family> families{Family::Other};
+    Family active = Family::Other;
     switch (detect_model_family(engine.model_file)) {
-    case ModelFamily::Qwen4Exp: families.push_back(Family::Qwen); break;
-    case ModelFamily::MiMo2: families.push_back(Family::MiMo2); break;
+    case ModelFamily::Qwen4Exp: families.push_back(Family::Qwen); active = Family::Qwen; break;
+    case ModelFamily::MiMo2: families.push_back(Family::MiMo2); active = Family::MiMo2; break;
     case ModelFamily::BailingMoE3:
       families.push_back(Family::Ling);
+      active = Family::Ling;
       if (!bailingmoe3_native_graph_enabled() || bailingmoe3_hybrid_cuda_graph_enabled())
-        families.push_back(Family::GlmGraph);
+        families.push_back(Family::Glm);
       break;
     case ModelFamily::GLM5NEXT:
-    case ModelFamily::GLM_DSA: families.push_back(Family::GlmGraph); break;
+    case ModelFamily::GLM_DSA:
+      families.push_back(Family::Glm);
+      active = Family::Glm;
+      break;
     default: break;
     }
+    set_active_family(active);
     // Other is used separately by the shared phase cache, not an adapter.
     std::string error;
     if (!validate_config(config.graph_settings, families, error))

@@ -372,7 +372,7 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
                  (double)f / (1024.0 * 1024.0 * 1024.0));
         if (g_graph->decode_mode)
           zeromoe::graphsettings::report_preflight(
-              "glm-graph", zeromoe::graphsettings::Family::GlmGraph,
+              "glm-graph", zeromoe::graphsettings::active_family(),
               zeromoe::graph::idle_vram_finding(d, (double)f / (1024.0 * 1024.0 * 1024.0)));
       }
     }

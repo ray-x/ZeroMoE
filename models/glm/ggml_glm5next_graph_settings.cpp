@@ -31,7 +31,7 @@ bool graph_enabled_for(const StreamingEngine &engine) {
 // ExpertResidency::begin/finish), so a background prefetch and a demand miss overlap instead of serializing on I/O.
 bool offload_async() {
   static const bool on = [] {
-    return zeromoe::graphsettings::settings_for(zeromoe::graphsettings::Family::GlmGraph)
+    return zeromoe::graphsettings::active_settings()
                .tun.offload_async.value != 0;
   }();
   return on;
@@ -39,7 +39,7 @@ bool offload_async() {
 
 int offload_first_layer() {
   static const int first = [] {
-    return int(zeromoe::graphsettings::settings_for(zeromoe::graphsettings::Family::GlmGraph)
+    return int(zeromoe::graphsettings::active_settings()
                    .tun.offload_first_layer.value);
   }();
   return first;
@@ -52,7 +52,9 @@ bool offload_layer(int layer) {
 
 std::string offload_env(const char *name, const char *dflt)  {
   constexpr const char *prefix = "ZEROMOE_GLM5NEXT_";
-  if (std::strncmp(name, prefix, std::strlen(prefix)) == 0) {
+  if (zeromoe::graphsettings::active_family() ==
+          zeromoe::graphsettings::Family::Ling &&
+      std::strncmp(name, prefix, std::strlen(prefix)) == 0) {
     const std::string ling_name =
         std::string("ZEROMOE_LING_") + (name + std::strlen(prefix));
     const char *ling = zeromoe::graphcfg::env(ling_name.c_str());
@@ -90,7 +92,7 @@ bool pilot_prefetch_on() {
 // VRAM ring and no layer waits for the prefetch, so the CPU computes every cold route as without staging.
 bool pilot_copy_on() {
   static const bool on = [] {
-    return zeromoe::graphsettings::settings_for(zeromoe::graphsettings::Family::GlmGraph).tun.pilot_copy.value != 0;
+    return zeromoe::graphsettings::active_settings().tun.pilot_copy.value != 0;
   }();
   return on;
 }
@@ -110,7 +112,7 @@ int pilot_lookahead() {
     const char *v = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PILOT_LOOKAHEAD");
     int want = v && v[0] ? std::max(1, std::min(4, std::atoi(v))) : 1;
     if (want > 1) {
-      if (zeromoe::graphsettings::settings_for(zeromoe::graphsettings::Family::GlmGraph).tun.pilot_copy.value != 0)
+      if (zeromoe::graphsettings::active_settings().tun.pilot_copy.value != 0)
         want = 1;
     }
     return want;
@@ -128,7 +130,7 @@ float pilot_min_score() {
 
 bool dynamic_cache_enabled() {
   static const bool enabled = [] {
-    return zeromoe::graphsettings::settings_for(zeromoe::graphsettings::Family::GlmGraph).tun.dynamic_cache.value != 0;
+    return zeromoe::graphsettings::active_settings().tun.dynamic_cache.value != 0;
   }();
   return enabled;
 }
@@ -202,7 +204,7 @@ double dynamic_upload_fraction() {
 // See docs/glm53flash-ram-decode-regression-2026-10-21.md for the recipe/results.
 bool early_ready_wanted(bool has_overlap_work) {
   // Preserve the explicit flag's legacy first-character semantics.
-  const long override_mode = zeromoe::graphsettings::settings_for(zeromoe::graphsettings::Family::GlmGraph).tun.early_ready.value;
+  const long override_mode = zeromoe::graphsettings::active_settings().tun.early_ready.value;
   return override_mode < 0 ? has_overlap_work : override_mode != 0;
 }
 
@@ -211,12 +213,12 @@ bool early_ready_wanted(bool has_overlap_work) {
 // On by default (order-balanced A/B: 4.29 -> 4.92 tok/s, logits and tokens identical);
 // ZEROMOE_GLM5NEXT_SPLIT_LOAD=0 opts out.
 bool split_load_wanted() {
-  static const bool on = zeromoe::graphsettings::settings_for(zeromoe::graphsettings::Family::GlmGraph).tun.split_load.value != 0;
+  static const bool on = zeromoe::graphsettings::active_settings().tun.split_load.value != 0;
   return on;
 }
 
 bool lane_with_gpu1_wanted() {
-  static const bool on = zeromoe::graphsettings::settings_for(zeromoe::graphsettings::Family::GlmGraph).tun.lane_with_gpu1.value != 0;
+  static const bool on = zeromoe::graphsettings::active_settings().tun.lane_with_gpu1.value != 0;
   return on;
 }
 
@@ -242,13 +244,13 @@ int gpu_assist2_device(int core_device) {
   return d;
 }
 int gpu_assist2_slots() {
-  static const int n = std::max(0, std::min(8, int(zeromoe::graphsettings::settings_for(zeromoe::graphsettings::Family::GlmGraph).tun.gpu_assist2_slots.value)));
+  static const int n = std::max(0, std::min(8, int(zeromoe::graphsettings::active_settings().tun.gpu_assist2_slots.value)));
   return n;
 }
 
 int gpu_assist_slots() {
   static const int n = std::max(
-      0, std::min(8, int(zeromoe::graphsettings::settings_for(zeromoe::graphsettings::Family::GlmGraph)
+      0, std::min(8, int(zeromoe::graphsettings::active_settings()
                              .tun.gpu_assist_slots.value)));
   return n;
 }
@@ -274,7 +276,7 @@ static bool gpu_assist_type_ok(int type) {
 }
 
 bool gpu_assist_layer_ok(const FullGraph &g, int layer) {
-  static const bool any = zeromoe::graphsettings::settings_for(zeromoe::graphsettings::Family::GlmGraph).tun.gpu_assist_any_type.value != 0;
+  static const bool any = zeromoe::graphsettings::active_settings().tun.gpu_assist_any_type.value != 0;
   if (any)
     return true;
   for (const char *stem : {"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"}) {

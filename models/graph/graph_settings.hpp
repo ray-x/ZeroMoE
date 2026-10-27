@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -29,10 +30,34 @@
 
 namespace zeromoe::graphsettings {
 
-// GlmGraph is the shared GLM graph implementation (GLM-5.x, GLM-DSA and Ling run through it); Ling also has
-// its own entry for the settings its model class reads.
-enum class Family : uint8_t { Other, MiMo2, Ling, GlmGraph, Qwen };
+// Concrete model families for settings resolution. Glm covers GLM-5.x and
+// GLM-DSA. The GLM graph implementation is shared with Ling, but that is a
+// topology fact, not a settings family: Ling has its own row and inherits the
+// Glm one through family_inherits().
+enum class Family : uint8_t { Other, MiMo2, Ling, Glm, Qwen };
+inline constexpr size_t kFamilyCount = static_cast<size_t>(Family::Qwen) + 1;
 enum class Source : uint8_t { Default, Family, Toml, Env };
+
+// Which adapters consume a setting. This is declared per field instead of being
+// inferred from aliases: alias visibility and capability differ for Ling, which
+// reads the Glm names in its shared-graph modes while the native Ling graph does
+// not consume the GLM offload tier.
+using FamilyMask = uint8_t;
+constexpr FamilyMask family_bit(Family f) {
+  return static_cast<FamilyMask>(1u << static_cast<unsigned>(f));
+}
+template <class... Fs> constexpr FamilyMask claims_for(Fs... fs) {
+  return (FamilyMask{0} | ... | family_bit(fs));
+}
+inline constexpr FamilyMask kClaimAll =
+    claims_for(Family::Other, Family::MiMo2, Family::Ling, Family::Glm, Family::Qwen);
+
+// Ling's default and hybrid graph modes run the GLM graph, so Ling starts from
+// the Glm settings row. The link is one-directional: Glm never reads Ling names
+// or Ling defaults.
+constexpr bool family_inherits(Family child, Family parent) {
+  return child == Family::Ling && parent == Family::Glm;
+}
 
 inline const char *source_name(Source s) {
   switch (s) {
@@ -115,11 +140,18 @@ struct Alias {
 inline Alias any_family(const char *env) { return {env, Family::Other, true}; }
 inline Alias only_family(Family f, const char *env) { return {env, f, false}; }
 
+// Ling's spelling of a knob shared with the GLM graph. Aliases are tried in
+// table order, so the Ling name must stay first.
+#define ZEROMOE_LING_GLM_ALIAS(suffix) \
+  only_family(Family::Ling, "ZEROMOE_LING_" suffix), \
+  only_family(Family::Glm, "ZEROMOE_GLM5NEXT_" suffix)
+
 template <class T> struct Field {
   const char *name;
   Resolved<T> &(*ref)(ResolvedSettings &);
   T dflt;
   Parse parse;
+  FamilyMask claims;          // adapters that consume it; 0 is a table error
   std::vector<Alias> aliases; // priority order; the first present value wins
   bool diagnostic;
 };
@@ -131,67 +163,83 @@ inline const std::vector<Field<long>> &long_fields() {
   using F = Family;
   static const std::vector<Field<long>> t = {
       {"device_expert_layers", ZEROMOE_SETTINGS_REF(tun.device_expert_layers), 0, Parse::IntStrict,
+       claims_for(F::Qwen),
        {only_family(F::Qwen, "ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS")}, false},
       {"device_expert_trailing", ZEROMOE_SETTINGS_REF(tun.device_expert_trailing), 0, Parse::FlagOn,
+       claims_for(F::Qwen),
        {only_family(F::Qwen, "ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING")}, false},
       {"phase_cache_mib", ZEROMOE_SETTINGS_REF(tun.phase_cache_mib), 0, Parse::IntStrict,
-       {any_family("ZEROMOE_PHASE_CACHE_MIB")}, false},
+       kClaimAll, {any_family("ZEROMOE_PHASE_CACHE_MIB")}, false},
       {"phase_cache_reserve_mib", ZEROMOE_SETTINGS_REF(tun.phase_cache_reserve_mib), 512, Parse::IntStrict,
-       {any_family("ZEROMOE_PHASE_CACHE_RESERVE_MIB")}, false},
+       kClaimAll, {any_family("ZEROMOE_PHASE_CACHE_RESERVE_MIB")}, false},
       {"cpu_threads_decode", ZEROMOE_SETTINGS_REF(tun.cpu_threads_decode), 10, Parse::IntStrict,
+       claims_for(F::MiMo2, F::Qwen),
        {only_family(F::MiMo2, "ZEROMOE_MIMO2_CPU_THREADS"),
         only_family(F::Qwen, "ZEROMOE_QWEN_CPU_THREADS")}, false},
       {"prefill_chunk", ZEROMOE_SETTINGS_REF(tun.prefill_chunk), 0, Parse::IntAtoi,
+       claims_for(F::MiMo2, F::Ling),
        {only_family(F::MiMo2, "ZEROMOE_MIMO2_PREFILL_CHUNK"),
         only_family(F::Ling, "ZEROMOE_LING_PREFILL_CHUNK")}, false},
-      {"prefill_min_batch", ZEROMOE_SETTINGS_REF(tun.prefill_min_batch), 64, Parse::IntStrict, {}, false},
+      {"prefill_min_batch", ZEROMOE_SETTINGS_REF(tun.prefill_min_batch), 64, Parse::IntStrict,
+       claims_for(F::MiMo2, F::Ling), {}, false},
       {"prefill_op_offload", ZEROMOE_SETTINGS_REF(tun.prefill_op_offload), -1, Parse::TriState,
+       claims_for(F::MiMo2, F::Glm),
        {only_family(F::MiMo2, "ZEROMOE_MIMO2_PREFILL_OP_OFFLOAD"),
-        only_family(F::GlmGraph, "ZEROMOE_LING_PREFILL_OP_OFFLOAD"), only_family(F::GlmGraph, "ZEROMOE_GLM5NEXT_PREFILL_OP_OFFLOAD")}, false},
+        ZEROMOE_LING_GLM_ALIAS("PREFILL_OP_OFFLOAD")}, false},
       {"prefill_offload_min_tokens", ZEROMOE_SETTINGS_REF(tun.prefill_offload_min_tokens), 256, Parse::IntStrict,
+       claims_for(F::MiMo2),
        {only_family(F::MiMo2, "ZEROMOE_MIMO2_PREFILL_OFFLOAD_MIN")}, false},
       {"offload_pinned_pct", ZEROMOE_SETTINGS_REF(tun.offload_pinned_pct), 50, Parse::IntStrict,
+       claims_for(F::MiMo2),
        {only_family(F::MiMo2, "ZEROMOE_MIMO2_OFFLOAD_PINNED_PCT")}, false},
       {"offload_pin", ZEROMOE_SETTINGS_REF(tun.offload_pin), 1, Parse::FlagUnlessOff,
+       claims_for(F::MiMo2),
        {only_family(F::MiMo2, "ZEROMOE_MIMO2_OFFLOAD_PIN")}, false},
       {"offload_async", ZEROMOE_SETTINGS_REF(tun.offload_async), 0, Parse::FlagOn,
-       {only_family(F::GlmGraph, "ZEROMOE_LING_OFFLOAD_ASYNC"), only_family(F::GlmGraph, "ZEROMOE_GLM5NEXT_OFFLOAD_ASYNC")}, false},
+       claims_for(F::Glm), {ZEROMOE_LING_GLM_ALIAS("OFFLOAD_ASYNC")}, false},
       {"offload_first_layer", ZEROMOE_SETTINGS_REF(tun.offload_first_layer), -1, Parse::IntAtoi,
-       {only_family(F::GlmGraph, "ZEROMOE_LING_OFFLOAD_FIRST_LAYER"), only_family(F::GlmGraph, "ZEROMOE_GLM5NEXT_OFFLOAD_FIRST_LAYER")}, false},
+       claims_for(F::Glm), {ZEROMOE_LING_GLM_ALIAS("OFFLOAD_FIRST_LAYER")}, false},
       {"gpu_assist_slots", ZEROMOE_SETTINGS_REF(tun.gpu_assist_slots), 0, Parse::IntStrict,
-       {only_family(F::MiMo2, "ZEROMOE_MIMO2_GPU_ASSIST"), only_family(F::GlmGraph, "ZEROMOE_GLM5NEXT_GPU_ASSIST")}, false},
+       claims_for(F::MiMo2, F::Glm),
+       {only_family(F::MiMo2, "ZEROMOE_MIMO2_GPU_ASSIST"),
+        only_family(F::Glm, "ZEROMOE_GLM5NEXT_GPU_ASSIST")}, false},
       {"use_gpu1", ZEROMOE_SETTINGS_REF(tun.use_gpu1), 1, Parse::FlagUnlessOff,
+       claims_for(F::MiMo2),
        {only_family(F::MiMo2, "ZEROMOE_MIMO2_GPU1")}, false},
       {"offload_thp", ZEROMOE_SETTINGS_REF(tun.offload_thp), 0, Parse::EqualsOne,
-       {only_family(F::GlmGraph, "ZEROMOE_LING_OFFLOAD_THP"), only_family(F::GlmGraph, "ZEROMOE_GLM5NEXT_OFFLOAD_THP")}, false},
+       claims_for(F::Glm), {ZEROMOE_LING_GLM_ALIAS("OFFLOAD_THP")}, false},
       {"offload_split_reads", ZEROMOE_SETTINGS_REF(tun.offload_split_reads), 0, Parse::EqualsOne,
-       {only_family(F::GlmGraph, "ZEROMOE_LING_OFFLOAD_SPLIT"), only_family(F::GlmGraph, "ZEROMOE_GLM5NEXT_OFFLOAD_SPLIT")}, false},
+       claims_for(F::Glm), {ZEROMOE_LING_GLM_ALIAS("OFFLOAD_SPLIT")}, false},
       {"offload_byte_cap", ZEROMOE_SETTINGS_REF(tun.offload_byte_cap), 0, Parse::EqualsOne,
-       {only_family(F::GlmGraph, "ZEROMOE_LING_OFFLOAD_BYTE_CAP"), only_family(F::GlmGraph, "ZEROMOE_GLM5NEXT_OFFLOAD_BYTE_CAP")}, false},
+       claims_for(F::Glm), {ZEROMOE_LING_GLM_ALIAS("OFFLOAD_BYTE_CAP")}, false},
       {"offload_pin_dma", ZEROMOE_SETTINGS_REF(tun.offload_pin_dma), -1, Parse::EqualsOne,
-       {only_family(F::GlmGraph, "ZEROMOE_LING_OFFLOAD_PIN"), only_family(F::GlmGraph, "ZEROMOE_GLM5NEXT_OFFLOAD_PIN")}, false},
+       claims_for(F::Glm), {ZEROMOE_LING_GLM_ALIAS("OFFLOAD_PIN")}, false},
       {"offload_seed_gpu1_hot", ZEROMOE_SETTINGS_REF(tun.offload_seed_gpu1_hot), 1, Parse::EqualsOne,
-       {only_family(F::GlmGraph, "ZEROMOE_LING_OFFLOAD_SEED_GPU1_HOT"), only_family(F::GlmGraph, "ZEROMOE_GLM5NEXT_OFFLOAD_SEED_GPU1_HOT")}, false},
+       claims_for(F::Glm), {ZEROMOE_LING_GLM_ALIAS("OFFLOAD_SEED_GPU1_HOT")}, false},
       {"early_ready", ZEROMOE_SETTINGS_REF(tun.early_ready), -1, Parse::TriState,
-       {only_family(F::GlmGraph, "ZEROMOE_GLM5NEXT_EARLY_READY")}, false},
+       claims_for(F::Glm), {only_family(F::Glm, "ZEROMOE_GLM5NEXT_EARLY_READY")}, false},
       {"split_load", ZEROMOE_SETTINGS_REF(tun.split_load), 1, Parse::FlagUnlessOff,
-       {only_family(F::GlmGraph, "ZEROMOE_GLM5NEXT_SPLIT_LOAD")}, false},
+       claims_for(F::Glm), {only_family(F::Glm, "ZEROMOE_GLM5NEXT_SPLIT_LOAD")}, false},
       {"lane_with_gpu1", ZEROMOE_SETTINGS_REF(tun.lane_with_gpu1), 1, Parse::FlagUnlessOff,
-       {only_family(F::GlmGraph, "ZEROMOE_GLM5NEXT_LANE_WITH_GPU1")}, false},
+       claims_for(F::Glm), {only_family(F::Glm, "ZEROMOE_GLM5NEXT_LANE_WITH_GPU1")}, false},
       {"pilot_copy", ZEROMOE_SETTINGS_REF(tun.pilot_copy), 1, Parse::FlagUnlessOff,
-       {only_family(F::GlmGraph, "ZEROMOE_GLM5NEXT_PILOT_COPY")}, false},
+       claims_for(F::Glm), {only_family(F::Glm, "ZEROMOE_GLM5NEXT_PILOT_COPY")}, false},
       {"gpu_assist_any_type", ZEROMOE_SETTINGS_REF(tun.gpu_assist_any_type), 0, Parse::FlagOn,
-       {only_family(F::GlmGraph, "ZEROMOE_GLM5NEXT_GPU_ASSIST_ANY_TYPE")}, false},
+       claims_for(F::Glm), {only_family(F::Glm, "ZEROMOE_GLM5NEXT_GPU_ASSIST_ANY_TYPE")}, false},
       {"dynamic_cache", ZEROMOE_SETTINGS_REF(tun.dynamic_cache), 0, Parse::FlagOn,
-       {only_family(F::GlmGraph, "ZEROMOE_GLM5NEXT_DYNAMIC_CACHE")}, false},
+       claims_for(F::Glm), {only_family(F::Glm, "ZEROMOE_GLM5NEXT_DYNAMIC_CACHE")}, false},
       {"gpu_assist2_slots", ZEROMOE_SETTINGS_REF(tun.gpu_assist2_slots), 1, Parse::IntAtoi,
-       {only_family(F::GlmGraph, "ZEROMOE_GLM5NEXT_ASSIST2_SLOTS"), only_family(F::MiMo2, "ZEROMOE_MIMO2_GPU_ASSIST2")}, false},
+       claims_for(F::Glm, F::MiMo2),
+       {only_family(F::Glm, "ZEROMOE_GLM5NEXT_ASSIST2_SLOTS"),
+        only_family(F::MiMo2, "ZEROMOE_MIMO2_GPU_ASSIST2")}, false},
       {"verify_alias", ZEROMOE_SETTINGS_REF(diag.verify_alias), 1, Parse::FlagUnlessOff,
+       claims_for(F::MiMo2),
        {only_family(F::MiMo2, "ZEROMOE_MIMO2_VERIFY_ALIAS")}, true},
       {"node_trace", ZEROMOE_SETTINGS_REF(diag.node_trace), 0, Parse::IntStrict,
+       claims_for(F::MiMo2),
        {only_family(F::MiMo2, "ZEROMOE_MIMO2_NODE_TRACE")}, true},
       {"preflight_strict", ZEROMOE_SETTINGS_REF(diag.preflight_strict), 0, Parse::FlagOn,
-       {any_family("ZEROMOE_PREFLIGHT_STRICT")}, true},
+       kClaimAll, {any_family("ZEROMOE_PREFLIGHT_STRICT")}, true},
   };
   return t;
 }
@@ -199,12 +247,13 @@ inline const std::vector<Field<long>> &long_fields() {
 inline const std::vector<Field<double>> &real_fields() {
   static const std::vector<Field<double>> t = {
       {"offload_ddr_gib", ZEROMOE_SETTINGS_REF(tun.offload_ddr_gib), -1.0, Parse::RealOrAuto,
+       claims_for(Family::MiMo2, Family::Glm),
        {only_family(Family::MiMo2, "ZEROMOE_MIMO2_OFFLOAD_DDR_GIB"),
-        only_family(Family::GlmGraph, "ZEROMOE_LING_OFFLOAD_DDR_GIB"), only_family(Family::GlmGraph, "ZEROMOE_GLM5NEXT_OFFLOAD_DDR_GIB")}, false},
+        ZEROMOE_LING_GLM_ALIAS("OFFLOAD_DDR_GIB")}, false},
       {"offload_pinned_fraction", ZEROMOE_SETTINGS_REF(tun.offload_pinned_fraction), 0.5, Parse::RealOrAuto,
-       {only_family(Family::GlmGraph, "ZEROMOE_LING_OFFLOAD_PINNED"), only_family(Family::GlmGraph, "ZEROMOE_GLM5NEXT_OFFLOAD_PINNED")}, false},
+       claims_for(Family::Glm), {ZEROMOE_LING_GLM_ALIAS("OFFLOAD_PINNED")}, false},
       {"offload_probation_fraction", ZEROMOE_SETTINGS_REF(tun.offload_probation_fraction), 0.25, Parse::RealOrAuto,
-       {only_family(Family::GlmGraph, "ZEROMOE_LING_OFFLOAD_PROBATION"), only_family(Family::GlmGraph, "ZEROMOE_GLM5NEXT_OFFLOAD_PROBATION")}, false},
+       claims_for(Family::Glm), {ZEROMOE_LING_GLM_ALIAS("OFFLOAD_PROBATION")}, false},
   };
   return t;
 }
@@ -212,29 +261,32 @@ inline const std::vector<Field<double>> &real_fields() {
 inline const std::vector<Field<std::string>> &text_fields() {
   static const std::vector<Field<std::string>> t = {
       {"offload_usage_file", ZEROMOE_SETTINGS_REF(tun.offload_usage_file), std::string(), Parse::Text,
+       claims_for(Family::MiMo2, Family::Glm),
        {only_family(Family::MiMo2, "ZEROMOE_MIMO2_OFFLOAD_USAGE"),
-        only_family(Family::GlmGraph, "ZEROMOE_LING_OFFLOAD_USAGE"), only_family(Family::GlmGraph, "ZEROMOE_GLM5NEXT_OFFLOAD_USAGE")}, false},
+        ZEROMOE_LING_GLM_ALIAS("OFFLOAD_USAGE")}, false},
       {"usage_record_file", ZEROMOE_SETTINGS_REF(diag.usage_record_file), std::string(), Parse::Text,
+       claims_for(Family::MiMo2, Family::Glm),
        {only_family(Family::MiMo2, "ZEROMOE_MIMO2_USAGE_RECORD"),
-        only_family(Family::GlmGraph, "ZEROMOE_LING_USAGE_RECORD"), only_family(Family::GlmGraph, "ZEROMOE_GLM5NEXT_USAGE_RECORD")}, true},
+        ZEROMOE_LING_GLM_ALIAS("USAGE_RECORD")}, true},
       {"offload_policy", ZEROMOE_SETTINGS_REF(tun.offload_policy), std::string("lru"), Parse::Text,
-       {only_family(Family::GlmGraph, "ZEROMOE_LING_OFFLOAD_POLICY"), only_family(Family::GlmGraph, "ZEROMOE_GLM5NEXT_OFFLOAD_POLICY")}, false},
+       claims_for(Family::Glm), {ZEROMOE_LING_GLM_ALIAS("OFFLOAD_POLICY")}, false},
       {"offload_mirror", ZEROMOE_SETTINGS_REF(tun.offload_mirror), std::string(), Parse::Text,
-       {only_family(Family::GlmGraph, "ZEROMOE_LING_OFFLOAD_MIRROR"), only_family(Family::GlmGraph, "ZEROMOE_GLM5NEXT_OFFLOAD_MIRROR")}, false},
+       claims_for(Family::Glm), {ZEROMOE_LING_GLM_ALIAS("OFFLOAD_MIRROR")}, false},
       {"offload_store", ZEROMOE_SETTINGS_REF(tun.offload_store), std::string(), Parse::Text,
-       {only_family(Family::GlmGraph, "ZEROMOE_LING_OFFLOAD_STORE"), only_family(Family::GlmGraph, "ZEROMOE_GLM5NEXT_OFFLOAD_STORE")}, false},
+       claims_for(Family::Glm), {ZEROMOE_LING_GLM_ALIAS("OFFLOAD_STORE")}, false},
       {"offload_model", ZEROMOE_SETTINGS_REF(tun.offload_model), std::string(), Parse::Text,
-       {only_family(Family::GlmGraph, "ZEROMOE_LING_OFFLOAD_MODEL"), only_family(Family::GlmGraph, "ZEROMOE_GLM5NEXT_OFFLOAD_MODEL")}, false},
+       claims_for(Family::Glm), {ZEROMOE_LING_GLM_ALIAS("OFFLOAD_MODEL")}, false},
   };
   return t;
 }
 
+// Capability: a TOML key is accepted only if one of the model's adapters
+// consumes it. `claims` is explicit because alias visibility is wider for Ling
+// (it reads the Glm names when the shared graph is active) while the native
+// Ling graph does not consume the GLM offload tier. The loader adds the Glm
+// adapter to the list for Ling's shared-graph modes.
 template<class T> inline bool applies(const Field<T> &f, Family fam) {
-  if (std::strcmp(f.name, "prefill_min_batch") == 0)
-    return fam == Family::MiMo2 || fam == Family::Ling;
-  if (f.aliases.empty()) return true;
-  return std::any_of(f.aliases.begin(), f.aliases.end(),
-                     [fam](const Alias &a) { return a.all || a.only == fam; });
+  return (f.claims & family_bit(fam)) != 0;
 }
 
 inline bool boolean(Parse p) {
@@ -264,7 +316,7 @@ inline const char *family_name(Family fam) {
   case Family::Other: return "shared";
   case Family::MiMo2: return "mimo2";
   case Family::Ling: return "ling";
-  case Family::GlmGraph: return "glm-graph";
+  case Family::Glm: return "glm";
   case Family::Qwen: return "qwen4exp";
   }
   throw std::invalid_argument("unknown graph family");
@@ -371,7 +423,7 @@ inline const std::vector<Override> &family_overrides() {
        "chunks >= 256 tokens let op-offload beat the CPU cold-expert path (docs/models/mimo26-flash.md)"},
       {Family::MiMo2, "prefill_min_batch", 8,
        "the default (64) made every chunk after the first run as one-token steps (docs/design/model-family-framework.md s1)"},
-      {Family::GlmGraph, "gpu_assist_slots", 3,
+      {Family::Glm, "gpu_assist_slots", 3,
        "GPU assist of 3 slots is the measured setting for the GLM graph (docs/GLM5.3-Flash-baseline.md)"},
       {Family::Ling, "prefill_min_batch", 2,
        "value used by Ling31FlashGraphModel before the resolver existed"},
@@ -385,10 +437,28 @@ namespace detail {
 
 inline bool present(const char *v) { return v && v[0]; }
 
+// Ling runs the shared GLM graph. It inherits the Glm alias namespace and
+// family defaults, and its own ZEROMOE_LING_* names win by table order. The
+// link is one-directional: a Glm run never sees Ling's names or defaults.
+inline bool alias_applies(const Alias &a, Family fam) {
+  if (a.all || a.only == fam) return true;
+  return family_inherits(fam, a.only);
+}
+
+// Whether this family's resolver reads the field's TOML key or env aliases.
+// This is wider than `applies` for shared-graph knobs: a Ling run that uses
+// that graph resolves them through Family::Ling even though the adapter list
+// credits the Glm row. A field with no aliases is gated by its claims.
+template<class T> inline bool reads(const Field<T> &f, Family fam) {
+  if (f.aliases.empty()) return applies(f, fam);
+  return std::any_of(f.aliases.begin(), f.aliases.end(),
+                     [fam](const Alias &a) { return alias_applies(a, fam); });
+}
+
 inline void read_long(const Field<long> &f, Family fam, const EnvView &env, Resolved<long> &out) {
   bool found = false, any_on = false;
   for (const Alias &a : f.aliases) {
-    if (!a.all && a.only != fam)
+    if (!alias_applies(a, fam))
       continue;
     const char *v = env(a.env);
     switch (f.parse) {
@@ -463,7 +533,9 @@ inline ResolvedSettings resolve_settings(Family fam, const EnvView &env, std::st
   for (const auto &f : text_fields()) f.ref(r).value = f.dflt;
 
   for (const Override &o : family_overrides()) {
-    if (o.family != fam)
+    // A child family starts from its parent's recipe; the child's own override
+    // wins because it is the exact match in this loop.
+    if (o.family != fam && !family_inherits(fam, o.family))
       continue;
     const Field<long> *hit = nullptr;
     for (const auto &f : long_fields())
@@ -477,7 +549,7 @@ inline ResolvedSettings resolve_settings(Family fam, const EnvView &env, std::st
 
   each_field([&](const auto &f) {
     const auto it = config.find(f.name);
-    if (it == config.end() || !applies(f, fam)) return;
+    if (it == config.end() || !detail::reads(f, fam)) return;
     try { detail::canonical(f, it->second, f.ref(r)); }
     catch (const std::invalid_argument &e) {
       const std::string message = "graph_" + std::string(f.name) + ": " + e.what();
@@ -509,7 +581,7 @@ inline ResolvedSettings resolve_settings(Family fam, const EnvView &env, std::st
     detail::read_long(f, fam, env, f.ref(r));
   for (const auto &f : real_fields()) {
     for (const Alias &a : f.aliases) {
-      if (!a.all && a.only != fam) continue;
+      if (!detail::alias_applies(a, fam)) continue;
       if (const char *v = env(a.env); detail::present(v)) {
         auto &s = f.ref(r);
         s.value = std::strcmp(v, "auto") == 0 ? -1.0 : std::atof(v);
@@ -520,7 +592,7 @@ inline ResolvedSettings resolve_settings(Family fam, const EnvView &env, std::st
   }
   for (const auto &f : text_fields()) {
     for (const Alias &a : f.aliases) {
-      if (!a.all && a.only != fam) continue;
+      if (!detail::alias_applies(a, fam)) continue;
       if (const char *v = env(a.env); detail::present(v)) {
         auto &s = f.ref(r);
         s.value = v; s.src = Source::Env; s.origin = a.env;
@@ -530,7 +602,7 @@ inline ResolvedSettings resolve_settings(Family fam, const EnvView &env, std::st
   }
   each_field([&](const auto &f) {
     for (const Alias &a : f.aliases) {
-      if ((!a.all && a.only != fam) || !detail::present(env(a.env))) continue;
+      if (!detail::alias_applies(a, fam) || !detail::present(env(a.env))) continue;
       std::string message = std::string(a.env) + " is a legacy override; use graph_" + f.name + " in TOML";
       if (config.contains(f.name))
         message += " (legacy environment takes precedence over TOML)";
@@ -542,6 +614,8 @@ inline ResolvedSettings resolve_settings(Family fam, const EnvView &env, std::st
 
 inline bool validate_config(const ConfigValues &values, const std::vector<Family> &families,
                             std::string &error) {
+  // The list is the model's active adapters (plus Other for shared knobs), not
+  // its alias namespace: Ling's shared-graph runs list Glm, native runs do not.
   for (const auto &[name, value] : values) {
     (void)value;
     bool known = false, supported = false;
@@ -584,14 +658,15 @@ inline std::string settings_reference() {
   std::string out = "Advanced graph settings (root TOML keys, before [[gpus]]).\n"
                     "Precedence: defaults < family < TOML < legacy environment.\n"
                     "These are not required setup switches. Use the model recipe first.\n"
-                    "Families listed below are the adapters that consume each setting.\n"
+                    "Families listed below resolve a value for each setting; Ling's shared\n"
+                    "GLM graph inherits the glm defaults.\n"
                     "zeromoe_cpu does not consume graph settings; use omp_max_threads there.\n";
   each_field([&](const auto &f) {
     out += "\ngraph_" + std::string(f.name) + (f.diagnostic ? " [diagnostic]\n  " : " [tuning]\n  ");
     out += meaning(f.name);
     out += "\n  Family defaults:";
-    for (Family fam : {Family::Other, Family::MiMo2, Family::Ling, Family::GlmGraph, Family::Qwen}) {
-      if (!applies(f, fam)) continue;
+    for (Family fam : {Family::Other, Family::MiMo2, Family::Ling, Family::Glm, Family::Qwen}) {
+      if (!detail::reads(f, fam)) continue;
       auto defaults = resolve_settings(fam, [](const char *) -> const char * { return nullptr; });
       out += " " + std::string(family_name(fam)) + "=" + setting_value(f, f.ref(defaults).value);
     }
@@ -660,7 +735,7 @@ inline std::string format_settings(const ResolvedSettings &r) {
   };
   auto settings = r;
   each_field([&](const auto &f) {
-    if (!applies(f, r.family)) return;
+    if (!detail::reads(f, r.family)) return;
     const auto &x = f.ref(settings);
     line(f.name, setting_value(f, x.value), x);
   });

@@ -15,8 +15,8 @@ namespace zeromoe::graphsettings {
 struct SettingsBinding {
   std::mutex mutex;
   ConfigValues config;
-  std::array<ResolvedSettings, 5> cache;
-  std::array<bool, 5> done{};
+  std::array<ResolvedSettings, kFamilyCount> cache;
+  std::array<bool, kFamilyCount> done{};
 };
 
 inline SettingsBinding &settings_binding() {
@@ -44,7 +44,7 @@ inline const ResolvedSettings &settings_for(Family fam) {
         fam, [](const char *n) { return zeromoe::graphcfg::env(n); }, &err, b.config);
     if (!err.empty()) throw std::invalid_argument("invalid graph settings:\n" + err);
     done[i] = true;
-    static const char *const names[] = {"other", "mimo2", "ling", "glm-graph", "qwen"};
+    static const char *const names[] = {"other", "mimo2", "ling", "glm", "qwen"};
     LOG_INFO("[SETTINGS] family=%s defaults_hash=%016llx\n%s", names[i],
              static_cast<unsigned long long>(defaults_hash()),
              format_settings(cache[i]).c_str());
@@ -58,6 +58,37 @@ inline const ResolvedSettings &settings_for(Family fam) {
     }
   }
   return cache[i];
+}
+
+// The concrete model family this process loaded. The GLM graph implementation
+// is shared by GLM-5.x, GLM-DSA and Ling, so resolving through this value keeps
+// Ling's ZEROMOE_LING_* aliases and family defaults out of GLM runs and vice
+// versa. Set once from the detected model family before graph initialization;
+// the cache is keyed by family, so a late change after the first resolution
+// would silently mix rows.
+namespace detail {
+struct ActiveFamilyState {
+  Family family = Family::Other;
+  bool set = false;
+};
+inline ActiveFamilyState &active_family_state() {
+  static ActiveFamilyState state;
+  return state;
+}
+} // namespace detail
+
+inline void set_active_family(Family family) {
+  auto &state = detail::active_family_state();
+  if (state.set && state.family != family)
+    throw std::logic_error("graph settings family already selected");
+  state.family = family;
+  state.set = true;
+}
+
+inline Family active_family() { return detail::active_family_state().family; }
+
+inline const ResolvedSettings &active_settings() {
+  return settings_for(active_family());
 }
 
 // A preflight finding from a run-time check (graph_health.hpp): a warning, or an abort under

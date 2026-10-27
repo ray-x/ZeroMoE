@@ -191,7 +191,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   if (ids && layer >= c.first_dense) {
     // Survey mode only (usage_record_file): count the layer's routes, hot or cold, without touching them.
     zeromoe::graph::GraphRouteSurvey::get().configure(
-        zeromoe::graphsettings::settings_for(zeromoe::graphsettings::Family::GlmGraph).diag.usage_record_file.value,
+        zeromoe::graphsettings::active_settings().diag.usage_record_file.value,
         c.n_layers, c.first_dense, c.n_experts);
     zeromoe::graph::GraphRouteSurvey::get().tap(ctx, g.graph, g.sched, g.cpu, ids, layer, g.decode_mode);
   }

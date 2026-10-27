@@ -239,7 +239,8 @@ mathematics (sigmoid + bias, top-k normalisation).
 6. Migrate the remaining families one at a time (GLM last: ~10k lines).
    **Settings boundary for the GLM graph (done):** the tunables of the supported Ling/GLM configurations
    (offload tier, GPU assist, lane and staging switches, DMA pinning, usage file) come from the resolver
-   (`Family::GlmGraph`). 81 direct `ZEROMOE_GLM5NEXT_/LING_` env reads remain, all experimental or
+   for the concrete model family (`Family::Glm` for GLM-5.x/DSA, `Family::Ling` for Ling; Ling inherits
+   the Glm row and reads `ZEROMOE_LING_*` before `ZEROMOE_GLM5NEXT_*`). 81 direct `ZEROMOE_GLM5NEXT_/LING_` env reads remain, all experimental or
    diagnostic (dynamic-cache heat, pilot ridge/score/lookahead tuning, GPU1 hot-set usage and layers, prefill
    prefetch variants, dumps, traces, CPU thread counts); `moe_conformance` ratchets that count so it can only
    shrink. `ModelFamily` references in `core/` are ratcheted the same way (112: Qwen4Exp and
