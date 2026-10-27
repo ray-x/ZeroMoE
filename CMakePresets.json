@@ -9,8 +9,7 @@
       "binaryDir": "${sourceDir}/build-cpu",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "ZEROMOE_CPU_ONLY": "ON",
-        "ZEROMOE_USE_GGML": "ON"
+        "ZEROMOE_CPU_ONLY": "ON"
       }
     },
     {
@@ -22,7 +21,6 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "ZEROMOE_CPU_ONLY": "OFF",
-        "ZEROMOE_USE_GGML": "ON",
         "ZEROMOE_USE_GGML_CUDA": "ON"
       }
     }

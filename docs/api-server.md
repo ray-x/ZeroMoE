@@ -12,15 +12,15 @@ Linux/CUDA serving build still require validation.
 
 ## Build
 
-The server is optional and disabled by default. Enabling it fetches pinned
-cpp-httplib and nlohmann/json dependencies. It does not download model weights.
+The server is built by default. Building it fetches pinned cpp-httplib and
+nlohmann/json dependencies; it does not download model weights. Configure with
+`-DZEROMOE_BUILD_SERVER=OFF` to omit it.
 
 Linux/CUDA:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-  -DZEROMOE_USE_GGML=ON -DZEROMOE_USE_GGML_CUDA=ON \
-  -DZEROMOE_BUILD_SERVER=ON
+  -DZEROMOE_USE_GGML_CUDA=ON
 cmake --build build --target zeromoe server_tests -j"$(nproc)"
 ```
 
@@ -28,8 +28,7 @@ macOS/CPU:
 
 ```bash
 cmake -S . -B build-cpu -DCMAKE_BUILD_TYPE=Release \
-  -DZEROMOE_CPU_ONLY=ON -DZEROMOE_USE_GGML=ON \
-  -DZEROMOE_BUILD_SERVER=ON
+  -DZEROMOE_CPU_ONLY=ON
 cmake --build build-cpu --target zeromoe_cpu server_tests cpu_api_tests \
   -j"$(sysctl -n hw.ncpu)"
 ctest --test-dir build-cpu --output-on-failure

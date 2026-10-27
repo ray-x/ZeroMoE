@@ -198,15 +198,21 @@ pass.
 
 | Macro | Defined by | Guard sites | Role | Disposition |
 | --- | --- | ---: | --- | --- |
-| `ZEROMOE_USE_GGML` | `CMakeLists.txt:37`; compile definition on `kernels_cpu` (PUBLIC) and the engine/tests/benches | 33 | Selects the bundled ggml quantized CPU kernels. Mandatory for a full engine build (`CMakeLists.txt:119`), optional only for CPU-only fallback builds. | Keep the capability; collapse the normal choice into the CPU/CUDA presets. |
+| `ZEROMOE_USE_GGML` | `CMakeLists.txt:37`; compile definition on `kernels_cpu` (PUBLIC) and the engine/tests/benches | 33 | Selects the bundled ggml quantized CPU kernels. Required; OFF is rejected at configure time because no-ggml CPU builds do not provide the Q2_0 dot product. | Keep as a required build capability; ON by default. |
 | `ZEROMOE_USE_GGML_CUDA` | `CMakeLists.txt:38`; compile definition on the engine and tests | 84 | Enables the ggml CUDA backend and the CUDA full-graph code paths. | Keep the capability; collapse into the CUDA preset. |
 | `ZEROMOE_EXL3_CUDA` | `CMakeLists.txt:561` | 18 | Compiles the EXL3 CUDA decode path. | Keep the capability; collapse into the CUDA preset. |
 | `ZEROMOE_EXL3_UPSTREAM` | `CMakeLists.txt:444` (source-file property) | 4 | Chooses upstream ExLlamaV3 EXL3 kernels instead of the legacy kernels; only defined when `ZEROMOE_EXLLAMAV3_SRC` supplies a checkout. | Internalize once one kernel path is pinned; currently a developer A/B. |
-| `ZEROMOE_BUILD_SERVER` | `CMakeLists.txt:36`; compile definitions at `1285`/`1290` | 7 | Includes the optional native OpenAI/Anthropic server. | Keep the capability; collapse into a server preset. |
+| `ZEROMOE_BUILD_SERVER` | `CMakeLists.txt:36`; compile definitions at `1286`/`1291` | 7 | Includes the native OpenAI/Anthropic server (ON by default). | Keep the capability; ON by default, OFF for a smaller binary. |
 | `ZEROMOE_METAL` | `CMakeLists.txt:70`; compile definition at `1221` | 2 | Enables Apple Metal dispatch in the NEON kernel path. | Keep as a platform capability. |
 
 `ZEROMOE_ARM_NEON` and `ZEROMOE_HAVE_CUFILE` were removed earlier and no
 longer appear in the inventory.
+
+`ZEROMOE_USE_GGML` and `ZEROMOE_BUILD_SERVER` now default to ON. ggml is
+required: a CPU-only build with `-DZEROMOE_USE_GGML=OFF` fails to compile
+`kernels_cpu.cpp` because the Q2_0 dot product is provided by ggml, so
+configure rejects OFF explicitly. `-DZEROMOE_BUILD_SERVER=OFF` still omits the
+server and its fetched dependencies.
 
 Build-time inputs that are not source guards remain, but they configure the
 build rather than branch engine code:

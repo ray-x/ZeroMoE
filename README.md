@@ -36,7 +36,7 @@ ZeroMoE/
 ├── scripts/                       # Build and validation helpers
 ├── patches/                       # ggml patch series
 ├── docs/                          # Design notes and model recipes
-└── server/                        # Optional native C++ OpenAI/Anthropic API server
+└── server/                        # Native C++ OpenAI/Anthropic API server
 
 ```
 
@@ -45,8 +45,7 @@ ZeroMoE/
 ### Linux + CUDA (full engine)
 
 Run the automated setup tool. It validates the required compilers (`g++`,
-`nvcc`) and builds the engine. Enable the native C++ HTTP server separately
-with `-DZEROMOE_BUILD_SERVER=ON`:
+`nvcc`) and builds the engine, including the native C++ HTTP server:
 
 ```bash
 chmod +x setup.sh
@@ -56,7 +55,7 @@ chmod +x setup.sh
 Or manually:
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DZEROMOE_USE_GGML=ON
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
 
@@ -71,9 +70,10 @@ both ZeroMoE and ggml CPU kernels.
 
 ### OpenAI and Anthropic APIs
 
-The optional C++ server exposes Chat Completions and Messages, including SSE,
-Qwen tool calls, cancellation, and bounded request queues. It runs in the engine
-process with one inference owner; no Python gateway is needed.
+The C++ server is built by default and exposes Chat Completions and Messages,
+including SSE, Qwen tool calls, cancellation, and bounded request queues. It
+runs in the engine process with one inference owner; no Python gateway is
+needed. Configure with `-DZEROMOE_BUILD_SERVER=OFF` for a smaller binary.
 
 See [API server](docs/api-server.md) for CPU/CUDA build commands, authentication,
 examples, feature limits, and the experimental opt-in CPU prompt-state cache.
@@ -114,11 +114,11 @@ cmake --build build-macos -j$(sysctl -n hw.ncpu)
 ```
 
 On Apple Silicon (M1/M2/M3/M4/M5) the CPU kernel backend uses ARM NEON +
-SDOT for the f32 and integer-dot-product paths.  For optimized quantized
-(MOE) expert decoding on macOS, build with ggml integration:
+SDOT for the f32 and integer-dot-product paths.  ggml integration for optimized
+quantized (MOE) expert decoding is enabled by default on macOS:
 
 ```bash
-cmake -S . -B build -DZEROMOE_USE_GGML=ON
+cmake -S . -B build
 cmake --build build -j$(sysctl -n hw.ncpu)
 ```
 
@@ -127,7 +127,7 @@ cmake --build build -j$(sysctl -n hw.ncpu)
 The experimental ggml-backed full-graph prefill/decode path (`ZEROMOE_QWEN4EXP_FULL_GRAPH*` env vars at runtime) requires linking ggml's CUDA backend:
 
 ```bash
-cmake -S . -B build -DZEROMOE_USE_GGML=ON -DZEROMOE_USE_GGML_CUDA=ON
+cmake -S . -B build -DZEROMOE_USE_GGML_CUDA=ON
 cmake --build build -j$(nproc)
 ```
 

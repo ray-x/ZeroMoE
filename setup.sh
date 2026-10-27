@@ -42,10 +42,9 @@ echo "[3/4] Triggering CMake build pipeline..."
 mkdir -p build
 cd build
 
-# Full engine builds require ggml.  Fetch a stable llama.cpp release by default
-# unless the caller opts out (e.g. they provide their own ggml install).
-GGML_FLAG="${ZEROMOE_USE_GGML:-${ZEROMOE_USE_LLAMA_CPP:-ON}}"
-cmake -DCMAKE_BUILD_TYPE=Release -DZEROMOE_USE_GGML="$GGML_FLAG" ..
+# Full engine builds require ggml, which is the default. The full engine
+# cannot be configured without it; ZEROMOE_GGML_ROOT can supply a local tree.
+cmake -DCMAKE_BUILD_TYPE=Release ..
 echo "[4/4] Compiling high-performance target binary..."
 make -j$(nproc)
 cd ..

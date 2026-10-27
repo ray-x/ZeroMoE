@@ -33,8 +33,8 @@ target_include_directories(mtp_speculation_test PRIVATE
 # Build options
 # ---------------------------------------------------------------------------
 option(ZEROMOE_CPU_ONLY "Disable CUDA and build CPU-only components" OFF)
-option(ZEROMOE_BUILD_SERVER "Build the optional C++ OpenAI/Anthropic API server" OFF)
-option(ZEROMOE_USE_GGML "Use ggml (via llama.cpp source tree) for quantized CPU kernels" OFF)
+option(ZEROMOE_BUILD_SERVER "Build the C++ OpenAI/Anthropic API server (disable for a smaller binary)" ON)
+option(ZEROMOE_USE_GGML "Use ggml (via llama.cpp source tree) for quantized CPU kernels (required)" ON)
 option(ZEROMOE_USE_GGML_CUDA
        "Build/link ggml-cuda for the experimental MUL_MAT_ID prefill backend"
        OFF)
@@ -96,8 +96,8 @@ if(NOT ZEROMOE_CPU_ONLY AND
 endif()
 
 # On macOS the CPU-only binary is the only usable engine, and real MoE models
-# are almost always quantized.  Default ggml fetch to ON here; users can still
-# override with -DZEROMOE_USE_GGML=OFF.
+# are almost always quantized. Keep ggml on there as well, including for build
+# directories that cached the old OFF default.
 if(APPLE)
     set(ZEROMOE_USE_GGML ON CACHE BOOL "Fetch ggml for quantized CPU decode" FORCE)
     message(STATUS "ZeroMoE: Apple platform auto-enabling ZEROMOE_USE_GGML=ON")
@@ -109,17 +109,18 @@ if(APPLE)
     message(STATUS "ZeroMoE: Apple platform detected — forcing ZEROMOE_CPU_ONLY=ON")
 endif()
 
-# The full engine links ggml for reference dequantizers.  If you already have
-# a ggml install somewhere else, point CMake to it and set this OFF; otherwise
-# setting this ON fetches a stable llama.cpp release and builds ggml in-tree.
+# ZeroMoE links ggml for reference dequantizers. The default fetches a stable
+# llama.cpp release and builds it in-tree; point ZEROMOE_GGML_ROOT or
+# ZEROMOE_GGML_PREBUILT_DIR at an existing tree to reuse it instead.
 if(ZEROMOE_USE_LLAMA_CPP AND NOT ZEROMOE_USE_GGML)
     set(ZEROMOE_USE_GGML ON CACHE BOOL "" FORCE)
     message(WARNING "ZEROMOE_USE_LLAMA_CPP is deprecated; use ZEROMOE_USE_GGML=ON")
 endif()
-if(NOT ZEROMOE_CPU_ONLY AND NOT ZEROMOE_USE_GGML)
+if(NOT ZEROMOE_USE_GGML)
     message(FATAL_ERROR
-        "Full engine builds require ggml. Either set ZEROMOE_USE_GGML=ON "
-        "to fetch ggml automatically, or provide your own ggml and link it.")
+        "ZeroMoE requires ggml. ZEROMOE_USE_GGML is ON by default and cannot "
+        "be disabled; point ZEROMOE_GGML_ROOT at a local llama.cpp tree to "
+        "reuse an existing checkout.")
 endif()
 
 # Detect Apple Silicon (M1/M2/M3/M4/M5 all share arm64; M3+ specific flags are
