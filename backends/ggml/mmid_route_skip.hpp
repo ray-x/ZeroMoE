@@ -12,20 +12,24 @@
 // mmid_inactive_route_id() instead of hard-coding -1 or 0.
 
 #include <cstdint>
-#include <cstdlib>
 
-// Weak so a build against a stock ggml still links; the symbol is null there.
+#include "logger.hpp"
+
+// The ZeroMoE ggml build always applies patches/ggml, so the capability is a
+// build invariant rather than a runtime option. The declaration stays weak so a
+// stock ggml still links for diagnostics; that build gets dummy routes and the
+// warning below instead of a user-facing environment switch.
 extern "C" int ggml_cpu_mul_mat_id_negative_skip(void) __attribute__((weak));
 
-// True when the linked ggml advertises negative-id skipping (and the user has not opted out with
-// ZEROMOE_MMID_NO_NEGATIVE_SKIP=1).
+// True when the linked ggml advertises negative-id skipping.
 inline bool mmid_negative_skip_available() {
   static const bool available = [] {
-    if (const char *e = std::getenv("ZEROMOE_MMID_NO_NEGATIVE_SKIP"))
-      if (e[0] && e[0] != '0')
-        return false;
-    return &ggml_cpu_mul_mat_id_negative_skip != nullptr &&
-           ggml_cpu_mul_mat_id_negative_skip() != 0;
+    const bool linked = &ggml_cpu_mul_mat_id_negative_skip != nullptr &&
+                        ggml_cpu_mul_mat_id_negative_skip() != 0;
+    if (!linked)
+      LOG_WARN("[MMID] linked ggml does not advertise negative-id skip; using "
+               "valid dummy routes (rebuild with the bundled ggml patches)\n");
+    return linked;
   }();
   return available;
 }
@@ -38,11 +42,13 @@ extern "C" int ggml_cuda_mul_mat_id_negative_skip_batched(void) __attribute__((w
 
 inline bool mmid_negative_skip_batched_available() {
   static const bool available = [] {
-    if (const char *e = std::getenv("ZEROMOE_MMID_NO_BATCHED_NEGATIVE_SKIP"))
-      if (e[0] && e[0] != '0')
-        return false;
-    return &ggml_cuda_mul_mat_id_negative_skip_batched != nullptr &&
-           ggml_cuda_mul_mat_id_negative_skip_batched() != 0;
+    const bool linked = &ggml_cuda_mul_mat_id_negative_skip_batched != nullptr &&
+                        ggml_cuda_mul_mat_id_negative_skip_batched() != 0;
+    if (!linked)
+      LOG_WARN("[MMID] linked ggml does not advertise batched negative-id skip; "
+               "batched prefill uses valid dummy routes (rebuild with the "
+               "bundled ggml patches)\n");
+    return linked;
   }();
   return available;
 }

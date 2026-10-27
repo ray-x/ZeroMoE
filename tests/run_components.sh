@@ -115,8 +115,8 @@ ROUTE_TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/zeromoe-route-test.XXXXXX")"
 trap 'rm -rf "$ROUTE_TEST_DIR"' EXIT
 ROUTE_TEST_BIN="$ROUTE_TEST_DIR/test_moe_partial_route"
 echo "[run_components] compiling allocation-free route classification tests"
-"$CXX" -std=c++20 -O2 -Iinclude -o "$ROUTE_TEST_BIN" tests/test_moe_partial_route.cpp
-for MODE in capable stock optout; do
+"$CXX" -std=c++20 -O2 -Icore -Ibackends/ggml -o "$ROUTE_TEST_BIN" tests/test_moe_partial_route.cpp
+for MODE in capable stock; do
     echo "[run_components] route classification mode: $MODE"
     "$ROUTE_TEST_BIN" "$MODE"
 done

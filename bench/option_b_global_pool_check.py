@@ -31,7 +31,6 @@ def setting(config, key, value):
 
 
 def layout(name):
-    name = name.removesuffix("_dummy")
     base = A.read_text() if name in ("A", "A_repeat", "C") else B.read_text()
     if name == "C":
         base = setting(base, "qwen4exp_option_b_right_size_top_n", "false")
@@ -58,7 +57,6 @@ def main():
     p.add_argument("--gpu", default="0")
     p.add_argument("--cpu-threads", type=int, default=10)
     p.add_argument("--layouts", default="A_repeat,B,C,D,V1,floor1")
-    p.add_argument("--no-negative-skip", action="store_true")
     p.add_argument("--resume", action="store_true", help="reuse complete runs in the output directory")
     p.add_argument("--wait-idle", type=int, default=0,
                    help="seconds to wait for competing inference processes before each launch")
@@ -77,7 +75,6 @@ def main():
         "engine_sha256": hashlib.sha256(args.engine.read_bytes()).hexdigest(),
         "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
         "ngen": args.ngen, "gpu": args.gpu, "cpu_threads": args.cpu_threads,
-        "no_negative_skip": args.no_negative_skip,
         "base_configs_sha256": [hashlib.sha256(p.read_bytes()).hexdigest() for p in (A, B)],
         "usage_sha256": hashlib.sha256((ROOT / "tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_usage_tap").read_bytes()).hexdigest(),
     }
@@ -100,8 +97,6 @@ def main():
         "ZEROMOE_BENCH_IGNORE_STOP": "1",
         "ZEROMOE_TOKEN_LOOP_DIAG": "1",
     })
-    if args.no_negative_skip:
-        env["ZEROMOE_MMID_NO_NEGATIVE_SKIP"] = "1"
     prompt_ids = args.out_dir / "prompt.tokens"
     teacher = args.out_dir / "A.tokens"
     summary_path = args.out_dir / "summary.json"
@@ -115,8 +110,6 @@ def main():
         config = setting(layout(name), "log_path", json.dumps(str(args.out_dir / f"{name}.engine.log")))
         cfg.write_text(config)
         run_env = env.copy()
-        if name.endswith("_dummy"):
-            run_env["ZEROMOE_MMID_NO_NEGATIVE_SKIP"] = "1"
         run_env["ZEROMOE_DECODE_LOGITS_DUMP"] = str(logits)
         run_env["ZEROMOE_GENERATED_TOKEN_FILE"] = str(captured)
         if name == "A":

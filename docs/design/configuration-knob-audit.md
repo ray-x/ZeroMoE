@@ -136,6 +136,30 @@ Verification for this batch:
 - A source/harness/config/test grep finds no remaining reference to the six
   retired names.
 
+### 2026-10-27 — retire the negative-skip opt-outs
+
+`ZEROMOE_MMID_NO_NEGATIVE_SKIP` and `ZEROMOE_MMID_NO_BATCHED_NEGATIVE_SKIP`
+looked like user settings but were controls for validating a ggml patch. The
+repository pins ggml and applies `patches/ggml` on every build; `CMakeLists.txt`
+calls `zeromoe_apply_ggml_patches()` and `scripts/build_ggml.sh` aborts when the
+negative-skip marker is missing. A supported build therefore always has the
+capability, and a stock ggml is not a supported configuration.
+
+| Control | Surface | Evidence | Change |
+| --- | --- | --- | --- |
+| `ZEROMOE_MMID_NO_NEGATIVE_SKIP` (K0343) | environment | The 2026-10-03 validation used `=1` to compare negative skipping with dummy-route masking; both produced byte-identical full logit dumps (`docs/option-b-global-pool-validation-2026-10-03.md`). The bundled ggml is always patched, so the remaining effect was to make a supported build silently take the slower dummy path. | Deleted the environment read. A stock ggml link still compiles (weak symbol) but warns once and uses dummy routes; the test `optout` mode and the bench `--no-negative-skip` flag were removed. |
+| `ZEROMOE_MMID_NO_BATCHED_NEGATIVE_SKIP` (K0342) | environment | Patch `0006-ggml-cuda-mmq-id-inactive-slots` is mandatory for batched MMQ: the fallback shares dummy id 0, which breaks ggml's batched id compaction. No document, config or harness set the opt-out outside the patch A/B. | Deleted the environment read; absence of the batched symbol now warns once and falls back to dummy routes for unsupported builds. |
+
+Verification for this pass:
+
+- `test_moe_partial_route` passes in `capable` and `stock` modes; `stock` now
+  exercises the warning path instead of an environment opt-out.
+- `zeromoe_cpu` builds, `ctest -R '^graph_settings'` passes 2/2 and
+  `python3 tools/config_inventory.py --check` passes.
+- `python3 -m py_compile bench/option_b_global_pool_check.py` passes.
+- `grep -rn 'MMID_NO_NEGATIVE_SKIP\|MMID_NO_BATCHED_NEGATIVE_SKIP'` finds only
+  the dated validation note and the audit records that mark them removed.
+
 ### Findings deliberately left in place
 
 These look dead but changing them would either alter a supported feature or
