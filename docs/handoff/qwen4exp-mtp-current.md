@@ -5,8 +5,9 @@ binary or citing a result.
 
 ## Master status (2026-10-27)
 
-`master` is at `0bd23c1`. Four changes landed after the `b78dd9b` binary that
-produced the matched raw-story numbers below, and none is a runtime change:
+`master` is at `19100ff`. Five changes landed after the `b78dd9b` binary that
+produced the matched raw-story numbers below, and none is a runtime change on
+the CUDA engine:
 
 - `5781401` removes the always-on `ZEROMOE_USE_GGML` and
   `ZEROMOE_BUILD_SERVER` build macros. The guards were true in every supported
@@ -21,14 +22,18 @@ produced the matched raw-story numbers below, and none is a runtime change:
   derived from `ZEROMOE_CPU_ONLY`, so every CUDA build links ggml-cuda; the
   previous default `OFF` failed to link. Build commands no longer pass the
   flag. `982dedd` keeps `test_components` assertions live in Release builds.
+- `19100ff` defaults `ZEROMOE_METAL` ON for Apple Silicon and limits MPS to
+  prefill-sized F32 matmul (`S>=32`), so macOS decode stays on NEON.
+  `GGML_METAL` is forced OFF; the CPU-only engine never selects a ggml
+  backend. This only affects macOS.
 
 `build/zeromoe` is still stamped from `b78dd9b` and fails
 `python3 tools/build_provenance.py check --binary build/zeromoe --repo .`
 against current master. Do not quote new rates from it; rebuild first. The
 validation build in `build_verify_master/` is current (CPU_ONLY=OFF, arch 86,
-no `ZEROMOE_USE_GGML_CUDA` input); its manifest reports `source=7f86269
-dirty=True` because the tree carried uncommitted edits during configure, and
-that dirty diff is now commit `0bd23c1`.
+no `ZEROMOE_USE_GGML_CUDA` input); its manifest reports `source=19100ff
+dirty=True` because `models/base/family_ops.cpp` remains uncommitted in its
+owning session.
 
 Outstanding items: the plain-mode rerun on current master (the `658a212` plain
 run never finished because the driver stopped answering `nvidia-smi`), and the
