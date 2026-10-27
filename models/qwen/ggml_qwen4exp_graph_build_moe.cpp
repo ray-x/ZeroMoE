@@ -675,10 +675,12 @@ bool exl3_ggml_bridge_requested(const FullGraph &g, int layer,
 // The early-ready CPU lane for multi-token decode windows is opt-in
 // (ZEROMOE_QWEN4EXP_WINDOW_LANE=1): with it on, the text of a window run diverged from plain
 // decoding on the test prompt (investigation open), and it saved only ~2 ms per window.
-// ZEROMOE_QWEN4EXP_COLD_FUSED=1 replaces the cold branch's ggml node chain by one fused CPU node.
+// The cold branch's ggml node chain is replaced by one fused CPU node (qwen4exp_cold::build) whenever the
+// expert tensors are Q2_0; ZEROMOE_QWEN4EXP_COLD_FUSED=0 turns it off. Bit-identical to the chain
+// (tests/test_cold_ffn_fused.cpp); 5-23% faster MTP windows (docs/design/mtp-window-timeline.md).
 static bool cold_fused_enabled() {
   const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_COLD_FUSED");
-  return v && v[0] == '1';
+  return !(v && v[0] == '0');
 }
 
 static bool window_lane_enabled() {
