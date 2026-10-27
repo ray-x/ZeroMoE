@@ -3,6 +3,7 @@
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
 #include <climits>
+#include <chrono>
 #include <limits>
 
 namespace zeromoe::graph {
@@ -43,8 +44,12 @@ std::unique_ptr<MtpGraphRuntime> MtpGraphRuntime::create(
     error = "invalid draft graph shape or memory budget";
     return nullptr;
   }
+  const auto setup_started = std::chrono::steady_clock::now();
   auto result = std::unique_ptr<MtpGraphRuntime>(new MtpGraphRuntime(shape));
+  const auto measure_build_started = std::chrono::steady_clock::now();
   auto measured = build(error);
+  const double measure_build_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - measure_build_started).count();
   if (!measured) {
     if (error.empty()) error = "draft measurement graph construction failed";
     return nullptr;
@@ -71,7 +76,10 @@ std::unique_ptr<MtpGraphRuntime> MtpGraphRuntime::create(
   // reserve_size mutates scheduler graph splitting. Neither that scheduler
   // nor its graph is reused for execution (see the Qwen target incident).
   measured.reset();
+  const auto execution_build_started = std::chrono::steady_clock::now();
   result->state_ = build(error);
+  const double execution_build_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - execution_build_started).count();
   if (!result->state_) {
     if (error.empty()) error = "draft execution graph construction failed";
     return nullptr;
@@ -107,10 +115,13 @@ std::unique_ptr<MtpGraphRuntime> MtpGraphRuntime::create(
     return nullptr;
   }
   result->workspace_reservation_ = m.host_workspace + scratch_bytes;
+  const auto scheduler_alloc_started = std::chrono::steady_clock::now();
   if (!ggml_backend_sched_alloc_graph(g.sched, g.graph)) {
     error = "draft scheduler graph allocation failed";
     return nullptr;
   }
+  result->memory_.scheduler_alloc_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - scheduler_alloc_started).count();
   const size_t actual_device = ggml_backend_sched_get_buffer_size(g.sched, g.cuda);
   const size_t actual_host = ggml_backend_sched_get_buffer_size(g.sched, g.cpu);
   // reserve_size estimates cross-backend copies slightly low (e.g. when a node
@@ -135,7 +146,14 @@ std::unique_ptr<MtpGraphRuntime> MtpGraphRuntime::create(
   result->hidden_scratch_.resize(shape.hidden);
   result->logits_scratch_.resize(shape.vocab);
   g.ready = true;
+  const auto reset_started = std::chrono::steady_clock::now();
   if (!result->reset(error)) return nullptr;
+  result->memory_.measure_build_ms = measure_build_ms;
+  result->memory_.execution_build_ms = execution_build_ms;
+  result->memory_.reset_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - reset_started).count();
+  result->memory_.total_setup_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - setup_started).count();
   return result;
 }
 

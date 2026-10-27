@@ -31,6 +31,11 @@ struct MtpGraphMemory {
   size_t state = 0;
   size_t device_workspace = 0;
   size_t host_workspace = 0;
+  double measure_build_ms = 0.0;
+  double execution_build_ms = 0.0;
+  double scheduler_alloc_ms = 0.0;
+  double reset_ms = 0.0;
+  double total_setup_ms = 0.0;
 };
 
 class MtpGraphRuntime {

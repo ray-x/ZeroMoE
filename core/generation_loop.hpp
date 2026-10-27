@@ -537,10 +537,10 @@ inline void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GG
     ram_mgr.calculate_safe_cache_capacity(engine, max_ctx);
 
     // Benchmark-only mode: max_new_tokens is normally an upper bound because
-    // EOS/turn-boundary tokens terminate generation early.  For controlled
+    // EOS/turn-boundary tokens terminate generation early. For controlled
     // throughput comparisons, allow the caller to request exactly the full
-    // configured decode length.  This is opt-in, applies to the normal
-    // non-MTP loop only, and leaves normal inference behavior unchanged.
+    // configured decode length in both plain and MTP modes. This is opt-in and
+    // leaves normal inference behavior unchanged.
     const bool bench_ignore_stop = [] {
         const char *env = std::getenv("ZEROMOE_BENCH_IGNORE_STOP");
         return env && env[0] == '1';
@@ -886,6 +886,10 @@ inline void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GG
     // without that breakdown was no longer well-founded. See CLAUDE.md.
     auto prefill_snap_start = perf().snapshot();
     PERF_START(prefill);
+    engine.qwen4exp_mtp_prefetch_requested =
+        !unbatched_prefill && engine.mtp_enabled && engine.mtp_graph_native &&
+        engine.family_ops.family == ModelFamily::Qwen4Exp && pc_reuse == 0 &&
+        !prompt_ids.empty() && pc_n_new == prompt_ids.size();
     // Hyper-Connections (DeepSeek-V4): expand into engine.hc_stream_buf
     // before, collapse back into hidden_states after -- see
     // hc_expand_embedding/hc_collapse_output's own declarations above.
@@ -1115,6 +1119,7 @@ inline void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GG
     // Exact decode-only timing boundary.  The legacy aggregate Rates line
     // subtracts t_prefill_total from the whole request wall time, which also
     // contains prompt embedding and full-graph setup before PERF_START.
+    engine.qwen4exp_mtp_prefetch_requested = false;
     const auto decode_boundary_start = std::chrono::high_resolution_clock::now();
     stats_scope.s.prompt_tokens = static_cast<int>(prompt_ids.size());
     stats_scope.s.prompt_cached_tokens = pc_reuse;
@@ -1167,9 +1172,10 @@ inline void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GG
     std::chrono::steady_clock::time_point first_token_output;
     std::chrono::steady_clock::time_point last_token_output;
     bool mtp_started = false;
+    const int mtp_eos_id = bench_ignore_stop ? -1 : eos_id;
     const bool mtp_context_ready =
         engine.mtp_enabled && pc_reuse == 0 && pc_n_new == prompt_ids.size() &&
-        !prompt_ids.empty() && !bench_ignore_stop;
+        !prompt_ids.empty();
     if (mtp_context_ready) {
         auto emit_mtp = [&](int next_token) {
             if (cancelled()) return false;
@@ -1177,8 +1183,8 @@ inline void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GG
             // Same ordering fix as the main decode loop above: check for a
             // stop token before printing its decoded text, so a correctly-
             // detected stop token's own string isn't echoed to the user.
-            const bool is_stop =
-                next_token == eos_id || tokenizer.is_stop_token(next_token);
+            const bool is_stop = !bench_ignore_stop &&
+                (next_token == eos_id || tokenizer.is_stop_token(next_token));
             if (control) {
                 ++control->generated_tokens;
                 if (is_stop) control->stopped = true;
@@ -1235,10 +1241,24 @@ inline void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GG
                     Sampler::probabilities(work, temperature, top_p, probs);
                     return true;
                 };
+            zeromoe::graph::SpecGreedy mtp_greedy;
+            const char *greedy_fast_env = std::getenv("ZEROMOE_MTP_GREEDY_FAST_PATH");
+            const bool greedy_fast_enabled = !greedy_fast_env || greedy_fast_env[0] != '0';
+            if (temperature <= 0.0f && greedy_fast_enabled) {
+                mtp_greedy = [&](std::span<const float> step_logits,
+                                 const std::vector<int> &context, int &token) {
+                    token = zeromoe::graph::detail::greedy_argmax_with_repetition_penalty(
+                        step_logits, context, prompt_ids.size(),
+                        zeromoe_repetition_penalty());
+                    return token >= 0;
+                };
+            }
+            LOG_INFO("[MTP-GREEDY] selector=%s temperature=%.3f\n",
+                     mtp_greedy ? "direct-argmax" : "probability-vector", temperature);
             mtp_started = qwen4exp_graph_mtp_run(
                 engine, ram_mgr, prefetcher, prompt_ids, logits, max_new_tokens,
-                eos_id, mtp_distribution, sequence, sampler.rng, emit_mtp,
-                mtp_error);
+                mtp_eos_id, mtp_distribution, sequence, sampler.rng, emit_mtp,
+                mtp_error, mtp_greedy);
             if (!mtp_started) {
                 engine.qwen4exp_full_graph_failure =
                     "graph-native MTP failed: " + mtp_error;
@@ -1249,12 +1269,12 @@ inline void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GG
         } else if (engine.family_ops.family == ModelFamily::Qwen4Exp) {
             Qwen4ExpMtpSpeculator mtp(engine, ram_mgr, prefetcher);
             mtp_started = mtp.run(prompt_ids, hidden_states, max_new_tokens,
-                                  eos_id, temperature, top_p, sequence,
+                                  mtp_eos_id, temperature, top_p, sequence,
                                   sampler.rng, emit_mtp);
         } else {
             MtpSpeculator mtp(engine, ram_mgr, prefetcher);
             mtp_started = mtp.run(prompt_ids, hidden_states, max_new_tokens,
-                                  eos_id, temperature, top_p, sequence,
+                                  mtp_eos_id, temperature, top_p, sequence,
                                   sampler.rng, emit_mtp);
         }
         if (mtp_started) {

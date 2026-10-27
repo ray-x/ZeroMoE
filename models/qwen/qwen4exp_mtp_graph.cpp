@@ -6,7 +6,9 @@
 #include "moe_routed_ggml.hpp"
 #include "qwen4exp_graph_ops.hpp"
 
+#include <chrono>
 #include <climits>
+#include <cstring>
 #include <limits>
 #include <numeric>
 
@@ -153,6 +155,7 @@ bool read_config(const StreamingEngine &e, int capacity, Config &c,
 std::shared_ptr<MtpGraphState> build(
     std::shared_ptr<StreamingEngine> owner, const Options &opts, const Config &c,
     std::string &error) {
+  const auto build_started = std::chrono::steady_clock::now();
   auto g = std::make_shared<MtpGraphState>();
   g->owner = std::move(owner);
   g->engine = g->owner.get();
@@ -301,8 +304,17 @@ std::shared_ptr<MtpGraphState> build(
   g->device_weight_bytes = ggml_backend_buffer_get_size(g->dense.buffer);
   g->device_state_bytes = ggml_backend_buffer_get_size(g->state.buffer);
   ggml_backend_buffer_set_usage(g->dense.buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-  for (const auto &[tensor, source] : uploads)
+  double weight_upload_ms = 0.0, head_upload_ms = 0.0;
+  for (const auto &[tensor, source] : uploads) {
+    const auto upload_started = std::chrono::steady_clock::now();
     ggml_backend_tensor_set(tensor, source->host_ptr, 0, ggml_nbytes(tensor));
+    const double upload_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - upload_started).count();
+    if (std::strcmp(ggml_get_name(tensor), "output.weight") == 0)
+      head_upload_ms += upload_ms;
+    else
+      weight_upload_ms += upload_ms;
+  }
   auto *ctx = g->ctx;
   g->embedding = g->host_input(ctx, GGML_TYPE_F32, {c.D, 1}, 0, "mtp_embedding");
   g->hidden = g->host_input(ctx, GGML_TYPE_F32, {W, 1}, 0, "mtp_hidden");
@@ -417,6 +429,12 @@ std::shared_ptr<MtpGraphState> build(
       mask[i] = ggml_fp32_to_fp16(i <= position ? 0.0f : -INFINITY);
     return {};
   };
+  const double build_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - build_started).count();
+  LOG_INFO("[MTP-GRAPH-BUILD] weights=%zu state=%zu weight_upload_ms=%.2f "
+           "head_upload_ms=%.2f build_ms=%.2f\n",
+           g->device_weight_bytes, g->device_state_bytes, weight_upload_ms,
+           head_upload_ms, build_ms);
   return g;
 }
 } // namespace

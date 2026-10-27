@@ -939,7 +939,11 @@ public:
     int mtp_draft_tokens = 3;
     // Graph-native Qwen4Exp MTP (EngineConfig::mtp_graph). Implies
     // qwen4exp_wide_export so the full graph publishes the draft's inputs.
-    bool mtp_graph_native = false;
+ bool mtp_graph_native = false;
+ // Request-scoped hook for preparing the Qwen4Exp draft graph after the target
+ // decode graph is admitted but before full-graph prefill executes.
+ bool qwen4exp_mtp_prefetch_requested = false;
+ std::shared_ptr<void> qwen4exp_mtp_prefetch_state;
 
     // Set from EngineConfig::cpu_offload_max_experts at startup (main.cpp).
     // 0 = off (default). See that field's own extensive comment
