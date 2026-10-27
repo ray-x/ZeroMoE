@@ -1698,8 +1698,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "CMakeLists.txt execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-27: the always-on ggml switch is gone. ggml is fetched and linked unconditionally, so neither the option nor its cache entry exists any more.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0015"
     },
@@ -1821,8 +1821,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "optional native HTTP serving library/executable integration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-27: the server is always built. Deleted the option and its compile definitions; add_subdirectory(server) is unconditional.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0017"
     },
@@ -2511,8 +2511,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "CMakeLists.txt execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-27: OFF never compiled (kernels_cpu.cpp needs ggml's Q2_0 dot product), so the option, its compile definitions and all 33 source guards plus their #else stubs were deleted.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0026"
     },
@@ -2673,8 +2673,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "llama.cpp-backed optional integration build boundary. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-27: the deprecated alias only forced ZEROMOE_USE_GGML=ON plus a warning; with ggml unconditional it had nothing left to do. ZEROMOE_LLAMA_CPP_ROOT stays as an alias for ZEROMOE_GGML_ROOT.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0028"
     },
@@ -2787,8 +2787,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "optional native HTTP serving library/executable integration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-27: macro deleted with its 7 guards; --serve, run_api() and the CPU API entry point are always available.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0029"
     },
@@ -4101,8 +4101,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "backends/core/models execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-27: the macro is gone; ggml is always linked and the fallback branches it guarded were deleted.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0034"
     },
@@ -132020,8 +132020,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "developer tools/scripts execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-27: removed the stale -DZEROMOE_USE_GGML=ON arguments from setup.sh, scripts, how-tos and measurement notes so documented commands no longer pass an unknown variable.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K1147"
     },
@@ -132083,8 +132083,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "llama.cpp-backed optional integration build boundary. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-27: no script, doc or command passes this alias any more; the option no longer exists.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K1148"
     }

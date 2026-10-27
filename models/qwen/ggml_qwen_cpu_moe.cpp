@@ -36,8 +36,6 @@
 #include <sstream>
 #include <vector>
 
-#if defined(ZEROMOE_USE_GGML)
-
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
@@ -2795,74 +2793,3 @@ bool GgmlQwenCpuMoeRunner::wait_strided_async() {
   async_cv_.wait(lock, [this] { return async_request_done_; });
   return async_result_;
 }
-
-#else
-
-void qwen_cpu_moe_diag_set_layer(int) {}
-
-GgmlQwenCpuMoeRunner &GgmlQwenCpuMoeRunner::instance() {
-  static GgmlQwenCpuMoeRunner runner;
-  return runner;
-}
-
-GgmlQwenCpuMoeRunner &GgmlQwenCpuMoeRunner::instance_for_strided(
-    const GgmlQwenCpuExpertRef &, int, int, int, int, size_t, bool) {
-  return instance();
-}
-GgmlQwenCpuMoeRunner &GgmlQwenCpuMoeRunner::instance_for_strided_planes(
-    const GgmlQwenCpuExpertRef &, int, int, int, int, size_t, size_t, size_t,
-    bool) {
-  return instance();
-}
-
-bool GgmlQwenCpuMoeRunner::compiled_in() { return false; }
-
-void GgmlQwenCpuMoeRunner::pause_workers() {}
-void GgmlQwenCpuMoeRunner::resume_workers() {}
-
-GgmlQwenCpuMoeRunner::~GgmlQwenCpuMoeRunner() = default;
-void GgmlQwenCpuMoeRunner::shutdown() {}
-bool GgmlQwenCpuMoeRunner::run(const float *, float *,
-                               const GgmlQwenCpuExpertRef *, int, const float *,
-                               int, int, int) {
-  return false;
-}
-bool GgmlQwenCpuMoeRunner::run_strided(const float *, float *,
-                                       const GgmlQwenCpuExpertRef &,
-                                       const void *, const void *, const void *,
-                                       const int *, int, const float *, int,
-                                       int, int, size_t) {
-  return false;
-}
-bool GgmlQwenCpuMoeRunner::run_strided_planes(
-    const float *, float *, const GgmlQwenCpuExpertRef &, const void *,
-    const void *, const void *, const int *, int, const float *, int, int, int,
-    size_t, size_t, size_t) {
-  return false;
-}
-bool GgmlQwenCpuMoeRunner::run_strided_planes_down(
-    const float *, float *, const GgmlQwenCpuExpertRef &, const void *,
-    const void *, const void *, const int *, int, int, int, int, size_t,
-    size_t, size_t) {
-  return false;
-}
-bool GgmlQwenCpuMoeRunner::run_strided_down(
-    const float *, float *, const GgmlQwenCpuExpertRef &, const void *,
-    const void *, const void *, const int *, int, int, int, int, size_t) {
-  return false;
-}
-bool GgmlQwenCpuMoeRunner::start_strided_async(
-    const float *, float *, const GgmlQwenCpuExpertRef &, const void *,
-    const void *, const void *, const int *, int, const float *, int, int, int,
-    size_t) {
-  return false;
-}
-bool GgmlQwenCpuMoeRunner::start_strided_async(
-    const float *, float *, const GgmlQwenCpuExpertRef &, const void *,
-    const void *, const void *, const int *, int, const float *, int, int, int,
-    size_t, AsyncCompletionFn, void *) {
-  return false;
-}
-bool GgmlQwenCpuMoeRunner::wait_strided_async() { return false; }
-
-#endif

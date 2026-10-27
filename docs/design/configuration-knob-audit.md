@@ -188,62 +188,92 @@ Verification for this pass:
 - `test_moe_partial_route` passes in `capable` and `stock` modes.
 - `python3 tools/config_inventory.py --check` passes.
 
-### 2026-10-27 — remaining compile-time macros
+### 2026-10-27 — remove the always-on ggml and server build macros
+
+The previous pass made `ZEROMOE_USE_GGML` and `ZEROMOE_BUILD_SERVER` default to
+`ON` but still advertised them as switches. Neither had a working `OFF` path, so
+keeping them only invited configure-time changes the tree cannot honour. Both
+capabilities are now unconditional and the option names are gone.
+
+| Control | Surface | Evidence | Change |
+| --- | --- | --- | --- |
+| `ZEROMOE_USE_GGML` (K0026, K0034, K1147) | CMake option, compile definition, 33 source guards | `OFF` never worked: `backends/cpu/kernels_cpu.cpp` needs `ggml_vec_dot_q2_0_q8_0`, which only ggml provides, so a no-ggml CPU build fails to compile. The previous pass made configure reject `OFF` for the same reason. | Deleted the option, its compile definitions, every `#if defined(ZEROMOE_USE_GGML)` guard and the `#else` stubs those guards protected (`kernels_cpu.cpp`, `kernels_cpu_neon.cpp`, `cpu_forward.cpp`, `cpu_engine.cpp`, `cpu_qwen_moe.hpp`, `cpu_qwen4exp.cpp`, `ggml_qwen_cpu_moe.cpp`, `ggml_resource_guards.hpp`, `main.cpp`, `engine_runner.hpp`). The ggml fetch/link block is unconditional. |
+| `ZEROMOE_BUILD_SERVER` (K0017, K0029) | CMake option, compile definition, 7 source guards | `OFF` only compiled out `--serve`, `EngineRunner::run_api()` and the CPU API entry point; no supported build needs a binary without them, and the server tests are already gated by `ZEROMOE_SERVER_TESTS`. | Deleted the option, its compile definitions and every guard in `core/main.cpp`, `core/engine_runner_api.cpp` and `backends/cpu/cpu_main.cpp`. `add_subdirectory(server)` and the `zeromoe_cpu_api` link are unconditional. |
+| `ZEROMOE_USE_LLAMA_CPP` (K0028, K1148) | CMake option | It only forced `ZEROMOE_USE_GGML=ON` plus a deprecation warning; it set no cache entry, path or definition of its own. With ggml unconditional the alias had nothing left to do. | Deleted the option and its remap block. `ZEROMOE_LLAMA_CPP_ROOT` stays as a deprecated alias for `ZEROMOE_GGML_ROOT`. |
+
+Stale `-DZEROMOE_USE_GGML=ON` / `-DZEROMOE_BUILD_SERVER=ON` arguments were also
+removed from `setup.sh`, `scripts/build_with_ggml.sh`, `bench/build_native.sh`,
+`tests/run_components.sh`, the build how-tos and the measurement notes, so
+following a documented command no longer produces an unused-variable warning.
+
+Verification for this batch:
+
+- Fresh CPU configure (`-DZEROMOE_CPU_ONLY=ON -DCMAKE_BUILD_TYPE=Release`) and
+  build of `zeromoe_cpu`, `server_tests`, `cpu_api_tests` and the graph-settings
+  tests; full `ctest` passes.
+- `-DZEROMOE_USE_GGML=OFF`, `-DZEROMOE_BUILD_SERVER=OFF` and
+  `-DZEROMOE_USE_LLAMA_CPP=ON` are no longer options: they are ignored as
+  unused variables instead of silently selecting an unsupported build.
+- `python3 tools/config_inventory.py --check` passes; the macro inventory drops
+  to four names and the CMake option list to nine entries.
+- A source/script/doc grep finds no remaining `ZEROMOE_USE_GGML`,
+  `ZEROMOE_BUILD_SERVER` or `ZEROMOE_USE_LLAMA_CPP` condition, definition or
+  flag.
+
+### 2026-10-27 — remaining compile-time macros (current tree)
 
 `tools/config_inventory.py --json` scans `core/`, `memory/`, `models/`,
 `backends/` and `kernels/` for `ZEROMOE_*`/`GGML_*` names in preprocessor
-conditions. The current tree has **six `ZEROMOE_*` source guards**. All are
+conditions. The current tree has **four `ZEROMOE_*` source guards**. All are
 build capabilities rather than per-request knobs, and none was removed in this
 pass.
 
 | Macro | Defined by | Guard sites | Role | Disposition |
 | --- | --- | ---: | --- | --- |
-| `ZEROMOE_USE_GGML` | `CMakeLists.txt:37`; compile definition on `kernels_cpu` (PUBLIC) and the engine/tests/benches | 33 | Selects the bundled ggml quantized CPU kernels. Required; OFF is rejected at configure time because no-ggml CPU builds do not provide the Q2_0 dot product. | Keep as a required build capability; ON by default. |
-| `ZEROMOE_USE_GGML_CUDA` | `CMakeLists.txt:38`; compile definition on the engine and tests | 84 | Enables the ggml CUDA backend and the CUDA full-graph code paths. | Keep the capability; collapse into the CUDA preset. |
-| `ZEROMOE_EXL3_CUDA` | `CMakeLists.txt:561` | 18 | Compiles the EXL3 CUDA decode path. | Keep the capability; collapse into the CUDA preset. |
-| `ZEROMOE_EXL3_UPSTREAM` | `CMakeLists.txt:444` (source-file property) | 4 | Chooses upstream ExLlamaV3 EXL3 kernels instead of the legacy kernels; only defined when `ZEROMOE_EXLLAMAV3_SRC` supplies a checkout. | Internalize once one kernel path is pinned; currently a developer A/B. |
-| `ZEROMOE_BUILD_SERVER` | `CMakeLists.txt:36`; compile definitions at `1286`/`1291` | 7 | Includes the native OpenAI/Anthropic server (ON by default). | Keep the capability; ON by default, OFF for a smaller binary. |
-| `ZEROMOE_METAL` | `CMakeLists.txt:70`; compile definition at `1221` | 2 | Enables Apple Metal dispatch in the NEON kernel path. | Keep as a platform capability. |
+| `ZEROMOE_USE_GGML_CUDA` | `CMakeLists.txt:36`; compile definition on the engine and tests | 84 | Enables the ggml CUDA backend and the CUDA full-graph code paths. | Keep the capability; collapse into the CUDA preset. |
+| `ZEROMOE_EXL3_CUDA` | `CMakeLists.txt:540` | 18 | Compiles the EXL3 CUDA decode path. | Keep the capability; collapse into the CUDA preset. |
+| `ZEROMOE_EXL3_UPSTREAM` | `CMakeLists.txt:424` (source-file property) | 4 | Chooses upstream ExLlamaV3 EXL3 kernels instead of the legacy kernels; only defined when `ZEROMOE_EXLLAMAV3_SRC` supplies a checkout. | Internalize once one kernel path is pinned; currently a developer A/B. |
+| `ZEROMOE_METAL` | `CMakeLists.txt:67`; compile definition at `1184` | 2 | Enables Apple Metal dispatch in the NEON kernel path. | Keep as a platform capability. |
 
-`ZEROMOE_ARM_NEON` and `ZEROMOE_HAVE_CUFILE` were removed earlier and no
-longer appear in the inventory.
+`ZEROMOE_ARM_NEON`, `ZEROMOE_HAVE_CUFILE`, `ZEROMOE_USE_GGML` and
+`ZEROMOE_BUILD_SERVER` are recorded as removed in the log above and no longer
+appear in the inventory.
 
-`ZEROMOE_USE_GGML` and `ZEROMOE_BUILD_SERVER` now default to ON. ggml is
-required: a CPU-only build with `-DZEROMOE_USE_GGML=OFF` fails to compile
-`kernels_cpu.cpp` because the Q2_0 dot product is provided by ggml, so
-configure rejects OFF explicitly. `-DZEROMOE_BUILD_SERVER=OFF` still omits the
-server and its fetched dependencies.
+ggml and the API server are no longer configurable: they are always linked and
+built, so no configure-time input can request a build the tree does not
+support. Removing the two options also removed their cache entries, which is
+why the build-cache list below is shorter than in earlier snapshots.
 
 Build-time inputs that are not source guards remain, but they configure the
 build rather than branch engine code:
 
-- **12 CMake options**: `ZEROMOE_CPU_ONLY`, `ZEROMOE_BUILD_SERVER`,
-  `ZEROMOE_USE_GGML`, `ZEROMOE_USE_GGML_CUDA`, `ZEROMOE_ENABLE_CUDA_GRAPHS`,
-  `ZEROMOE_ENABLE_AVX512_VNNI`, `ZEROMOE_GGML_OPENMP`,
-  `ZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES`, `ZEROMOE_GGML_DEBUG_PATCHES`,
-  `ZEROMOE_USE_LLAMA_CPP`, `ZEROMOE_METAL` and `ZEROMOE_SERVER_TESTS`
+- **9 CMake options**: `ZEROMOE_CPU_ONLY`, `ZEROMOE_USE_GGML_CUDA`,
+  `ZEROMOE_ENABLE_CUDA_GRAPHS`, `ZEROMOE_ENABLE_AVX512_VNNI`,
+  `ZEROMOE_GGML_OPENMP`, `ZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES`,
+  `ZEROMOE_GGML_DEBUG_PATCHES`, `ZEROMOE_METAL` and `ZEROMOE_SERVER_TESTS`
   (`server/CMakeLists.txt:31`).
-- **6 build-cache inputs**: `ZEROMOE_CPU_ONLY`, `ZEROMOE_USE_GGML`,
-  `ZEROMOE_EXLLAMAV3_SRC`, `ZEROMOE_GGML_COMMIT`,
-  `ZEROMOE_GGML_PREBUILT_DIR` and `ZEROMOE_GGML_ROOT`.
-- **Deprecated aliases**: `ZEROMOE_USE_LLAMA_CPP` and
-  `ZEROMOE_LLAMA_CPP_ROOT` are still parsed and remapped; they are
-  compatibility inputs, not dead names.
+- **5 build-cache inputs**: `ZEROMOE_CPU_ONLY`, `ZEROMOE_EXLLAMAV3_SRC`,
+  `ZEROMOE_GGML_COMMIT`, `ZEROMOE_GGML_PREBUILT_DIR` and `ZEROMOE_GGML_ROOT`.
+- **Deprecated alias**: `ZEROMOE_LLAMA_CPP_ROOT` is still parsed and remapped to
+  `ZEROMOE_GGML_ROOT`; it is a compatibility input, not a dead name.
 - **9 forwarded `GGML_*` options**: `GGML_AVX512`, `GGML_AVX512_VNNI`,
   `GGML_CUDA`, `GGML_CUDA_GRAPHS`, `GGML_HIPBLAS`, `GGML_METAL`,
   `GGML_OPENMP`, `GGML_SYCL` and `GGML_VULKAN` (K0001-K0009). These belong to
   the ggml dependency and are not ZeroMoE source guards.
 
-The JSON still carries the pre-merge recommendations for K0017-K0035; this
-section records the current source inventory, not a new removal decision.
+The JSON's recommendation rows still carry the pre-merge proposals for
+K0017-K0035 and its `counts` object still describes the 2026-10-26 snapshot.
+Only the `review_decision` and `removal_status` fields of the rows retired in
+the removal log above were updated; this section records the current source
+inventory.
 
 ### Findings deliberately left in place
 
 These look dead but changing them would either alter a supported feature or
 require a product decision, so they are not safe deletions for this batch:
 
-- **`ZEROMOE_USE_LLAMA_CPP` / `ZEROMOE_LLAMA_CPP_ROOT`** are deprecated but
-  live CMake aliases: they are still parsed and remapped. Deleting them is a
+- **`ZEROMOE_LLAMA_CPP_ROOT`** is a deprecated but live CMake alias for
+  `ZEROMOE_GGML_ROOT`: it is still parsed and remapped. Deleting it is a
   compatibility break, not a dead-code removal.
 
 ## How to use

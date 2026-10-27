@@ -66,7 +66,7 @@ forward is omitted. Rebuild the validated dependency selection with:
 
 ```bash
 cmake -S . -B build_fork_diag -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CUDA_ARCHITECTURES=86 -DZEROMOE_USE_GGML=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=86 \
   -DZEROMOE_USE_GGML_CUDA=ON -DZEROMOE_ENABLE_CUDA_GRAPHS=ON \
   -DZEROMOE_GGML_ROOT="$PWD/.ggml-fork-diag/ggml"
 cmake --build build_fork_diag -j10

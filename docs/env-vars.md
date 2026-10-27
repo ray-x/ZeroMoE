@@ -27,9 +27,7 @@ Settings are read when the process starts, and graph settings are cached per mod
 
 | Option | Default | Effect |
 | --- | --- | --- |
-| `ZEROMOE_USE_GGML` | ON | Use ggml for the quantized CPU kernels. Required; setting OFF is rejected at configure time. |
 | `ZEROMOE_CPU_ONLY` | OFF | Build without CUDA. Forced ON on macOS. |
-| `ZEROMOE_BUILD_SERVER` | ON | Build the OpenAI/Anthropic API server into `zeromoe` (`--serve`) and `zeromoe_cpu` (`cpu_api_*` tests). Set OFF for a smaller binary. |
 | `ZEROMOE_USE_GGML_CUDA` | OFF | Build the ggml CUDA backend for the MUL_MAT_ID prefill path (experimental). |
 | `ZEROMOE_ENABLE_CUDA_GRAPHS` | ON | Enable ggml CUDA graph capture and replay. |
 | `ZEROMOE_ENABLE_AVX512_VNNI` | ON | Compile with AVX-512 VNNI. Set OFF on a CPU without VNNI, or the binary fails with an illegal instruction. |

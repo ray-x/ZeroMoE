@@ -32,9 +32,7 @@
 #include "startup_preflight.hpp"
 #include "tensor_trace.hpp"
 
-#if defined(ZEROMOE_USE_GGML)
 #include "ggml.h"
-#endif
 
 #include <algorithm>
 #include <chrono>
@@ -175,7 +173,6 @@ load_exl3_model_only(const std::string &path) {
   return {};
 }
 
-#if defined(ZEROMOE_USE_GGML)
 // The ggml tree used by the CUDA build is also shared with llama.cpp and emits
 // CUDA-graph reuse diagnostics through GGML_LOG_DEBUG.  At ZeroMoE's
 // normal INFO/WARN/ERROR levels those messages are not useful, but a full
@@ -193,7 +190,6 @@ static void zeromoe_ggml_log_callback(enum ggml_log_level level,
   std::fputs(text, stderr);
   std::fflush(stderr);
 }
-#endif
 
 void print_usage(bool all = false) {
   if (!all) {
@@ -658,12 +654,6 @@ int main(int argc, char *argv[]) {
   config.api_host = api_host_cli;
   config.api_port = api_port_cli;
   config.api_model = api_model_cli;
-#ifndef ZEROMOE_BUILD_SERVER
-  if (config.serve_api) {
-    std::cerr << "Error: --serve requires -DZEROMOE_BUILD_SERVER=ON\n";
-    return 1;
-  }
-#endif
   if (config.serve_api && (config.raw_prompt || raw_prompt_cli || zeromoe::bench::plan().enabled)) {
     std::cerr << "Error: --serve cannot be combined with raw prompt or benchmark mode\n";
     return 1;
@@ -735,11 +725,9 @@ int main(int argc, char *argv[]) {
   // Initialize the logger before anything else logs — empty log_path keeps
   // everything on stderr exactly as before.
   Logger::instance().init(config.log_path, config.log_level);
-#if defined(ZEROMOE_USE_GGML)
   bool allow_ggml_debug = config.log_level == "DEBUG" ||
                           config.log_level == "VERBOSE";
   ggml_log_set(zeromoe_ggml_log_callback, &allow_ggml_debug);
-#endif
   TraceFilter::instance().configure(config.trace_filter,
                                     config.trace_abort_on_nan);
 

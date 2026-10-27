@@ -12,9 +12,9 @@ Linux/CUDA serving build still require validation.
 
 ## Build
 
-The server is built by default. Building it fetches pinned cpp-httplib and
-nlohmann/json dependencies; it does not download model weights. Configure with
-`-DZEROMOE_BUILD_SERVER=OFF` to omit it.
+The server is always built. Building it fetches pinned cpp-httplib and
+nlohmann/json dependencies; it does not download model weights. There is no
+option to omit it from the binary.
 
 Linux/CUDA:
 

@@ -3,18 +3,14 @@
 #include <cstddef>
 #include <utility>
 
-#if defined(ZEROMOE_USE_GGML)
 #include "ggml.h"
 #include "ggml-backend.h"
-#endif
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
 #include <cuda_runtime.h>
 #endif
 
 namespace moe {
-
-#if defined(ZEROMOE_USE_GGML)
 
 class GgmlContextGuard {
  public:
@@ -111,8 +107,6 @@ class GgmlBackendEventGuard {
  private:
   ggml_backend_event_t event_ = nullptr;
 };
-
-#endif
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
 

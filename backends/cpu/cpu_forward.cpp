@@ -4,10 +4,8 @@
 
 #include <cstring>
 
-#ifdef ZEROMOE_USE_GGML
 extern "C" int ggml_dequant_row(uint32_t type, const void *src, float *out,
                                 int n);
-#endif
 
 bool cpu_embed_token(CPUEngine &engine, int tok, float *out, int D) {
   CPUQuantizedTensor *emb = engine.find_layer("token_embd.weight");
@@ -36,10 +34,8 @@ bool cpu_embed_token(CPUEngine &engine, int tok, float *out, int D) {
         }
         return true;
       }
-#ifdef ZEROMOE_USE_GGML
       return ggml_dequant_row(static_cast<uint32_t>(emb->meta.type), src,
                               out, D) != 0;
-#endif
     }
   }
 

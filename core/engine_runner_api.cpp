@@ -1,6 +1,5 @@
 #include "engine_runner.hpp"
 
-#ifdef ZEROMOE_BUILD_SERVER
 #include "generation_loop.hpp"
 #include "server/server.hpp"
 #include "server/chat_template.hpp"
@@ -79,12 +78,8 @@ private:
     TemplateKind kind;
 };
 }
-#endif
 
 std::expected<void, std::string> EngineRunner::run_api() {
-#ifndef ZEROMOE_BUILD_SERVER
-    return std::unexpected("API serving requires -DZEROMOE_BUILD_SERVER=ON");
-#else
     using namespace zeromoe::server;
     session_start = std::chrono::high_resolution_clock::now();
     TemplateKind kind;
@@ -133,5 +128,4 @@ std::expected<void, std::string> EngineRunner::run_api() {
         return std::unexpected(e.what());
     }
     return {};
-#endif
 }

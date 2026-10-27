@@ -33,8 +33,6 @@ target_include_directories(mtp_speculation_test PRIVATE
 # Build options
 # ---------------------------------------------------------------------------
 option(ZEROMOE_CPU_ONLY "Disable CUDA and build CPU-only components" OFF)
-option(ZEROMOE_BUILD_SERVER "Build the C++ OpenAI/Anthropic API server (disable for a smaller binary)" ON)
-option(ZEROMOE_USE_GGML "Use ggml (via llama.cpp source tree) for quantized CPU kernels (required)" ON)
 option(ZEROMOE_USE_GGML_CUDA
        "Build/link ggml-cuda for the experimental MUL_MAT_ID prefill backend"
        OFF)
@@ -66,7 +64,6 @@ option(ZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES
 option(ZEROMOE_GGML_DEBUG_PATCHES
        "Also apply the debug/profiling ggml patches in patches/debug (not part of the main series)"
        OFF)
-option(ZEROMOE_USE_LLAMA_CPP "Deprecated alias for ZEROMOE_USE_GGML" OFF)
 option(ZEROMOE_METAL "Enable Apple Metal GPU backend (requires ggml)" OFF)
 
 # Resolve the architecture list before add_subdirectory(ggml): ggml-cuda
@@ -96,32 +93,15 @@ if(NOT ZEROMOE_CPU_ONLY AND
 endif()
 
 # On macOS the CPU-only binary is the only usable engine, and real MoE models
-# are almost always quantized. Keep ggml on there as well, including for build
-# directories that cached the old OFF default.
-if(APPLE)
-    set(ZEROMOE_USE_GGML ON CACHE BOOL "Fetch ggml for quantized CPU decode" FORCE)
-    message(STATUS "ZeroMoE: Apple platform auto-enabling ZEROMOE_USE_GGML=ON")
-endif()
-
-# macOS has no NVIDIA CUDA SDK, so the full engine cannot build there.
+# are almost always quantized.
 if(APPLE)
     set(ZEROMOE_CPU_ONLY ON CACHE BOOL "macOS has no CUDA SDK; force CPU-only build" FORCE)
     message(STATUS "ZeroMoE: Apple platform detected — forcing ZEROMOE_CPU_ONLY=ON")
 endif()
 
-# ZeroMoE links ggml for reference dequantizers. The default fetches a stable
-# llama.cpp release and builds it in-tree; point ZEROMOE_GGML_ROOT or
+# ZeroMoE always links ggml for reference dequantizers. The default fetches a
+# stable llama.cpp release and builds it in-tree; point ZEROMOE_GGML_ROOT or
 # ZEROMOE_GGML_PREBUILT_DIR at an existing tree to reuse it instead.
-if(ZEROMOE_USE_LLAMA_CPP AND NOT ZEROMOE_USE_GGML)
-    set(ZEROMOE_USE_GGML ON CACHE BOOL "" FORCE)
-    message(WARNING "ZEROMOE_USE_LLAMA_CPP is deprecated; use ZEROMOE_USE_GGML=ON")
-endif()
-if(NOT ZEROMOE_USE_GGML)
-    message(FATAL_ERROR
-        "ZeroMoE requires ggml. ZEROMOE_USE_GGML is ON by default and cannot "
-        "be disabled; point ZEROMOE_GGML_ROOT at a local llama.cpp tree to "
-        "reuse an existing checkout.")
-endif()
 
 # Detect Apple Silicon (M1/M2/M3/M4/M5 all share arm64; M3+ specific flags are
 # applied below when the compiler supports them).
@@ -188,176 +168,174 @@ endif()
 find_package(OpenMP)
 
 # ---------------------------------------------------------------------------
-# ggml integration (optional)
+# ggml integration
 # ---------------------------------------------------------------------------
-if(ZEROMOE_USE_GGML)
-    # Default to a stable, verified ggml tag in the ggerganov/ggml repo.
-    # (The old "b3923" string was not a valid tag in either ggml or llama.cpp.)
-    set(ZEROMOE_GGML_COMMIT "8baabd53b77d1c48c6ef8d3b620436292f3f6231" CACHE STRING "llama.cpp commit whose ggml/ directory is built (used when the third_party/llama.cpp submodule is absent)")
-    set(ZEROMOE_GGML_ROOT "" CACHE PATH "Path to a local ggml checkout (fetched automatically if empty)")
+# Default to a stable, verified ggml tag in the ggerganov/ggml repo.
+# (The old "b3923" string was not a valid tag in either ggml or llama.cpp.)
+set(ZEROMOE_GGML_COMMIT "8baabd53b77d1c48c6ef8d3b620436292f3f6231" CACHE STRING "llama.cpp commit whose ggml/ directory is built (used when the third_party/llama.cpp submodule is absent)")
+set(ZEROMOE_GGML_ROOT "" CACHE PATH "Path to a local ggml checkout (fetched automatically if empty)")
 
-    # Provide a deprecated alias for configs that still set it.
-    if(ZEROMOE_LLAMA_CPP_ROOT AND NOT ZEROMOE_GGML_ROOT)
-        set(ZEROMOE_GGML_ROOT "${ZEROMOE_LLAMA_CPP_ROOT}" CACHE PATH "" FORCE)
-        message(WARNING "ZEROMOE_LLAMA_CPP_ROOT is deprecated; use ZEROMOE_GGML_ROOT")
-    endif()
+# Provide a deprecated alias for configs that still set it.
+if(ZEROMOE_LLAMA_CPP_ROOT AND NOT ZEROMOE_GGML_ROOT)
+    set(ZEROMOE_GGML_ROOT "${ZEROMOE_LLAMA_CPP_ROOT}" CACHE PATH "" FORCE)
+    message(WARNING "ZEROMOE_LLAMA_CPP_ROOT is deprecated; use ZEROMOE_GGML_ROOT")
+endif()
 
-    # Disable everything we do not need for a CPU decode assistant, except the
-    # explicit experimental CUDA backend option. GGML_CUDA must be set BEFORE
-    # the subproject is configured.
-    set(GGML_CUDA        ${ZEROMOE_USE_GGML_CUDA} CACHE BOOL "" FORCE)
-    set(GGML_CUDA_GRAPHS ${ZEROMOE_ENABLE_CUDA_GRAPHS} CACHE BOOL "" FORCE)
-    # Loud, impossible-to-miss configure-time confirmation of the exact
-    # setting that silently regressed full-graph decode from ~20 tok/s to
-    # ~8 tok/s once already (see ZEROMOE_ENABLE_CUDA_GRAPHS's own comment
-    # above). A default is not a guarantee -- print the resolved value on
-    # every configure, and fail outright if CUDA is on but graphs got
-    # turned off without an explicit, informed override.
-    if(ZEROMOE_USE_GGML_CUDA AND NOT ZEROMOE_ENABLE_CUDA_GRAPHS)
-        message(WARNING
-            "ZEROMOE_USE_GGML_CUDA=ON but ZEROMOE_ENABLE_CUDA_GRAPHS=OFF: "
-            "full-graph decode will silently run WITHOUT CUDA graph capture/"
-            "replay (every node becomes an individual cudaLaunchKernel). "
-            "This previously cost ~20 tok/s -> ~8 tok/s and was mistaken for "
-            "a correctness/scheduling bug for an entire investigation. Only "
-            "disable this deliberately for a real A/B; the runtime "
-            "[CUDA-GRAPHS-CHECK] log line will also confirm this at every "
-            "process start regardless of this setting.")
-    else()
-        message(STATUS "ZeroMoE: GGML_CUDA_GRAPHS=${GGML_CUDA_GRAPHS} "
-                       "(verified again at runtime via [CUDA-GRAPHS-CHECK])")
-    endif()
-    set(GGML_HIPBLAS     OFF CACHE BOOL "" FORCE)
-    set(GGML_VULKAN      OFF CACHE BOOL "" FORCE)
-    set(GGML_SYCL        OFF CACHE BOOL "" FORCE)
-    if(ZEROMOE_GGML_OPENMP AND NOT OpenMP_CXX_FOUND)
-        message(WARNING "ZEROMOE_GGML_OPENMP=ON requested, but OpenMP was not found; ggml CPU backend will use its native threadpool")
-    endif()
-    set(GGML_OPENMP      ${ZEROMOE_GGML_OPENMP} CACHE BOOL "" FORCE)
-    message(STATUS "ZeroMoE: GGML_OPENMP=${GGML_OPENMP} (ZEROMOE_GGML_OPENMP=${ZEROMOE_GGML_OPENMP})")
-    # Keep ggml's CPU backend on the same ISA choice as ZeroMoE's CPU
-    # kernels.  This is the single opt-out for older CPUs: setting
-    # ZEROMOE_ENABLE_AVX512_VNNI=OFF also disables VNNI in ggml, including
-    # when reconfiguring a build directory that previously had it enabled.
-    set(GGML_AVX512_VNNI ${ZEROMOE_ENABLE_AVX512_VNNI} CACHE BOOL "" FORCE)
-    if(ZEROMOE_ENABLE_AVX512_VNNI)
-        set(GGML_AVX512       ON CACHE BOOL "" FORCE)
-    endif()
-    message(STATUS
-        "ZeroMoE: AVX-512 VNNI=${ZEROMOE_ENABLE_AVX512_VNNI} (ZeroMoE and ggml CPU kernels)")
+# Disable everything we do not need for a CPU decode assistant, except the
+# explicit experimental CUDA backend option. GGML_CUDA must be set BEFORE
+# the subproject is configured.
+set(GGML_CUDA        ${ZEROMOE_USE_GGML_CUDA} CACHE BOOL "" FORCE)
+set(GGML_CUDA_GRAPHS ${ZEROMOE_ENABLE_CUDA_GRAPHS} CACHE BOOL "" FORCE)
+# Loud, impossible-to-miss configure-time confirmation of the exact
+# setting that silently regressed full-graph decode from ~20 tok/s to
+# ~8 tok/s once already (see ZEROMOE_ENABLE_CUDA_GRAPHS's own comment
+# above). A default is not a guarantee -- print the resolved value on
+# every configure, and fail outright if CUDA is on but graphs got
+# turned off without an explicit, informed override.
+if(ZEROMOE_USE_GGML_CUDA AND NOT ZEROMOE_ENABLE_CUDA_GRAPHS)
+    message(WARNING
+        "ZEROMOE_USE_GGML_CUDA=ON but ZEROMOE_ENABLE_CUDA_GRAPHS=OFF: "
+        "full-graph decode will silently run WITHOUT CUDA graph capture/"
+        "replay (every node becomes an individual cudaLaunchKernel). "
+        "This previously cost ~20 tok/s -> ~8 tok/s and was mistaken for "
+        "a correctness/scheduling bug for an entire investigation. Only "
+        "disable this deliberately for a real A/B; the runtime "
+        "[CUDA-GRAPHS-CHECK] log line will also confirm this at every "
+        "process start regardless of this setting.")
+else()
+    message(STATUS "ZeroMoE: GGML_CUDA_GRAPHS=${GGML_CUDA_GRAPHS} "
+                   "(verified again at runtime via [CUDA-GRAPHS-CHECK])")
+endif()
+set(GGML_HIPBLAS     OFF CACHE BOOL "" FORCE)
+set(GGML_VULKAN      OFF CACHE BOOL "" FORCE)
+set(GGML_SYCL        OFF CACHE BOOL "" FORCE)
+if(ZEROMOE_GGML_OPENMP AND NOT OpenMP_CXX_FOUND)
+    message(WARNING "ZEROMOE_GGML_OPENMP=ON requested, but OpenMP was not found; ggml CPU backend will use its native threadpool")
+endif()
+set(GGML_OPENMP      ${ZEROMOE_GGML_OPENMP} CACHE BOOL "" FORCE)
+message(STATUS "ZeroMoE: GGML_OPENMP=${GGML_OPENMP} (ZEROMOE_GGML_OPENMP=${ZEROMOE_GGML_OPENMP})")
+# Keep ggml's CPU backend on the same ISA choice as ZeroMoE's CPU
+# kernels.  This is the single opt-out for older CPUs: setting
+# ZEROMOE_ENABLE_AVX512_VNNI=OFF also disables VNNI in ggml, including
+# when reconfiguring a build directory that previously had it enabled.
+set(GGML_AVX512_VNNI ${ZEROMOE_ENABLE_AVX512_VNNI} CACHE BOOL "" FORCE)
+if(ZEROMOE_ENABLE_AVX512_VNNI)
+    set(GGML_AVX512       ON CACHE BOOL "" FORCE)
+endif()
+message(STATUS
+    "ZeroMoE: AVX-512 VNNI=${ZEROMOE_ENABLE_AVX512_VNNI} (ZeroMoE and ggml CPU kernels)")
 
-    if(ZEROMOE_METAL AND APPLE)
-        # ggml's Metal backend requires the offline shader compiler (metal,
-        # metallib), which Apple only ships inside the full Xcode.app.  Our
-        # own MPS dispatch uses the runtime Metal Performance Shaders API and
-        # does NOT need those tools.  If the compiler is missing, keep our MPS
-        # path alive but turn off ggml Metal to avoid a configure/build failure.
-        find_program(_ZEROMOE_METALC metal)
-        find_program(_ZEROMOE_METALLIB metallib)
-        if(_ZEROMOE_METALC AND _ZEROMOE_METALLIB)
-            set(GGML_METAL ON CACHE BOOL "" FORCE)
-            message(STATUS "ZeroMoE: ggml Metal backend enabled (metal/metallib found)")
-        else()
-            set(GGML_METAL OFF CACHE BOOL "" FORCE)
-            message(STATUS "ZeroMoE: ggml Metal backend disabled (full Xcode not installed); "
-                            "custom MPS dispatch still enabled")
-        endif()
+if(ZEROMOE_METAL AND APPLE)
+    # ggml's Metal backend requires the offline shader compiler (metal,
+    # metallib), which Apple only ships inside the full Xcode.app.  Our
+    # own MPS dispatch uses the runtime Metal Performance Shaders API and
+    # does NOT need those tools.  If the compiler is missing, keep our MPS
+    # path alive but turn off ggml Metal to avoid a configure/build failure.
+    find_program(_ZEROMOE_METALC metal)
+    find_program(_ZEROMOE_METALLIB metallib)
+    if(_ZEROMOE_METALC AND _ZEROMOE_METALLIB)
+        set(GGML_METAL ON CACHE BOOL "" FORCE)
+        message(STATUS "ZeroMoE: ggml Metal backend enabled (metal/metallib found)")
     else()
         set(GGML_METAL OFF CACHE BOOL "" FORCE)
+        message(STATUS "ZeroMoE: ggml Metal backend disabled (full Xcode not installed); "
+                        "custom MPS dispatch still enabled")
     endif()
-
-    if(NOT ZEROMOE_GGML_ROOT)
-        # Default: ggml/ from the pinned llama.cpp submodule (third_party/llama.cpp, commit ZEROMOE_GGML_COMMIT).
-        # It is copied into the build tree before the patch series is applied, so the submodule is never modified.
-        set(_zeromoe_ggml_src "${CMAKE_BINARY_DIR}/_deps/ggml-src")
-        set(_zeromoe_ggml_submodule "${CMAKE_SOURCE_DIR}/third_party/llama.cpp/ggml")
-        if(NOT EXISTS "${_zeromoe_ggml_src}/CMakeLists.txt")
-            if(EXISTS "${_zeromoe_ggml_submodule}/CMakeLists.txt")
-                message(STATUS "ZeroMoE: copying ggml from third_party/llama.cpp/ggml into the build tree")
-                file(COPY "${_zeromoe_ggml_submodule}/" DESTINATION "${_zeromoe_ggml_src}"
-                     PATTERN ".git" EXCLUDE)
-            else()
-                # Submodule not initialised: fetch the same commit into the build tree.
-                message(STATUS "ZeroMoE: third_party/llama.cpp missing; fetching ${ZEROMOE_GGML_COMMIT} ...")
-                set(_zeromoe_fetch "${CMAKE_BINARY_DIR}/_deps/llama-fetch")
-                file(MAKE_DIRECTORY "${_zeromoe_fetch}")
-                file(REMOVE_RECURSE "${_zeromoe_fetch}")
-                file(MAKE_DIRECTORY "${_zeromoe_fetch}")
-                # Shallow, blob-less, sparse: only ggml/ is downloaded (about 5 MB, not the 390 MB whole tree).
-                foreach(_cmd "init -q"
-                              "remote add origin https://github.com/ggml-org/llama.cpp"
-                              "config extensions.partialClone origin"
-                              "config remote.origin.promisor true"
-                              "config remote.origin.partialclonefilter blob:none"
-                              "sparse-checkout init --no-cone"
-                              "sparse-checkout set /ggml/"
-                              "fetch -q --depth 1 --filter=blob:none origin ${ZEROMOE_GGML_COMMIT}"
-                              "checkout -q FETCH_HEAD")
-                    separate_arguments(_args UNIX_COMMAND "${_cmd}")
-                    execute_process(COMMAND git ${_args} WORKING_DIRECTORY "${_zeromoe_fetch}"
-                        RESULT_VARIABLE _rc ERROR_VARIABLE _err OUTPUT_QUIET)
-                    if(NOT _rc EQUAL 0)
-                        message(FATAL_ERROR
-                            "ggml source not found: third_party/llama.cpp is empty and the fetch failed (${_err}). "
-                            "Run: scripts/init_ggml.sh (fetches only ggml/, about 5 MB), or set ZEROMOE_GGML_ROOT.")
-                    endif()
-                endforeach()
-                file(COPY "${_zeromoe_fetch}/ggml/" DESTINATION "${_zeromoe_ggml_src}")
-                endif()
-            endif()
-        set(ZEROMOE_GGML_ROOT "${_zeromoe_ggml_src}")
-    endif()
-
-    # Apply ZeroMoE's ggml patch series (patches/README.md).  Idempotent:
-    # already-applied patches are detected by a reverse apply check.
-    # Link an already-built ggml instead of compiling it in-tree. The prebuilt tree must come
-    # from the same ZEROMOE_GGML_ROOT (its headers are used) and ggml patches are NOT re-applied.
-    set(ZEROMOE_GGML_PREBUILT_DIR "" CACHE PATH "Directory holding prebuilt libggml*.so (skips building ggml)")
-    if(ZEROMOE_GGML_PREBUILT_DIR)
-        foreach(_lib ggml ggml-base ggml-cpu)
-            add_library(${_lib} SHARED IMPORTED GLOBAL)
-            set_target_properties(${_lib} PROPERTIES
-                IMPORTED_LOCATION "${ZEROMOE_GGML_PREBUILT_DIR}/src/lib${_lib}.so"
-                INTERFACE_INCLUDE_DIRECTORIES "${ZEROMOE_GGML_ROOT}/include")
-        endforeach()
-        set_property(TARGET ggml PROPERTY INTERFACE_LINK_LIBRARIES "ggml-cpu;ggml-base")
-        set_property(TARGET ggml-cpu PROPERTY INTERFACE_LINK_LIBRARIES "ggml-base")
-        add_library(ggml-cuda SHARED IMPORTED GLOBAL)
-        set_target_properties(ggml-cuda PROPERTIES
-            IMPORTED_LOCATION "${ZEROMOE_GGML_PREBUILT_DIR}/src/ggml-cuda/libggml-cuda.so"
-            INTERFACE_INCLUDE_DIRECTORIES "${ZEROMOE_GGML_ROOT}/include"
-            INTERFACE_LINK_LIBRARIES "ggml-base")
-        message(STATUS "ZeroMoE: linking PREBUILT ggml from ${ZEROMOE_GGML_PREBUILT_DIR} (no ggml compile)")
-    else()
-        include(cmake/ZeroMoEGgmlPatches.cmake)
-        zeromoe_apply_ggml_patches("${ZEROMOE_GGML_ROOT}")
-        # The common build-tree copy has no .git directory. Without an
-        # explicit revision, ggml's version probe can walk up to ZeroMoE's
-        # repository and stamp the application commit as GGML_COMMIT.
-        set(_zeromoe_ggml_build_commit "")
-        if(EXISTS "${ZEROMOE_GGML_ROOT}/.git")
-            execute_process(
-                COMMAND git -C "${ZEROMOE_GGML_ROOT}" rev-parse --short HEAD
-                OUTPUT_VARIABLE _zeromoe_ggml_build_commit
-                OUTPUT_STRIP_TRAILING_WHITESPACE
-                ERROR_QUIET)
-        endif()
-        if(NOT _zeromoe_ggml_build_commit AND ZEROMOE_GGML_COMMIT)
-            set(_zeromoe_ggml_build_commit "${ZEROMOE_GGML_COMMIT}")
-        endif()
-        if(NOT _zeromoe_ggml_build_commit)
-            set(_zeromoe_ggml_build_commit "unknown")
-        endif()
-        set(GGML_BUILD_COMMIT "${_zeromoe_ggml_build_commit}")
-        message(STATUS "ZeroMoE: GGML source revision=${GGML_BUILD_COMMIT}")
-        add_subdirectory("${ZEROMOE_GGML_ROOT}" ggml-build)
-    endif()
-    message(STATUS "ZeroMoE: using ggml at ${ZEROMOE_GGML_ROOT}")
-
-    # ggml-quants.h lives in ggml/src/, not in the public include/ directory.
-    # Expose it to our bridge translation unit.
-    set(ZEROMOE_GGML_SRC_DIR "${ZEROMOE_GGML_ROOT}/src")
+else()
+    set(GGML_METAL OFF CACHE BOOL "" FORCE)
 endif()
+
+if(NOT ZEROMOE_GGML_ROOT)
+    # Default: ggml/ from the pinned llama.cpp submodule (third_party/llama.cpp, commit ZEROMOE_GGML_COMMIT).
+    # It is copied into the build tree before the patch series is applied, so the submodule is never modified.
+    set(_zeromoe_ggml_src "${CMAKE_BINARY_DIR}/_deps/ggml-src")
+    set(_zeromoe_ggml_submodule "${CMAKE_SOURCE_DIR}/third_party/llama.cpp/ggml")
+    if(NOT EXISTS "${_zeromoe_ggml_src}/CMakeLists.txt")
+        if(EXISTS "${_zeromoe_ggml_submodule}/CMakeLists.txt")
+            message(STATUS "ZeroMoE: copying ggml from third_party/llama.cpp/ggml into the build tree")
+            file(COPY "${_zeromoe_ggml_submodule}/" DESTINATION "${_zeromoe_ggml_src}"
+                 PATTERN ".git" EXCLUDE)
+        else()
+            # Submodule not initialised: fetch the same commit into the build tree.
+            message(STATUS "ZeroMoE: third_party/llama.cpp missing; fetching ${ZEROMOE_GGML_COMMIT} ...")
+            set(_zeromoe_fetch "${CMAKE_BINARY_DIR}/_deps/llama-fetch")
+            file(MAKE_DIRECTORY "${_zeromoe_fetch}")
+            file(REMOVE_RECURSE "${_zeromoe_fetch}")
+            file(MAKE_DIRECTORY "${_zeromoe_fetch}")
+            # Shallow, blob-less, sparse: only ggml/ is downloaded (about 5 MB, not the 390 MB whole tree).
+            foreach(_cmd "init -q"
+                          "remote add origin https://github.com/ggml-org/llama.cpp"
+                          "config extensions.partialClone origin"
+                          "config remote.origin.promisor true"
+                          "config remote.origin.partialclonefilter blob:none"
+                          "sparse-checkout init --no-cone"
+                          "sparse-checkout set /ggml/"
+                          "fetch -q --depth 1 --filter=blob:none origin ${ZEROMOE_GGML_COMMIT}"
+                          "checkout -q FETCH_HEAD")
+                separate_arguments(_args UNIX_COMMAND "${_cmd}")
+                execute_process(COMMAND git ${_args} WORKING_DIRECTORY "${_zeromoe_fetch}"
+                    RESULT_VARIABLE _rc ERROR_VARIABLE _err OUTPUT_QUIET)
+                if(NOT _rc EQUAL 0)
+                    message(FATAL_ERROR
+                        "ggml source not found: third_party/llama.cpp is empty and the fetch failed (${_err}). "
+                        "Run: scripts/init_ggml.sh (fetches only ggml/, about 5 MB), or set ZEROMOE_GGML_ROOT.")
+                endif()
+            endforeach()
+            file(COPY "${_zeromoe_fetch}/ggml/" DESTINATION "${_zeromoe_ggml_src}")
+            endif()
+        endif()
+    set(ZEROMOE_GGML_ROOT "${_zeromoe_ggml_src}")
+endif()
+
+# Apply ZeroMoE's ggml patch series (patches/README.md).  Idempotent:
+# already-applied patches are detected by a reverse apply check.
+# Link an already-built ggml instead of compiling it in-tree. The prebuilt tree must come
+# from the same ZEROMOE_GGML_ROOT (its headers are used) and ggml patches are NOT re-applied.
+set(ZEROMOE_GGML_PREBUILT_DIR "" CACHE PATH "Directory holding prebuilt libggml*.so (skips building ggml)")
+if(ZEROMOE_GGML_PREBUILT_DIR)
+    foreach(_lib ggml ggml-base ggml-cpu)
+        add_library(${_lib} SHARED IMPORTED GLOBAL)
+        set_target_properties(${_lib} PROPERTIES
+            IMPORTED_LOCATION "${ZEROMOE_GGML_PREBUILT_DIR}/src/lib${_lib}.so"
+            INTERFACE_INCLUDE_DIRECTORIES "${ZEROMOE_GGML_ROOT}/include")
+    endforeach()
+    set_property(TARGET ggml PROPERTY INTERFACE_LINK_LIBRARIES "ggml-cpu;ggml-base")
+    set_property(TARGET ggml-cpu PROPERTY INTERFACE_LINK_LIBRARIES "ggml-base")
+    add_library(ggml-cuda SHARED IMPORTED GLOBAL)
+    set_target_properties(ggml-cuda PROPERTIES
+        IMPORTED_LOCATION "${ZEROMOE_GGML_PREBUILT_DIR}/src/ggml-cuda/libggml-cuda.so"
+        INTERFACE_INCLUDE_DIRECTORIES "${ZEROMOE_GGML_ROOT}/include"
+        INTERFACE_LINK_LIBRARIES "ggml-base")
+    message(STATUS "ZeroMoE: linking PREBUILT ggml from ${ZEROMOE_GGML_PREBUILT_DIR} (no ggml compile)")
+else()
+    include(cmake/ZeroMoEGgmlPatches.cmake)
+    zeromoe_apply_ggml_patches("${ZEROMOE_GGML_ROOT}")
+    # The common build-tree copy has no .git directory. Without an
+    # explicit revision, ggml's version probe can walk up to ZeroMoE's
+    # repository and stamp the application commit as GGML_COMMIT.
+    set(_zeromoe_ggml_build_commit "")
+    if(EXISTS "${ZEROMOE_GGML_ROOT}/.git")
+        execute_process(
+            COMMAND git -C "${ZEROMOE_GGML_ROOT}" rev-parse --short HEAD
+            OUTPUT_VARIABLE _zeromoe_ggml_build_commit
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET)
+    endif()
+    if(NOT _zeromoe_ggml_build_commit AND ZEROMOE_GGML_COMMIT)
+        set(_zeromoe_ggml_build_commit "${ZEROMOE_GGML_COMMIT}")
+    endif()
+    if(NOT _zeromoe_ggml_build_commit)
+        set(_zeromoe_ggml_build_commit "unknown")
+    endif()
+    set(GGML_BUILD_COMMIT "${_zeromoe_ggml_build_commit}")
+    message(STATUS "ZeroMoE: GGML source revision=${GGML_BUILD_COMMIT}")
+    add_subdirectory("${ZEROMOE_GGML_ROOT}" ggml-build)
+endif()
+message(STATUS "ZeroMoE: using ggml at ${ZEROMOE_GGML_ROOT}")
+
+# ggml-quants.h lives in ggml/src/, not in the public include/ directory.
+# Expose it to our bridge translation unit.
+set(ZEROMOE_GGML_SRC_DIR "${ZEROMOE_GGML_ROOT}/src")
 
 # ---------------------------------------------------------------------------
 # Common include path
@@ -572,24 +550,21 @@ if(NOT ZEROMOE_CPU_ONLY)
     if(OpenMP_CXX_FOUND)
         target_link_libraries(zeromoe PRIVATE OpenMP::OpenMP_CXX)
     endif()
-    if(ZEROMOE_USE_GGML)
-        target_link_libraries(zeromoe PRIVATE ggml)
-        if(ZEROMOE_USE_GGML_CUDA)
-            target_link_libraries(zeromoe PRIVATE ggml-cuda)
-            # Gates backends/ggml/ggml_moe_backend.hpp's real implementation. Without
-            # it that file still compiles, but every entry point returns false
-            # and execution_layer.cpp falls back to its own dispatch.
-            target_compile_definitions(zeromoe PRIVATE ZEROMOE_USE_GGML_CUDA=1)
-        endif()
-        target_compile_definitions(zeromoe PRIVATE ZEROMOE_USE_GGML=1)
-        target_include_directories(zeromoe PRIVATE ${ZEROMOE_GGML_SRC_DIR})
-        if(ZEROMOE_USE_GGML_CUDA)
-            target_sources(zeromoe PRIVATE
-                backends/exl3/exl3_ggml_backend.cpp
-                backends/exl3/exl3_ggml_ffn.cpp
-                backends/exl3/exl3_ggml_model.cpp)
-            target_include_directories(zeromoe PRIVATE ${ZEROMOE_GGML_SRC_DIR}/src)
-        endif()
+    target_link_libraries(zeromoe PRIVATE ggml)
+    if(ZEROMOE_USE_GGML_CUDA)
+        target_link_libraries(zeromoe PRIVATE ggml-cuda)
+        # Gates backends/ggml/ggml_moe_backend.hpp's real implementation. Without
+        # it that file still compiles, but every entry point returns false
+        # and execution_layer.cpp falls back to its own dispatch.
+        target_compile_definitions(zeromoe PRIVATE ZEROMOE_USE_GGML_CUDA=1)
+    endif()
+    target_include_directories(zeromoe PRIVATE ${ZEROMOE_GGML_SRC_DIR})
+    if(ZEROMOE_USE_GGML_CUDA)
+        target_sources(zeromoe PRIVATE
+            backends/exl3/exl3_ggml_backend.cpp
+            backends/exl3/exl3_ggml_ffn.cpp
+            backends/exl3/exl3_ggml_model.cpp)
+        target_include_directories(zeromoe PRIVATE ${ZEROMOE_GGML_SRC_DIR}/src)
     endif()
 
     # Synthetic parity: legacy EXL3 kernel vs upstream exl3_gemm (no model needed).
@@ -710,23 +685,20 @@ if(NOT ZEROMOE_CPU_ONLY)
     if(OpenMP_CXX_FOUND)
         target_link_libraries(zeromoe_tests PRIVATE OpenMP::OpenMP_CXX)
     endif()
-    if(ZEROMOE_USE_GGML)
-        target_link_libraries(zeromoe_tests PRIVATE ggml)
-        if(ZEROMOE_USE_GGML_CUDA)
-            target_link_libraries(zeromoe_tests PRIVATE ggml-cuda)
-            target_compile_definitions(zeromoe_tests PRIVATE ZEROMOE_USE_GGML_CUDA=1)
-        endif()
-        target_compile_definitions(zeromoe_tests PRIVATE ZEROMOE_USE_GGML=1)
-        target_include_directories(zeromoe_tests PRIVATE ${ZEROMOE_GGML_SRC_DIR})
-        if(ZEROMOE_USE_GGML_CUDA)
-            target_sources(zeromoe_tests PRIVATE
-                backends/exl3/exl3_ggml_backend.cpp
-                backends/exl3/exl3_ggml_ffn.cpp
-                backends/exl3/exl3_ggml_model.cpp
-                backends/exl3/exl3_model_loader.cpp
-                models/base/safetensors_adapter.cpp)
-            target_include_directories(zeromoe_tests PRIVATE ${ZEROMOE_GGML_SRC_DIR}/src)
-        endif()
+    target_link_libraries(zeromoe_tests PRIVATE ggml)
+    if(ZEROMOE_USE_GGML_CUDA)
+        target_link_libraries(zeromoe_tests PRIVATE ggml-cuda)
+        target_compile_definitions(zeromoe_tests PRIVATE ZEROMOE_USE_GGML_CUDA=1)
+    endif()
+    target_include_directories(zeromoe_tests PRIVATE ${ZEROMOE_GGML_SRC_DIR})
+    if(ZEROMOE_USE_GGML_CUDA)
+        target_sources(zeromoe_tests PRIVATE
+            backends/exl3/exl3_ggml_backend.cpp
+            backends/exl3/exl3_ggml_ffn.cpp
+            backends/exl3/exl3_ggml_model.cpp
+            backends/exl3/exl3_model_loader.cpp
+            models/base/safetensors_adapter.cpp)
+        target_include_directories(zeromoe_tests PRIVATE ${ZEROMOE_GGML_SRC_DIR}/src)
     endif()
 
     if(ZEROMOE_USE_GGML_CUDA)
@@ -761,7 +733,7 @@ if(NOT ZEROMOE_CPU_ONLY)
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
         VERBATIM)
 
-    if(ZEROMOE_USE_GGML AND ZEROMOE_USE_GGML_CUDA)
+    if(ZEROMOE_USE_GGML_CUDA)
         add_executable(phase_alias_numerics_test EXCLUDE_FROM_ALL tests/test_phase_alias_numerics.cpp)
         target_include_directories(phase_alias_numerics_test PRIVATE ${ZEROMOE_GGML_ROOT}/include ${CUDAToolkit_INCLUDE_DIRS})
         target_link_libraries(phase_alias_numerics_test PRIVATE ggml ggml-cuda CUDA::cudart)
@@ -769,20 +741,16 @@ if(NOT ZEROMOE_CPU_ONLY)
     target_include_directories(real_tensor_numerics_test PRIVATE ${ZEROMOE_GGML_ROOT}/include ${CUDAToolkit_INCLUDE_DIRS})
     target_link_libraries(real_tensor_numerics_test PRIVATE ggml ggml-cuda CUDA::cudart)
     endif()
-    if(ZEROMOE_USE_GGML)
-        add_executable(layer_plan_test EXCLUDE_FROM_ALL tests/test_layer_plan.cpp)
-        target_include_directories(layer_plan_test PRIVATE ${ZEROMOE_INCLUDE_DIRS}
-            ${ZEROMOE_GGML_SRC_DIR})
-        target_include_directories(layer_plan_test PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
-        target_compile_definitions(layer_plan_test PRIVATE ZEROMOE_USE_GGML=1 ZEROMOE_USE_GGML_CUDA=1)
-        target_link_libraries(layer_plan_test PRIVATE ggml CUDA::cudart)
-    endif()
-    if(ZEROMOE_USE_GGML)
-        add_executable(quant_table_test EXCLUDE_FROM_ALL tests/test_quant_table.cpp)
-        target_include_directories(quant_table_test PRIVATE ${ZEROMOE_INCLUDE_DIRS}
-            ${ZEROMOE_GGML_SRC_DIR})
-        target_link_libraries(quant_table_test PRIVATE ggml)
-    endif()
+    add_executable(layer_plan_test EXCLUDE_FROM_ALL tests/test_layer_plan.cpp)
+    target_include_directories(layer_plan_test PRIVATE ${ZEROMOE_INCLUDE_DIRS}
+        ${ZEROMOE_GGML_SRC_DIR})
+    target_include_directories(layer_plan_test PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    target_compile_definitions(layer_plan_test PRIVATE ZEROMOE_USE_GGML_CUDA=1)
+    target_link_libraries(layer_plan_test PRIVATE ggml CUDA::cudart)
+    add_executable(quant_table_test EXCLUDE_FROM_ALL tests/test_quant_table.cpp)
+    target_include_directories(quant_table_test PRIVATE ${ZEROMOE_INCLUDE_DIRS}
+        ${ZEROMOE_GGML_SRC_DIR})
+    target_link_libraries(quant_table_test PRIVATE ggml)
     add_executable(graph_settings_test EXCLUDE_FROM_ALL tests/test_graph_settings.cpp)
     target_include_directories(graph_settings_test PRIVATE ${ZEROMOE_INCLUDE_DIRS})
     add_executable(resident_memory_policy_test EXCLUDE_FROM_ALL tests/test_resident_memory_policy.cpp)
@@ -795,7 +763,7 @@ if(NOT ZEROMOE_CPU_ONLY)
 
     # Exact F32 parity for DeepSeek's quantized grouped output projection.
     # Uses the real CPU dot and GGML quantizer/dequantizer as the oracle.
-    if(ZEROMOE_USE_GGML AND ZEROMOE_USE_GGML_CUDA)
+    if(ZEROMOE_USE_GGML_CUDA)
         add_executable(dsv41_grouped_outproj_test EXCLUDE_FROM_ALL
             tests/test_dsv41_grouped_outproj.cpp
             backends/cpu/kernels_cpu.cpp
@@ -803,8 +771,6 @@ if(NOT ZEROMOE_CPU_ONLY)
             kernels/quant/kquant_matmul.cu)
         target_include_directories(dsv41_grouped_outproj_test PRIVATE
             ${ZEROMOE_GGML_SRC_DIR})
-        target_compile_definitions(dsv41_grouped_outproj_test PRIVATE
-            ZEROMOE_USE_GGML=1)
         target_compile_options(dsv41_grouped_outproj_test PRIVATE
             ${ZEROMOE_AVX512_FLAGS})
         set_target_properties(dsv41_grouped_outproj_test PROPERTIES
@@ -835,18 +801,16 @@ if(NOT ZEROMOE_CPU_ONLY)
     target_include_directories(cuda_raii_test PRIVATE ${ZEROMOE_INCLUDE_DIRS})
     target_link_libraries(cuda_raii_test PRIVATE CUDA::cudart)
 
-    # GGML-only Qwen CPU MoE timing probe.  The same source is also compiled
+    # GGML Qwen CPU MoE timing probe.  The same source is also compiled
     # by bench/run_qwen_cpu_moe_compare.sh against llama.cpp's GGML shared
     # libraries, giving a layer-graph comparison without loading a model.
-    if(ZEROMOE_USE_GGML)
-        add_executable(qwen_cpu_moe_ggml_bench
-            bench/qwen_cpu_moe_ggml_bench.cpp)
-        target_include_directories(qwen_cpu_moe_ggml_bench PRIVATE
-            ${ZEROMOE_GGML_SRC_DIR})
-        target_compile_options(qwen_cpu_moe_ggml_bench PRIVATE
-            ${ZEROMOE_AVX512_FLAGS})
-        target_link_libraries(qwen_cpu_moe_ggml_bench PRIVATE ggml)
-    endif()
+    add_executable(qwen_cpu_moe_ggml_bench
+        bench/qwen_cpu_moe_ggml_bench.cpp)
+    target_include_directories(qwen_cpu_moe_ggml_bench PRIVATE
+        ${ZEROMOE_GGML_SRC_DIR})
+    target_compile_options(qwen_cpu_moe_ggml_bench PRIVATE
+        ${ZEROMOE_AVX512_FLAGS})
+    target_link_libraries(qwen_cpu_moe_ggml_bench PRIVATE ggml)
 
     add_executable(exl3_kernel_bench EXCLUDE_FROM_ALL
         bench/exl3_kernel_bench.cu
@@ -859,7 +823,7 @@ if(NOT ZEROMOE_CPU_ONLY)
         CUDA_ARCHITECTURES 86)
     target_link_libraries(exl3_kernel_bench PRIVATE CUDA::cudart)
 
-    if(ZEROMOE_USE_GGML AND ZEROMOE_USE_GGML_CUDA)
+    if(ZEROMOE_USE_GGML_CUDA)
         add_executable(exl3_ggml_custom_bench EXCLUDE_FROM_ALL
             bench/exl3_ggml_custom_bench.cpp
             backends/exl3/exl3_aux.cu
@@ -868,7 +832,7 @@ if(NOT ZEROMOE_CPU_ONLY)
             ${ZEROMOE_INCLUDE_DIRS}
             ${ZEROMOE_GGML_SRC_DIR})
         target_compile_definitions(exl3_ggml_custom_bench PRIVATE
-            ZEROMOE_USE_GGML=1 ZEROMOE_USE_GGML_CUDA=1)
+            ZEROMOE_USE_GGML_CUDA=1)
         set_target_properties(exl3_ggml_custom_bench PROPERTIES
             CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
         target_link_libraries(exl3_ggml_custom_bench PRIVATE
@@ -884,7 +848,7 @@ if(NOT ZEROMOE_CPU_ONLY)
             ${ZEROMOE_GGML_SRC_DIR}
             ${ZEROMOE_GGML_SRC_DIR}/src)
         target_compile_definitions(exl3_ggml_cuda_adapter_bench PRIVATE
-            ZEROMOE_USE_GGML=1 ZEROMOE_USE_GGML_CUDA=1)
+            ZEROMOE_USE_GGML_CUDA=1)
         set_target_properties(exl3_ggml_cuda_adapter_bench PROPERTIES
             CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
         target_link_libraries(exl3_ggml_cuda_adapter_bench PRIVATE
@@ -907,7 +871,7 @@ if(NOT ZEROMOE_CPU_ONLY)
         target_compile_options(exl3_ggml_cuda_real_bench PRIVATE
             ${ZEROMOE_AVX512_FLAGS})
         target_compile_definitions(exl3_ggml_cuda_real_bench PRIVATE
-            ZEROMOE_USE_GGML=1 ZEROMOE_USE_GGML_CUDA=1)
+            ZEROMOE_USE_GGML_CUDA=1)
         set_target_properties(exl3_ggml_cuda_real_bench PROPERTIES
             CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
         target_link_libraries(exl3_ggml_cuda_real_bench PRIVATE
@@ -936,7 +900,7 @@ if(NOT ZEROMOE_CPU_ONLY)
         target_compile_options(exl3_ggml_cuda_real_ffn_bench PRIVATE
             ${ZEROMOE_AVX512_FLAGS})
         target_compile_definitions(exl3_ggml_cuda_real_ffn_bench PRIVATE
-            ZEROMOE_USE_GGML=1 ZEROMOE_USE_GGML_CUDA=1
+            ZEROMOE_USE_GGML_CUDA=1
             ZEROMOE_EXL3_CUDA=1)
         set_target_properties(exl3_ggml_cuda_real_ffn_bench PROPERTIES
             CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
@@ -966,7 +930,7 @@ if(NOT ZEROMOE_CPU_ONLY)
         target_compile_options(exl3_ggml_cuda_real_routed_ffn_bench PRIVATE
             ${ZEROMOE_AVX512_FLAGS})
         target_compile_definitions(exl3_ggml_cuda_real_routed_ffn_bench PRIVATE
-            ZEROMOE_USE_GGML=1 ZEROMOE_USE_GGML_CUDA=1
+            ZEROMOE_USE_GGML_CUDA=1
             ZEROMOE_EXL3_CUDA=1)
         set_target_properties(exl3_ggml_cuda_real_routed_ffn_bench PROPERTIES
             CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
@@ -997,7 +961,7 @@ if(NOT ZEROMOE_CPU_ONLY)
         target_compile_options(exl3_ggml_cuda_cache_graph_bench PRIVATE
             ${ZEROMOE_AVX512_FLAGS})
         target_compile_definitions(exl3_ggml_cuda_cache_graph_bench PRIVATE
-            ZEROMOE_USE_GGML=1 ZEROMOE_USE_GGML_CUDA=1
+            ZEROMOE_USE_GGML_CUDA=1
             ZEROMOE_EXL3_CUDA=1)
         set_target_properties(exl3_ggml_cuda_cache_graph_bench PROPERTIES
             CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
@@ -1018,7 +982,7 @@ if(NOT ZEROMOE_CPU_ONLY)
             ${ZEROMOE_GGML_SRC_DIR}
             ${ZEROMOE_GGML_SRC_DIR}/src)
         target_compile_definitions(exl3_ggml_cuda_fused_ffn_bench PRIVATE
-            ZEROMOE_USE_GGML=1 ZEROMOE_USE_GGML_CUDA=1)
+            ZEROMOE_USE_GGML_CUDA=1)
         set_target_properties(exl3_ggml_cuda_fused_ffn_bench PROPERTIES
             CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
         target_link_libraries(exl3_ggml_cuda_fused_ffn_bench PRIVATE
@@ -1033,14 +997,14 @@ if(NOT ZEROMOE_CPU_ONLY)
             ${ZEROMOE_GGML_SRC_DIR}
             ${ZEROMOE_GGML_SRC_DIR}/src)
         target_compile_definitions(exl3_ggml_cuda_moe_bench PRIVATE
-            ZEROMOE_USE_GGML=1 ZEROMOE_USE_GGML_CUDA=1)
+            ZEROMOE_USE_GGML_CUDA=1)
         set_target_properties(exl3_ggml_cuda_moe_bench PROPERTIES
             CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
         target_link_libraries(exl3_ggml_cuda_moe_bench PRIVATE
             CUDA::cudart CUDA::cublas CUDA::cublasLt ggml ggml-cuda)
     endif()
 
-    if(ZEROMOE_USE_GGML AND OpenMP_CXX_FOUND)
+    if(OpenMP_CXX_FOUND)
         add_executable(exl3_cpu_bench EXCLUDE_FROM_ALL
             bench/exl3_cpu_bench.cpp
             backends/exl3/exl3_cpu.cpp
@@ -1051,7 +1015,6 @@ if(NOT ZEROMOE_CPU_ONLY)
             ${ZEROMOE_GGML_SRC_DIR}
             ${ZEROMOE_GGML_SRC_DIR}/src)
         target_compile_options(exl3_cpu_bench PRIVATE ${ZEROMOE_AVX512_FLAGS})
-        target_compile_definitions(exl3_cpu_bench PRIVATE ZEROMOE_USE_GGML=1)
         target_link_libraries(exl3_cpu_bench PRIVATE ggml OpenMP::OpenMP_CXX)
 
         add_executable(exl3_hc_bench EXCLUDE_FROM_ALL
@@ -1068,7 +1031,6 @@ if(NOT ZEROMOE_CPU_ONLY)
             ${ZEROMOE_GGML_SRC_DIR}/src)
         target_compile_options(exl3_hc_bench PRIVATE
             "$<$<COMPILE_LANGUAGE:CXX>:${ZEROMOE_AVX512_FLAGS}>")
-        target_compile_definitions(exl3_hc_bench PRIVATE ZEROMOE_USE_GGML=1)
         set_target_properties(exl3_hc_bench PROPERTIES
             CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
         target_link_libraries(exl3_hc_bench PRIVATE
@@ -1091,7 +1053,7 @@ if(NOT ZEROMOE_CPU_ONLY)
         target_link_libraries(qwen_iq2_cpu_cuda_probe PRIVATE
             ggml ggml-cuda CUDA::cudart)
         target_compile_definitions(qwen_iq2_cpu_cuda_probe PRIVATE
-            ZEROMOE_USE_GGML=1 ZEROMOE_USE_GGML_CUDA=1)
+            ZEROMOE_USE_GGML_CUDA=1)
     endif()
 
     # Layer-13 pointer-indirection Phase-1 laboratory.  This target links
@@ -1100,7 +1062,7 @@ if(NOT ZEROMOE_CPU_ONLY)
     # does not link the engine or mutate runtime dispatch; see the benchmark
     # source for the VRAM/mapped/H2D-stage conditions and M=1/3/6 contention
     # protocol.
-    if(ZEROMOE_USE_GGML AND EXISTS
+    if(EXISTS
        "${CMAKE_CURRENT_SOURCE_DIR}/bench/qwen4exp_pointer_spike.cu")
         add_executable(qwen4exp_pointer_spike
             bench/qwen4exp_pointer_spike.cu
@@ -1223,14 +1185,11 @@ else()
         endif()
     endif()
 
-    if(ZEROMOE_USE_GGML)
-        target_sources(kernels_cpu PRIVATE
-            backends/cpu/ggml_dequant.cpp
-            backends/cpu/ggml_grids.cpp)
-        target_link_libraries(kernels_cpu PUBLIC ggml)
-        target_compile_definitions(kernels_cpu PUBLIC ZEROMOE_USE_GGML=1)
-        target_include_directories(kernels_cpu PUBLIC ${ZEROMOE_GGML_SRC_DIR})
-    endif()
+    target_sources(kernels_cpu PRIVATE
+        backends/cpu/ggml_dequant.cpp
+        backends/cpu/ggml_grids.cpp)
+    target_link_libraries(kernels_cpu PUBLIC ggml)
+    target_include_directories(kernels_cpu PUBLIC ${ZEROMOE_GGML_SRC_DIR})
 
     # CPU-only component tests (cross-platform, no CUDA)
     add_executable(test_components tests/test_components.cpp)
@@ -1255,9 +1214,6 @@ else()
     )
     target_link_libraries(zeromoe_cpu_runtime PUBLIC kernels_cpu)
     add_executable(zeromoe_cpu backends/cpu/cpu_main.cpp)
-    if(NOT ZEROMOE_BUILD_SERVER)
-        target_link_libraries(zeromoe_cpu PRIVATE zeromoe_cpu_runtime)
-    endif()
 
     # When the kernel backend contains Objective-C++ (Metal dispatch), the
     # final executable must link the Objective-C runtime / Foundation so the
@@ -1278,22 +1234,18 @@ endif()
 
 message(STATUS "ZeroMoE: configure done")
 
-if(ZEROMOE_BUILD_SERVER)
-    enable_testing()
-    add_subdirectory(server)
-    if(TARGET zeromoe)
-        target_link_libraries(zeromoe PRIVATE zeromoe_server)
-        target_compile_definitions(zeromoe PRIVATE ZEROMOE_BUILD_SERVER=1)
-    else()
-        add_library(zeromoe_cpu_api STATIC backends/cpu/cpu_api.cpp)
-        target_link_libraries(zeromoe_cpu_api PUBLIC zeromoe_cpu_runtime zeromoe_server)
-        target_link_libraries(zeromoe_cpu PRIVATE zeromoe_cpu_api)
-        target_compile_definitions(zeromoe_cpu PRIVATE ZEROMOE_BUILD_SERVER=1)
-        if(ZEROMOE_SERVER_TESTS)
-            add_executable(cpu_api_tests tests/cpu_api_test.cpp)
-            target_link_libraries(cpu_api_tests PRIVATE zeromoe_cpu_api)
-            add_test(NAME cpu_api_tests COMMAND cpu_api_tests)
-        endif()
+enable_testing()
+add_subdirectory(server)
+if(TARGET zeromoe)
+    target_link_libraries(zeromoe PRIVATE zeromoe_server)
+else()
+    add_library(zeromoe_cpu_api STATIC backends/cpu/cpu_api.cpp)
+    target_link_libraries(zeromoe_cpu_api PUBLIC zeromoe_cpu_runtime zeromoe_server)
+    target_link_libraries(zeromoe_cpu PRIVATE zeromoe_cpu_api)
+    if(ZEROMOE_SERVER_TESTS)
+        add_executable(cpu_api_tests tests/cpu_api_test.cpp)
+        target_link_libraries(cpu_api_tests PRIVATE zeromoe_cpu_api)
+        add_test(NAME cpu_api_tests COMMAND cpu_api_tests)
     endif()
 endif()
 

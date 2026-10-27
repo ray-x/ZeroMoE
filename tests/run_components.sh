@@ -79,11 +79,6 @@ else
     if [ -f "$GGML_LIB_DIR/libggml-base.so" ]; then
         GGML_LIB_DIR="$(cd "$GGML_LIB_DIR" && pwd)"
         EXTRA_LDFLAGS="-L$GGML_LIB_DIR -lggml-cpu -lggml-base -Wl,-rpath,$GGML_LIB_DIR"
-        # kernels_cpu.cpp's direct GGML adapters (including the Q2_0 x Q8_0
-        # fallback used by the CPU components build) are guarded by this
-        # feature define. The standalone test command links GGML manually,
-        # so mirror the CMake target's compile definition when GGML is present.
-        GGML_FLAGS="-DZEROMOE_USE_GGML=1"
     else
         echo "[run_components] WARNING: $GGML_LIB_DIR/libggml-base.so not found" \
              "(run 'make build' first); backends/cpu/kernels_cpu.cpp will not link."
@@ -97,8 +92,6 @@ else
     fi
 fi
 
-GGML_FLAGS="${GGML_FLAGS:-}"
-
 # OpenMP is optional.  If the compiler accepts -fopenmp we use it; otherwise
 # the kernel sources compile single-threaded (the #pragma omp lines are
 # ignored and <omp.h> is not included).
@@ -108,8 +101,8 @@ if "$CXX" -std=c++23 -fopenmp -c -x c++ /dev/null -o /dev/null 2>/dev/null; then
 fi
 
 mkdir -p "$(dirname "$BIN")"
-echo "[run_components] $CXX -std=c++23 -O2 -Iinclude $INC_FLAGS $GGML_FLAGS $ARCH_FLAGS $OMP_FLAGS $SRC $SUPPORT_SRCS $KERNEL_SRC $EXTRA_SRCS $EXTRA_LDFLAGS -> $BIN"
-"$CXX" -std=c++23 -O2 -Iinclude $INC_FLAGS $GGML_FLAGS $ARCH_FLAGS $OMP_FLAGS -o "$BIN" "$SRC" $SUPPORT_SRCS "$KERNEL_SRC" $EXTRA_SRCS $EXTRA_LDFLAGS
+echo "[run_components] $CXX -std=c++23 -O2 -Iinclude $INC_FLAGS $ARCH_FLAGS $OMP_FLAGS $SRC $SUPPORT_SRCS $KERNEL_SRC $EXTRA_SRCS $EXTRA_LDFLAGS -> $BIN"
+"$CXX" -std=c++23 -O2 -Iinclude $INC_FLAGS $ARCH_FLAGS $OMP_FLAGS -o "$BIN" "$SRC" $SUPPORT_SRCS "$KERNEL_SRC" $EXTRA_SRCS $EXTRA_LDFLAGS
 
 ROUTE_TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/zeromoe-route-test.XXXXXX")"
 trap 'rm -rf "$ROUTE_TEST_DIR"' EXIT

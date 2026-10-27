@@ -42,8 +42,8 @@ echo "[3/4] Triggering CMake build pipeline..."
 mkdir -p build
 cd build
 
-# Full engine builds require ggml, which is the default. The full engine
-# cannot be configured without it; ZEROMOE_GGML_ROOT can supply a local tree.
+# ggml is always fetched and built; ZEROMOE_GGML_ROOT can supply a local tree
+# instead of the pinned download.
 cmake -DCMAKE_BUILD_TYPE=Release ..
 echo "[4/4] Compiling high-performance target binary..."
 make -j$(nproc)

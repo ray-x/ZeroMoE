@@ -16,7 +16,6 @@
 #include <cstdint>
 #include <mutex>
 #include <vector>
-#if defined(ZEROMOE_USE_GGML)
 // Keep these two ggml-internal declarations local instead of including
 // ggml-common.h: that header defines QK_K/QK8_0 macros and block_q*_0 types
 // which intentionally have different compatibility structs in kernels_cpu.hpp.
@@ -60,7 +59,6 @@ static void ensure_ggml_cpu_initialized() {
   static std::once_flag once;
   std::call_once(once, [] { ggml_cpu_init(); });
 }
-#endif
 
 // Qwen4Exp's direct grouped CPU path is intentionally model-local. The
 // process-wide omp_max_threads setting remains the default, but a decode
@@ -2053,7 +2051,6 @@ void matmul_iq2_xxs_ggml_avx2(float *y, const float *x,
 // IQ1_M branch is guarded by __AVX2__, not by an AVX-512/VNNI specialization.
 bool matmul_iq1_m_ggml_q8k(float *y, const float *x, const uint8_t *W_quantized,
                            int S, int I, int O) {
-#if defined(ZEROMOE_USE_GGML)
   constexpr int QK_K = 256;
   if (!y || !x || !W_quantized || S <= 0 || I <= 0 || O <= 0 || I % QK_K != 0) {
     return false;
@@ -2084,18 +2081,9 @@ bool matmul_iq1_m_ggml_q8k(float *y, const float *x, const uint8_t *W_quantized,
     }
   }
   return true;
-#else
-  (void)y;
-  (void)x;
-  (void)W_quantized;
-  (void)S;
-  (void)I;
-  (void)O;
-  return false;
-#endif
 }
 
-#if defined(ZEROMOE_USE_GGML) && defined(__AVX512F__) && \
+#if defined(__AVX512F__) && \
     defined(__AVX512BW__)
 namespace {
 
@@ -2236,7 +2224,7 @@ static float dot_iq1_m_q8k_avx512(const uint8_t *weight,
 bool matmul_iq1_m_avx512_q8k_grouped(
     float *const *y, const float *x, const uint8_t *const *W_quantized,
     int n_matrices, int S, int I, int O) {
-#if defined(ZEROMOE_USE_GGML) && defined(__AVX512F__) && defined(__AVX512BW__)
+#if defined(__AVX512F__) && defined(__AVX512BW__)
   constexpr int QK_K = 256;
   if (!y || !x || !W_quantized || n_matrices <= 0 || S <= 0 || I <= 0 ||
       O <= 0 || I % QK_K != 0)
@@ -2272,7 +2260,6 @@ namespace {
 bool matmul_iq1_m_ggml_q8k_grouped_impl(float *const *y, const float *const *x,
                                         const uint8_t *const *W_quantized,
                                         int n_matrices, int S, int I, int O) {
-#if defined(ZEROMOE_USE_GGML)
   constexpr int QK_K = 256;
   if (!y || !x || !W_quantized || n_matrices <= 0 || S <= 0 || I <= 0 ||
       O <= 0 || I % QK_K != 0)
@@ -2322,16 +2309,6 @@ bool matmul_iq1_m_ggml_q8k_grouped_impl(float *const *y, const float *const *x,
   PerfCounters::atomic_add(perf().t_cpu_dot,
                            std::chrono::duration<double>(t1 - t0).count());
   return true;
-#else
-  (void)y;
-  (void)x;
-  (void)W_quantized;
-  (void)n_matrices;
-  (void)S;
-  (void)I;
-  (void)O;
-  return false;
-#endif
 }
 
 } // namespace
@@ -2350,7 +2327,6 @@ bool matmul_iq1_m_ggml_q8k_grouped_pair(
     float *const *gate_y, float *const *up_y, const float *x,
     const uint8_t *const *gate_weights, const uint8_t *const *up_weights,
     int n_matrices, int S, int I, int O) {
-#if defined(ZEROMOE_USE_GGML)
   constexpr int QK_K = 256;
   if (!gate_y || !up_y || !x || !gate_weights || !up_weights ||
       n_matrices <= 0 || S <= 0 || I <= 0 || O <= 0 || I % QK_K != 0)
@@ -2394,18 +2370,6 @@ bool matmul_iq1_m_ggml_q8k_grouped_pair(
   PerfCounters::atomic_add(perf().t_cpu_dot,
                            std::chrono::duration<double>(t1 - t0).count());
   return true;
-#else
-  (void)gate_y;
-  (void)up_y;
-  (void)x;
-  (void)gate_weights;
-  (void)up_weights;
-  (void)n_matrices;
-  (void)S;
-  (void)I;
-  (void)O;
-  return false;
-#endif
 }
 
 bool matmul_iq1_m_ggml_q8k_grouped_inputs(float *const *y,
@@ -2651,7 +2615,6 @@ namespace {
 using q8k_dot_fn = float (*)(const uint8_t *, const block_q8_K_local *,
                              int64_t);
 
-#if defined(ZEROMOE_USE_GGML)
 // The linked GGML CPU backend exports the same production dot functions that
 // its MUL_MAT_ID implementation calls.  Keep the small adapter here so the
 // grouped Qwen path can share the existing matrix loop without changing the
@@ -2669,13 +2632,11 @@ static float dot_iq3_xxs_ggml_q8k_exact(const uint8_t *w,
   ggml_vec_dot_iq3_xxs_q8_K((int)n, &out, 0, w, 0, xq, 0, 1);
   return out;
 }
-#endif
 
 bool matmul_iqxxs_ggml_avx2_grouped_impl(float *const *y, const float *x,
                                          const uint8_t *const *W_quantized,
                                          int n_matrices, int S, int I, int O,
                                          size_t block_bytes, q8k_dot_fn dot) {
-#if defined(ZEROMOE_USE_GGML)
   constexpr int QK_K = 256;
   if (!y || !x || !W_quantized || !dot || n_matrices <= 0 || S <= 0 || I <= 0 ||
       O <= 0 || I % QK_K != 0)
@@ -2708,25 +2669,12 @@ bool matmul_iqxxs_ggml_avx2_grouped_impl(float *const *y, const float *x,
   PerfCounters::atomic_add(perf().t_cpu_dot,
                            std::chrono::duration<double>(t1 - t0).count());
   return true;
-#else
-  (void)y;
-  (void)x;
-  (void)W_quantized;
-  (void)n_matrices;
-  (void)S;
-  (void)I;
-  (void)O;
-  (void)block_bytes;
-  (void)dot;
-  return false;
-#endif
 }
 
 bool matmul_iq4_nl_ggml_q8_0_grouped_impl(float *const *y,
                                           const float *const *x,
                                           const uint8_t *const *W_quantized,
                                           int n_matrices, int S, int I, int O) {
-#if defined(ZEROMOE_USE_GGML)
   constexpr int QK4_NL = 32;
   if (!y || !x || !W_quantized || n_matrices <= 0 || S <= 0 || I <= 0 ||
       O <= 0 || I % QK4_NL != 0)
@@ -2764,16 +2712,6 @@ bool matmul_iq4_nl_ggml_q8_0_grouped_impl(float *const *y,
   PerfCounters::atomic_add(perf().t_cpu_dot,
                            std::chrono::duration<double>(t1 - t0).count());
   return true;
-#else
-  (void)y;
-  (void)x;
-  (void)W_quantized;
-  (void)n_matrices;
-  (void)S;
-  (void)I;
-  (void)O;
-  return false;
-#endif
 }
 
 } // namespace
@@ -2783,7 +2721,6 @@ bool matmul_qwen_iq1_m_iq4_nl_fused(
     const float *x, const uint8_t *const *gate_weights,
     const uint8_t *const *up_weights, const uint8_t *const *down_weights,
     int n_matrices, int I, int gate_O, int down_O, int n_threads) {
-#if defined(ZEROMOE_USE_GGML)
   constexpr int QK_K = 256;
   constexpr int QK4_NL = 32;
   if (!gate_y || !up_y || !down_y || !x || !gate_weights || !up_weights ||
@@ -2907,20 +2844,6 @@ bool matmul_qwen_iq1_m_iq4_nl_fused(
   if (stage_timing)
     qwen_cpu_stage_add(perf().t_qwen_cpu_grouped_down, stage_start);
   return true;
-#else
-  (void)gate_y;
-  (void)up_y;
-  (void)down_y;
-  (void)x;
-  (void)gate_weights;
-  (void)up_weights;
-  (void)down_weights;
-  (void)n_matrices;
-  (void)I;
-  (void)gate_O;
-  (void)down_O;
-  return false;
-#endif
 }
 
 bool matmul_qwen_iq2_xxs_iq4_nl_fused(
@@ -2928,7 +2851,6 @@ bool matmul_qwen_iq2_xxs_iq4_nl_fused(
     const float *x, const uint8_t *const *gate_weights,
     const uint8_t *const *up_weights, const uint8_t *const *down_weights,
     int n_matrices, int I, int gate_O, int down_O, int n_threads) {
-#if defined(ZEROMOE_USE_GGML)
   constexpr int QK_K = 256;
   constexpr int QK4_NL = 32;
   constexpr size_t IQ2_XXS_BLOCK_BYTES = 66;
@@ -3035,20 +2957,6 @@ bool matmul_qwen_iq2_xxs_iq4_nl_fused(
   if (stage_timing)
     qwen_cpu_stage_add(perf().t_qwen_cpu_grouped_down, stage_start);
   return true;
-#else
-  (void)gate_y;
-  (void)up_y;
-  (void)down_y;
-  (void)x;
-  (void)gate_weights;
-  (void)up_weights;
-  (void)down_weights;
-  (void)n_matrices;
-  (void)I;
-  (void)gate_O;
-  (void)down_O;
-  return false;
-#endif
 }
 
 bool matmul_qwen_q4_0_q4_0_fused(
@@ -3056,7 +2964,6 @@ bool matmul_qwen_q4_0_q4_0_fused(
     const float *x, const uint8_t *const *gate_weights,
     const uint8_t *const *up_weights, const uint8_t *const *down_weights,
     int n_matrices, int I, int gate_O, int down_O, int n_threads) {
-#if defined(ZEROMOE_USE_GGML)
   constexpr int QK4_0 = 32;
   if (!gate_y || !up_y || !down_y || !x || !gate_weights || !up_weights ||
       !down_weights || n_matrices <= 0 || I <= 0 || gate_O <= 0 ||
@@ -3157,20 +3064,6 @@ bool matmul_qwen_q4_0_q4_0_fused(
   if (stage_timing)
     qwen_cpu_stage_add(perf().t_qwen_cpu_grouped_down, stage_start);
   return true;
-#else
-  (void)gate_y;
-  (void)up_y;
-  (void)down_y;
-  (void)x;
-  (void)gate_weights;
-  (void)up_weights;
-  (void)down_weights;
-  (void)n_matrices;
-  (void)I;
-  (void)gate_O;
-  (void)down_O;
-  return false;
-#endif
 }
 
 namespace {
@@ -3394,7 +3287,6 @@ bool matmul_qwen_q2_0_q2_0_fused(
     const float *x, const uint8_t *const *gate_weights,
     const uint8_t *const *up_weights, const uint8_t *const *down_weights,
     int n_matrices, int I, int gate_O, int down_O, int n_threads) {
-#if defined(ZEROMOE_USE_GGML)
   constexpr int kBlock = 64;
   if (!gate_y || !up_y || !down_y || !x || !gate_weights || !up_weights ||
       !down_weights || n_matrices <= 0 || I <= 0 || gate_O <= 0 ||
@@ -3485,21 +3377,6 @@ bool matmul_qwen_q2_0_q2_0_fused(
     }
   }
   return true;
-#else
-  (void)gate_y;
-  (void)up_y;
-  (void)down_y;
-  (void)x;
-  (void)gate_weights;
-  (void)up_weights;
-  (void)down_weights;
-  (void)n_matrices;
-  (void)I;
-  (void)gate_O;
-  (void)down_O;
-  (void)n_threads;
-  return false;
-#endif
 }
 
 bool matmul_iq2_xxs_ggml_avx2_grouped(float *const *y, const float *x,
@@ -3519,37 +3396,15 @@ bool matmul_iq3_xxs_ggml_avx2_grouped(float *const *y, const float *x,
 bool matmul_iq2_xxs_ggml_q8k_grouped(float *const *y, const float *x,
                                      const uint8_t *const *W_quantized,
                                      int n_matrices, int S, int I, int O) {
-#if defined(ZEROMOE_USE_GGML)
   return matmul_iqxxs_ggml_avx2_grouped_impl(
       y, x, W_quantized, n_matrices, S, I, O, 66, dot_iq2_xxs_ggml_q8k_exact);
-#else
-  (void)y;
-  (void)x;
-  (void)W_quantized;
-  (void)n_matrices;
-  (void)S;
-  (void)I;
-  (void)O;
-  return false;
-#endif
 }
 
 bool matmul_iq3_xxs_ggml_q8k_grouped(float *const *y, const float *x,
                                      const uint8_t *const *W_quantized,
                                      int n_matrices, int S, int I, int O) {
-#if defined(ZEROMOE_USE_GGML)
   return matmul_iqxxs_ggml_avx2_grouped_impl(
       y, x, W_quantized, n_matrices, S, I, O, 98, dot_iq3_xxs_ggml_q8k_exact);
-#else
-  (void)y;
-  (void)x;
-  (void)W_quantized;
-  (void)n_matrices;
-  (void)S;
-  (void)I;
-  (void)O;
-  return false;
-#endif
 }
 
 bool matmul_iq4_nl_ggml_q8_0_grouped_inputs(float *const *y,

@@ -27,7 +27,6 @@ The required graph-capture build settings are:
 ```text
 CMAKE_BUILD_TYPE=Release
 CUDA target=sm_86
-ZEROMOE_USE_GGML=ON
 ZEROMOE_USE_GGML_CUDA=ON
 ZEROMOE_ENABLE_CUDA_GRAPHS=ON
 GGML_CUDA_GRAPHS=ON

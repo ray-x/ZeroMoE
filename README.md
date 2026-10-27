@@ -70,10 +70,10 @@ both ZeroMoE and ggml CPU kernels.
 
 ### OpenAI and Anthropic APIs
 
-The C++ server is built by default and exposes Chat Completions and Messages,
+The C++ server is always built and exposes Chat Completions and Messages,
 including SSE, Qwen tool calls, cancellation, and bounded request queues. It
 runs in the engine process with one inference owner; no Python gateway is
-needed. Configure with `-DZEROMOE_BUILD_SERVER=OFF` for a smaller binary.
+needed.
 
 See [API server](docs/api-server.md) for CPU/CUDA build commands, authentication,
 examples, feature limits, and the experimental opt-in CPU prompt-state cache.

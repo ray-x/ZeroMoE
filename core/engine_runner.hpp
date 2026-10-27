@@ -33,9 +33,7 @@
 #include "shutdown.hpp"
 #include "startup_preflight.hpp"
 #include "tensor_trace.hpp"
-#if defined(ZEROMOE_USE_GGML)
 #include "ggml.h"
-#endif
 #include <algorithm>
 #include <chrono>
 #include <climits>

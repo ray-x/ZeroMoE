@@ -18,10 +18,8 @@
 #include <exception>
 #include <numeric>
 
-#ifdef ZEROMOE_USE_GGML
 extern "C" int ggml_dequant_row(uint32_t type, const void *src, float *out,
                                 int n);
-#endif
 
 // Convert a quantized or F16/BF16 dense tensor to F32 in-place so the
 // CPU forward pass can call matmul() with plain float pointers.
@@ -53,7 +51,6 @@ static bool densify_tensor(CPUQuantizedTensor &qt) {
       }
     }
   } else {
-#ifdef ZEROMOE_USE_GGML
     // Quantized row-major weight [I, O]; dequantize one output row at a time.
     int I = static_cast<int>(qt.meta.shape[0]);
     int O = static_cast<int>(ne / I);
@@ -72,12 +69,6 @@ static bool densify_tensor(CPUQuantizedTensor &qt) {
         return false;
       }
     }
-#else
-    std::cerr << "[CPU-ENGINE] Quantized dense tensor requires ggml (set "
-                 "ZEROMOE_USE_GGML=ON) or a F32/F16/BF16 model.\n";
-    free(f32_buf);
-    return false;
-#endif
   }
 
   free(qt.host_ptr);

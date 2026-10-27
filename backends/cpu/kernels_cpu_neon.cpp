@@ -7,9 +7,7 @@
 // Current coverage:
 //   * f32 matmul / dot / rmsnorm / silu / elem-mul — NEON-4/NEON-8
 //   * Q4_0 / Q8_0 / IDOT paths — NEON SDOT when available, scalar tail
-//   * K-quants (Q2_K/Q3_K) and IQ types — scalar reference fallbacks.
-//     For a production CPU-only build set ZEROMOE_USE_GGML=ON so
-//     these delegate to ggml's hand-tuned ARM dequantizers.
+//   * K-quants (Q2_K/Q3_K) and IQ types — ggml ARM dequantizers.
 //
 // The function names retain their historical "_avx512" suffix in a few
 // places; this is an intentional ABI compatibility shim while the wider
@@ -452,56 +450,46 @@ void matmul_q8_idot(float *y, const float *x, const int8_t *q,
 }
 
 // ----------------------------------------------------------------------------
-// K-quant / IQ dequant — scalar reference fallbacks.
-// In a production CPU-only build, set ZEROMOE_USE_GGML=ON so these
-// call into ggml's optimized ARM dequantizers instead.
+// K-quant / IQ dequant — routed through ggml's optimized ARM dequantizers.
 // ----------------------------------------------------------------------------
-#ifdef ZEROMOE_USE_GGML
 extern "C" int ggml_dequant_row(uint32_t type, const void *src, float *out,
                                 int n);
-#endif
 
 namespace {
 
-void fallback_dequant(const char *name, const uint8_t *block, float *y,
-                      int64_t k, uint32_t type) {
-#ifdef ZEROMOE_USE_GGML
+void dequant_with_ggml(const char *name, const uint8_t *block, float *y,
+                       int64_t k, uint32_t type) {
   if (ggml_dequant_row(type, block, y, static_cast<int>(k)))
     return;
-#endif
   static std::atomic<bool> logged{false};
   if (should_log_once(logged)) {
-    LOG_INFO("[ARM-NEON] %s dequant using slow scalar fallback (set "
-             "ZEROMOE_USE_GGML=ON for optimized path)\n",
-             name);
+    LOG_INFO("[ARM-NEON] %s dequant failed; zero-filling output\n", name);
   }
-  // Zero output is wrong but prevents NaNs.  A real scalar reference should
-  // be added here for types that matter when llama.cpp is not linked.
   std::fill(y, y + k, 0.0f);
 }
 
 } // namespace
 
 void dequantize_row_q2_K_avx512(const uint8_t *block, float *y, int64_t k) {
-  fallback_dequant("Q2_K", block, y, k,
+  dequant_with_ggml("Q2_K", block, y, k,
                    static_cast<uint32_t>(10)); // GGML_TYPE_Q2_K
 }
 
 void dequantize_row_q3_K_avx512(const uint8_t *block, float *y, int64_t k) {
-  fallback_dequant("Q3_K", block, y, k,
+  dequant_with_ggml("Q3_K", block, y, k,
                    static_cast<uint32_t>(11)); // GGML_TYPE_Q3_K
 }
 
 void dequantize_row_iq2_xxs_avx512(const uint8_t *block, float *y, int64_t k) {
-  fallback_dequant("IQ2_XXS", block, y, k, static_cast<uint32_t>(16));
+  dequant_with_ggml("IQ2_XXS", block, y, k, static_cast<uint32_t>(16));
 }
 
 void dequantize_row_iq3_xxs_avx512(const uint8_t *block, float *y, int64_t k) {
-  fallback_dequant("IQ3_XXS", block, y, k, static_cast<uint32_t>(18));
+  dequant_with_ggml("IQ3_XXS", block, y, k, static_cast<uint32_t>(18));
 }
 
 void dequantize_row_iq2_s_avx512(const uint8_t *block, float *y, int64_t k) {
-  fallback_dequant("IQ2_S", block, y, k, static_cast<uint32_t>(22));
+  dequant_with_ggml("IQ2_S", block, y, k, static_cast<uint32_t>(22));
 }
 
 void dequantize_row_iq2_xxs_avx512_wide(const uint8_t *block, float *y,

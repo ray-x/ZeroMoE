@@ -5,12 +5,10 @@
 #include "exllamav3_backend.hpp"
 #include "logger.hpp"
 #include "model_family.hpp"
-#ifdef ZEROMOE_BUILD_SERVER
 #include "cpu_api.hpp"
 #include <csignal>
 static volatile std::sig_atomic_t cpu_api_stop = 0;
 static void stop_cpu_api(int) { cpu_api_stop = 1; }
-#endif
 
 #include <algorithm>
 #include <charconv>
@@ -59,13 +57,6 @@ int main(int argc, char **argv) {
   }
   bool serve = false;
   for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "--serve") serve = true;
-#ifndef ZEROMOE_BUILD_SERVER
-  if (serve) {
-    std::cerr << "Error: --serve requires -DZEROMOE_BUILD_SERVER=ON\n";
-    return 1;
-  }
-#endif
-#ifdef ZEROMOE_BUILD_SERVER
   zeromoe::server::Options api_options;
   std::string api_model = "zeromoe";
   size_t api_cache_bytes = 0;
@@ -103,7 +94,6 @@ int main(int argc, char **argv) {
       return 1;
     }
   }
-#endif
   std::string config_path = parse_arg(argc, argv, "--config", "");
   if (config_path.empty()) {
     print_usage(argv[0]);
@@ -227,7 +217,6 @@ int main(int argc, char **argv) {
   if (!reasoning_effort_cli.empty())
     engine.config.reasoning_effort = reasoning_effort_cli;
 
-#ifdef ZEROMOE_BUILD_SERVER
   if (serve) {
     using namespace zeromoe::server;
     try {
@@ -256,7 +245,6 @@ int main(int argc, char **argv) {
       return 1;
     }
   }
-#endif
 
   // Startup/model loading is complete here. In CLI mode the prompt argument
   // is already available, so this is the closest equivalent to receiving the

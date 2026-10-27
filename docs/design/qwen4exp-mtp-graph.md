@@ -432,7 +432,7 @@ with CUDA:
 
 ```sh
 cmake -S . -B build-mtp -DCMAKE_BUILD_TYPE=Release \
-    -DZEROMOE_USE_GGML=ON -DZEROMOE_USE_GGML_CUDA=ON
+    -DZEROMOE_USE_GGML_CUDA=ON
 cmake --build build-mtp --target qwen4exp_mtp_parity -j
 ./build-mtp/qwen4exp_mtp_parity trunk.gguf mtp.gguf fixture.txt \
     zeromoe.dump 0 4096 --reference-cpu-norms

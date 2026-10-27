@@ -469,46 +469,8 @@ inline void CPUQwenMoEBackend::forward_moe_ffn(CPUEngine &engine, int layer_idx,
 // Dequantize one row of a quantized weight matrix and multiply by x.
 // This is a minimal helper used only by the CPU MoE path; full-engine builds
 // use kquant_dequant.hpp which pulls engine.hpp (CUDA).
-#ifdef ZEROMOE_USE_GGML
 extern "C" int ggml_dequant_row(uint32_t type, const void *src, float *out,
                                 int n);
-#endif
-
-// Convert a raw bfloat16 bit pattern to float.  BF16 is the upper 16 bits of
-// an IEEE-754 float32 (8-bit exponent, 7-bit mantissa), NOT the same layout
-// as FP16 (5-bit exponent, 10-bit mantissa).  Feeding BF16 bits to an FP16
-// decoder produces garbage exponents and NaN/Inf floods.
-static inline float bf16_to_fp32(uint16_t b) {
-  uint32_t u = static_cast<uint32_t>(b) << 16;
-  float f;
-  std::memcpy(&f, &u, sizeof(f));
-  return f;
-}
-
-inline int cpu_dequant_row_fallback(uint32_t type, const void *src, float *out,
-                                    int n) {
-  // Minimal fallback for F32/F16/BF16 when ggml is not linked.  Quantized
-  // types need ggml (or a native dequant implementation) and will return 0.
-  if (type == 0) { // F32
-    std::memcpy(out, src, (size_t)n * sizeof(float));
-    return 1;
-  }
-  if (type == 1) { // F16
-    const uint16_t *s = reinterpret_cast<const uint16_t *>(src);
-    for (int i = 0; i < n; ++i)
-      out[i] = fp16_to_fp32(s[i]);
-    return 1;
-  }
-  if (type == 25) { // BF16
-    const uint16_t *s = reinterpret_cast<const uint16_t *>(src);
-    for (int i = 0; i < n; ++i)
-      out[i] = bf16_to_fp32(s[i]);
-    return 1;
-  }
-  // Keep this function quiet: the caller (dequant_matmul) logs once per matmul
-  // if any row fails, avoiding millions of synchronous stderr prints.
-  return 0;
-}
 
 inline void CPUQwenMoEBackend::dequant_matmul(GGUFType type, const uint8_t *w,
                                               size_t w_bytes, const float *x,
@@ -521,14 +483,9 @@ inline void CPUQwenMoEBackend::dequant_matmul(GGUFType type, const uint8_t *w,
     row_bytes = (int)w_bytes;
   int ok_rows = 0;
   for (int o = 0; o < O; ++o) {
-    int ok = 0;
-#ifdef ZEROMOE_USE_GGML
-    ok = ggml_dequant_row((uint32_t)type, w + (size_t)o * row_bytes,
-                          wf.data() + o * I, I);
-#else
-    ok = cpu_dequant_row_fallback((uint32_t)type, w + (size_t)o * row_bytes,
-                                  wf.data() + o * I, I);
-#endif
+    const int ok = ggml_dequant_row((uint32_t)type,
+                                    w + (size_t)o * row_bytes,
+                                    wf.data() + o * I, I);
     if (ok)
       ++ok_rows;
   }

@@ -22,10 +22,8 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#ifdef ZEROMOE_USE_GGML
 extern "C" int ggml_dequant_row(uint32_t type, const void *src, float *out,
                                 int n);
-#endif
 
 namespace {
 
@@ -128,12 +126,8 @@ bool CPUQwen4ExpBackend::dequant_row(const CPUQuantizedTensor &t, int row,
       out[i] = bf16_to_float(p[i]);
     return true;
   }
-#ifdef ZEROMOE_USE_GGML
   return ggml_dequant_row(static_cast<uint32_t>(t.meta.type), src, out, n) !=
          0;
-#else
-  return false;
-#endif
 }
 
 bool CPUQwen4ExpBackend::dequant_tensor(const CPUQuantizedTensor &t, float *out,
@@ -928,11 +922,7 @@ void CPUQwen4ExpBackend::forward_moe(CPUEngine &engine, int layer_idx,
           for (int i = 0; i < n; ++i) dst[i] = bf16_to_float(p[i]);
           return true;
         }
-#ifdef ZEROMOE_USE_GGML
         return ggml_dequant_row(static_cast<uint32_t>(type), src, dst, n) != 0;
-#else
-        return false;
-#endif
       };
       const float *x = hidden_states + static_cast<size_t>(s) * D;
       for (int o = 0; o < inter; ++o) {
