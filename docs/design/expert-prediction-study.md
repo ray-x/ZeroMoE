@@ -1,5 +1,12 @@
 # Predicting which experts a window will need
 
+**Status: dead end for Qwen4Exp (decided 2026-10-27).** Router lookahead, the ridge correction and the history
+predictors all fail the same test: reaching useful cold-expert recall needs many more predicted experts than the
+copy or CPU budget allows (section 5). Reactive promotion (`expert-promotion.md`) already removes most misses.
+Do not retry staging, pilot prefetch or ridge refits for this model unless the budget changes (for example a
+much faster host-to-device path). The lane's prediction code (`ZEROMOE_QWEN_EARLY_READY_PREDICT`) stays
+available for the measurement only; it is off by default.
+
 Question: can the experts that will be computed on the CPU (cold) be predicted early enough to stage them
 into VRAM or start the CPU work sooner? Measured on the palindrome and math prompts, 3090, 13,000 hot experts,
 promotion on (cap 12). Traces are in `~/Projects/ZeroMoE-results/promotion-study/mtp-traces/`.
