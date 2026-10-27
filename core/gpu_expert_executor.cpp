@@ -1,4 +1,5 @@
 #include "gpu_expert_executor.hpp"
+#include "graph_config.hpp"
 
 #include "cuda_kernel_dispatcher.hpp"
 #include "dense_dispatch.hpp"
@@ -316,14 +317,14 @@ bool expert_ffn_gpu_issue(GpuExpertScratch &scratch,
   {
     static std::atomic<bool> activation_dumped{false};
     if (!activation_dumped.load(std::memory_order_relaxed)) {
-      const char *layer = std::getenv("ZEROMOE_DUMP_ACTIVATION_LAYER");
-      const char *expert = std::getenv("ZEROMOE_DUMP_ACTIVATION_EXPERT");
+      const char *layer = zeromoe::graphcfg::env("ZEROMOE_DUMP_ACTIVATION_LAYER");
+      const char *expert = zeromoe::graphcfg::env("ZEROMOE_DUMP_ACTIVATION_EXPERT");
       if (layer && expert && location->layer_idx == std::atoi(layer) &&
           location->expert_id == std::atoi(expert)) {
         bool expected = false;
         if (activation_dumped.compare_exchange_strong(expected, true)) {
           const char *configured =
-              std::getenv("ZEROMOE_DUMP_ACTIVATION_OUT");
+              zeromoe::graphcfg::env("ZEROMOE_DUMP_ACTIVATION_OUT");
           const std::string path =
               configured ? configured : "/tmp/real_activation.bin";
           std::ofstream file(path, std::ios::binary);

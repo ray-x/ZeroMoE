@@ -609,7 +609,7 @@ int main(int argc, char *argv[]) {
     }
     if (!is_placeholder_model_path(target))
       return true;
-    const char *env_model = std::getenv("ZEROMOE_MODEL_PATH");
+    const char *env_model = zeromoe::graphcfg::env("ZEROMOE_MODEL_PATH");
     if (env_model && *env_model) {
       target = env_model;
       return true;
@@ -627,7 +627,8 @@ int main(int argc, char *argv[]) {
       return 1;
     if (!config.validate())
       return 1;
-  } else if (!model_path.empty() || std::getenv("ZEROMOE_MODEL_PATH")) {
+  } else if (!model_path.empty() ||
+             zeromoe::graphcfg::env("ZEROMOE_MODEL_PATH")) {
     // Build config from CLI arguments (backward compat), or from ZEROMOE_MODEL_PATH when no --model is given
     config.model_path = model_path;
     if (!resolve_model_path(config.model_path))

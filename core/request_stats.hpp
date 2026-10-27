@@ -25,6 +25,7 @@
 #pragma once
 
 #include <algorithm>
+#include "graph_config.hpp"
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -247,7 +248,7 @@ class Sink {
 
  private:
   static std::string env_path() {
-    const char *e = std::getenv("ZEROMOE_STATS_FILE");
+    const char *e = zeromoe::graphcfg::env("ZEROMOE_STATS_FILE");
     return e ? e : "";
   }
   std::mutex mu_;

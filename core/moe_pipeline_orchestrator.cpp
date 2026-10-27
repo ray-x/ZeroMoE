@@ -1,4 +1,5 @@
 #include "active_layer_upload_workers.hpp"
+#include "graph_config.hpp"
 #include "async_prefetcher.hpp"
 #include "cpu_expert_executor.hpp"
 #include "gpu_expert_executor.hpp"
@@ -192,7 +193,7 @@ uint64_t diag_get_decode_qwen_cpu_offload_fence_failures() {
 // ZEROMOE_QWEN_DECODE_LAYER_TIMING=1.
 static bool qwen4exp_decode_layer_timing_enabled() {
   static const bool enabled = [] {
-    const char *e = std::getenv("ZEROMOE_QWEN_DECODE_LAYER_TIMING");
+    const char *e = zeromoe::graphcfg::env("ZEROMOE_QWEN_DECODE_LAYER_TIMING");
     return e && e[0] == '1';
   }();
   return enabled;

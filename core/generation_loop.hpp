@@ -1,5 +1,6 @@
 #pragma once
 #include "engine.hpp"
+#include "graph_config.hpp"
 #include "full_graph_model.hpp"
 #include "tensor_trace.hpp"
 #include "ram_manager.hpp"
@@ -57,7 +58,7 @@ inline void check_hidden_finite(const char* label, const float* data, size_t n) 
 // absolute logit delta instead of relying only on sampled text.
 inline void dump_decode_logits_if_enabled(int step, const float *logits,
                                           size_t n) {
-    static const char *path = std::getenv("ZEROMOE_DECODE_LOGITS_DUMP");
+    static const char *path = zeromoe::graphcfg::env("ZEROMOE_DECODE_LOGITS_DUMP");
     if (!path || !path[0] || !logits || n == 0)
         return;
 
@@ -79,7 +80,7 @@ inline void dump_decode_logits_if_enabled(int step, const float *logits,
 // output-projection-only difference during llama.cpp parity checks.
 inline void dump_prefill_final_hidden_if_enabled(int step, const float *hidden,
                                                   size_t n) {
-    static const char *path = std::getenv("ZEROMOE_PREFILL_FINAL_HIDDEN_DUMP");
+    static const char *path = zeromoe::graphcfg::env("ZEROMOE_PREFILL_FINAL_HIDDEN_DUMP");
     if (step != 0 || !path || !path[0] || !hidden || n == 0)
         return;
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
@@ -108,7 +109,7 @@ inline uint64_t decode_logits_fnv64(const float *logits, size_t n) {
 
 inline bool decode_logits_hash_enabled() {
     static const bool enabled = [] {
-        const char *value = std::getenv("ZEROMOE_DECODE_LOGITS_HASH");
+        const char *value = zeromoe::graphcfg::env("ZEROMOE_DECODE_LOGITS_HASH");
         return value && value[0] == '1';
     }();
     return enabled;
@@ -122,7 +123,7 @@ inline bool decode_logits_hash_enabled() {
 // with llama.cpp launched using -b 1 -ub 1.
 inline bool prefill_unbatched_enabled() {
     static const bool enabled = [] {
-        const char *value = std::getenv("ZEROMOE_PREFILL_UNBATCHED");
+        const char *value = zeromoe::graphcfg::env("ZEROMOE_PREFILL_UNBATCHED");
         return value && value[0] == '1';
     }();
     return enabled;
@@ -145,7 +146,7 @@ inline void log_decode_logits_hash(int step, uint64_t hash, int sampled_token,
 // dumps its own logits, but the next input token is taken from the reference
 // sequence so autoregressive divergence cannot hide a numerical mismatch.
 inline void dump_generated_token_if_enabled(int step, int token) {
-    static const char *path = std::getenv("ZEROMOE_GENERATED_TOKEN_FILE");
+    static const char *path = zeromoe::graphcfg::env("ZEROMOE_GENERATED_TOKEN_FILE");
     if (!path || !path[0]) {
         return;
     }
@@ -159,7 +160,7 @@ inline void dump_generated_token_if_enabled(int step, int token) {
 inline const std::vector<int> & teacher_force_tokens_if_enabled(int step) {
     // A multi-request diagnostic needs a distinct authoritative token stream
     // per prompt. The original single-file mode remains unchanged.
-    static const char *directory = std::getenv("ZEROMOE_TEACHER_FORCE_REQUEST_DIR");
+    static const char *directory = zeromoe::graphcfg::env("ZEROMOE_TEACHER_FORCE_REQUEST_DIR");
     if (directory && directory[0]) {
         static size_t request = 0;
         static std::vector<int> request_tokens;
@@ -176,7 +177,7 @@ inline const std::vector<int> & teacher_force_tokens_if_enabled(int step) {
     }
     static const std::vector<int> tokens = [] {
         std::vector<int> result;
-        const char *path = std::getenv("ZEROMOE_TEACHER_FORCE_TOKEN_FILE");
+        const char *path = zeromoe::graphcfg::env("ZEROMOE_TEACHER_FORCE_TOKEN_FILE");
         if (!path || !path[0]) {
             return result;
         }
@@ -194,7 +195,7 @@ inline const std::vector<int> & teacher_force_tokens_if_enabled(int step) {
 inline bool teacher_force_skip_sampling_enabled() {
     static const bool enabled = [] {
         const char *value =
-            std::getenv("ZEROMOE_TEACHER_FORCE_SKIP_SAMPLING");
+            zeromoe::graphcfg::env("ZEROMOE_TEACHER_FORCE_SKIP_SAMPLING");
         return value && value[0] == '1';
     }();
     return enabled;
@@ -462,7 +463,7 @@ inline float zeromoe_repetition_penalty() {
         // configurable via ZEROMOE_REPETITION_PENALTY for anyone who wants
         // the old anti-loop behavior back.
         constexpr float default_penalty = 1.0f;
-        const char* text = std::getenv("ZEROMOE_REPETITION_PENALTY");
+        const char* text = zeromoe::graphcfg::env("ZEROMOE_REPETITION_PENALTY");
         if (!text || !*text) return default_penalty;
 
         char* end = nullptr;
@@ -541,7 +542,7 @@ inline void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GG
     // configured decode length.  This is opt-in, applies to the normal
     // non-MTP loop only, and leaves normal inference behavior unchanged.
     const bool bench_ignore_stop = [] {
-        const char *env = std::getenv("ZEROMOE_BENCH_IGNORE_STOP");
+        const char *env = zeromoe::graphcfg::env("ZEROMOE_BENCH_IGNORE_STOP");
         return env && env[0] == '1';
     }();
     // llama-bench measures token generation without decoding/printing every
@@ -549,11 +550,11 @@ inline void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GG
     // ZeroMoE's compute path and request summary while removing that CLI
     // streaming work from apples-to-apples throughput measurements.
     const bool bench_silent = control || [] {
-        const char *env = std::getenv("ZEROMOE_BENCH_SILENT");
+        const char *env = zeromoe::graphcfg::env("ZEROMOE_BENCH_SILENT");
         return env && env[0] == '1';
     }();
     const bool token_loop_diag_enabled = [] {
-        const char *env = std::getenv("ZEROMOE_TOKEN_LOOP_DIAG");
+        const char *env = zeromoe::graphcfg::env("ZEROMOE_TOKEN_LOOP_DIAG");
         return env && env[0] == '1';
     }();
     if (bench_ignore_stop) {
@@ -867,7 +868,7 @@ inline void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GG
 
     if (!bench_silent) {
         std::cout << "\n[Prefill] Processing " << prompt_ids.size() << " tokens..." << std::flush;
-        if (const char *dump = std::getenv("ZEROMOE_DUMP_PROMPT_TOKENS"); dump && dump[0]) {
+        if (const char *dump = zeromoe::graphcfg::env("ZEROMOE_DUMP_PROMPT_TOKENS"); dump && dump[0]) {
             std::ofstream pf(dump, std::ios::trunc);
             for (auto id : prompt_ids) pf << id << '\n';
         }
@@ -1089,7 +1090,7 @@ inline void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GG
                                : 0.0)
                        << "ms\n";
     check_hidden_finite("after prefill", hidden_states.data(), hidden_states.size());
-    if (const char *dump = std::getenv("ZEROMOE_DUMP_LAST_HIDDEN"); dump && dump[0] && hidden_states.size() >= (size_t)D) {
+    if (const char *dump = zeromoe::graphcfg::env("ZEROMOE_DUMP_LAST_HIDDEN"); dump && dump[0] && hidden_states.size() >= (size_t)D) {
         std::ofstream hf(dump, std::ios::binary | std::ios::trunc);
         hf.write(reinterpret_cast<const char *>(hidden_states.data() + hidden_states.size() - D), (std::streamsize)D * sizeof(float));
     }
@@ -1415,7 +1416,7 @@ inline void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GG
         // a fixed text by mean NLL (quality) as well as by speed.
         if (has_teacher_token) {
             static const bool log_nll = [] {
-                const char *e = std::getenv("ZEROMOE_TEACHER_FORCE_NLL");
+                const char *e = zeromoe::graphcfg::env("ZEROMOE_TEACHER_FORCE_NLL");
                 return e && e[0] == '1';
             }();
             const int ft = teacher_tokens[step];

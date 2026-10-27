@@ -2,6 +2,7 @@
 // Split from the former run_engine() in src/main.cpp; bodies are unchanged except where
 // a former local became an EngineRunner member of the same name.
 #include "engine_runner.hpp"
+#include "graph_config.hpp"
 #include "execution_policy.hpp"
 
 #include <limits>
@@ -224,7 +225,7 @@ std::expected<void, std::string> EngineRunner::init_ram_tier() {
   // source-backed fallback and retain normal lazy cache behavior.
   if (ram_graph_cache) {
     const char *layer0_diag_env =
-        std::getenv("ZEROMOE_QWEN4EXP_DIAG_LAYER0_RESIDUAL");
+        zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_DIAG_LAYER0_RESIDUAL");
     const bool narrow_layer0_diag =
         layer0_diag_env && layer0_diag_env[0] == '1';
     std::vector<int> graph_ram_full_layers;
@@ -265,12 +266,12 @@ std::expected<void, std::string> EngineRunner::init_ram_tier() {
       // use the same no-duplicate layout for every Qwen graph layer. Keep an
       // explicit opt-out for A/B comparisons; it changes only the DDR arena
       // layout, not layer placement or graph topology.
-      const char *compact_env = std::getenv(
+      const char *compact_env = zeromoe::graphcfg::env(
           "ZEROMOE_QWEN4EXP_GRAPH_PROJECTION_COMPACT");
       const bool projection_compact_enabled =
           !(compact_env && compact_env[0] == '0');
       const char *host_node_env =
-          std::getenv("ZEROMOE_QWEN4EXP_HOST_NODE");
+          zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_HOST_NODE");
       const bool host_node_enabled = host_node_env && host_node_env[0] == '1';
       // The legacy scheduler CPUOffload path still uses the single-stride
       // runner, so retain its interleaved arena. The opt-in host-node path

@@ -6,6 +6,7 @@
 // and can make a production process harder to recover.
 
 #include "logger.hpp"
+#include "graph_config.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -37,18 +38,18 @@ struct ThreadProfile {
 };
 
 inline bool zeromoe_thread_profile_enabled() {
-  const char *value = std::getenv("ZEROMOE_THREAD_PROFILE");
+  const char *value = zeromoe::graphcfg::env("ZEROMOE_THREAD_PROFILE");
   return value && (value[0] == '1' || value[0] == 'y' || value[0] == 'Y' ||
                    value[0] == 't' || value[0] == 'T');
 }
 
 inline bool zeromoe_thread_profile_rt_enabled() {
-  const char *value = std::getenv("ZEROMOE_THREAD_PROFILE_RT");
+  const char *value = zeromoe::graphcfg::env("ZEROMOE_THREAD_PROFILE_RT");
   return value && value[0] == '1';
 }
 
 inline bool zeromoe_thread_profile_nice_enabled() {
-  const char *value = std::getenv("ZEROMOE_THREAD_PROFILE_APPLY_NICE");
+  const char *value = zeromoe::graphcfg::env("ZEROMOE_THREAD_PROFILE_APPLY_NICE");
   return value && value[0] == '1';
 }
 

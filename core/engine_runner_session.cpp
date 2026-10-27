@@ -2,6 +2,7 @@
 // Split from the former run_engine() in src/main.cpp; bodies are unchanged except where
 // a former local became an EngineRunner member of the same name.
 #include "ggml_mimo2_graph.hpp"
+#include "graph_config.hpp"
 #include "engine_runner.hpp"
 #include "generation_loop.hpp"
 #include "bench_mode.hpp"
@@ -420,7 +421,7 @@ std::expected<void, std::string> EngineRunner::run_repl() {
     // wrapper differences. The normal text prompt path is unchanged when
     // this variable is absent.
     if (const char *token_input =
-            std::getenv("ZEROMOE_PROMPT_TOKEN_INPUT_FILE")) {
+            zeromoe::graphcfg::env("ZEROMOE_PROMPT_TOKEN_INPUT_FILE")) {
       std::ifstream input(token_input);
       std::vector<int> exact_tokens;
       long long value = 0;
@@ -440,7 +441,7 @@ std::expected<void, std::string> EngineRunner::run_repl() {
                           << " exact token IDs from " << token_input << "\n";
       }
     }
-    if (std::getenv("ZEROMOE_MOE_SET_TRACE") != nullptr) {
+    if (zeromoe::graphcfg::env("ZEROMOE_MOE_SET_TRACE") != nullptr) {
       uint64_t hash = 1469598103934665603ULL;
       for (int token : prompt_tokens) {
         uint32_t value = (uint32_t)token;
@@ -452,7 +453,7 @@ std::expected<void, std::string> EngineRunner::run_repl() {
       LOG_STREAM_INFO() << "[MOE-PROMPT] tokens=" << prompt_tokens.size()
                         << " fnv64=0x" << std::hex << hash << std::dec << "\n";
     }
-    if (const char *token_path = std::getenv("ZEROMOE_PROMPT_TOKEN_FILE")) {
+    if (const char *token_path = zeromoe::graphcfg::env("ZEROMOE_PROMPT_TOKEN_FILE")) {
       std::ofstream output(token_path);
       if (!output) {
         LOG_STREAM_ERROR()

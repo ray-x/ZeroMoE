@@ -1,4 +1,5 @@
 #include "active_layer_upload_workers.hpp"
+#include "graph_config.hpp"
 #include "async_prefetcher.hpp"
 #include "cpu_expert_executor.hpp"
 #include "gpu_expert_executor.hpp"
@@ -67,7 +68,7 @@ extern bool qwen4exp_copy_gdn_device_output_to_host(const void *device_output,
 
 static int ggml_fixed_chunk_pair_capacity() {
   static const int value = [] {
-    const char *env = std::getenv("ZEROMOE_GGML_FIXED_PAIR_CAPACITY");
+    const char *env = zeromoe::graphcfg::env("ZEROMOE_GGML_FIXED_PAIR_CAPACITY");
     if (!env || !env[0])
       return 0;
     const int requested = std::atoi(env);
@@ -87,7 +88,7 @@ static int ggml_fixed_chunk_pair_capacity() {
 // existing quantized-tail clear path.
 static int ggml_fixed_expert_slots() {
   static const int value = [] {
-    const char *env = std::getenv("ZEROMOE_GGML_FIXED_EXPERT_SLOTS");
+    const char *env = zeromoe::graphcfg::env("ZEROMOE_GGML_FIXED_EXPERT_SLOTS");
     if (!env || !env[0])
       return 0;
     const int requested = std::atoi(env);
@@ -120,7 +121,7 @@ static bool qwen_ddr_only_expert_source(const StreamingEngine &engine,
 // existing per-expert transfer behavior.
 static bool qwen_batch_d2d_unpack_enabled() {
   static const bool enabled = [] {
-    const char *env = std::getenv("ZEROMOE_QWEN_BATCH_D2D_UNPACK");
+    const char *env = zeromoe::graphcfg::env("ZEROMOE_QWEN_BATCH_D2D_UNPACK");
     return env && env[0] == '1';
   }();
   return enabled;
@@ -445,7 +446,7 @@ static bool run_ggml_moe_layer(
   if (!topo)
     return false;
   static const bool trace_set = [] {
-    const char *env = std::getenv("ZEROMOE_MOE_SET_TRACE");
+    const char *env = zeromoe::graphcfg::env("ZEROMOE_MOE_SET_TRACE");
     return env != nullptr && env[0] != '0';
   }();
 
@@ -487,7 +488,7 @@ static bool run_ggml_moe_layer(
     // is no way to weigh "more free VRAM" against "twice the link bandwidth"
     // without knowing how much of each the layer will need, so this is a
     // manual override rather than a heuristic.
-    if (const char *envd = std::getenv("ZEROMOE_GGML_MOE_DEVICE")) {
+    if (const char *envd = zeromoe::graphcfg::env("ZEROMOE_GGML_MOE_DEVICE")) {
       const int d = std::atoi(envd);
       LOG_INFO("[GGML-MOE] device forced to GPU %d by "
                "ZEROMOE_GGML_MOE_DEVICE\n",
@@ -523,7 +524,7 @@ static bool run_ggml_moe_layer(
     return false;
 
   static const bool chunk_pipeline = [] {
-    const char *env = std::getenv("ZEROMOE_GGML_CHUNK_PIPELINE");
+    const char *env = zeromoe::graphcfg::env("ZEROMOE_GGML_CHUNK_PIPELINE");
     return env && env[0] == '1';
   }();
   if (chunk_pipeline && !device_route_ids && !device_route_weights &&
@@ -749,7 +750,7 @@ static bool run_ggml_moe_layer(
   trace_resident_gpu.reserve((size_t)n_used);
 
   static const bool no_d2d = [] {
-    const char *ev = std::getenv("ZEROMOE_GGML_NO_D2D");
+    const char *ev = zeromoe::graphcfg::env("ZEROMOE_GGML_NO_D2D");
     return ev && ev[0] == '1';
   }();
   // Diagnostic/optimization switch for the packed transfer design. The
@@ -759,7 +760,7 @@ static bool run_ggml_moe_layer(
   // which tests whether launch/submission overhead is larger than the extra
   // DDR->pinned-DDR memcpy.
   static const bool env_force_batch_stage = [] {
-    const char *ev = std::getenv("ZEROMOE_GGML_FORCE_BATCH_STAGE");
+    const char *ev = zeromoe::graphcfg::env("ZEROMOE_GGML_FORCE_BATCH_STAGE");
     return ev && ev[0] == '1';
   }();
   const bool qwen_decode_batch_stage =
@@ -1023,7 +1024,7 @@ static bool run_ggml_moe_layer(
     // per prefill, which is pure overhead once the file is in page cache.
     // ZEROMOE_GGML_NO_WILLNEED=1 measures that.
     static const bool skip_willneed = [] {
-      const char *e = std::getenv("ZEROMOE_GGML_NO_WILLNEED");
+      const char *e = zeromoe::graphcfg::env("ZEROMOE_GGML_NO_WILLNEED");
       return e && e[0] == '1';
     }();
     if (!qwen_ddr_only_source && !skip_willneed &&
@@ -1436,7 +1437,7 @@ BatchedDispatchResult BatchedDispatchPipeline::run(
       if (scratch.expert_freq[(size_t)e] > 0)
         used.push_back(e);
     static const bool trace_required_set = [] {
-      const char *env = std::getenv("ZEROMOE_MOE_SET_TRACE");
+      const char *env = zeromoe::graphcfg::env("ZEROMOE_MOE_SET_TRACE");
       return env && env[0] != '0';
     }();
     if (trace_required_set && gpu_route_device && device_router) {
@@ -1661,7 +1662,7 @@ BatchedDispatchResult BatchedDispatchPipeline::run(
           used.push_back(e);
       const int n_used = (int)used.size();
       static const bool trace_required_set = [] {
-        const char *env = std::getenv("ZEROMOE_MOE_SET_TRACE");
+        const char *env = zeromoe::graphcfg::env("ZEROMOE_MOE_SET_TRACE");
         return env && env[0] != '0';
       }();
       if (trace_required_set) {

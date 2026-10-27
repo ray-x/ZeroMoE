@@ -1,4 +1,5 @@
 #include "active_layer_upload_workers.hpp"
+#include "graph_config.hpp"
 #include "async_prefetcher.hpp"
 #include "cpu_expert_executor.hpp"
 #include "gpu_expert_executor.hpp"
@@ -759,13 +760,13 @@ static double g_diag_decode_layer_input_ms = 0.0;
 // writes exact F32 rows for one selected layer and prompt position. It is
 // disabled by default and intended only for A/A diagnosis.
 static const char *prefill_boundary_dump_base() {
-  static const char *value = std::getenv("ZEROMOE_PREFILL_BOUNDARY_DUMP");
+  static const char *value = zeromoe::graphcfg::env("ZEROMOE_PREFILL_BOUNDARY_DUMP");
   return value && *value ? value : nullptr;
 }
 
 static int prefill_boundary_dump_last_pos() {
   static const int value = [] {
-    const char *env = std::getenv("ZEROMOE_PREFILL_BOUNDARY_LAST_POS");
+    const char *env = zeromoe::graphcfg::env("ZEROMOE_PREFILL_BOUNDARY_LAST_POS");
     return env && *env ? std::atoi(env) : -1;
   }();
   return value;
@@ -773,7 +774,7 @@ static int prefill_boundary_dump_last_pos() {
 
 static int prefill_boundary_dump_first_pos() {
   static const int value = [] {
-    const char *env = std::getenv("ZEROMOE_PREFILL_BOUNDARY_FIRST_POS");
+    const char *env = zeromoe::graphcfg::env("ZEROMOE_PREFILL_BOUNDARY_FIRST_POS");
     return env && *env ? std::atoi(env) : 0;
   }();
   return value;
@@ -781,7 +782,7 @@ static int prefill_boundary_dump_first_pos() {
 
 static int prefill_boundary_dump_layer() {
   static const int value = [] {
-    const char *env = std::getenv("ZEROMOE_PREFILL_BOUNDARY_LAYER");
+    const char *env = zeromoe::graphcfg::env("ZEROMOE_PREFILL_BOUNDARY_LAYER");
     return env && *env ? std::atoi(env) : 0;
   }();
   return value;
@@ -1507,7 +1508,7 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     if (S >= 1 && !scratch.pilot_attn_snapshot.empty())
       std::memcpy(scratch.pilot_attn_snapshot.data(), hidden_states + (size_t)(S - 1) * D, (size_t)D * sizeof(float));
     std::vector<float> probe_last_scores; // layer l's score row of the last token (route-agreement check)
-    if (static const char *probe_dir = std::getenv("ZEROMOE_PROBE_DUMP");
+    if (static const char *probe_dir = zeromoe::graphcfg::env("ZEROMOE_PROBE_DUMP");
         probe_dir && probe_dir[0] && l >= c.first_dense && c.n_experts > 0 &&
         engine.family_ops.family != ModelFamily::Qwen4Exp) {
       const std::string norm_key = "blk." + std::to_string(l) + ".ffn_norm.weight";

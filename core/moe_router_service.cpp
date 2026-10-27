@@ -1,4 +1,5 @@
 #include "active_layer_upload_workers.hpp"
+#include "graph_config.hpp"
 #include "async_prefetcher.hpp"
 #include "cpu_expert_executor.hpp"
 #include "gpu_expert_executor.hpp"
@@ -73,8 +74,8 @@ extern bool qwen4exp_copy_gdn_device_output_to_host(const void *device_output,
 // projection/input drift from top-k gather/normalization drift.
 static void dump_qwen_router_probs_diag(int layer, const float *data,
                                         int n_experts) {
-  const char *base = std::getenv("ZEROMOE_PREFILL_BOUNDARY_DUMP");
-  const char *layer_env = std::getenv("ZEROMOE_PREFILL_BOUNDARY_LAYER");
+  const char *base = zeromoe::graphcfg::env("ZEROMOE_PREFILL_BOUNDARY_DUMP");
+  const char *layer_env = zeromoe::graphcfg::env("ZEROMOE_PREFILL_BOUNDARY_LAYER");
   if (!base || !data || n_experts <= 0 ||
       (layer_env && std::atoi(layer_env) >= 0 &&
        std::atoi(layer_env) != layer))
@@ -149,7 +150,7 @@ void moe_pipeline_internal::qwen4exp_record_pilot_fetch_start(int layer_idx) {
 
 static bool qwen4exp_device_route_enabled() {
   static const bool enabled = [] {
-    const char *e = std::getenv("ZEROMOE_QWEN4EXP_DEVICE_ROUTE");
+    const char *e = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_DEVICE_ROUTE");
     return e && e[0] == '1';
   }();
   return enabled;
@@ -417,7 +418,7 @@ bool moe_pipeline_detail::qwen4exp_decode_ggml_path(
 // this branch.
 static bool qwen4exp_decode_cpu_router_enabled() {
   static const bool enabled = [] {
-    const char *e = std::getenv("ZEROMOE_QWEN_DECODE_CPU_ROUTER");
+    const char *e = zeromoe::graphcfg::env("ZEROMOE_QWEN_DECODE_CPU_ROUTER");
     return e && e[0] == '1';
   }();
   return enabled;
@@ -431,7 +432,7 @@ static bool qwen4exp_decode_cpu_router_enabled() {
 // device/host numerical result and real decode timing are confirmed.
 static bool qwen4exp_decode_device_router_gemv_enabled() {
   static const bool enabled = [] {
-    const char *e = std::getenv("ZEROMOE_QWEN_DECODE_DEVICE_ROUTER_GEMV");
+    const char *e = zeromoe::graphcfg::env("ZEROMOE_QWEN_DECODE_DEVICE_ROUTER_GEMV");
     return e && e[0] == '1';
   }();
   return enabled;
@@ -459,7 +460,7 @@ static bool qwen4exp_decode_scheduler_enabled(const StreamingEngine &engine) {
 // ever populated from the full-graph prepare path.
 static int qwen4exp_ppp_target_layer() {
   static const int layer = [] {
-    const char *v = std::getenv("ZEROMOE_QWEN4EXP_PARTIAL_LAYER");
+    const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PARTIAL_LAYER");
     if (!v || !v[0])
       return -1;
     char *end = nullptr;
@@ -481,7 +482,7 @@ static const std::unordered_set<int> &qwen4exp_ppp_pin_set(StreamingEngine &engi
     const int layer = qwen4exp_ppp_target_layer();
     if (layer < 0)
       return result;
-    const char *topn_env = std::getenv("ZEROMOE_QWEN4EXP_PARTIAL_LAYER_TOP_N");
+    const char *topn_env = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PARTIAL_LAYER_TOP_N");
     int top_n = 256;
     if (topn_env && topn_env[0]) {
       char *end = nullptr;
@@ -784,7 +785,7 @@ bool MoeRouterService::route(MoePipelineContext &context) {
       const int scheduler_device =
           moe_ggml_device() >= 0 ? moe_ggml_device() : 0;
       const bool no_external_shared_weights = [] {
-        const char *e = std::getenv("ZEROMOE_GGML_SHARED_NO_EXTERNAL");
+        const char *e = zeromoe::graphcfg::env("ZEROMOE_GGML_SHARED_NO_EXTERNAL");
         return e && e[0] == '1';
       }();
       const int shared_inter = moe_inter * c.n_expert_shared;
@@ -1044,7 +1045,7 @@ bool MoeRouterService::route(MoePipelineContext &context) {
         std::memcpy(scratch.normed.data(), hidden_states,
                     S * D * sizeof(float));
       if (qwen_hc_route_input && layer_idx == 0 && S == 1 &&
-          std::getenv("ZEROMOE_PREFILL_BOUNDARY_DUMP")) {
+          zeromoe::graphcfg::env("ZEROMOE_PREFILL_BOUNDARY_DUMP")) {
         uint64_t hash = 1469598103934665603ULL;
         const auto *bytes = reinterpret_cast<const uint8_t *>(scratch.normed.data());
         for (size_t i = 0; i < (size_t)D * sizeof(float); ++i) {
@@ -1168,7 +1169,7 @@ bool MoeRouterService::route(MoePipelineContext &context) {
         // This deliberately downloads one [D] row and repeats the host
         // projection/top-k; it is never part of the production path.
         static const bool compare_qwen_router = [] {
-          const char *e = std::getenv("ZEROMOE_QWEN_ROUTER_COMPARE");
+          const char *e = zeromoe::graphcfg::env("ZEROMOE_QWEN_ROUTER_COMPARE");
           return e && e[0] == '1';
         }();
         if (compare_qwen_router && gpu_router_handled && S == 1 &&
@@ -1444,7 +1445,7 @@ bool MoeRouterService::route(MoePipelineContext &context) {
       std::fill(scratch.first_needed_by_token.begin(),
                 scratch.first_needed_by_token.end(), INT_MAX);
       const char *dsv41_gpu_prefill_env =
-          std::getenv("ZEROMOE_DEEPSEEK_V41_GPU_PREFILL");
+          zeromoe::graphcfg::env("ZEROMOE_DEEPSEEK_V41_GPU_PREFILL");
       const bool stable_dsv41_boundary =
           engine.family_ops.family == ModelFamily::DeepSeek_V41 && S > 1 &&
           dsv41_gpu_prefill_env && std::atoi(dsv41_gpu_prefill_env) != 0;
@@ -1615,11 +1616,11 @@ bool MoeRouterService::route(MoePipelineContext &context) {
             // come from the unbiased router probability of whichever experts
             // are chosen. This changes the model's output; 0 (default) = off.
             static const float bonus_vram = [] {
-              const char *e = std::getenv("ZEROMOE_DSV41_CACHE_BONUS_VRAM");
+              const char *e = zeromoe::graphcfg::env("ZEROMOE_DSV41_CACHE_BONUS_VRAM");
               return e ? (float)std::atof(e) : 0.0f;
             }();
             static const float bonus_ram = [] {
-              const char *e = std::getenv("ZEROMOE_DSV41_CACHE_BONUS_RAM");
+              const char *e = zeromoe::graphcfg::env("ZEROMOE_DSV41_CACHE_BONUS_RAM");
               return e ? (float)std::atof(e) : 0.0f;
             }();
             const bool cache_aware =
@@ -1689,7 +1690,7 @@ bool MoeRouterService::route(MoePipelineContext &context) {
         // Offline route log (ZEROMOE_ROUTE_LOG=<path>): one line per
         // (layer, token) with the final top-k ids, in call order, so cache
         // and predictor studies can replay real routing. Off by default.
-        if (const char *route_log_path = std::getenv("ZEROMOE_ROUTE_LOG");
+        if (const char *route_log_path = zeromoe::graphcfg::env("ZEROMOE_ROUTE_LOG");
             route_log_path && *route_log_path) {
           static std::mutex route_log_mutex;
           static FILE *route_log = std::fopen(route_log_path, "w");
@@ -1706,7 +1707,7 @@ bool MoeRouterService::route(MoePipelineContext &context) {
         // {int32 layer, int32 S, int32 s, float32 x[D]} holding this layer's
         // router input, so a pilot (layer N+1's router applied to layer N's
         // hidden state) can be replayed offline. Off by default.
-        if (const char *in_log_path = std::getenv("ZEROMOE_ROUTER_IN_LOG");
+        if (const char *in_log_path = zeromoe::graphcfg::env("ZEROMOE_ROUTER_IN_LOG");
             in_log_path && *in_log_path) {
           static std::mutex in_log_mutex;
           static FILE *in_log = std::fopen(in_log_path, "wb");
@@ -1735,7 +1736,7 @@ bool MoeRouterService::route(MoePipelineContext &context) {
         if (S == 1 &&
             engine.family_ops.family == ModelFamily::DeepSeek_V41) {
           static const int pilot_k = [] {
-            const char *e = std::getenv("ZEROMOE_DSV41_PILOT_K");
+            const char *e = zeromoe::graphcfg::env("ZEROMOE_DSV41_PILOT_K");
             const int k = e ? std::atoi(e) : 0;
             return std::min(std::max(k, 0), 16);
           }();
@@ -1744,7 +1745,7 @@ bool MoeRouterService::route(MoePipelineContext &context) {
           // overall and hoping some are cold. 0 keeps the historical
           // top-k-overall behavior for A/B.
           static const int cold_k = [] {
-            const char *e = std::getenv("ZEROMOE_DSV41_PILOT_COLD_K");
+            const char *e = zeromoe::graphcfg::env("ZEROMOE_DSV41_PILOT_COLD_K");
             const int k = e ? std::atoi(e) : 0;
             return std::min(std::max(k, 0), 8);
           }();
@@ -1855,19 +1856,19 @@ bool MoeRouterService::route(MoePipelineContext &context) {
               // check below one layer later. Before min_samples, keep the
               // old allow-all behavior so a cold start is not starved.
               static const bool gate_enabled = [] {
-                const char *e = std::getenv("ZEROMOE_DSV41_PILOT_GATE");
+                const char *e = zeromoe::graphcfg::env("ZEROMOE_DSV41_PILOT_GATE");
                 return !e || std::atoi(e) != 0;
               }();
               static const double ddr_threshold = [] {
-                const char *e = std::getenv("ZEROMOE_DSV41_PILOT_DDR_THRESHOLD");
+                const char *e = zeromoe::graphcfg::env("ZEROMOE_DSV41_PILOT_DDR_THRESHOLD");
                 return e ? std::atof(e) : 0.50;
               }();
               static const double vram_threshold = [] {
-                const char *e = std::getenv("ZEROMOE_DSV41_PILOT_VRAM_THRESHOLD");
+                const char *e = zeromoe::graphcfg::env("ZEROMOE_DSV41_PILOT_VRAM_THRESHOLD");
                 return e ? std::atof(e) : 0.90;
               }();
               static const int gate_min_samples = [] {
-                const char *e = std::getenv("ZEROMOE_DSV41_PILOT_GATE_MIN_SAMPLES");
+                const char *e = zeromoe::graphcfg::env("ZEROMOE_DSV41_PILOT_GATE_MIN_SAMPLES");
                 return e ? std::max(std::atoi(e), 1) : 30;
               }();
               const int active_fill_k =
@@ -1876,7 +1877,7 @@ bool MoeRouterService::route(MoePipelineContext &context) {
               // The historical active-layer path is kept for A/B only: at
               // 77-90% predicted accuracy it is net-negative on decode.
               static const int promote_mode = [] {
-                const char *e = std::getenv("ZEROMOE_DSV41_PILOT_PROMOTE_MODE");
+                const char *e = zeromoe::graphcfg::env("ZEROMOE_DSV41_PILOT_PROMOTE_MODE");
                 if (!e || !*e) return 0;
                 if (!std::strcmp(e, "main")) return 1;
                 if (!std::strcmp(e, "active")) return 2;

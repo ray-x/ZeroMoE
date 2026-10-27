@@ -9,6 +9,7 @@
 // first token, not baked into every output.
 #pragma once
 #include "engine.hpp"
+#include "graph_config.hpp"
 #include "cuda_manager.hpp"
 #include "kernels_cpu.hpp"        // matmul
 #include "kquant_dequant.hpp"     // cpu_quant_matmul (CPU fallback)
@@ -34,7 +35,7 @@
 // culprit; if still garbage, the bug is in the CPU math (attention/MoE/
 // embedding) and is independent of where compute runs.
 inline bool& cpu_only_flag() {
-    static bool v = (std::getenv("ZEROMOE_CPU_ONLY") != nullptr);
+    static bool v = (zeromoe::graphcfg::env("ZEROMOE_CPU_ONLY") != nullptr);
     return v;
 }
 inline bool cpu_only_mode() { return cpu_only_flag(); }
@@ -199,7 +200,7 @@ inline bool& moe_ggml_mul_mat_id_flag() {
 }
 inline bool moe_ggml_mul_mat_id() {
   static const bool env = [] {
-    const char *e = std::getenv("ZEROMOE_GGML_MUL_MAT_ID");
+    const char *e = zeromoe::graphcfg::env("ZEROMOE_GGML_MUL_MAT_ID");
     return e && e[0] == '1';
   }();
   return env || moe_ggml_mul_mat_id_flag();
@@ -215,7 +216,7 @@ inline void set_moe_ggml_mul_mat_id(bool v) { moe_ggml_mul_mat_id_flag() = v; }
 inline bool &moe_ggml_shared_expert_flag() { static bool v = false; return v; }
 inline bool moe_ggml_shared_expert() {
   static const bool env = [] {
-    const char *e = std::getenv("ZEROMOE_GGML_SHARED_EXPERT");
+    const char *e = zeromoe::graphcfg::env("ZEROMOE_GGML_SHARED_EXPERT");
     return e && e[0] == '1';
   }();
   return env || moe_ggml_shared_expert_flag();
@@ -239,7 +240,7 @@ inline bool moe_ggml_gpu_router() {
   // router without making a temporary config copy.  The override is scoped
   // to this Qwen-only feature; other model routers do not consult it.
   static const int env_override = [] {
-    const char *e = std::getenv("ZEROMOE_GGML_GPU_ROUTER");
+    const char *e = zeromoe::graphcfg::env("ZEROMOE_GGML_GPU_ROUTER");
     if (!e || !e[0]) return -1;
     return e[0] == '1' ? 1 : 0;
   }();
@@ -280,7 +281,7 @@ inline bool& hc_ggml_flag() {
 }
 inline bool hc_ggml() {
   static const bool env = [] {
-    const char *e = std::getenv("ZEROMOE_HC_GGML");
+    const char *e = zeromoe::graphcfg::env("ZEROMOE_HC_GGML");
     return e && e[0] == '1';
   }();
   return env || hc_ggml_flag();
@@ -304,7 +305,7 @@ inline bool& gdn_proj_ggml_flag() {
 }
 inline bool gdn_proj_ggml() {
   static const bool env = [] {
-    const char *e = std::getenv("ZEROMOE_GDN_PROJ_GGML");
+    const char *e = zeromoe::graphcfg::env("ZEROMOE_GDN_PROJ_GGML");
     return e && e[0] == '1';
   }();
   return env || gdn_proj_ggml_flag();
@@ -320,7 +321,7 @@ inline bool& gdn_full_ggml_flag() {
 }
 inline bool gdn_full_ggml() {
   static const bool env = [] {
-    const char *e = std::getenv("ZEROMOE_GDN_FULL_GGML");
+    const char *e = zeromoe::graphcfg::env("ZEROMOE_GDN_FULL_GGML");
     return e && e[0] == '1';
   }();
   return env || gdn_full_ggml_flag();
@@ -363,7 +364,7 @@ inline bool& moe_expert_bf16_gemm_flag() {
 }
 inline bool moe_expert_bf16_gemm() {
   static const bool env = [] {
-    const char *e = std::getenv("ZEROMOE_EXPERT_BF16_GEMM");
+    const char *e = zeromoe::graphcfg::env("ZEROMOE_EXPERT_BF16_GEMM");
     return e && e[0] == '1';
   }();
   return env || moe_expert_bf16_gemm_flag();
@@ -372,7 +373,7 @@ inline void set_moe_expert_bf16_gemm(bool v) { moe_expert_bf16_gemm_flag() = v; 
 
 inline bool expert_stream_no_sync() {
   static const bool v = [] {
-    const char *e = std::getenv("ZEROMOE_EXPERT_STREAM_NOSYNC");
+    const char *e = zeromoe::graphcfg::env("ZEROMOE_EXPERT_STREAM_NOSYNC");
     return e && *e == '1';
   }();
   return v;
@@ -1248,11 +1249,11 @@ inline void dense_proj(StreamingEngine& engine, const std::string& wname,
       wname == "blk.1.ple_key.weight" ||
       wname == "blk.1.ple_value.weight";
   const char* ple_diag_env =
-      std::getenv("ZEROMOE_QWEN4EXP_PLE_PATH_DIAG");
+      zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PLE_PATH_DIAG");
   const bool ple_path_diag = ple_projection && ple_diag_env &&
                              ple_diag_env[0] == '1';
   const char* ple_cpu_env =
-      std::getenv("ZEROMOE_QWEN4EXP_PLE_FORCE_CPU");
+      zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PLE_FORCE_CPU");
   const bool ple_force_cpu = ple_path_diag && ple_cpu_env &&
                              ple_cpu_env[0] == '1';
   if (ple_path_diag) {

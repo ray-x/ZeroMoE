@@ -2,6 +2,7 @@
 // Split from the former run_engine() in src/main.cpp; bodies are unchanged except where
 // a former local became an EngineRunner member of the same name.
 #include "engine_runner.hpp"
+#include "graph_config.hpp"
 
 // Batches up to Ring::CAPACITY/3 packed-format experts' reads into ONE
 // io_uring submission, for the startup [PIN] preload pass -- real
@@ -1231,7 +1232,7 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
       // disabled batch ring exercises the original one-expert loader
       // without changing runtime inference behavior.
       const bool disable_preload_batch =
-          std::getenv("ZEROMOE_DISABLE_PRELOAD_BATCH") != nullptr;
+          zeromoe::graphcfg::env("ZEROMOE_DISABLE_PRELOAD_BATCH") != nullptr;
       bool preload_ring_ok = !disable_preload_batch && preload_ring.init();
       if (preload_ring_ok) {
         preload_ring.register_iowq_workers(

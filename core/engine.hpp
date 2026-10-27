@@ -1,5 +1,6 @@
 #pragma once
 #include <unordered_set>
+#include "graph_config.hpp"
 #include "gguf_loader.hpp"
 #include "direct_io.hpp"
 #include "io_uring_backend.hpp"
@@ -2931,7 +2932,7 @@ public:
             // default; the logical tensor layout is unchanged.  Set
             // ZEROMOE_QWEN_GRAPH_HOST_OFFSET=0 for the page-aligned A/B.
             size_t host_offset = 32;
-            if (const char *v = std::getenv("ZEROMOE_QWEN_GRAPH_HOST_OFFSET")) {
+            if (const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN_GRAPH_HOST_OFFSET")) {
                 char *end = nullptr;
                 const long parsed = std::strtol(v, &end, 10);
                 if (end != v && *end == '\0' && parsed >= 0 && parsed <= 4096)
@@ -2972,7 +2973,7 @@ public:
             // set consumes the process's memlock allowance and should not be
             // enabled without an explicit host-memory budget.
             const char *graph_mlock =
-                std::getenv("ZEROMOE_QWEN_GRAPH_MLOCK");
+                zeromoe::graphcfg::env("ZEROMOE_QWEN_GRAPH_MLOCK");
             if (graph_mlock && std::atoi(graph_mlock) != 0) {
                 if (mlock(arena.allocation_base, arena.allocation_bytes) == 0) {
                     arena.mlocked = true;
@@ -2993,9 +2994,9 @@ public:
             // budget or the layer stays pageable.  ZEROMOE_QWEN_GRAPH_REGISTER=0
             // and the older ZEROMOE_QWEN_GRAPH_NO_REGISTER=1 turn it off.
             const char * graph_register =
-                std::getenv("ZEROMOE_QWEN_GRAPH_REGISTER");
+                zeromoe::graphcfg::env("ZEROMOE_QWEN_GRAPH_REGISTER");
             const char * graph_no_register =
-                std::getenv("ZEROMOE_QWEN_GRAPH_NO_REGISTER");
+                zeromoe::graphcfg::env("ZEROMOE_QWEN_GRAPH_NO_REGISTER");
             const bool graph_register_default =
                 family_ops.family == ModelFamily::Qwen4Exp;
             const bool graph_register_enabled =

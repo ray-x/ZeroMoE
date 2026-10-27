@@ -2,12 +2,13 @@
 // Split from the former run_engine() in src/main.cpp; bodies are unchanged except where
 // a former local became an EngineRunner member of the same name.
 #include "engine_runner.hpp"
+#include "graph_config.hpp"
 #include "graph_settings_global.hpp"
 #include <cstdlib>
 
 std::expected<void, std::string> EngineRunner::apply_graph_tuning() {
   const FullGraphModel *model = engine.family_ops.graph_model;
-  const bool cpu_only = config.cpu_only || std::getenv("ZEROMOE_CPU_ONLY");
+  const bool cpu_only = config.cpu_only || zeromoe::graphcfg::env("ZEROMOE_CPU_ONLY");
   const bool cuda_moe = !cpu_only && !gpu.topology.devices.empty() &&
                         engine.model_file.architecture_config.n_experts > 0;
   engine.cuda_moe_graph_policy_applies = cuda_moe;
@@ -67,7 +68,7 @@ std::expected<void, std::string> EngineRunner::apply_graph_tuning() {
 
 std::expected<void, std::string>
 EngineRunner::resolve_cuda_moe_graph_policy() {
-  const bool cpu_only = config.cpu_only || std::getenv("ZEROMOE_CPU_ONLY");
+  const bool cpu_only = config.cpu_only || zeromoe::graphcfg::env("ZEROMOE_CPU_ONLY");
   const bool cuda_moe = !cpu_only && !gpu.topology.devices.empty() &&
                         engine.model_file.architecture_config.n_experts > 0;
   engine.cuda_moe_graph_policy_applies = cuda_moe;
@@ -194,7 +195,7 @@ std::expected<void, std::string> EngineRunner::apply_engine_config() {
 #if !defined(ZEROMOE_USE_GGML_CUDA)
     return std::unexpected("graph_* settings require a build with ZEROMOE_USE_GGML_CUDA=ON");
 #endif
-    if (config.cpu_only || std::getenv("ZEROMOE_CPU_ONLY"))
+    if (config.cpu_only || zeromoe::graphcfg::env("ZEROMOE_CPU_ONLY"))
       return std::unexpected("graph_* settings require CUDA graph execution, not CPU-only mode");
   }
   try {

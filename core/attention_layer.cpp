@@ -1,4 +1,5 @@
 #include "cuda_manager.hpp"
+#include "graph_config.hpp"
 #include "dense_dispatch.hpp"
 #include "dsv41_attention.hpp"
 #include "dsv41_trace.hpp"
@@ -119,7 +120,7 @@ void invalidate_glm5next_kda_gpu_states(StreamingEngine &engine) {
 // anti-aliasing check the S=1 test structurally cannot perform).
 static bool wuv_int8_enabled() {
   static const bool on = [] {
-    const char *e = std::getenv("ZEROMOE_WUV_INT8");
+    const char *e = zeromoe::graphcfg::env("ZEROMOE_WUV_INT8");
     return e && e[0] == '1';
   }();
   return on;
@@ -127,7 +128,7 @@ static bool wuv_int8_enabled() {
 
 static bool score_prefill_legacy_forced() {
   static const bool forced = [] {
-    const char *e = std::getenv("ZEROMOE_SCORE_PREFILL_LEGACY");
+    const char *e = zeromoe::graphcfg::env("ZEROMOE_SCORE_PREFILL_LEGACY");
     return e && e[0] == '1';
   }();
   return forced;
@@ -141,7 +142,7 @@ static bool score_prefill_legacy_forced() {
 // changing model weights or routing.
 static bool force_gdn_full_host() {
   static const bool enabled = [] {
-    const char *v = std::getenv("ZEROMOE_GGML_FORCE_GDN_FULL_HOST");
+    const char *v = zeromoe::graphcfg::env("ZEROMOE_GGML_FORCE_GDN_FULL_HOST");
     return v && v[0] == '1';
   }();
   return enabled;
@@ -149,7 +150,7 @@ static bool force_gdn_full_host() {
 
 static bool gdn_full_stats_enabled() {
   static const bool enabled = [] {
-    const char *v = std::getenv("ZEROMOE_GGML_GDN_FULL_STATS");
+    const char *v = zeromoe::graphcfg::env("ZEROMOE_GGML_GDN_FULL_STATS");
     return v && v[0] == '1';
   }();
   return enabled;
@@ -463,7 +464,7 @@ static bool ensure_wuk_wuv_cached(StreamingEngine &engine, int layer_idx) {
 // (outproj 131 s of 400 s). ZEROMOE_DENSE_SCRATCH_RESERVE_MB raises it.
 static size_t dense_scratch_reserve_bytes() {
   static const size_t v = [] {
-    const char *e = std::getenv("ZEROMOE_DENSE_SCRATCH_RESERVE_MB");
+    const char *e = zeromoe::graphcfg::env("ZEROMOE_DENSE_SCRATCH_RESERVE_MB");
     const long mb = (e && e[0]) ? std::atol(e) : 256;
     return (size_t)(mb > 0 ? mb : 256) * 1024ULL * 1024ULL;
   }();
@@ -2000,7 +2001,7 @@ static void qwen4exp_gdn_delta_rule(const float *Q, const float *K,
   // A/B'd on real hardware before it becomes the default; same env-flag
   // precedent as ZEROMOE_KQUANT_LEGACY / ZEROMOE_WUV_INT8.
   static const bool gdn_chunked = [] {
-    const char *e = std::getenv("ZEROMOE_GDN_CHUNKED");
+    const char *e = zeromoe::graphcfg::env("ZEROMOE_GDN_CHUNKED");
     return e && e[0] == '1';
   }();
   // 64 matches llama.cpp's own CS for the non-KDA (GDN) branch.

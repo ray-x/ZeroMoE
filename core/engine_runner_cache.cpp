@@ -2,6 +2,7 @@
 // Split from the former run_engine() in src/main.cpp; bodies are unchanged except where
 // a former local became an EngineRunner member of the same name.
 #include "engine_runner.hpp"
+#include "graph_config.hpp"
 #include "ggml_bailingmoe3_graph.hpp"
 #include "ggml_mimo2_graph.hpp"
 
@@ -170,7 +171,7 @@ std::expected<void, std::string> EngineRunner::plan_expert_cache() {
   // their own source-ownership policy behind the explicit environment flag.
   graph_ram_cache =
       graph_mode &&
-      (std::getenv("ZEROMOE_FULL_GRAPH_USE_RAM_CACHE") != nullptr ||
+      (zeromoe::graphcfg::env("ZEROMOE_FULL_GRAPH_USE_RAM_CACHE") != nullptr ||
        (graph_engine_caps(engine).ram_cache_with_preload &&
         config.ram_preload_all_experts) ||
        (engine.family_ops.family == ModelFamily::Qwen4Exp &&

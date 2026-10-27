@@ -2,6 +2,7 @@
 // Implements Profiles A/B/C from optimize.md
 #pragma once
 #include <cuda_runtime.h>
+#include "graph_config.hpp"
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -928,13 +929,13 @@ public:
             // primary full-graph path; ZEROMOE_CUDA_SCHEDULE=blocking
             // remains available for anyone who needs to A/B the legacy path
             // against the old default.
-            const char * schedule_env = std::getenv("ZEROMOE_CUDA_SCHEDULE");
+            const char * schedule_env = zeromoe::graphcfg::env("ZEROMOE_CUDA_SCHEDULE");
             // Host-node mode (ZEROMOE_QWEN4EXP_HOST_NODE=1) runs the CPU MoE from a CUDA host callback while the
             // generation thread waits in cudaStreamSynchronize. With the Auto (spin) schedule that waiting thread
             // burns a logical CPU the 12-thread OpenMP team needs, stalling every barrier: measured 18.2 vs 22.6
             // tok/s (+24%) with a blocking wait (see tests/option_b_split_reverify_howto.md section 16). An explicit
             // ZEROMOE_CUDA_SCHEDULE still wins; every other mode keeps Auto.
-            const char * host_node_env = std::getenv("ZEROMOE_QWEN4EXP_HOST_NODE");
+            const char * host_node_env = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_HOST_NODE");
             if ((!schedule_env || !schedule_env[0]) && host_node_env && std::strcmp(host_node_env, "1") == 0)
                 schedule_env = "blocking";
             unsigned schedule_flags = cudaDeviceScheduleAuto;

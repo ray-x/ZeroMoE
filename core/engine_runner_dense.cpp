@@ -2,6 +2,7 @@
 // Split from the former run_engine() in src/main.cpp; bodies are unchanged except where
 // a former local became an EngineRunner member of the same name.
 #include "engine_runner.hpp"
+#include "graph_config.hpp"
 
 std::expected<void, std::string> EngineRunner::offload_dense_tensors() {
   gpu.report_vram_usage("after expert cache setup");
@@ -201,7 +202,7 @@ std::expected<void, std::string> EngineRunner::offload_dense_tensors() {
   int gate_inp_scheduler_kept = 0;
   size_t gate_inp_bf16_bytes_used = 0, gate_inp_f32_equivalent_bytes = 0;
   const bool disable_router_bf16 = [] {
-    const char *value = std::getenv("ZEROMOE_DISABLE_ROUTER_BF16");
+    const char *value = zeromoe::graphcfg::env("ZEROMOE_DISABLE_ROUTER_BF16");
     return value && value[0] == '1';
   }();
   // llama.cpp's CPU-MoE topology keeps the router projection on CUDA and moves only
