@@ -410,6 +410,7 @@ std::shared_ptr<MtpGraphState> build(
   if (opts.reference_cpu_norms)
     for (auto *norm : cpu_norms)
       ggml_backend_sched_set_tensor_backend(g->sched, norm, g->cpu);
+  g->allocate_to_measure = true;  // one build, admitted by its real workspace (MtpGraphRuntime::create)
   const auto *head_ptr = resident(*g->engine, "output.weight")->host_ptr;
   const auto head_meta = resident(*g->engine, "output.weight")->meta;
   auto *raw = g.get();
