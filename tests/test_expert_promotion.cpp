@@ -138,6 +138,27 @@ int main() {
     check(count_step() > cfg.cap, "begin_request re-arms the burst");
   }
 
+  // 4b) Effectiveness counters: a promotion that is used counts as a promoted hit, one evicted unused is wasted.
+  {
+    PromotionConfig cfg;
+    cfg.cap = 1; cfg.burst_extra = 0; cfg.min_misses = 1;
+    ExpertPromotionPolicy p(cfg, E, initial_slots());
+    p.note_routed(0, 50);
+    auto a = p.plan();
+    p.confirm(a[0]);
+    p.note_routed(0, 50);  // used once after the copy landed
+    check(p.stats().hits_promoted == 1 && p.stats().hits_static == 0, "promoted hit counted separately");
+    p.note_routed(0, 3);
+    check(p.stats().hits_static == 1, "static hit counted");
+    p.note_routed(0, 51);  // another miss: evicts something; make the new promotion get evicted unused
+    auto b = p.plan();
+    p.confirm(b[0]);
+    for (int e = 0; e < K; ++e) p.note_routed(0, e);  // touch all static residents so the new one is the victim
+    p.note_routed(0, 52);
+    auto c = p.plan();
+    check(!c.empty() && c[0].expert_out == 51 && p.stats().wasted == 1, "unused promotion evicted counts as wasted");
+  }
+
   // 5) Frozen: enabled=false plans nothing and the set never changes.
   {
     PromotionConfig cfg; cfg.enabled = false;

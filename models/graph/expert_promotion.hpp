@@ -50,6 +50,9 @@ struct PromotionAction {
 
 struct PromotionStats {
   uint64_t routed = 0, misses = 0, planned = 0, confirmed = 0;
+  // Effectiveness: hits served by an expert that was promoted at run time vs by the startup set, promoted
+  // experts evicted again without a single use, and tokens between a confirm and the first use.
+  uint64_t hits_static = 0, hits_promoted = 0, wasted = 0, first_use_n = 0, first_use_tokens = 0;
 };
 
 class ExpertPromotionPolicy {
@@ -87,6 +90,13 @@ class ExpertPromotionPolicy {
     const int s = slot_of_[size_t(layer)][size_t(expert)];
     if (s >= 0) {
       Slot &slot = slots_[size_t(layer)][size_t(s)];
+      if (slot.promoted) {
+        ++stats_.hits_promoted;
+        if (slot.used == 0) { ++stats_.first_use_n; stats_.first_use_tokens += step_ - slot.confirm_step; }
+        ++slot.used;
+      } else {
+        ++stats_.hits_static;
+      }
       slot.last_used = clock_;
       ++slot.hits;
       if (++hits_since_decay_ >= cfg_.decay_every) decay();
@@ -131,6 +141,7 @@ class ExpertPromotionPolicy {
       PromotionAction a;
       a.layer = c.layer; a.expert_in = c.expert; a.expert_out = slot.expert;
       a.slot = victim; a.misses = c.misses;
+      if (slot.promoted && slot.used == 0) ++stats_.wasted;
       if (slot.expert >= 0) slot_of_[size_t(c.layer)][size_t(slot.expert)] = -1;
       slot.pending = true;
       slot.incoming = c.expert;
@@ -150,6 +161,9 @@ class ExpertPromotionPolicy {
     slot.incoming = -1;
     slot.last_used = clock_;
     slot.hits = a.misses;
+    slot.promoted = true;
+    slot.used = 0;
+    slot.confirm_step = step_;
     slot_of_[size_t(a.layer)][size_t(a.expert_in)] = a.slot;
     incoming_[size_t(a.layer)][size_t(a.expert_in)] = 0;
     ++stats_.confirmed;
@@ -173,6 +187,9 @@ class ExpertPromotionPolicy {
     uint32_t hits = 0;
     bool pending = false;
     int incoming = -1;
+    bool promoted = false;     // holds an expert that was promoted at run time
+    uint32_t used = 0;         // hits since that promotion landed
+    uint64_t confirm_step = 0; // step_ when it landed
   };
   void decay() {
     hits_since_decay_ = 0;

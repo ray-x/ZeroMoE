@@ -9,6 +9,8 @@
 #include "ggml_qwen4exp_graph_internal.hpp"
 #include "moe_partial_route.hpp"
 #include "nvtx_range.hpp"
+#include <algorithm>
+#include <cstdio>
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
 
@@ -94,6 +96,26 @@ void write_tables(FullGraph &g, int layer) {
 
 }  // namespace
 
+namespace {
+
+struct PredictStats {
+  uint64_t layers_tokens = 0;      // (layer, token) pairs with a prediction
+  uint64_t actual = 0, hit = 0;    // routed experts, and how many the prediction contained
+  uint64_t actual_cold = 0, cold_hit = 0;   // routed experts that were not resident, and how many were predicted
+  uint64_t predicted_cold = 0, predicted_cold_used = 0;   // predicted non-resident experts, and how many were routed
+};
+PredictStats g_pred;
+
+FILE *promo_trace_file() {
+  static FILE *f = [] {
+    const char *path = std::getenv("ZEROMOE_PROMO_TRACE");
+    return path && path[0] ? std::fopen(path, "w") : nullptr;
+  }();
+  return f;
+}
+
+}  // namespace
+
 // Call after a run has completed (device idle) and `tokens` of its tokens are committed.
 void qwen4exp_promotion_step(FullGraph &g, int tokens) {
   if (g.engine->qwen4exp_expert_promotion <= 0 || !g.decode_mode || tokens < 1) return;
@@ -108,7 +130,55 @@ void qwen4exp_promotion_step(FullGraph &g, int tokens) {
   const auto &c = g.engine->model_file.architecture_config;
   std::vector<uint8_t> dirty(static_cast<size_t>(g.n_layers), 0);
 
-  // 1. copies that have landed make their experts resident
+  // 1. routed ids of the committed tokens, counted against the residency the run actually executed with
+  ZE_NVTX("promo.ids");
+  const size_t row = static_cast<size_t>(c.topk) * g.n_layers;
+  g.promo_ids_host.resize(row * static_cast<size_t>(g.S));
+  ggml_backend_tensor_get(g.usage_track_ids, g.promo_ids_host.data(), 0,
+                          g.promo_ids_host.size() * sizeof(int32_t));
+  FILE *trace = promo_trace_file();
+  const int ntok = std::min(tokens, g.S);
+  for (int t = 0; t < ntok; ++t)
+    for (int l = 0; l < g.n_layers; ++l) {
+      if (policy.slots(l) == 0) continue;
+      const int32_t *ids = &g.promo_ids_host[static_cast<size_t>(t) * row + static_cast<size_t>(l) * c.topk];
+      if (trace) {
+        std::fprintf(trace, "%llu %d %d", static_cast<unsigned long long>(g.promo_steps + static_cast<uint64_t>(t)), t, l);
+        for (int k = 0; k < c.topk; ++k)
+          std::fprintf(trace, " %d:%d", ids[k], ids[k] >= 0 && ids[k] < c.n_experts && policy.resident(l, ids[k]) ? 1 : 0);
+        std::fputc('\n', trace);
+      }
+      // next-layer prediction (early-ready lane, single-token decode only): predicted vs actual for layer l+1
+      if (g.S == 1) {
+        const auto lane = g.early_ready.find(l);
+        if (lane != g.early_ready.end() && lane->second->prediction && l + 1 < g.n_layers &&
+            lane->second->prediction_layer == l + 1 && policy.slots(l + 1) > 0) {
+          int32_t pred[64] = {};
+          const int k = std::min<int>(c.topk, 64);
+          if (ggml_nbytes(lane->second->prediction) >= static_cast<size_t>(k) * sizeof(int32_t)) {
+            ggml_backend_tensor_get(lane->second->prediction, pred, 0, static_cast<size_t>(k) * sizeof(int32_t));
+            const int32_t *actual = &g.promo_ids_host[static_cast<size_t>(l + 1) * c.topk];
+            ++g_pred.layers_tokens;
+            for (int i = 0; i < k; ++i) {
+              const bool in_pred = std::find(pred, pred + k, actual[i]) != pred + k;
+              const bool cold = actual[i] >= 0 && actual[i] < c.n_experts && !policy.resident(l + 1, actual[i]);
+              ++g_pred.actual; g_pred.hit += in_pred;
+              if (cold) { ++g_pred.actual_cold; g_pred.cold_hit += in_pred; }
+            }
+            for (int i = 0; i < k; ++i) {
+              if (pred[i] < 0 || pred[i] >= c.n_experts || policy.resident(l + 1, pred[i])) continue;
+              ++g_pred.predicted_cold;
+              g_pred.predicted_cold_used += std::find(actual, actual + c.topk, pred[i]) != actual + c.topk;
+            }
+          }
+        }
+      }
+      for (int k = 0; k < c.topk; ++k)
+        if (ids[k] >= 0 && ids[k] < c.n_experts) policy.note_routed(l, ids[k]);
+    }
+  if (trace) std::fflush(trace);
+
+  // 2. copies that have landed make their experts resident
   if (!g.promo_pending.empty()) {
     if (cudaEventQuery(g.promo_event) == cudaSuccess) {
       for (const auto &a : g.promo_pending) { policy.confirm(a); dirty[static_cast<size_t>(a.layer)] = 1; }
@@ -117,21 +187,6 @@ void qwen4exp_promotion_step(FullGraph &g, int tokens) {
       ++g.promo_late;
     }
   }
-
-  // 2. routed ids of the committed tokens
-  ZE_NVTX("promo.ids");
-  const size_t row = static_cast<size_t>(c.topk) * g.n_layers;
-  g.promo_ids_host.resize(row * static_cast<size_t>(g.S));
-  ggml_backend_tensor_get(g.usage_track_ids, g.promo_ids_host.data(), 0,
-                          g.promo_ids_host.size() * sizeof(int32_t));
-  for (int t = 0; t < std::min(tokens, g.S); ++t)
-    for (int l = 0; l < g.n_layers; ++l) {
-      if (policy.slots(l) == 0) continue;
-      for (int k = 0; k < c.topk; ++k) {
-        const int32_t e = g.promo_ids_host[static_cast<size_t>(t) * row + static_cast<size_t>(l) * c.topk + k];
-        if (e >= 0 && e < c.n_experts) policy.note_routed(l, e);
-      }
-    }
 
   // 3. plan, unless the previous batch of copies is still in flight
   if (g.promo_pending.empty()) {
@@ -157,11 +212,25 @@ void qwen4exp_promotion_step(FullGraph &g, int tokens) {
   g.promo_steps += static_cast<uint64_t>(tokens);
   if (g.promo_steps / 100 != (g.promo_steps - static_cast<uint64_t>(tokens)) / 100) {
     const auto &st = policy.stats();
-    LOG_INFO("[EXPERT-PROMOTION] tokens=%llu routed=%llu miss=%.2f%% planned=%llu confirmed=%llu late=%llu\n",
+    const double hits = static_cast<double>(st.hits_static + st.hits_promoted);
+    LOG_INFO("[EXPERT-PROMOTION] tokens=%llu routed=%llu miss=%.2f%% planned=%llu confirmed=%llu late=%llu | "
+             "hits from promoted=%.1f%% wasted=%llu first_use=%.1f tokens\n",
              static_cast<unsigned long long>(g.promo_steps), static_cast<unsigned long long>(st.routed),
              st.routed ? 100.0 * static_cast<double>(st.misses) / static_cast<double>(st.routed) : 0.0,
              static_cast<unsigned long long>(st.planned), static_cast<unsigned long long>(st.confirmed),
-             static_cast<unsigned long long>(g.promo_late));
+             static_cast<unsigned long long>(g.promo_late),
+             hits > 0 ? 100.0 * static_cast<double>(st.hits_promoted) / hits : 0.0,
+             static_cast<unsigned long long>(st.wasted),
+             st.first_use_n ? static_cast<double>(st.first_use_tokens) / static_cast<double>(st.first_use_n) : 0.0);
+    if (g_pred.layers_tokens)
+      LOG_INFO("[NEXT-LAYER-PREDICTION] samples=%llu recall@%d=%.1f%% | cold experts: recall=%.1f%% (%llu of %llu) "
+               "precision=%.1f%% (%llu of %llu predicted cold were used)\n",
+               static_cast<unsigned long long>(g_pred.layers_tokens), c.topk,
+               100.0 * static_cast<double>(g_pred.hit) / static_cast<double>(g_pred.actual),
+               g_pred.actual_cold ? 100.0 * static_cast<double>(g_pred.cold_hit) / static_cast<double>(g_pred.actual_cold) : 0.0,
+               static_cast<unsigned long long>(g_pred.cold_hit), static_cast<unsigned long long>(g_pred.actual_cold),
+               g_pred.predicted_cold ? 100.0 * static_cast<double>(g_pred.predicted_cold_used) / static_cast<double>(g_pred.predicted_cold) : 0.0,
+               static_cast<unsigned long long>(g_pred.predicted_cold_used), static_cast<unsigned long long>(g_pred.predicted_cold));
   }
 }
 
