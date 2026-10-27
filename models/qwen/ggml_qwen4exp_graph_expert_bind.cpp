@@ -891,7 +891,7 @@ SplitExpertWeight expert_weight_split(FullGraph &g, ggml_context *ctx,
     return r; // today's whole-layer/boundary VRAM path, unchanged
   }
   r.cpu = load_full_weight(g, ctx, name, /*device_resident=*/false);
-  if (!r.cpu || g.S != 1)
+  if (!r.cpu || (g.S != 1 && !g.decode_mode))
     return r; // today's whole-layer CPU path, unchanged; or non-decode build
   auto it = g.split_gpu_expert_ids.find(layer);
   if (it == g.split_gpu_expert_ids.end() || it->second.empty())

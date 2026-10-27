@@ -128,15 +128,55 @@ ggml_tensor *build_gdn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   glog = ggml_reshape_4d(ctx, glog, 1, g.Hv_gdn, g.S, 1);
   beta = ggml_reshape_4d(ctx, beta, 1, g.Hv_gdn, g.S, 1);
   diag("gdn_state_in", state_in);
-  ggml_tensor *gdn =
-      ggml_gated_delta_net(ctx, q, k, v, glog, beta, state_in, 1);
-  diag("gdn_output", gdn);
-
   const size_t hd_row = ggml_row_size(GGML_TYPE_F32, g.gdn_hd);
   const size_t value_row = ggml_row_size(GGML_TYPE_F32, g.value_dim);
   const size_t state_row = ggml_row_size(GGML_TYPE_F32, g.gdn_hd * g.gdn_hd);
-  ggml_tensor *core = ggml_view_4d(ctx, gdn, g.gdn_hd, g.Hv_gdn, g.S, 1, hd_row,
-                                   value_row, value_row * g.S, 0);
+  ggml_tensor *gdn = nullptr;
+  ggml_tensor *core = nullptr;
+  ggml_tensor *state_raw = nullptr;
+  if (g.decode_mode && g.S > 1) {
+    // Decode window: S chained single-token ops, exactly what S ordinary
+    // decode steps compute, keeping each intermediate state so a prefix of the
+    // window can be committed without replaying it.
+    auto token_view = [&](ggml_tensor *t, int i) {
+      return ggml_view_4d(ctx, t, t->ne[0], t->ne[1], 1, 1, t->nb[1], t->nb[2],
+                          t->nb[3], static_cast<size_t>(i) * t->nb[2]);
+    };
+    ggml_tensor *prev = state_in;
+    std::vector<ggml_tensor *> snaps;
+    for (int i = 0; i < g.S; ++i) {
+      ggml_tensor *one = ggml_gated_delta_net(
+          ctx, token_view(q, i), token_view(k, i), token_view(v, i),
+          token_view(glog, i), token_view(beta, i), prev, 1);
+      ggml_tensor *core_i = ggml_cont(
+          ctx, ggml_view_4d(ctx, one, g.gdn_hd, g.Hv_gdn, 1, 1, hd_row,
+                            value_row, value_row, 0));
+      core = core ? ggml_concat(ctx, core, core_i, 2) : core_i;
+      state_raw = ggml_view_4d(ctx, one, g.gdn_hd, g.gdn_hd, g.Hv_gdn, 1, hd_row,
+                               state_row, state_row * g.Hv_gdn,
+                               static_cast<size_t>(g.value_dim) * sizeof(float));
+      if (i + 1 < g.S) {
+        ggml_set_output(one);
+        ggml_build_forward_expand(g.graph, one);
+        snaps.push_back(state_raw);
+      }
+      prev = state_raw;
+    }
+    g.window_gdn_states.push_back(std::move(snaps));
+    ggml_set_output(conv_in);
+    ggml_build_forward_expand(g.graph, conv_in);
+    g.window_conv_in.push_back(conv_in);
+    gdn = core;
+  } else {
+    gdn = ggml_gated_delta_net(ctx, q, k, v, glog, beta, state_in, 1);
+    core = ggml_view_4d(ctx, gdn, g.gdn_hd, g.Hv_gdn, g.S, 1, hd_row,
+                        value_row, value_row * g.S, 0);
+    state_raw = ggml_view_4d(
+        ctx, gdn, g.gdn_hd, g.gdn_hd, g.Hv_gdn, 1, hd_row, state_row,
+        state_row * g.Hv_gdn,
+        static_cast<size_t>(g.value_dim) * g.S * sizeof(float));
+  }
+  diag("gdn_output", gdn);
   diag("gdn_core", core);
   // *state_out is kept in the op's own NATIVE layout (ne[0]=k, ne[1]=v; see
   // the gdn_state_transpose_host comment above) because the full-graph
@@ -148,10 +188,6 @@ ggml_tensor *build_gdn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   // transpose baked in here only benefits the host path and silently
   // breaks the device-resident self-loop instead (this was the actual bug:
   // wrong values from the second decode token onward).
-  ggml_tensor *state_raw =
-      ggml_view_4d(ctx, gdn, g.gdn_hd, g.gdn_hd, g.Hv_gdn, 1, hd_row, state_row,
-                   state_row * g.Hv_gdn,
-                   static_cast<size_t>(g.value_dim) * g.S * sizeof(float));
   // Qwen's decode graph can feed this contiguous snapshot view directly to a
   // cache CPY. ggml-cuda recognizes the GATED_DELTA_NET -> VIEW -> CPY pattern
   // and writes the recurrent snapshot into the persistent state buffer from
@@ -368,14 +404,15 @@ ggml_tensor *build_full_attention_decode(
   };
   return qwen4exp_ops::attention_decode(
       attention, ctx, cur, w_q, w_k, w_v, w_qn, w_kn, w_o, k_storage,
-      v_storage, g.positions, g.decode_indices, g.attn_mask, nullptr, diag);
+      v_storage, g.positions, g.decode_indices, g.attn_mask, nullptr, diag,
+      g.S);
 }
 
 bool prepare_ple_embedding(FullGraph &g, std::vector<float> &embedding, int S,
                            int pos_base, const int *token_ids) {
   const auto &c = g.engine->model_file.architecture_config;
   if (!has_ple_layer(c) || !token_ids ||
-      (pos_base != 0 && !(g.decode_mode && S == 1) && g.decode_mode))
+      (pos_base != 0 && g.decode_mode && S != g.S))
     return !has_ple_layer(c);
   const GGUFTensor *table =
       model_tensor(*g.engine, "per_layer_token_embd.weight");
@@ -395,29 +432,24 @@ bool prepare_ple_embedding(FullGraph &g, std::vector<float> &embedding, int S,
     ctx[0] = token_ids[i];
     bool cut = false;
     for (int s = 1; s < c.ple_ngram_size; ++s) {
-      if (g.decode_mode) {
-        const int64_t pos = pos_base + i;
-        const int64_t back = s - i;
-        const auto &history = g.engine->qwen4exp_ple_tok_hist;
-        if (g.engine->qwen4exp_ple_next_pos == pos && back > 0 &&
-            back <= static_cast<int64_t>(history.size())) {
-          const size_t index = history.size() - static_cast<size_t>(back);
-          ctx[s] = history[index];
-        } else {
-          ctx[s] = eos;
-        }
-      } else {
+      {
         const int j = i - s;
+        const int64_t pos = pos_base + i;
         if (j >= 0) {
           ctx[s] = token_ids[j];
-        } else if (pos_base > 0 && g.engine->qwen4exp_ple_next_pos == pos_base) {
-          // Chunked prefill: the tokens before this batch are the previous batch's n-gram window.
+        } else if (g.decode_mode ? g.engine->qwen4exp_ple_next_pos == pos_base
+                                 : (pos_base > 0 &&
+                                    g.engine->qwen4exp_ple_next_pos == pos_base)) {
+          // The tokens before this batch / window are the previous n-gram window.
           const auto &history = g.engine->qwen4exp_ple_tok_hist;
           const int64_t back = s - i;
-          ctx[s] = back <= static_cast<int64_t>(history.size()) ? history[history.size() - (size_t)back] : eos;
+          ctx[s] = back > 0 && back <= static_cast<int64_t>(history.size())
+                       ? history[history.size() - static_cast<size_t>(back)]
+                       : eos;
         } else {
           ctx[s] = eos;
         }
+        (void)pos;
       }
       if (cut || ctx[s] == eos) {
         ctx[s] = eos;

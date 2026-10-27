@@ -16,7 +16,8 @@ using namespace zeromoe::graph;
 namespace {
 
 constexpr size_t W = 4;
-bool g_batch = false;  // run every scenario once stepwise and once with batched verification
+int g_mode = 0;  // 0 stepwise, 1 batched + restore/replay, 2 batched + prefix commit
+bool g_batch = false;
 
 uint32_t mix(uint32_t a, uint32_t b, uint32_t c = 0) {
   uint32_t x = a * 2654435761u ^ (b + 0x9e3779b9u) * 40503u ^ (c + 77u) * 2246822519u;
@@ -43,15 +44,28 @@ struct FakeTarget : SpecTarget {
   std::map<int, uint32_t> checkpoints;
   explicit FakeTarget(size_t vocab) : V(vocab) {}
   bool supports_batch() const override { return g_batch; }
+  bool supports_prefix_commit() const override { return g_mode == 2; }
+  std::vector<uint32_t> window_states;  // state after each token of the last batch
+  int commits = 0;
+  bool commit_prefix(int m, std::string &error) override {
+    if (m < 1 || m > int(window_states.size())) { error = "bad prefix"; return false; }
+    h = window_states[size_t(m - 1)];
+    window_states.clear();
+    ++commits;
+    return true;
+  }
   int batches = 0, batch_tokens = 0;
   bool step_batch(std::span<const int> tokens, int position, std::span<float> wide,
                   std::span<float> logits, std::string &error) override {
     ++batches;
     batch_tokens += int(tokens.size());
-    for (size_t i = 0; i < tokens.size(); ++i)
+    window_states.clear();
+    for (size_t i = 0; i < tokens.size(); ++i) {
       if (!step(tokens[i], position + int(i), wide.subspan(i * W, W),
                 logits.subspan(i * V, V), error))
         return false;
+      window_states.push_back(h);
+    }
     return true;
   }
   bool step(int token, int position, std::span<float> wide, std::span<float> logits,
@@ -183,7 +197,9 @@ std::vector<int> plain_decode(size_t V, const std::vector<int> &prompt, int max_
   return out;
 }
 
-int run_all(bool batch) {
+int run_all(int mode) {
+  g_mode = mode;
+  const bool batch = mode >= 1;
   g_batch = batch;
   int failures = 0;
   const auto check = [&](bool ok, const char *name) {
@@ -253,7 +269,8 @@ int run_all(bool batch) {
           "test exercises both acceptance and rejection");
     if (batch) {
       check(batch_passes > 0, "batched verification path exercised");
-      check(replays > 0, "mid-batch rollback (restore + replay) exercised");
+      if (g_mode == 1) check(replays > 0, "mid-batch rollback (restore + replay) exercised");
+      if (g_mode == 2) check(replays == 0, "prefix commit never replays");
       check(perfect_replays == 0, "a perfect draft never needs a replay");
       check(batch_state_ok, "driver and target agree on batch counts");
     }
@@ -460,9 +477,10 @@ int run_all(bool batch) {
 
 int main() {
   int failures = 0;
-  for (bool batch : {false, true}) {
-    std::fprintf(stderr, "-- %s verification\n", batch ? "batched" : "stepwise");
-    failures += run_all(batch);
+  const char *names[] = {"stepwise", "batched (restore + replay)", "batched (prefix commit)"};
+  for (int mode : {0, 1, 2}) {
+    std::fprintf(stderr, "-- %s verification\n", names[mode]);
+    failures += run_all(mode);
   }
   std::printf("MTP speculation: %s\n", failures ? "FAIL" : "PASS");
   return failures ? 1 : 0;

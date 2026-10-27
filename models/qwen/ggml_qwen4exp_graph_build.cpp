@@ -342,12 +342,12 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
                            "qwen_full_positions");
   if (g.decode_mode) {
     g.attn_mask = host_input(
-        g, g.ctx, GGML_TYPE_F16, {g.kv_capacity, 1, 1, 1},
-        static_cast<size_t>(g.kv_capacity) * sizeof(ggml_fp16_t),
+        g, g.ctx, GGML_TYPE_F16, {g.kv_capacity, g.S},
+        static_cast<size_t>(g.kv_capacity) * g.S * sizeof(ggml_fp16_t),
         "qwen_full_decode_mask");
     g.decode_indices = host_input(
-        g, g.ctx, GGML_TYPE_I32, {g.Hkv},
-        static_cast<size_t>(g.Hkv) * sizeof(int32_t),
+        g, g.ctx, GGML_TYPE_I32, {static_cast<int64_t>(g.Hkv) * g.S},
+        static_cast<size_t>(g.Hkv) * g.S * sizeof(int32_t),
         "qwen_full_decode_kv_indices");
   } else {
     const int64_t kv_len = (int64_t)g.pos_base + g.S;
@@ -373,7 +373,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     }
   }
   if (g.decode_mode) {
-    for (int k = 0; k < g.kv_capacity; ++k)
+    for (size_t k = 0; k < static_cast<size_t>(g.kv_capacity) * g.S; ++k)
       mask[k] = ggml_fp32_to_fp16(0.0f);
     auto *indices = static_cast<int32_t *>(g.decode_indices->data);
     // k_cache/v_cache are [hd, kv_capacity * Hkv]; the later
@@ -383,8 +383,9 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     // head is the outer index, position the inner one. Must write
     // h * kv_capacity + pos, not pos * Hkv + h (this is the pos_base=0
     // case of that same formula).
-    for (int h = 0; h < g.Hkv; ++h)
-      indices[h] = h * g.kv_capacity;
+    for (int t = 0; t < g.S; ++t)
+      for (int h = 0; h < g.Hkv; ++h)
+        indices[t * g.Hkv + h] = h * g.kv_capacity + t;
   } else {
     const int kv_len = g.pos_base + g.S;
     for (int q = 0; q < g.S; ++q)
@@ -551,6 +552,11 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       conv_out =
           ggml_reshape_3d(g.ctx, ggml_silu(g.ctx, conv_out), g.D, g.HC, g.S);
       res = ggml_add(g.ctx, res, ggml_add(g.ctx, gated, conv_out));
+      if (g.decode_mode && g.S > 1) {
+        ggml_set_output(padded);
+        ggml_build_forward_expand(g.graph, padded);
+        g.window_ple_padded = padded;
+      }
       g.ple_hist_out = ggml_cont(
           g.ctx, ggml_view_3d(g.ctx, padded, hist, g.D * g.HC, 1, padded->nb[1],
                               padded->nb[2], ggml_row_size(padded->type, g.S)));
@@ -720,7 +726,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     // two, matching llama.cpp's reference graph.
     const auto split_it = g.split_gpu_expert_ids.find(l);
     const bool split_planned =
-        g.S == 1 && split_it != g.split_gpu_expert_ids.end() &&
+        (g.S == 1 || g.decode_mode) && split_it != g.split_gpu_expert_ids.end() &&
         !split_it->second.empty();
     ggml_tensor *moe = nullptr;
 

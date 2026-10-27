@@ -66,6 +66,21 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
                                     const int *token_ids, float *logits,
                                     int vocab);
 
+// Run a window of S consecutive tokens through the decode graph (built with
+// engine.qwen4exp_decode_window == S) in one submission. The caller has already
+// written the S HC-expanded embeddings to engine.hc_stream_buf (S * D * HC floats)
+// and called qwen4exp_full_graph_decode_prepare(engine, pos_base, token_ids).
+// logits receives S * vocab floats, wide S * D * HC (pre-head residual per token).
+bool qwen4exp_full_graph_window_run(StreamingEngine &engine, int S, int pos_base,
+                                    const int *token_ids, float *logits,
+                                    float *wide);
+
+// Keep the first m tokens of the window last run (1 <= m <= S): the device
+// state becomes the state after exactly those tokens (per-token GDN snapshots,
+// shifted conv/PLE histories; KV needs nothing) and host metadata advances by m.
+// Must be called before the next window run. m == S is free.
+bool qwen4exp_full_graph_window_commit(StreamingEngine &engine, int m);
+
 // Device-side checkpoints of the decode graph's recurrent state (GDN state and
 // conv history, PLE history, plus the host PLE window), for graph-native MTP
 // verification. Valid only on the live decode graph that took them; a rebuilt

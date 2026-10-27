@@ -932,7 +932,8 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     // sorted paths the patch does not cover, so it keeps the valid dummy id
     // and relies on the mask multiply to zero the foreign contribution.
     ExpertSplitTables tab = build_expert_split_tables(
-        g, ctx, c.n_experts, *split_gpu_ids, /*safe_dummy_fill=*/g.S != 1);
+        g, ctx, c.n_experts, *split_gpu_ids,
+        /*safe_dummy_fill=*/g.S != 1 && !g.decode_mode);
     if (tab.remap_gpu && tab.remap_cpu && tab.mask_gpu && tab.mask_cpu) {
       const char *early_env = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_LAYER13");
       const char *all_early_env = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT");
@@ -994,14 +995,27 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
           g.early_stage_pools.push_back(std::move(pool));
         }
       }
-      ggml_tensor *ids_gpu_raw = ggml_get_rows(ctx, route_tab.remap_gpu, ids);
+      // The split tables are [1, n_experts, 1]; ggml_get_rows wants one row
+      // index per element, so a window (S > 1) looks up the flattened ids and
+      // the results are reshaped back to the [topk, S] / weights layout.
+      ggml_tensor *ids_flat =
+          g.S == 1 ? ids
+                   : ggml_reshape_1d(ctx, ggml_cont(ctx, ids),
+                                     static_cast<int64_t>(c.topk) * g.S);
+      const auto lookup_like_weights = [&](ggml_tensor *table) {
+        ggml_tensor *r = ggml_get_rows(ctx, table, ids_flat);
+        return g.S == 1 ? r
+                        : ggml_reshape_4d(ctx, r, weights->ne[0], weights->ne[1],
+                                          weights->ne[2], weights->ne[3]);
+      };
+      ggml_tensor *ids_gpu_raw = ggml_get_rows(ctx, route_tab.remap_gpu, ids_flat);
       ggml_tensor *ids_gpu = ggml_reshape_2d(ctx, ids_gpu_raw, c.topk, g.S);
-      ggml_tensor *ids_cpu_raw = ggml_get_rows(ctx, route_tab.remap_cpu, ids);
+      ggml_tensor *ids_cpu_raw = ggml_get_rows(ctx, route_tab.remap_cpu, ids_flat);
       ggml_tensor *ids_cpu = ggml_reshape_2d(ctx, ids_cpu_raw, c.topk, g.S);
       ggml_tensor *weights_gpu =
-          ggml_mul(ctx, weights, ggml_get_rows(ctx, route_tab.mask_gpu, ids));
+          ggml_mul(ctx, weights, lookup_like_weights(route_tab.mask_gpu));
       ggml_tensor *weights_cpu =
-          ggml_mul(ctx, weights, ggml_get_rows(ctx, route_tab.mask_cpu, ids));
+          ggml_mul(ctx, weights, lookup_like_weights(route_tab.mask_cpu));
 
       ggml_tensor *cold_weighted = nullptr;
       if (partial_requested) {
