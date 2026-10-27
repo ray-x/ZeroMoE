@@ -1377,8 +1377,8 @@ void update_partial_routes(FullGraph &g, int pos_base, double compute_ms) {
       if (g.dynamic_upload->stopping)
         g.dynamic_upload_disabled = true;
     }
-    int budget = dynamic_upload_budget_override();
-    if (budget < 0 && !g.dynamic_upload_disabled) {
+    int budget = -1; // adaptive; fixed share of compute time per upload
+    if (!g.dynamic_upload_disabled) {
       if (!ensure_dynamic_upload_worker(g)) {
         g.dynamic_upload_disabled = true;
       } else {
@@ -1399,8 +1399,9 @@ void update_partial_routes(FullGraph &g, int pos_base, double compute_ms) {
                       g.dynamic_upload->completed.size() +
                       (g.dynamic_upload->active ? 1 : 0);
           }
+          constexpr double kComputeShareForUploads = 0.25;
           const double affordable =
-              dynamic_upload_fraction() * g.dynamic_compute_ms_ema /
+              kComputeShareForUploads * g.dynamic_compute_ms_ema /
               g.dynamic_upload_ms_per_job;
           const size_t total_budget =
               std::min<size_t>(active_layers,

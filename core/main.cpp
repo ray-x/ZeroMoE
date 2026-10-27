@@ -53,6 +53,7 @@
 #include <string>
 #include <thread>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 #include "request_stats.hpp"
 #include "bench_mode.hpp"
@@ -467,10 +468,23 @@ int main(int argc, char *argv[]) {
   std::string api_host_cli = "127.0.0.1";
   std::string api_model_cli = "zeromoe";
   int api_port_cli = 8080;
+  zeromoe::graphsettings::CliValues graph_cli_settings;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
-    if (arg == "--config" && i + 1 < argc)
+    std::string graph_setting;
+    if (zeromoe::graphsettings::cli_setting_name(arg, graph_setting)) {
+      if (i + 1 >= argc ||
+          (argv[i + 1][0] == '-' && argv[i + 1][1] == '-')) {
+        std::cerr << "Error: " << arg << " requires a value\n";
+        return 1;
+      }
+      graph_cli_settings[graph_setting] = argv[++i];
+    } else if (arg.rfind("--graph-", 0) == 0) {
+      std::cerr << "Error: unknown graph setting option " << arg
+                << " (see --help-settings)\n";
+      return 1;
+    } else if (arg == "--config" && i + 1 < argc)
       config_path = argv[++i];
     else if (arg == "--serve")
       serve_api_cli = true;
@@ -592,6 +606,7 @@ int main(int argc, char *argv[]) {
   }
 
   EngineConfig config;
+  config.graph_cli_settings = std::move(graph_cli_settings);
 
   // Public configs carry a placeholder model_path ("/path/to/model-or-shard-directory"). Resolve the model here:
   // --model wins; otherwise a real model_path in the config; otherwise ZEROMOE_MODEL_PATH; otherwise stop.

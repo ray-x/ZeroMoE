@@ -667,7 +667,7 @@ FamilyOps resolve_family_ops(ModelFamily fam, const ArchitectureConfig &c) {
   case ModelFamily::Unknown:
   default:
     // Matches today's actual pre-refactor behavior: nothing in the live GPU
-    // path branches on Qwen/GemmaMoE/KimiMoE/Unknown either -- they all fell
+    // path branches on Hunyuan/GemmaMoE/KimiMoE/Unknown either -- they all fell
     // through is_mla's `else` branch (dense) exactly like Hunyuan/Llama do.
     // Note: graph_initializer.cpp's OLD use_sigmoid_gate fallback compared
     // arch0 == "hy_v3" (missing hyphen -- the real family string everywhere

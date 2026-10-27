@@ -36,7 +36,7 @@ namespace zeromoe::graphsettings {
 // Glm one through family_inherits().
 enum class Family : uint8_t { Other, MiMo2, Ling, Glm, Qwen };
 inline constexpr size_t kFamilyCount = static_cast<size_t>(Family::Qwen) + 1;
-enum class Source : uint8_t { Default, Family, Toml, Env };
+enum class Source : uint8_t { Default, Family, Toml, Env, Cli };
 
 // Which adapters consume a setting. This is declared per field instead of being
 // inferred from aliases: alias visibility and capability differ for Ling, which
@@ -65,6 +65,7 @@ inline const char *source_name(Source s) {
   case Source::Family: return "family";
   case Source::Toml: return "toml";
   case Source::Env: return "env";
+  case Source::Cli: return "cli";
   }
   return "?";
 }
@@ -102,7 +103,7 @@ struct GraphSettings {
   // GLM graph lane / staging switches.
   Resolved<long> early_ready;              // -1 = on when the layer has overlap work, 0 off, 1 forced
   Resolved<long> split_load, lane_with_gpu1, pilot_copy;  // bool, on by default
-  Resolved<long> gpu_assist_any_type, dynamic_cache;      // bool, off by default
+  Resolved<long> dynamic_cache;                          // bool, off by default
   Resolved<long> gpu_assist2_slots;
   Resolved<double> offload_pinned_fraction;
   Resolved<double> offload_probation_fraction;
@@ -129,6 +130,7 @@ struct ResolvedSettings {
 
 using EnvView = std::function<const char *(const char *)>;
 using ConfigValues = std::map<std::string, std::string>;
+using CliValues = std::map<std::string, std::string>;
 
 enum class Parse { IntStrict, IntAtoi, FlagOn, FlagUnlessOff, TriState, EqualsOne, RealOrAuto, Text };
 
@@ -139,6 +141,13 @@ struct Alias {
 };
 inline Alias any_family(const char *env) { return {env, Family::Other, true}; }
 inline Alias only_family(Family f, const char *env) { return {env, f, false}; }
+
+inline std::string cli_option(const char *name) {
+  std::string option = "--graph-";
+  for (const char *p = name; *p; ++p)
+    option += *p == '_' ? '-' : *p;
+  return option;
+}
 
 // Ling's spelling of a knob shared with the GLM graph. Aliases are tried in
 // table order, so the Ling name must stay first.
@@ -224,8 +233,6 @@ inline const std::vector<Field<long>> &long_fields() {
        claims_for(F::Glm), {only_family(F::Glm, "ZEROMOE_GLM5NEXT_LANE_WITH_GPU1")}, false},
       {"pilot_copy", ZEROMOE_SETTINGS_REF(tun.pilot_copy), 1, Parse::FlagUnlessOff,
        claims_for(F::Glm), {only_family(F::Glm, "ZEROMOE_GLM5NEXT_PILOT_COPY")}, false},
-      {"gpu_assist_any_type", ZEROMOE_SETTINGS_REF(tun.gpu_assist_any_type), 0, Parse::FlagOn,
-       claims_for(F::Glm), {only_family(F::Glm, "ZEROMOE_GLM5NEXT_GPU_ASSIST_ANY_TYPE")}, false},
       {"dynamic_cache", ZEROMOE_SETTINGS_REF(tun.dynamic_cache), 0, Parse::FlagOn,
        claims_for(F::Glm), {only_family(F::Glm, "ZEROMOE_GLM5NEXT_DYNAMIC_CACHE")}, false},
       {"gpu_assist2_slots", ZEROMOE_SETTINGS_REF(tun.gpu_assist2_slots), 1, Parse::IntAtoi,
@@ -313,6 +320,14 @@ template<class Fn> inline void each_field(Fn fn) {
   for (const auto &f : text_fields()) fn(f);
 }
 
+inline bool cli_setting_name(const std::string &option, std::string &name) {
+  bool found = false;
+  each_field([&](const auto &f) {
+    if (option == cli_option(f.name)) { name = f.name; found = true; }
+  });
+  return found;
+}
+
 inline const char *family_name(Family fam) {
   switch (fam) {
   case Family::Other: return "shared";
@@ -351,7 +366,6 @@ inline const char *meaning(const std::string &name) {
       {"split_load", "Allow GLM split expert-load scheduling; false changes the overlap strategy."},
       {"lane_with_gpu1", "Allow the GLM overlap lane alongside second-GPU expert work."},
       {"pilot_copy", "Allow GLM pilot-driven expert-copy staging."},
-      {"gpu_assist_any_type", "Experimental GLM assist for additional quantization types; leave at the validated family value."},
       {"dynamic_cache", "Experimental GLM dynamic expert cache rather than the fixed validated placement."},
       {"offload_pinned_fraction", "Pinned fraction of the GLM/Ling host offload pool (0..1), not a GiB budget."},
       {"offload_probation_fraction", "GLM/Ling segmented-cache probation fraction (0..1); applies to the segmented policy."},
@@ -523,10 +537,11 @@ inline void read_long(const Field<long> &f, Family fam, const EnvView &env, Reso
 
 } // namespace detail
 
-// Resolves defaults -> family overrides -> TOML -> legacy env. Errors (redundant or reasonless
+// Resolves defaults -> family overrides -> TOML -> legacy env -> CLI. Errors (redundant or reasonless
 // overrides, unknown fields) are appended to *err, one per line.
 inline ResolvedSettings resolve_settings(Family fam, const EnvView &env, std::string *err = nullptr,
-                                         const ConfigValues &config = {}) {
+                                         const ConfigValues &config = {},
+                                         const CliValues &cli = {}) {
   ResolvedSettings r;
   r.family = fam;
   auto note = [&](const std::string &m) { if (err) *err += m + "\n"; };
@@ -602,11 +617,30 @@ inline ResolvedSettings resolve_settings(Family fam, const EnvView &env, std::st
       }
     }
   }
+  // CLI values share the canonical setting parser and apply last, above
+  // compatibility environment aliases and TOML.
+  each_field([&](const auto &f) {
+    const auto it = cli.find(f.name);
+    if (it == cli.end() || !detail::reads(f, fam)) return;
+    try {
+      auto &slot = f.ref(r);
+      detail::canonical(f, it->second, slot);
+      slot.src = Source::Cli;
+      slot.origin = cli_option(f.name);
+    } catch (const std::invalid_argument &e) {
+      const std::string message = cli_option(f.name) + ": " + e.what();
+      if (!err) throw std::invalid_argument(message);
+      note(message);
+    }
+  });
   each_field([&](const auto &f) {
     for (const Alias &a : f.aliases) {
       if (!detail::alias_applies(a, fam) || !detail::present(env(a.env))) continue;
-      std::string message = std::string(a.env) + " is a legacy override; use graph_" + f.name + " in TOML";
-      if (config.contains(f.name))
+      std::string message = std::string(a.env) + " is a legacy override; use graph_" +
+                            f.name + " in TOML or " + cli_option(f.name);
+      if (cli.contains(f.name))
+        message += " (CLI takes precedence)";
+      else if (config.contains(f.name))
         message += " (legacy environment takes precedence over TOML)";
       r.warnings.push_back(std::move(message));
     }
@@ -615,10 +649,12 @@ inline ResolvedSettings resolve_settings(Family fam, const EnvView &env, std::st
 }
 
 inline bool validate_config(const ConfigValues &values, const std::vector<Family> &families,
-                            std::string &error) {
+                            std::string &error, const CliValues &cli = {}) {
+  ConfigValues merged = values;
+  for (const auto &[name, value] : cli) merged[name] = value;
   // The list is the model's active adapters (plus Other for shared knobs), not
   // its alias namespace: Ling's shared-graph runs list Glm, native runs do not.
-  for (const auto &[name, value] : values) {
+  for (const auto &[name, value] : merged) {
     (void)value;
     bool known = false, supported = false;
     each_field([&](const auto &f) {
@@ -631,12 +667,13 @@ inline bool validate_config(const ConfigValues &values, const std::vector<Family
   }
   if (!error.empty()) return false;
   for (Family family : families)
-    resolve_settings(family, [](const char *) -> const char * { return nullptr; }, &error, values);
+    resolve_settings(family, [](const char *) -> const char * { return nullptr; }, &error, merged);
   return error.empty();
 }
 
 inline long prefill_chunk_value(const Resolved<long> &chunk, long engine_chunk, long family_fallback) {
-  if (chunk.src == Source::Env || (chunk.src == Source::Toml && chunk.value > 0))
+  if (chunk.src == Source::Env ||
+      ((chunk.src == Source::Toml || chunk.src == Source::Cli) && chunk.value > 0))
     return chunk.value;
   if (engine_chunk > 0) return engine_chunk;
   return chunk.value > 0 ? chunk.value : family_fallback;
@@ -658,7 +695,7 @@ template<class T> inline std::string setting_value(const Field<T> &f, const T &v
 
 inline std::string settings_reference() {
   std::string out = "Advanced graph settings (root TOML keys, before [[gpus]]).\n"
-                    "Precedence: defaults < family < TOML < legacy environment.\n"
+                    "Precedence: defaults < family < TOML < legacy environment < CLI.\n"
                     "These are not required setup switches. Use the model recipe first.\n"
                     "Families listed below resolve a value for each setting; Ling's shared\n"
                     "GLM graph inherits the glm defaults.\n"
@@ -675,6 +712,7 @@ inline std::string settings_reference() {
     out += "\n  Legacy env:";
     for (const auto &a : f.aliases) out += " " + std::string(a.env);
     if (f.aliases.empty()) out += " (none)";
+    out += "\n  CLI: " + cli_option(f.name);
     out += '\n';
   });
   return out;

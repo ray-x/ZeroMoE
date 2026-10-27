@@ -1,12 +1,12 @@
 # Settings resolver and sparse profile pins
 
-Status: **defaults, family overrides, canonical root TOML and compatibility environment
-aliases implemented**. Qwen whole-layer placement and shared CPU thread caps also use
-the resolver. Profile pins, a generic CLI layer and capability negotiation remain
-design proposals. User-facing behavior and commands: [configuration guide](../configuration.md).
+Status: **defaults, family overrides, canonical root TOML, compatibility environment
+aliases and generated graph CLI flags implemented**. Qwen whole-layer placement and
+shared CPU thread caps also use the resolver. Profile pins and capability negotiation
+remain design proposals. User-facing behavior and commands: [configuration guide](../configuration.md).
 The sections below describe the broader target design, not all shipped behavior.
 Code: `models/graph/graph_settings.hpp`
-(pure), `graph_settings_global.hpp` (real env + `[SETTINGS]` log), `tests/test_graph_settings.cpp`. Detail for rollout steps 0–1 of
+(pure), `graph_settings_global.hpp` (real env/CLI binding + `[SETTINGS]` log), `tests/test_graph_settings.cpp`. Detail for rollout steps 0–1 of
 `docs/design/model-family-framework.md` (§4.2, §5). Assumes the sparse-pin proposal: a profile stores
 only measured fields, everything else follows live defaults, and a version-plus-hash drift check
 guards it. If the R4 owner rejects that, §7 gives the fallback. Extends `docs/execution-profile-spec.md`

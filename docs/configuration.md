@@ -16,7 +16,7 @@ silently changes numerical or memory policy.
 | Model TOML recipe | Persistent model paths, topology, budgets, context and generation settings |
 | Normal CLI / `--help` | Common per-run overrides |
 | `--help-all` | Compatibility flags, advanced tuning, tracing and benchmarks |
-| Root `graph_*` TOML keys / `--help-settings` | Advanced typed graph tuning; reference includes effects, units, family defaults and legacy names |
+| Root `graph_*` TOML keys / generated `--graph-*` flags / `--help-settings` | Advanced typed graph tuning; reference includes effects, units, family defaults and legacy names |
 | Legacy `ZEROMOE_*` environment variables | Existing scripts and controlled experiments, not required setup for the Qwen recipe |
 | CMake presets/options | Platform/backend capabilities compiled into the binary, not per-request tuning |
 
@@ -27,12 +27,15 @@ to apply CUDA graph tuning. Use a CPU configuration, not a CUDA model recipe.
 
 ## Advanced graph tuning and precedence
 
-The implemented graph resolver uses:
+The graph resolver uses:
 
-**common defaults < family defaults < root TOML settings < legacy environment**.
+**common defaults < family defaults < root TOML settings < legacy environment < CLI**.
 
-There is no new generic CLI override or profile-pin layer for these fields yet.
-Existing non-graph CLI flags keep their existing behavior.
+Every registered graph setting also has a generated `--graph-<setting-name>` CLI
+flag. Convert underscores to hyphens; for example, `graph_prefill_chunk` can be
+overridden with `--graph-prefill-chunk 256`. CLI values use the same strict
+canonical parser as TOML. Existing non-graph CLI flags keep their existing
+behavior.
 
 Place graph settings **before the first `[[gpus]]` table**. Do not add a
 `[graph]` section: the lightweight TOML readers do not support nested settings.
@@ -78,12 +81,14 @@ Only set values justified for your model and hardware. This is not a generic
 recommended tuning block.
 
 At initialization, `[SETTINGS]` prints each applicable canonical key and its
-effective value/source (`default`, `family`, `toml:graph_...`, or `env:ZEROMOE_...`).
+effective value/source (`default`, `family`, `toml:graph_...`, `env:ZEROMOE_...`,
+or `cli:--graph-...`).
 Family overrides include their reason. A legacy alias logs a migration warning.
-If both TOML and a legacy alias are set, **the environment still wins**.
-Remove the exported variable after migrating, or your TOML change will not take
-effect. Historical environment parsing is preserved, including its inconsistent
-boolean and malformed-number behavior; it is not the stricter canonical parser.
+If both TOML and a legacy alias are set, the environment wins unless the CLI
+sets that same key. Remove the exported variable after migrating so TOML remains
+effective. Historical environment parsing is preserved, including its
+inconsistent boolean and malformed-number behavior; TOML and CLI use the
+stricter canonical parser.
 
 Graph settings are bound before initialization and then immutable. Changing
 environment variables or rewriting the config while the process runs is not a

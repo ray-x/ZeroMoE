@@ -15,6 +15,7 @@ namespace zeromoe::graphsettings {
 struct SettingsBinding {
   std::mutex mutex;
   ConfigValues config;
+  CliValues cli;
   std::array<ResolvedSettings, kFamilyCount> cache;
   std::array<bool, kFamilyCount> done{};
 };
@@ -24,12 +25,14 @@ inline SettingsBinding &settings_binding() {
   return binding;
 }
 
-inline void configure_settings(const ConfigValues &config) {
+inline void configure_settings(const ConfigValues &config,
+                               const CliValues &cli = {}) {
   auto &b = settings_binding();
   std::lock_guard lock(b.mutex);
   if (std::any_of(b.done.begin(), b.done.end(), [](bool done) { return done; }))
     throw std::logic_error("graph settings must be configured before graph initialization");
   b.config = config;
+  b.cli = cli;
 }
 
 inline const ResolvedSettings &settings_for(Family fam) {
@@ -41,7 +44,8 @@ inline const ResolvedSettings &settings_for(Family fam) {
   if (!done[i]) {
     std::string err;
     cache[i] = resolve_settings(
-        fam, [](const char *n) { return zeromoe::graphcfg::env(n); }, &err, b.config);
+        fam, [](const char *n) { return zeromoe::graphcfg::env(n); }, &err,
+        b.config, b.cli);
     if (!err.empty()) throw std::invalid_argument("invalid graph settings:\n" + err);
     done[i] = true;
     static const char *const names[] = {"other", "mimo2", "ling", "glm", "qwen"};

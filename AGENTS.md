@@ -1,5 +1,13 @@
 # ZeroMoE agent instructions
 
+## Large file creation
+
+- Before creating or copying any individual file larger than 10 GiB, get the
+  user's explicit permission. First state the destination and expected size;
+  check available space and explain any existing files that would be replaced.
+  This applies to generated model shards, spliced GGUFs, build artifacts, and
+  other large outputs. Do not treat available disk space as permission.
+
 ## CUDA MoE architecture is full graph
 
 - Do not add a new CUDA MoE family through the legacy layer-by-layer expert

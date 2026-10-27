@@ -1,31 +1,32 @@
 # Configuration knob removal inventory
 
-Planning snapshot, 2026-10-26. This preserves the work so removal can resume
-after worktree integration. The removals that were actually applied are listed
-in [Removal log](#removal-log); everything else remains a proposal.
+Started from the planning snapshot of 2026-10-26. This preserves the work so
+removal can resume after worktree integration. The removals that were actually
+applied are listed in [Removal log](#removal-log); everything else remains a
+proposal unless called out in the 2026-10-27 refresh below.
 
 ## Integration status
 
-The uncommitted settings worktree was merged into `master` in `6e247ed`
-(2026-10-27). That merge brought the typed resolver, root `graph_*` TOML layer,
-legacy-alias warnings, startup `[SETTINGS]` binding, concise/advanced help,
-Release presets, configuration guide and the settings tests into the active
-checkout. CPU build, resolver tests and the Qwen migration inventory check pass
-on the merged tree.
+The settings resolver and subsequent full-graph cleanup are integrated in the
+active checkout. The current scan below uses `/home/ray/Projects/ZeroMoE`,
+branch `master`, HEAD `92674a8b03433d8e94c2f8a8560fb65b72ba3a29`, plus its
+working-tree changes. The detailed per-control tables and companion JSON still
+contain the earlier four-worktree snapshot; use the fresh counts and removal
+log below for current status, and treat old rows as candidates until their
+evidence is checked against this checkout.
 
-The inventory below still describes the pre-merge snapshots. Re-run the
-inventory against the integrated checkout before deleting any row, and record
-decisions in the JSON `review_decision` field rather than editing generated
-counts by hand.
+Record new decisions in the JSON `review_decision` field rather than editing
+generated historical counts by hand.
 
 ## Removal log
 
-Scope agreed for this pass: environment variables and compile-time macros only
-(no CLI or TOML surface changes), limited to controls that are provably
-unreachable rather than merely unused-looking. Each entry names the evidence
-that made the deletion behavior-neutral. One exception was requested
-explicitly: retiring the dead cuFile feature also removes the `cuda_cufile`
-TOML key (and its CLI help mention) because that key was its only consumer.
+Scope for removal decisions: simplify environment and build-time controls after
+checking their consumers. Remove dead controls only with reachability evidence;
+remove test or experiment controls when the normal validated behavior is clear
+and the experiment has no supported product use. Each entry names the evidence
+and behavior affected. Canonical TOML/CLI keys are removed only when they expose
+the same retired behavior, as with cuFile and the experimental GPU-assist
+override.
 
 ### 2026-10-27 — full-graph gates and Qwen preload defaults
 
@@ -286,6 +287,31 @@ pass.
 `ZEROMOE_BUILD_SERVER` are recorded as removed in the log above and no longer
 appear in the inventory.
 
+### 2026-10-27 — make CUDA build provenance mandatory
+
+| Control | Surface | Evidence | Change |
+| --- | --- | --- | --- |
+| `ZEROMOE_WRITE_BUILD_PROVENANCE` | CMake option | The option only wrapped the source snapshot at configure time and manifest stamping after linking. Both defaults were ON, and project benchmark policy requires the binary manifest to match the selected source tree. | Removed the opt-out. CUDA `zeromoe` configure now always snapshots source provenance and every successful link stamps the binary manifest. CPU-only builds do not produce the CUDA `zeromoe` target and do not require this step. |
+
+### 2026-10-27 — remove the obsolete llama.cpp root alias
+
+| Control | Surface | Evidence | Change |
+| --- | --- | --- | --- |
+| `ZEROMOE_LLAMA_CPP_ROOT` | CMake input | The only native reader was the alias block in `CMakeLists.txt`. Maintained launch/build scripts and current configuration docs use `ZEROMOE_GGML_ROOT`; the build consumes the `ggml/` directory, not a full llama.cpp checkout. | Removed the compatibility remap and warning. `ZEROMOE_GGML_ROOT` is the sole local-source path; this project accepts clean-break removal of the legacy alias. |
+
+### 2026-10-27 — retire the experimental GLM any-type GPU assist override
+
+| Control | Surface | Evidence | Change |
+| --- | --- | --- | --- |
+| `ZEROMOE_GLM5NEXT_GPU_ASSIST_ANY_TYPE` / `graph_gpu_assist_any_type` (K0233, K0499) | environment, TOML, generated CLI | The setting only bypassed `gpu_assist_type_ok()`'s quantization allowlist. The source records the measured Q2_K result: three assist slots took 88 ms/token versus 70.6 ms without the override. Default false already enforced the allowlist. | Removed the setting from the resolver and its generated CLI/TOML surface. The measured allowlist is now fixed; no decode behavior changes under the validated default. |
+
+### 2026-10-27 — finalize adaptive dynamic-cache upload policy
+
+| Control | Surface | Evidence | Change |
+| --- | --- | --- | --- |
+| `ZEROMOE_GLM5NEXT_DYNAMIC_CACHE_UPLOADS_PER_TOKEN` (K0218) | environment | The reader returned `-1` when unset, selecting the adaptive upload budget; the hard-coded bootstrap and adaptive path already capped work to available layers and 128 uploads. No maintained launcher referenced the override. | Removed the fixed-budget escape hatch. Dynamic cache now always uses its existing adaptive budget policy. |
+| `ZEROMOE_GLM5NEXT_DYNAMIC_CACHE_SWAP_FRAC` (K0217) | environment | The reader returned `0.25` when unset; the adaptive controller multiplies measured compute time by this share to derive upload work. No maintained launcher referenced the override. | Removed the fraction override and fixed the existing default at 25% of observed compute time. |
+
 ### Metal on macOS (default on for Apple Silicon)
 
 macOS is forced to `ZEROMOE_CPU_ONLY=ON`, so none of the CUDA or ggml-cuda
@@ -334,15 +360,13 @@ shorter than in earlier snapshots.
 Build-time inputs that are not source guards remain, but they configure the
 build rather than branch engine code:
 
-- **8 CMake options**: `ZEROMOE_CPU_ONLY`, `ZEROMOE_ENABLE_CUDA_GRAPHS`,
+- **7 root CMake options plus 1 server option**: `ZEROMOE_CPU_ONLY`, `ZEROMOE_ENABLE_CUDA_GRAPHS`,
   `ZEROMOE_ENABLE_AVX512_VNNI`, `ZEROMOE_GGML_OPENMP`,
   `ZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES`, `ZEROMOE_GGML_DEBUG_PATCHES`,
-  `ZEROMOE_METAL` and `ZEROMOE_WRITE_BUILD_PROVENANCE`, plus
-  `ZEROMOE_SERVER_TESTS` (`server/CMakeLists.txt:31`).
+  `ZEROMOE_METAL`; the server subproject has `ZEROMOE_SERVER_TESTS`
+  (`server/CMakeLists.txt:31`).
 - **5 build-cache inputs**: `ZEROMOE_CPU_ONLY`, `ZEROMOE_EXLLAMAV3_SRC`,
   `ZEROMOE_GGML_COMMIT`, `ZEROMOE_GGML_PREBUILT_DIR` and `ZEROMOE_GGML_ROOT`.
-- **Deprecated alias**: `ZEROMOE_LLAMA_CPP_ROOT` is still parsed and remapped to
-  `ZEROMOE_GGML_ROOT`; it is a compatibility input, not a dead name.
 - **9 forwarded `GGML_*` options**: `GGML_AVX512`, `GGML_AVX512_VNNI`,
   `GGML_CUDA`, `GGML_CUDA_GRAPHS`, `GGML_HIPBLAS`, `GGML_METAL`,
   `GGML_OPENMP`, `GGML_SYCL` and `GGML_VULKAN` (K0001-K0009). These belong to
@@ -356,12 +380,9 @@ inventory.
 
 ### Findings deliberately left in place
 
-These look dead but changing them would either alter a supported feature or
-require a product decision, so they are not safe deletions for this batch:
-
-- **`ZEROMOE_LLAMA_CPP_ROOT`** is a deprecated but live CMake alias for
-  `ZEROMOE_GGML_ROOT`: it is still parsed and remapped. Deleting it is a
-  compatibility break, not a dead-code removal.
+No additional build input was removed in this pass without tracing its
+consumers. The remaining cache values select source trees, prebuilt libraries,
+dependency revisions or optional EXL3 checkout paths.
 
 ## How to use
 
@@ -385,7 +406,7 @@ The companion [JSON](configuration-knob-audit.json) includes source excerpts, de
 
 ## Existing work to preserve
 
-The settings worktree already implements 39 canonical graph fields, strict TOML validation, provenance/legacy warnings, startup binding, Qwen placement/thread wiring, concise/advanced help, Release presets and configuration documentation.
+The active resolver now implements 38 canonical graph fields with strict TOML validation, generated CLI flags, startup binding and Qwen placement/thread wiring. Legacy environment aliases remain during migration; the final public interface is still intended to be smaller.
 That compatibility-first implementation is a transitional baseline, **not** the desired final public interface. The later decision favors a clean break; do not spend more work maintaining hundreds of aliases.
 CPU build, settings tests and sanitizer checks passed previously. Linux/CUDA and real-model numerical/performance parity remain unverified.
 The API worktree contains native OpenAI/Anthropic serving and opt-in CPU prompt checkpoints; native CUDA state caching is intentionally not claimed safe. Preserve cancellation, backpressure, authentication and state ownership.
@@ -408,6 +429,8 @@ Build-cache rows include `CACHE ... FORCE` assignments that are already internal
 
 ## Counts
 
+### Historical four-worktree snapshot (2026-10-26)
+
 | Surface | Distinct names |
 |---|---:|
 | build_cache | 15 |
@@ -423,9 +446,44 @@ Build-cache rows include `CACHE ... FORCE` assignments that are already internal
 | tool_environment_reference | 171 |
 | **Surface/name rows** | **1148** |
 
-These totals are deliberately broader than the earlier settings-only scan: they include other worktrees, non-ZEROMOE environment reads, extra table-presence checks and separate tooling names.
+These totals are deliberately broader than the earlier settings-only scan: they include other worktrees, non-ZEROMOE environment reads, extra table-presence checks and separate tooling names. They are not current-checkout counts.
 Do not add these totals and call them independent user decisions. Tool references/forwarded arguments and capability macros are not necessarily configurable engine controls.
-The table is the pre-merge snapshot; the [removal log](#removal-log) lists the rows already deleted. A fresh source inventory on 2026-10-27 over `core/`, `memory/`, `models/`, `backends/` and `kernels/` reports **363 environment names**, **6 source macro guards**, **11 root CMake options** (plus `ZEROMOE_SERVER_TESTS` in `server/CMakeLists.txt`) and **6 build-cache entries**, with no `build_legacy_input` row. The environment count covers native source only, not `tools/`, `tests/` or `bench/`.
+The table is the pre-merge snapshot; the [removal log](#removal-log) lists the rows already deleted.
+
+### Current native-source inventory (2026-10-27)
+
+Refreshed with `python3 tools/config_inventory.py --json` against the active
+ZeroMoE checkout. The scanner covers `core/`, `memory/`, `models/`,
+`backends/`, `kernels/`, root `CMakeLists.txt` and `cmake/*.cmake`; it expands
+the shared Ling/GLM environment-alias macro into concrete names. It does not
+scan `tools/`, `tests/`, `bench/`, shell launchers, third-party code or other
+worktrees. Counts are distinct lexical names, not independent decisions or
+proof that a setting is read on a normal run.
+
+| Surface | Names | Notes |
+| --- | ---: | --- |
+| Native environment names | 384 | Includes registered graph aliases and non-graph reads |
+| Root CMake options | 7 | `ZEROMOE_CPU_ONLY` also appears as a cached build variable |
+| Server CMake options | 1 | `ZEROMOE_SERVER_TESTS`, owned by the optional server subproject |
+| CMake cache variables | 5 | Includes internal build/dependency paths and revision pins |
+| Compile-time ZeroMoE guards | 4 | Source `#if`/`#ifdef` references found by the scanner |
+| Registered graph settings | 38 | Typed TOML fields with generated `--graph-*` aliases |
+| TOML keys | 249 | Lexical parser calls; not all are user tuning knobs |
+| Native CLI names | 95 | Includes the 38 generated graph-setting flags |
+
+The full-graph gate environment variables removed in the first removal batch
+remain only in historical benchmark and handoff records; they are not live
+runtime inputs. The remaining graph environment aliases are still a
+compatibility layer, despite having canonical TOML and CLI forms. The agreed
+clean-break direction is to remove those aliases after maintained launchers
+have migrated.
+
+Build settings are a separate surface from runtime environment variables. The
+current normal CMake options select build capability or platform policy; the
+GGML revision/root/prebuilt-directory and EXL3 source cache values identify
+dependencies or local build inputs. Keep those identities reproducible, and
+prefer CPU/CUDA presets for normal builds. Provenance stamping is now mandatory
+for the CUDA engine binary rather than a user-selectable option.
 
 ## Manually checked exceptions
 
@@ -450,7 +508,7 @@ The table is the pre-merge snapshot; the [removal log](#removal-log) lists the r
 **INTERNALIZE** means remove the external selector, retain its required behavior in typed engine state, and assign an owner. It does not mean delete the algorithm.
 **COMBINE** means preserve independent semantics while unifying input/diagnostics; verbosity must not activate execution experiments.
 **KEEP DEV/TOOL** is conditional on a maintained use; it is not a requirement to keep old names.
-No row is automatically safe to delete based on risk alone. No engine runtime flag is declared proven dead; the warning-only build compatibility input is a separately checked exception.
+No row is automatically safe to delete based on risk alone. Every removal is recorded in the log with its evidence; no additional engine runtime flag is declared dead from lexical counts alone.
 
 ## Removal batches
 

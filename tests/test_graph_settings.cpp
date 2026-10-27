@@ -265,7 +265,7 @@ int main(int argc, char **argv) {
   {
     auto d = resolve_settings(Family::Glm, env_of({}));
     CHECK(d.tun.early_ready.value == -1 && d.tun.split_load.value == 1 && d.tun.lane_with_gpu1.value == 1);
-    CHECK(d.tun.pilot_copy.value == 1 && d.tun.gpu_assist_any_type.value == 0 && d.tun.dynamic_cache.value == 0);
+    CHECK(d.tun.pilot_copy.value == 1 && d.tun.dynamic_cache.value == 0);
     CHECK(d.tun.gpu_assist2_slots.value == 1);
     auto e = resolve_settings(Family::Glm, env_of({{"ZEROMOE_GLM5NEXT_EARLY_READY", "0"}, {"ZEROMOE_GLM5NEXT_SPLIT_LOAD", "0"},
         {"ZEROMOE_GLM5NEXT_PILOT_COPY", "0"}, {"ZEROMOE_GLM5NEXT_DYNAMIC_CACHE", "1"}, {"ZEROMOE_GLM5NEXT_ASSIST2_SLOTS", "4"}}));

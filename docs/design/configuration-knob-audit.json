@@ -3802,7 +3802,7 @@
           "role": "conditional compilation guard",
           "tooling": false,
           "nearby_function_candidate": "",
-          "excerpt": "711:   // Initialize the logger before anything else logs \u2014 empty log_path keeps\n712:   // everything on stderr exactly as before.\n713:   Logger::instance().init(config.log_path, config.log_level);\n714: #if defined(ZEROMOE_USE_GGML)\n715:   bool allow_ggml_debug = config.log_level == \"DEBUG\" ||\n716:                           config.log_level == \"VERBOSE\";\n717:   ggml_log_set(zeromoe_ggml_log_callback, &allow_ggml_debug);\n718: #endif\n719:   TraceFilter::instance().configure(config.trace_filter,\n720:                                     config.trace_abort_on_nan);",
+          "excerpt": "711:   // Initialize the logger before anything else logs — empty log_path keeps\n712:   // everything on stderr exactly as before.\n713:   Logger::instance().init(config.log_path, config.log_level);\n714: #if defined(ZEROMOE_USE_GGML)\n715:   bool allow_ggml_debug = config.log_level == \"DEBUG\" ||\n716:                           config.log_level == \"VERBOSE\";\n717:   ggml_log_set(zeromoe_ggml_log_callback, &allow_ggml_debug);\n718: #endif\n719:   TraceFilter::instance().configure(config.trace_filter,\n720:                                     config.trace_abort_on_nan);",
           "file_sha256": "d1b1ba35bf2bf3c282cd5e0f0dcf3af245ef7411e8b86107941b66b1ad29d317"
         },
         {
@@ -3952,7 +3952,7 @@
           "role": "conditional compilation guard",
           "tooling": false,
           "nearby_function_candidate": "",
-          "excerpt": "684:   // Initialize the logger before anything else logs \u2014 empty log_path keeps\n685:   // everything on stderr exactly as before.\n686:   Logger::instance().init(config.log_path, config.log_level);\n687: #if defined(ZEROMOE_USE_GGML)\n688:   bool allow_ggml_debug = config.log_level == \"DEBUG\" ||\n689:                           config.log_level == \"VERBOSE\";\n690:   ggml_log_set(zeromoe_ggml_log_callback, &allow_ggml_debug);\n691: #endif\n692:   TraceFilter::instance().configure(config.trace_filter,\n693:                                     config.trace_abort_on_nan);",
+          "excerpt": "684:   // Initialize the logger before anything else logs — empty log_path keeps\n685:   // everything on stderr exactly as before.\n686:   Logger::instance().init(config.log_path, config.log_level);\n687: #if defined(ZEROMOE_USE_GGML)\n688:   bool allow_ggml_debug = config.log_level == \"DEBUG\" ||\n689:                           config.log_level == \"VERBOSE\";\n690:   ggml_log_set(zeromoe_ggml_log_callback, &allow_ggml_debug);\n691: #endif\n692:   TraceFilter::instance().configure(config.trace_filter,\n693:                                     config.trace_abort_on_nan);",
           "file_sha256": "c768a488893f42a8ba1e10464e90bd486f89fc82b4adaa20d948fb6a723f0718"
         },
         {
@@ -4038,7 +4038,7 @@
           "role": "conditional compilation guard",
           "tooling": false,
           "nearby_function_candidate": "",
-          "excerpt": "734:   // Initialize the logger before anything else logs \u2014 empty log_path keeps\n735:   // everything on stderr exactly as before.\n736:   Logger::instance().init(config.log_path, config.log_level);\n737: #if defined(ZEROMOE_USE_GGML)\n738:   bool allow_ggml_debug = config.log_level == \"DEBUG\" ||\n739:                           config.log_level == \"VERBOSE\";\n740:   ggml_log_set(zeromoe_ggml_log_callback, &allow_ggml_debug);\n741: #endif\n742:   TraceFilter::instance().configure(config.trace_filter,\n743:                                     config.trace_abort_on_nan);",
+          "excerpt": "734:   // Initialize the logger before anything else logs — empty log_path keeps\n735:   // everything on stderr exactly as before.\n736:   Logger::instance().init(config.log_path, config.log_level);\n737: #if defined(ZEROMOE_USE_GGML)\n738:   bool allow_ggml_debug = config.log_level == \"DEBUG\" ||\n739:                           config.log_level == \"VERBOSE\";\n740:   ggml_log_set(zeromoe_ggml_log_callback, &allow_ggml_debug);\n741: #endif\n742:   TraceFilter::instance().configure(config.trace_filter,\n743:                                     config.trace_abort_on_nan);",
           "file_sha256": "650244f4919eb2fc27892c792b925459720b7b1382098d6f533f490e8bf337eb"
         },
         {
@@ -10653,7 +10653,7 @@
           "role": "tool/script reference; may be assignment, not a reader",
           "tooling": true,
           "nearby_function_candidate": "",
-          "excerpt": "31:     printf 'Tell a story.\\n:q\\n' | env CUDA_VISIBLE_DEVICES=0 \\\n32:       ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1 \\\n33:       ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \\\n34:       ZEROMOE_BENCH_SILENT=1 ZEROMOE_BENCH_IGNORE_STOP=1 \\\n35:       timeout 900 \"$BIN\" --config \"$TMP/cfg.toml\" > \"$LOG.log\" 2>&1 || rc=$?\n36:     grep -E \"PREFILL-DONE\\] 16|REQUEST-DECODE-WALL\" \"$LOG.engine.log\" | cut -c1-170 || true\n37:     # Emit teardown evidence so the gate can recognize a benign teardown crash (\u00a73.7) rather\n38:     # than treat any nonzero exit as benign.\n39:     grep -m1 \"driver shutting down\" \"$LOG.log\" || true\n40:     exit \"$rc\"",
+          "excerpt": "31:     printf 'Tell a story.\\n:q\\n' | env CUDA_VISIBLE_DEVICES=0 \\\n32:       ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1 \\\n33:       ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \\\n34:       ZEROMOE_BENCH_SILENT=1 ZEROMOE_BENCH_IGNORE_STOP=1 \\\n35:       timeout 900 \"$BIN\" --config \"$TMP/cfg.toml\" > \"$LOG.log\" 2>&1 || rc=$?\n36:     grep -E \"PREFILL-DONE\\] 16|REQUEST-DECODE-WALL\" \"$LOG.engine.log\" | cut -c1-170 || true\n37:     # Emit teardown evidence so the gate can recognize a benign teardown crash (§3.7) rather\n38:     # than treat any nonzero exit as benign.\n39:     grep -m1 \"driver shutting down\" \"$LOG.log\" || true\n40:     exit \"$rc\"",
           "file_sha256": "d3167d6badb438a1b86c177e4bc8b0e3d409d991711891e9fa4350f725a53a1e"
         },
         {
@@ -10843,7 +10843,7 @@
           "role": "tool/script reference; may be assignment, not a reader",
           "tooling": true,
           "nearby_function_candidate": "",
-          "excerpt": "31:     printf 'Tell a story.\\n:q\\n' | env CUDA_VISIBLE_DEVICES=0 \\\n32:       ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1 \\\n33:       ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \\\n34:       ZEROMOE_BENCH_SILENT=1 ZEROMOE_BENCH_IGNORE_STOP=1 \\\n35:       timeout 900 \"$BIN\" --config \"$TMP/cfg.toml\" > \"$LOG.log\" 2>&1 || rc=$?\n36:     grep -E \"PREFILL-DONE\\] 16|REQUEST-DECODE-WALL\" \"$LOG.engine.log\" | cut -c1-170 || true\n37:     # Emit teardown evidence so the gate can recognize a benign teardown crash (\u00a73.7) rather\n38:     # than treat any nonzero exit as benign.\n39:     grep -m1 \"driver shutting down\" \"$LOG.log\" || true\n40:     exit \"$rc\"",
+          "excerpt": "31:     printf 'Tell a story.\\n:q\\n' | env CUDA_VISIBLE_DEVICES=0 \\\n32:       ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1 \\\n33:       ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \\\n34:       ZEROMOE_BENCH_SILENT=1 ZEROMOE_BENCH_IGNORE_STOP=1 \\\n35:       timeout 900 \"$BIN\" --config \"$TMP/cfg.toml\" > \"$LOG.log\" 2>&1 || rc=$?\n36:     grep -E \"PREFILL-DONE\\] 16|REQUEST-DECODE-WALL\" \"$LOG.engine.log\" | cut -c1-170 || true\n37:     # Emit teardown evidence so the gate can recognize a benign teardown crash (§3.7) rather\n38:     # than treat any nonzero exit as benign.\n39:     grep -m1 \"driver shutting down\" \"$LOG.log\" || true\n40:     exit \"$rc\"",
           "file_sha256": "d3167d6badb438a1b86c177e4bc8b0e3d409d991711891e9fa4350f725a53a1e"
         },
         {
@@ -21503,8 +21503,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "GLM: host/VRAM accounting, residency, expert cache and transfer lifetime. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-27: the unset behavior used 0.25; fixed the adaptive controller at that 25% compute-time share and removed the environment override.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0217"
     },
@@ -21566,8 +21566,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "GLM: host/VRAM accounting, residency, expert cache and transfer lifetime. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-27: the unset behavior was adaptive budgeting; removed the fixed-budget override and retained the adaptive controller with its existing layer/128-job caps.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0218"
     },
@@ -23966,8 +23966,8 @@
       ],
       "affected_if_removed": "GLM: models execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include models/glm/ggml_glm5next_graph_settings.cpp, models/graph/graph_settings.hpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-27: this only bypassed the validated quantization allowlist; source records Q2_K at 88 ms/token with three assist slots versus 70.6 ms without. The fixed allowlist preserves the default behavior.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0233"
     },
@@ -40221,7 +40221,7 @@
           "role": "tool/script reference; may be assignment, not a reader",
           "tooling": true,
           "nearby_function_candidate": "",
-          "excerpt": "29:     # \"Tell a story.\" is 4 tokens; with the chat template the prompt is 16 tokens ([PREFILL-DONE] must say 16)\n30:     rc=0\n31:     printf 'Tell a story.\\n:q\\n' | env CUDA_VISIBLE_DEVICES=0 \\\n32:       ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1 \\\n33:       ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \\\n34:       ZEROMOE_BENCH_SILENT=1 ZEROMOE_BENCH_IGNORE_STOP=1 \\\n35:       timeout 900 \"$BIN\" --config \"$TMP/cfg.toml\" > \"$LOG.log\" 2>&1 || rc=$?\n36:     grep -E \"PREFILL-DONE\\] 16|REQUEST-DECODE-WALL\" \"$LOG.engine.log\" | cut -c1-170 || true\n37:     # Emit teardown evidence so the gate can recognize a benign teardown crash (\u00a73.7) rather\n38:     # than treat any nonzero exit as benign.",
+          "excerpt": "29:     # \"Tell a story.\" is 4 tokens; with the chat template the prompt is 16 tokens ([PREFILL-DONE] must say 16)\n30:     rc=0\n31:     printf 'Tell a story.\\n:q\\n' | env CUDA_VISIBLE_DEVICES=0 \\\n32:       ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1 \\\n33:       ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \\\n34:       ZEROMOE_BENCH_SILENT=1 ZEROMOE_BENCH_IGNORE_STOP=1 \\\n35:       timeout 900 \"$BIN\" --config \"$TMP/cfg.toml\" > \"$LOG.log\" 2>&1 || rc=$?\n36:     grep -E \"PREFILL-DONE\\] 16|REQUEST-DECODE-WALL\" \"$LOG.engine.log\" | cut -c1-170 || true\n37:     # Emit teardown evidence so the gate can recognize a benign teardown crash (§3.7) rather\n38:     # than treat any nonzero exit as benign.",
           "file_sha256": "d3167d6badb438a1b86c177e4bc8b0e3d409d991711891e9fa4350f725a53a1e"
         },
         {
@@ -40471,7 +40471,7 @@
           "role": "tool/script reference; may be assignment, not a reader",
           "tooling": true,
           "nearby_function_candidate": "",
-          "excerpt": "29:     # \"Tell a story.\" is 4 tokens; with the chat template the prompt is 16 tokens ([PREFILL-DONE] must say 16)\n30:     rc=0\n31:     printf 'Tell a story.\\n:q\\n' | env CUDA_VISIBLE_DEVICES=0 \\\n32:       ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1 \\\n33:       ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \\\n34:       ZEROMOE_BENCH_SILENT=1 ZEROMOE_BENCH_IGNORE_STOP=1 \\\n35:       timeout 900 \"$BIN\" --config \"$TMP/cfg.toml\" > \"$LOG.log\" 2>&1 || rc=$?\n36:     grep -E \"PREFILL-DONE\\] 16|REQUEST-DECODE-WALL\" \"$LOG.engine.log\" | cut -c1-170 || true\n37:     # Emit teardown evidence so the gate can recognize a benign teardown crash (\u00a73.7) rather\n38:     # than treat any nonzero exit as benign.",
+          "excerpt": "29:     # \"Tell a story.\" is 4 tokens; with the chat template the prompt is 16 tokens ([PREFILL-DONE] must say 16)\n30:     rc=0\n31:     printf 'Tell a story.\\n:q\\n' | env CUDA_VISIBLE_DEVICES=0 \\\n32:       ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1 \\\n33:       ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \\\n34:       ZEROMOE_BENCH_SILENT=1 ZEROMOE_BENCH_IGNORE_STOP=1 \\\n35:       timeout 900 \"$BIN\" --config \"$TMP/cfg.toml\" > \"$LOG.log\" 2>&1 || rc=$?\n36:     grep -E \"PREFILL-DONE\\] 16|REQUEST-DECODE-WALL\" \"$LOG.engine.log\" | cut -c1-170 || true\n37:     # Emit teardown evidence so the gate can recognize a benign teardown crash (§3.7) rather\n38:     # than treat any nonzero exit as benign.",
           "file_sha256": "d3167d6badb438a1b86c177e4bc8b0e3d409d991711891e9fa4350f725a53a1e"
         },
         {
@@ -41713,7 +41713,7 @@
           "role": "tool/script reference; may be assignment, not a reader",
           "tooling": true,
           "nearby_function_candidate": "",
-          "excerpt": "30:     rc=0\n31:     printf 'Tell a story.\\n:q\\n' | env CUDA_VISIBLE_DEVICES=0 \\\n32:       ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1 \\\n33:       ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \\\n34:       ZEROMOE_BENCH_SILENT=1 ZEROMOE_BENCH_IGNORE_STOP=1 \\\n35:       timeout 900 \"$BIN\" --config \"$TMP/cfg.toml\" > \"$LOG.log\" 2>&1 || rc=$?\n36:     grep -E \"PREFILL-DONE\\] 16|REQUEST-DECODE-WALL\" \"$LOG.engine.log\" | cut -c1-170 || true\n37:     # Emit teardown evidence so the gate can recognize a benign teardown crash (\u00a73.7) rather\n38:     # than treat any nonzero exit as benign.\n39:     grep -m1 \"driver shutting down\" \"$LOG.log\" || true",
+          "excerpt": "30:     rc=0\n31:     printf 'Tell a story.\\n:q\\n' | env CUDA_VISIBLE_DEVICES=0 \\\n32:       ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1 \\\n33:       ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \\\n34:       ZEROMOE_BENCH_SILENT=1 ZEROMOE_BENCH_IGNORE_STOP=1 \\\n35:       timeout 900 \"$BIN\" --config \"$TMP/cfg.toml\" > \"$LOG.log\" 2>&1 || rc=$?\n36:     grep -E \"PREFILL-DONE\\] 16|REQUEST-DECODE-WALL\" \"$LOG.engine.log\" | cut -c1-170 || true\n37:     # Emit teardown evidence so the gate can recognize a benign teardown crash (§3.7) rather\n38:     # than treat any nonzero exit as benign.\n39:     grep -m1 \"driver shutting down\" \"$LOG.log\" || true",
           "file_sha256": "d3167d6badb438a1b86c177e4bc8b0e3d409d991711891e9fa4350f725a53a1e"
         },
         {
@@ -43368,7 +43368,7 @@
           "role": "tool/script reference; may be assignment, not a reader",
           "tooling": true,
           "nearby_function_candidate": "",
-          "excerpt": "30:     rc=0\n31:     printf 'Tell a story.\\n:q\\n' | env CUDA_VISIBLE_DEVICES=0 \\\n32:       ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1 \\\n33:       ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \\\n34:       ZEROMOE_BENCH_SILENT=1 ZEROMOE_BENCH_IGNORE_STOP=1 \\\n35:       timeout 900 \"$BIN\" --config \"$TMP/cfg.toml\" > \"$LOG.log\" 2>&1 || rc=$?\n36:     grep -E \"PREFILL-DONE\\] 16|REQUEST-DECODE-WALL\" \"$LOG.engine.log\" | cut -c1-170 || true\n37:     # Emit teardown evidence so the gate can recognize a benign teardown crash (\u00a73.7) rather\n38:     # than treat any nonzero exit as benign.\n39:     grep -m1 \"driver shutting down\" \"$LOG.log\" || true",
+          "excerpt": "30:     rc=0\n31:     printf 'Tell a story.\\n:q\\n' | env CUDA_VISIBLE_DEVICES=0 \\\n32:       ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1 \\\n33:       ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \\\n34:       ZEROMOE_BENCH_SILENT=1 ZEROMOE_BENCH_IGNORE_STOP=1 \\\n35:       timeout 900 \"$BIN\" --config \"$TMP/cfg.toml\" > \"$LOG.log\" 2>&1 || rc=$?\n36:     grep -E \"PREFILL-DONE\\] 16|REQUEST-DECODE-WALL\" \"$LOG.engine.log\" | cut -c1-170 || true\n37:     # Emit teardown evidence so the gate can recognize a benign teardown crash (§3.7) rather\n38:     # than treat any nonzero exit as benign.\n39:     grep -m1 \"driver shutting down\" \"$LOG.log\" || true",
           "file_sha256": "d3167d6badb438a1b86c177e4bc8b0e3d409d991711891e9fa4350f725a53a1e"
         },
         {
@@ -56293,8 +56293,8 @@
       ],
       "affected_if_removed": "full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include models/glm/ggml_glm5next_graph_settings.cpp, models/graph/graph_settings.hpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-27: removed the experimental selector and made the measured GPU-assist quantization allowlist unconditional; default behavior is unchanged.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0499"
     },
@@ -79900,28 +79900,28 @@
           "path": "core/engine_config.hpp",
           "line": 1697,
           "initializer_expression": "true",
-          "comment_and_declaration": "\n  // Three-tier VRAM caching configuration\n  // Tier overlap fix: MOVE instead of COPY on RAM\u2192VRAM promotion\n  bool move_on_promotion = true;"
+          "comment_and_declaration": "\n  // Three-tier VRAM caching configuration\n  // Tier overlap fix: MOVE instead of COPY on RAM→VRAM promotion\n  bool move_on_promotion = true;"
         },
         {
           "worktree": "original",
           "path": "core/engine_config.hpp",
           "line": 1695,
           "initializer_expression": "true",
-          "comment_and_declaration": "\n  // Three-tier VRAM caching configuration\n  // Tier overlap fix: MOVE instead of COPY on RAM\u2192VRAM promotion\n  bool move_on_promotion = true;"
+          "comment_and_declaration": "\n  // Three-tier VRAM caching configuration\n  // Tier overlap fix: MOVE instead of COPY on RAM→VRAM promotion\n  bool move_on_promotion = true;"
         },
         {
           "worktree": "api",
           "path": "core/engine_config.hpp",
           "line": 1699,
           "initializer_expression": "true",
-          "comment_and_declaration": "\n  // Three-tier VRAM caching configuration\n  // Tier overlap fix: MOVE instead of COPY on RAM\u2192VRAM promotion\n  bool move_on_promotion = true;"
+          "comment_and_declaration": "\n  // Three-tier VRAM caching configuration\n  // Tier overlap fix: MOVE instead of COPY on RAM→VRAM promotion\n  bool move_on_promotion = true;"
         },
         {
           "worktree": "mtp",
           "path": "core/engine_config.hpp",
           "line": 1695,
           "initializer_expression": "true",
-          "comment_and_declaration": "\n  // Three-tier VRAM caching configuration\n  // Tier overlap fix: MOVE instead of COPY on RAM\u2192VRAM promotion\n  bool move_on_promotion = true;"
+          "comment_and_declaration": "\n  // Three-tier VRAM caching configuration\n  // Tier overlap fix: MOVE instead of COPY on RAM→VRAM promotion\n  bool move_on_promotion = true;"
         }
       ],
       "current_read_excerpt": "3188:   move_on_promotion = doc.root.get_bool(\"move_on_promotion\", move_on_promotion);",
@@ -106726,56 +106726,56 @@
           "path": "backends/cpu/cpu_config.hpp",
           "line": 226,
           "initializer_expression": "(no explicit initializer)",
-          "comment_and_declaration": "  // Optional system-role message, prepended ahead of the user turn when a\n  // chat template is in use (see GGUFTokenizer::has_chat_template /\n  // has_deepseek_chat_template). Empty by default -- ZeroMoE never\n  // synthesizes a system prompt on its own, matching what the real\n  // DeepSeek-V4 jinja template produces when no \"system\" message is passed\n  // in (confirmed byte-for-byte against\n  // models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja in a real\n  // llama.cpp checkout: no system role -> ns.system_prompt stays \"\" ->\n  // {bos}<\uff5cUser\uff5c>{msg}<\uff5cAssistant\uff5c></think>, exactly what this engine\n  // already sent). A base model with no language-steering instruction will\n  // happily answer an ambiguous/short English prompt in Chinese -- this is\n  // normal, well-documented behavior for DeepSeek/Qwen/GLM-family models,\n  // not evidence of a missing/broken template. Set this (or --system-prompt)\n  // to add one, e.g. \"Respond in English unless asked otherwise.\"\n  std::string system_prompt;"
+          "comment_and_declaration": "  // Optional system-role message, prepended ahead of the user turn when a\n  // chat template is in use (see GGUFTokenizer::has_chat_template /\n  // has_deepseek_chat_template). Empty by default -- ZeroMoE never\n  // synthesizes a system prompt on its own, matching what the real\n  // DeepSeek-V4 jinja template produces when no \"system\" message is passed\n  // in (confirmed byte-for-byte against\n  // models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja in a real\n  // llama.cpp checkout: no system role -> ns.system_prompt stays \"\" ->\n  // {bos}<｜User｜>{msg}<｜Assistant｜></think>, exactly what this engine\n  // already sent). A base model with no language-steering instruction will\n  // happily answer an ambiguous/short English prompt in Chinese -- this is\n  // normal, well-documented behavior for DeepSeek/Qwen/GLM-family models,\n  // not evidence of a missing/broken template. Set this (or --system-prompt)\n  // to add one, e.g. \"Respond in English unless asked otherwise.\"\n  std::string system_prompt;"
         },
         {
           "worktree": "settings",
           "path": "core/engine_config.hpp",
           "line": 2346,
           "initializer_expression": "(no explicit initializer)",
-          "comment_and_declaration": "\n  // Optional system-role message, prepended ahead of the user turn when a\n  // chat template is in use (GGUFTokenizer::has_chat_template /\n  // has_deepseek_chat_template). Empty by default -- confirmed\n  // byte-for-byte against the real DeepSeek-V4-Flash jinja template\n  // (models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja in a real\n  // llama.cpp checkout) that an absent system message legitimately\n  // produces {bos}<\uff5cUser\uff5c>{msg}<\uff5cAssistant\uff5c></think> with no system\n  // text at all -- exactly what this engine already sent, so \"missing\n  // system prompt\" alone is not a template bug. A base model with no\n  // language-steering instruction will happily answer an\n  // ambiguous/short English prompt in Chinese; that's normal\n  // DeepSeek/Qwen/GLM-family behavior without one. Set this (or\n  // --system-prompt) to add one, e.g. \"Respond in English unless asked\n  // otherwise.\"\n  std::string system_prompt;"
+          "comment_and_declaration": "\n  // Optional system-role message, prepended ahead of the user turn when a\n  // chat template is in use (GGUFTokenizer::has_chat_template /\n  // has_deepseek_chat_template). Empty by default -- confirmed\n  // byte-for-byte against the real DeepSeek-V4-Flash jinja template\n  // (models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja in a real\n  // llama.cpp checkout) that an absent system message legitimately\n  // produces {bos}<｜User｜>{msg}<｜Assistant｜></think> with no system\n  // text at all -- exactly what this engine already sent, so \"missing\n  // system prompt\" alone is not a template bug. A base model with no\n  // language-steering instruction will happily answer an\n  // ambiguous/short English prompt in Chinese; that's normal\n  // DeepSeek/Qwen/GLM-family behavior without one. Set this (or\n  // --system-prompt) to add one, e.g. \"Respond in English unless asked\n  // otherwise.\"\n  std::string system_prompt;"
         },
         {
           "worktree": "original",
           "path": "backends/cpu/cpu_config.hpp",
           "line": 225,
           "initializer_expression": "(no explicit initializer)",
-          "comment_and_declaration": "  // Optional system-role message, prepended ahead of the user turn when a\n  // chat template is in use (see GGUFTokenizer::has_chat_template /\n  // has_deepseek_chat_template). Empty by default -- ZeroMoE never\n  // synthesizes a system prompt on its own, matching what the real\n  // DeepSeek-V4 jinja template produces when no \"system\" message is passed\n  // in (confirmed byte-for-byte against\n  // models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja in a real\n  // llama.cpp checkout: no system role -> ns.system_prompt stays \"\" ->\n  // {bos}<\uff5cUser\uff5c>{msg}<\uff5cAssistant\uff5c></think>, exactly what this engine\n  // already sent). A base model with no language-steering instruction will\n  // happily answer an ambiguous/short English prompt in Chinese -- this is\n  // normal, well-documented behavior for DeepSeek/Qwen/GLM-family models,\n  // not evidence of a missing/broken template. Set this (or --system-prompt)\n  // to add one, e.g. \"Respond in English unless asked otherwise.\"\n  std::string system_prompt;"
+          "comment_and_declaration": "  // Optional system-role message, prepended ahead of the user turn when a\n  // chat template is in use (see GGUFTokenizer::has_chat_template /\n  // has_deepseek_chat_template). Empty by default -- ZeroMoE never\n  // synthesizes a system prompt on its own, matching what the real\n  // DeepSeek-V4 jinja template produces when no \"system\" message is passed\n  // in (confirmed byte-for-byte against\n  // models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja in a real\n  // llama.cpp checkout: no system role -> ns.system_prompt stays \"\" ->\n  // {bos}<｜User｜>{msg}<｜Assistant｜></think>, exactly what this engine\n  // already sent). A base model with no language-steering instruction will\n  // happily answer an ambiguous/short English prompt in Chinese -- this is\n  // normal, well-documented behavior for DeepSeek/Qwen/GLM-family models,\n  // not evidence of a missing/broken template. Set this (or --system-prompt)\n  // to add one, e.g. \"Respond in English unless asked otherwise.\"\n  std::string system_prompt;"
         },
         {
           "worktree": "original",
           "path": "core/engine_config.hpp",
           "line": 2344,
           "initializer_expression": "(no explicit initializer)",
-          "comment_and_declaration": "\n  // Optional system-role message, prepended ahead of the user turn when a\n  // chat template is in use (GGUFTokenizer::has_chat_template /\n  // has_deepseek_chat_template). Empty by default -- confirmed\n  // byte-for-byte against the real DeepSeek-V4-Flash jinja template\n  // (models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja in a real\n  // llama.cpp checkout) that an absent system message legitimately\n  // produces {bos}<\uff5cUser\uff5c>{msg}<\uff5cAssistant\uff5c></think> with no system\n  // text at all -- exactly what this engine already sent, so \"missing\n  // system prompt\" alone is not a template bug. A base model with no\n  // language-steering instruction will happily answer an\n  // ambiguous/short English prompt in Chinese; that's normal\n  // DeepSeek/Qwen/GLM-family behavior without one. Set this (or\n  // --system-prompt) to add one, e.g. \"Respond in English unless asked\n  // otherwise.\"\n  std::string system_prompt;"
+          "comment_and_declaration": "\n  // Optional system-role message, prepended ahead of the user turn when a\n  // chat template is in use (GGUFTokenizer::has_chat_template /\n  // has_deepseek_chat_template). Empty by default -- confirmed\n  // byte-for-byte against the real DeepSeek-V4-Flash jinja template\n  // (models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja in a real\n  // llama.cpp checkout) that an absent system message legitimately\n  // produces {bos}<｜User｜>{msg}<｜Assistant｜></think> with no system\n  // text at all -- exactly what this engine already sent, so \"missing\n  // system prompt\" alone is not a template bug. A base model with no\n  // language-steering instruction will happily answer an\n  // ambiguous/short English prompt in Chinese; that's normal\n  // DeepSeek/Qwen/GLM-family behavior without one. Set this (or\n  // --system-prompt) to add one, e.g. \"Respond in English unless asked\n  // otherwise.\"\n  std::string system_prompt;"
         },
         {
           "worktree": "api",
           "path": "backends/cpu/cpu_config.hpp",
           "line": 225,
           "initializer_expression": "(no explicit initializer)",
-          "comment_and_declaration": "  // Optional system-role message, prepended ahead of the user turn when a\n  // chat template is in use (see GGUFTokenizer::has_chat_template /\n  // has_deepseek_chat_template). Empty by default -- ZeroMoE never\n  // synthesizes a system prompt on its own, matching what the real\n  // DeepSeek-V4 jinja template produces when no \"system\" message is passed\n  // in (confirmed byte-for-byte against\n  // models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja in a real\n  // llama.cpp checkout: no system role -> ns.system_prompt stays \"\" ->\n  // {bos}<\uff5cUser\uff5c>{msg}<\uff5cAssistant\uff5c></think>, exactly what this engine\n  // already sent). A base model with no language-steering instruction will\n  // happily answer an ambiguous/short English prompt in Chinese -- this is\n  // normal, well-documented behavior for DeepSeek/Qwen/GLM-family models,\n  // not evidence of a missing/broken template. Set this (or --system-prompt)\n  // to add one, e.g. \"Respond in English unless asked otherwise.\"\n  std::string system_prompt;"
+          "comment_and_declaration": "  // Optional system-role message, prepended ahead of the user turn when a\n  // chat template is in use (see GGUFTokenizer::has_chat_template /\n  // has_deepseek_chat_template). Empty by default -- ZeroMoE never\n  // synthesizes a system prompt on its own, matching what the real\n  // DeepSeek-V4 jinja template produces when no \"system\" message is passed\n  // in (confirmed byte-for-byte against\n  // models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja in a real\n  // llama.cpp checkout: no system role -> ns.system_prompt stays \"\" ->\n  // {bos}<｜User｜>{msg}<｜Assistant｜></think>, exactly what this engine\n  // already sent). A base model with no language-steering instruction will\n  // happily answer an ambiguous/short English prompt in Chinese -- this is\n  // normal, well-documented behavior for DeepSeek/Qwen/GLM-family models,\n  // not evidence of a missing/broken template. Set this (or --system-prompt)\n  // to add one, e.g. \"Respond in English unless asked otherwise.\"\n  std::string system_prompt;"
         },
         {
           "worktree": "api",
           "path": "core/engine_config.hpp",
           "line": 2348,
           "initializer_expression": "(no explicit initializer)",
-          "comment_and_declaration": "\n  // Optional system-role message, prepended ahead of the user turn when a\n  // chat template is in use (GGUFTokenizer::has_chat_template /\n  // has_deepseek_chat_template). Empty by default -- confirmed\n  // byte-for-byte against the real DeepSeek-V4-Flash jinja template\n  // (models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja in a real\n  // llama.cpp checkout) that an absent system message legitimately\n  // produces {bos}<\uff5cUser\uff5c>{msg}<\uff5cAssistant\uff5c></think> with no system\n  // text at all -- exactly what this engine already sent, so \"missing\n  // system prompt\" alone is not a template bug. A base model with no\n  // language-steering instruction will happily answer an\n  // ambiguous/short English prompt in Chinese; that's normal\n  // DeepSeek/Qwen/GLM-family behavior without one. Set this (or\n  // --system-prompt) to add one, e.g. \"Respond in English unless asked\n  // otherwise.\"\n  std::string system_prompt;"
+          "comment_and_declaration": "\n  // Optional system-role message, prepended ahead of the user turn when a\n  // chat template is in use (GGUFTokenizer::has_chat_template /\n  // has_deepseek_chat_template). Empty by default -- confirmed\n  // byte-for-byte against the real DeepSeek-V4-Flash jinja template\n  // (models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja in a real\n  // llama.cpp checkout) that an absent system message legitimately\n  // produces {bos}<｜User｜>{msg}<｜Assistant｜></think> with no system\n  // text at all -- exactly what this engine already sent, so \"missing\n  // system prompt\" alone is not a template bug. A base model with no\n  // language-steering instruction will happily answer an\n  // ambiguous/short English prompt in Chinese; that's normal\n  // DeepSeek/Qwen/GLM-family behavior without one. Set this (or\n  // --system-prompt) to add one, e.g. \"Respond in English unless asked\n  // otherwise.\"\n  std::string system_prompt;"
         },
         {
           "worktree": "mtp",
           "path": "backends/cpu/cpu_config.hpp",
           "line": 225,
           "initializer_expression": "(no explicit initializer)",
-          "comment_and_declaration": "  // Optional system-role message, prepended ahead of the user turn when a\n  // chat template is in use (see GGUFTokenizer::has_chat_template /\n  // has_deepseek_chat_template). Empty by default -- ZeroMoE never\n  // synthesizes a system prompt on its own, matching what the real\n  // DeepSeek-V4 jinja template produces when no \"system\" message is passed\n  // in (confirmed byte-for-byte against\n  // models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja in a real\n  // llama.cpp checkout: no system role -> ns.system_prompt stays \"\" ->\n  // {bos}<\uff5cUser\uff5c>{msg}<\uff5cAssistant\uff5c></think>, exactly what this engine\n  // already sent). A base model with no language-steering instruction will\n  // happily answer an ambiguous/short English prompt in Chinese -- this is\n  // normal, well-documented behavior for DeepSeek/Qwen/GLM-family models,\n  // not evidence of a missing/broken template. Set this (or --system-prompt)\n  // to add one, e.g. \"Respond in English unless asked otherwise.\"\n  std::string system_prompt;"
+          "comment_and_declaration": "  // Optional system-role message, prepended ahead of the user turn when a\n  // chat template is in use (see GGUFTokenizer::has_chat_template /\n  // has_deepseek_chat_template). Empty by default -- ZeroMoE never\n  // synthesizes a system prompt on its own, matching what the real\n  // DeepSeek-V4 jinja template produces when no \"system\" message is passed\n  // in (confirmed byte-for-byte against\n  // models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja in a real\n  // llama.cpp checkout: no system role -> ns.system_prompt stays \"\" ->\n  // {bos}<｜User｜>{msg}<｜Assistant｜></think>, exactly what this engine\n  // already sent). A base model with no language-steering instruction will\n  // happily answer an ambiguous/short English prompt in Chinese -- this is\n  // normal, well-documented behavior for DeepSeek/Qwen/GLM-family models,\n  // not evidence of a missing/broken template. Set this (or --system-prompt)\n  // to add one, e.g. \"Respond in English unless asked otherwise.\"\n  std::string system_prompt;"
         },
         {
           "worktree": "mtp",
           "path": "core/engine_config.hpp",
           "line": 2344,
           "initializer_expression": "(no explicit initializer)",
-          "comment_and_declaration": "\n  // Optional system-role message, prepended ahead of the user turn when a\n  // chat template is in use (GGUFTokenizer::has_chat_template /\n  // has_deepseek_chat_template). Empty by default -- confirmed\n  // byte-for-byte against the real DeepSeek-V4-Flash jinja template\n  // (models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja in a real\n  // llama.cpp checkout) that an absent system message legitimately\n  // produces {bos}<\uff5cUser\uff5c>{msg}<\uff5cAssistant\uff5c></think> with no system\n  // text at all -- exactly what this engine already sent, so \"missing\n  // system prompt\" alone is not a template bug. A base model with no\n  // language-steering instruction will happily answer an\n  // ambiguous/short English prompt in Chinese; that's normal\n  // DeepSeek/Qwen/GLM-family behavior without one. Set this (or\n  // --system-prompt) to add one, e.g. \"Respond in English unless asked\n  // otherwise.\"\n  std::string system_prompt;"
+          "comment_and_declaration": "\n  // Optional system-role message, prepended ahead of the user turn when a\n  // chat template is in use (GGUFTokenizer::has_chat_template /\n  // has_deepseek_chat_template). Empty by default -- confirmed\n  // byte-for-byte against the real DeepSeek-V4-Flash jinja template\n  // (models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja in a real\n  // llama.cpp checkout) that an absent system message legitimately\n  // produces {bos}<｜User｜>{msg}<｜Assistant｜></think> with no system\n  // text at all -- exactly what this engine already sent, so \"missing\n  // system prompt\" alone is not a template bug. A base model with no\n  // language-steering instruction will happily answer an\n  // ambiguous/short English prompt in Chinese; that's normal\n  // DeepSeek/Qwen/GLM-family behavior without one. Set this (or\n  // --system-prompt) to add one, e.g. \"Respond in English unless asked\n  // otherwise.\"\n  std::string system_prompt;"
         }
       ],
       "current_read_excerpt": "299:     system_prompt = doc.root.get_str(\"system_prompt\", system_prompt);",
@@ -108787,28 +108787,28 @@
           "path": "core/engine_config.hpp",
           "line": 1525,
           "initializer_expression": "false",
-          "comment_and_declaration": "\n  // Log every host RAM cache HIT for the MoE expert cache (high volume \u2014\n  // one line per routed expert per token). MISS/LOAD and VRAM PROMOTE/READY\n  // events are always logged regardless of this flag since they're rare.\n  bool verbose_moe_log = false;"
+          "comment_and_declaration": "\n  // Log every host RAM cache HIT for the MoE expert cache (high volume —\n  // one line per routed expert per token). MISS/LOAD and VRAM PROMOTE/READY\n  // events are always logged regardless of this flag since they're rare.\n  bool verbose_moe_log = false;"
         },
         {
           "worktree": "original",
           "path": "core/engine_config.hpp",
           "line": 1523,
           "initializer_expression": "false",
-          "comment_and_declaration": "\n  // Log every host RAM cache HIT for the MoE expert cache (high volume \u2014\n  // one line per routed expert per token). MISS/LOAD and VRAM PROMOTE/READY\n  // events are always logged regardless of this flag since they're rare.\n  bool verbose_moe_log = false;"
+          "comment_and_declaration": "\n  // Log every host RAM cache HIT for the MoE expert cache (high volume —\n  // one line per routed expert per token). MISS/LOAD and VRAM PROMOTE/READY\n  // events are always logged regardless of this flag since they're rare.\n  bool verbose_moe_log = false;"
         },
         {
           "worktree": "api",
           "path": "core/engine_config.hpp",
           "line": 1527,
           "initializer_expression": "false",
-          "comment_and_declaration": "\n  // Log every host RAM cache HIT for the MoE expert cache (high volume \u2014\n  // one line per routed expert per token). MISS/LOAD and VRAM PROMOTE/READY\n  // events are always logged regardless of this flag since they're rare.\n  bool verbose_moe_log = false;"
+          "comment_and_declaration": "\n  // Log every host RAM cache HIT for the MoE expert cache (high volume —\n  // one line per routed expert per token). MISS/LOAD and VRAM PROMOTE/READY\n  // events are always logged regardless of this flag since they're rare.\n  bool verbose_moe_log = false;"
         },
         {
           "worktree": "mtp",
           "path": "core/engine_config.hpp",
           "line": 1523,
           "initializer_expression": "false",
-          "comment_and_declaration": "\n  // Log every host RAM cache HIT for the MoE expert cache (high volume \u2014\n  // one line per routed expert per token). MISS/LOAD and VRAM PROMOTE/READY\n  // events are always logged regardless of this flag since they're rare.\n  bool verbose_moe_log = false;"
+          "comment_and_declaration": "\n  // Log every host RAM cache HIT for the MoE expert cache (high volume —\n  // one line per routed expert per token). MISS/LOAD and VRAM PROMOTE/READY\n  // events are always logged regardless of this flag since they're rare.\n  bool verbose_moe_log = false;"
         }
       ],
       "current_read_excerpt": "3066:   verbose_moe_log = doc.root.get_bool(\"verbose_moe_log\", verbose_moe_log);",
@@ -126860,7 +126860,7 @@
           "role": "tool/script reference; may be assignment, not a reader",
           "tooling": true,
           "nearby_function_candidate": "Flash",
-          "excerpt": "281: run_qwen38() {\n282:   local log=\"$LOG_DIR/qwen38.$STAMP.log\" eng=\"logs/qwen_decode_split_$STAMP.engine.log\" rc=0\n283:   echo \"--- qwen38: split 22/26, 400 tokens (single 3090) ---\"\n284:   ZEROMOE_BIN=\"$BIN\" QWN_STAMP=\"$STAMP\" bench/qwen_decode_baselines.sh split 10 400 > \"$log\" 2>&1 || rc=$?\n285:   report qwen38 \"$(grab_rate \"$eng\")\" \"$rc\" \"$log\" \"$(grab_tokens \"$eng\")\" 400\n286: }\n287: \n288: # ---------------------------------------------------------------------------\n289: # glm53flash \u2014 GLM 5.3 Flash (GLM5NEXT), whole-layer placement, single 3090.\n290: # ---------------------------------------------------------------------------",
+          "excerpt": "281: run_qwen38() {\n282:   local log=\"$LOG_DIR/qwen38.$STAMP.log\" eng=\"logs/qwen_decode_split_$STAMP.engine.log\" rc=0\n283:   echo \"--- qwen38: split 22/26, 400 tokens (single 3090) ---\"\n284:   ZEROMOE_BIN=\"$BIN\" QWN_STAMP=\"$STAMP\" bench/qwen_decode_baselines.sh split 10 400 > \"$log\" 2>&1 || rc=$?\n285:   report qwen38 \"$(grab_rate \"$eng\")\" \"$rc\" \"$log\" \"$(grab_tokens \"$eng\")\" 400\n286: }\n287: \n288: # ---------------------------------------------------------------------------\n289: # glm53flash — GLM 5.3 Flash (GLM5NEXT), whole-layer placement, single 3090.\n290: # ---------------------------------------------------------------------------",
           "file_sha256": "5487f1529c7939b8aaebc892863eadd8dcbc4baa446644993ba61e7e934b4492"
         },
         {
@@ -126890,7 +126890,7 @@
           "role": "tool/script reference; may be assignment, not a reader",
           "tooling": true,
           "nearby_function_candidate": "",
-          "excerpt": "14: set -euo pipefail\n15: \n16: CONFIG=\"${ZEROMOE_CONFIG:-configs/testing/glm52_dual.toml}\"   # <-- the GLM-5.2 config you run with\n17: BINARY=\"${ZEROMOE_BIN:-./build/zeromoe}\"\n18: PROMPT=\"${1:-Hello}\"\n19: OUT=\"${2:-ms_trace.log}\"\n20: \n21: # --ngen 1 : generate one token, then stdin EOF exits the REPL cleanly.\n22: # --temp 0 : greedy / argmax \u2014 deterministic, no sampling noise.\n23: # The diff script takes the FIRST occurrence of each (layer, stage), i.e. the",
+          "excerpt": "14: set -euo pipefail\n15: \n16: CONFIG=\"${ZEROMOE_CONFIG:-configs/testing/glm52_dual.toml}\"   # <-- the GLM-5.2 config you run with\n17: BINARY=\"${ZEROMOE_BIN:-./build/zeromoe}\"\n18: PROMPT=\"${1:-Hello}\"\n19: OUT=\"${2:-ms_trace.log}\"\n20: \n21: # --ngen 1 : generate one token, then stdin EOF exits the REPL cleanly.\n22: # --temp 0 : greedy / argmax — deterministic, no sampling noise.\n23: # The diff script takes the FIRST occurrence of each (layer, stage), i.e. the",
           "file_sha256": "f400ea19f3b7bdbeb17dc78f440b9ad93d5d58a895a71cafd2dcd2dbee0c74c6"
         },
         {
@@ -126905,7 +126905,7 @@
           "role": "shell parameter default/required-value expansion; may be locally assigned",
           "tooling": true,
           "nearby_function_candidate": "",
-          "excerpt": "14: set -euo pipefail\n15: \n16: CONFIG=\"${ZEROMOE_CONFIG:-configs/testing/glm52_dual.toml}\"   # <-- the GLM-5.2 config you run with\n17: BINARY=\"${ZEROMOE_BIN:-./build/zeromoe}\"\n18: PROMPT=\"${1:-Hello}\"\n19: OUT=\"${2:-ms_trace.log}\"\n20: \n21: # --ngen 1 : generate one token, then stdin EOF exits the REPL cleanly.\n22: # --temp 0 : greedy / argmax \u2014 deterministic, no sampling noise.\n23: # The diff script takes the FIRST occurrence of each (layer, stage), i.e. the",
+          "excerpt": "14: set -euo pipefail\n15: \n16: CONFIG=\"${ZEROMOE_CONFIG:-configs/testing/glm52_dual.toml}\"   # <-- the GLM-5.2 config you run with\n17: BINARY=\"${ZEROMOE_BIN:-./build/zeromoe}\"\n18: PROMPT=\"${1:-Hello}\"\n19: OUT=\"${2:-ms_trace.log}\"\n20: \n21: # --ngen 1 : generate one token, then stdin EOF exits the REPL cleanly.\n22: # --temp 0 : greedy / argmax — deterministic, no sampling noise.\n23: # The diff script takes the FIRST occurrence of each (layer, stage), i.e. the",
           "file_sha256": "f400ea19f3b7bdbeb17dc78f440b9ad93d5d58a895a71cafd2dcd2dbee0c74c6"
         }
       ],
@@ -126953,7 +126953,7 @@
           "role": "tool/script reference; may be assignment, not a reader",
           "tooling": true,
           "nearby_function_candidate": "",
-          "excerpt": "13: # appear in the output, check the config isn't pinning log_level below VERBOSE.\n14: set -euo pipefail\n15: \n16: CONFIG=\"${ZEROMOE_CONFIG:-configs/testing/glm52_dual.toml}\"   # <-- the GLM-5.2 config you run with\n17: BINARY=\"${ZEROMOE_BIN:-./build/zeromoe}\"\n18: PROMPT=\"${1:-Hello}\"\n19: OUT=\"${2:-ms_trace.log}\"\n20: \n21: # --ngen 1 : generate one token, then stdin EOF exits the REPL cleanly.\n22: # --temp 0 : greedy / argmax \u2014 deterministic, no sampling noise.",
+          "excerpt": "13: # appear in the output, check the config isn't pinning log_level below VERBOSE.\n14: set -euo pipefail\n15: \n16: CONFIG=\"${ZEROMOE_CONFIG:-configs/testing/glm52_dual.toml}\"   # <-- the GLM-5.2 config you run with\n17: BINARY=\"${ZEROMOE_BIN:-./build/zeromoe}\"\n18: PROMPT=\"${1:-Hello}\"\n19: OUT=\"${2:-ms_trace.log}\"\n20: \n21: # --ngen 1 : generate one token, then stdin EOF exits the REPL cleanly.\n22: # --temp 0 : greedy / argmax — deterministic, no sampling noise.",
           "file_sha256": "f400ea19f3b7bdbeb17dc78f440b9ad93d5d58a895a71cafd2dcd2dbee0c74c6"
         },
         {
@@ -126968,7 +126968,7 @@
           "role": "shell parameter default/required-value expansion; may be locally assigned",
           "tooling": true,
           "nearby_function_candidate": "",
-          "excerpt": "13: # appear in the output, check the config isn't pinning log_level below VERBOSE.\n14: set -euo pipefail\n15: \n16: CONFIG=\"${ZEROMOE_CONFIG:-configs/testing/glm52_dual.toml}\"   # <-- the GLM-5.2 config you run with\n17: BINARY=\"${ZEROMOE_BIN:-./build/zeromoe}\"\n18: PROMPT=\"${1:-Hello}\"\n19: OUT=\"${2:-ms_trace.log}\"\n20: \n21: # --ngen 1 : generate one token, then stdin EOF exits the REPL cleanly.\n22: # --temp 0 : greedy / argmax \u2014 deterministic, no sampling noise.",
+          "excerpt": "13: # appear in the output, check the config isn't pinning log_level below VERBOSE.\n14: set -euo pipefail\n15: \n16: CONFIG=\"${ZEROMOE_CONFIG:-configs/testing/glm52_dual.toml}\"   # <-- the GLM-5.2 config you run with\n17: BINARY=\"${ZEROMOE_BIN:-./build/zeromoe}\"\n18: PROMPT=\"${1:-Hello}\"\n19: OUT=\"${2:-ms_trace.log}\"\n20: \n21: # --ngen 1 : generate one token, then stdin EOF exits the REPL cleanly.\n22: # --temp 0 : greedy / argmax — deterministic, no sampling noise.",
           "file_sha256": "f400ea19f3b7bdbeb17dc78f440b9ad93d5d58a895a71cafd2dcd2dbee0c74c6"
         }
       ],

@@ -5,9 +5,6 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-option(ZEROMOE_WRITE_BUILD_PROVENANCE
-       "Write a source/binary provenance manifest after building zeromoe" ON)
-
 # Resolver/default/binding tests need neither CUDA nor model weights.
 enable_testing()
 add_executable(graph_settings_test tests/test_graph_settings.cpp)
@@ -212,12 +209,6 @@ find_package(OpenMP)
 set(ZEROMOE_GGML_COMMIT "8baabd53b77d1c48c6ef8d3b620436292f3f6231" CACHE STRING "llama.cpp commit whose ggml/ directory is built (used when the third_party/llama.cpp submodule is absent)")
 set(ZEROMOE_GGML_ROOT "" CACHE PATH "Path to a local ggml checkout (fetched automatically if empty)")
 
-# Provide a deprecated alias for configs that still set it.
-if(ZEROMOE_LLAMA_CPP_ROOT AND NOT ZEROMOE_GGML_ROOT)
-    set(ZEROMOE_GGML_ROOT "${ZEROMOE_LLAMA_CPP_ROOT}" CACHE PATH "" FORCE)
-    message(WARNING "ZEROMOE_LLAMA_CPP_ROOT is deprecated; use ZEROMOE_GGML_ROOT")
-endif()
-
 # Disable everything we do not need for a CPU decode assistant. GGML_CUDA
 # follows the derived ZEROMOE_USE_GGML_CUDA and must be set BEFORE the
 # subproject is configured.
@@ -413,22 +404,22 @@ if(NOT ZEROMOE_CPU_ONLY)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
     find_package(CUDAToolkit REQUIRED)
-    if(ZEROMOE_WRITE_BUILD_PROVENANCE)
-        find_package(Python3 COMPONENTS Interpreter REQUIRED)
-        execute_process(
-            COMMAND "${Python3_EXECUTABLE}"
-                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_provenance.py"
-                    snapshot --repo "${CMAKE_CURRENT_SOURCE_DIR}"
-            RESULT_VARIABLE _zeromoe_snapshot_result
-            OUTPUT_VARIABLE _zeromoe_source_snapshot
-            ERROR_VARIABLE _zeromoe_snapshot_error
-            OUTPUT_STRIP_TRAILING_WHITESPACE)
-        if(NOT _zeromoe_snapshot_result EQUAL 0)
-            message(FATAL_ERROR "Could not snapshot source for build provenance: ${_zeromoe_snapshot_error}")
-        endif()
-        string(JSON ZEROMOE_CONFIGURED_SOURCE_COMMIT GET "${_zeromoe_source_snapshot}" source_commit)
-        string(JSON ZEROMOE_CONFIGURED_SOURCE_SNAPSHOT_SHA256 GET "${_zeromoe_source_snapshot}" source_snapshot_sha256)
+    # Provenance is mandatory for the CUDA engine binary: performance and
+    # rollout records must identify the exact source and GGML snapshot.
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_provenance.py"
+                snapshot --repo "${CMAKE_CURRENT_SOURCE_DIR}"
+        RESULT_VARIABLE _zeromoe_snapshot_result
+        OUTPUT_VARIABLE _zeromoe_source_snapshot
+        ERROR_VARIABLE _zeromoe_snapshot_error
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(NOT _zeromoe_snapshot_result EQUAL 0)
+        message(FATAL_ERROR "Could not snapshot source for build provenance: ${_zeromoe_snapshot_error}")
     endif()
+    string(JSON ZEROMOE_CONFIGURED_SOURCE_COMMIT GET "${_zeromoe_source_snapshot}" source_commit)
+    string(JSON ZEROMOE_CONFIGURED_SOURCE_SNAPSHOT_SHA256 GET "${_zeromoe_source_snapshot}" source_snapshot_sha256)
 
     # Engine executable
     # CUDA kernel sources (cuda/*.cu) and the GPU Qwen MoE backend
@@ -1334,7 +1325,7 @@ if(TARGET zeromoe_exl3_upstream)
     endforeach()
 endif()
 
-if(TARGET zeromoe AND ZEROMOE_WRITE_BUILD_PROVENANCE)
+if(TARGET zeromoe)
     set(_zeromoe_provenance_args
         stamp
         --binary "$<TARGET_FILE:zeromoe>"

@@ -4,7 +4,6 @@ device_expert_trailing=0
 dynamic_cache=0
 early_ready=-1
 gpu_assist2_slots=1
-gpu_assist_any_type=0
 gpu_assist_slots=0
 lane_with_gpu1=1
 offload_async=0

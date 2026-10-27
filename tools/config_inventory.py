@@ -27,13 +27,34 @@ def inventory(root=ROOT):
             text = path.read_text()
             for kind, pattern in PATTERNS.items():
                 for match in pattern.finditer(text):
+                    if kind == "environment" and match[1] in {
+                        "ZEROMOE_LING_", "ZEROMOE_GLM5NEXT_"
+                    }:
+                        # Prefixes used by ZEROMOE_LING_GLM_ALIAS are expanded
+                        # into concrete family aliases below.
+                        continue
                     line = text.count("\n", 0, match.start()) + 1
                     entries[kind, match[1]].add(f"{path.relative_to(root)}:{line}")
+            for match in re.finditer(r'ZEROMOE_LING_GLM_ALIAS\("([A-Z0-9_]+)"\)', text):
+                line = text.count("\n", 0, match.start()) + 1
+                location = f"{path.relative_to(root)}:{line}"
+                suffix = match[1]
+                entries["environment", "ZEROMOE_LING_" + suffix].add(location)
+                entries["environment", "ZEROMOE_GLM5NEXT_" + suffix].add(location)
             for number, line in enumerate(text.splitlines(), 1):
                 if re.match(r"^\s*#\s*(?:if|ifdef|ifndef|elif)\b", line):
                     for name in re.findall(r"\b(?:ZEROMOE|GGML)_[A-Z0-9_]+", line.split("//", 1)[0]):
                         entries["macro", name].add(f"{path.relative_to(root)}:{number}")
-    for path in [root / "CMakeLists.txt", *sorted((root / "cmake").glob("*.cmake"))]:
+    # Graph CLI flags are generated from the canonical graph-setting table,
+    # rather than stored as individual string literals in the CLI parser.
+    for (kind, name), locations in list(entries.items()):
+        if kind == "graph_setting":
+            entries["cli", "--graph-" + name.replace("_", "-")].update(locations)
+    cmake_files = [root / "CMakeLists.txt", root / "server" / "CMakeLists.txt"]
+    cmake_files.extend(sorted((root / "cmake").glob("*.cmake")))
+    for path in cmake_files:
+        if not path.is_file():
+            continue
         text = path.read_text()
         for match in re.finditer(r"\boption\s*\(\s*(ZEROMOE_[A-Z0-9_]+)\b", text):
             line = text.count("\n", 0, match.start()) + 1

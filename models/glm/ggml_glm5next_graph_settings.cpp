@@ -165,30 +165,6 @@ bool layer_timing_env() {
   return on;
 }
 
-int dynamic_upload_budget_override() {
-  const char *value =
-      zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_DYNAMIC_CACHE_UPLOADS_PER_TOKEN");
-  if (!value || !value[0])
-    return -1;
-  char *end = nullptr;
-  const long parsed = std::strtol(value, &end, 10);
-  if (end == value || *end != '\0' || parsed < 0)
-    return -1;
-  return (int)std::min<long>(parsed, 128);
-}
-
-double dynamic_upload_fraction() {
-  const char *value =
-      zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_DYNAMIC_CACHE_SWAP_FRAC");
-  if (!value || !value[0])
-    return 0.25;
-  char *end = nullptr;
-  const double parsed = std::strtod(value, &end);
-  return end != value && *end == '\0' && parsed >= 0.0 && parsed <= 1.0
-             ? parsed
-             : 0.25;
-}
-
 // Run each layer's cold (CPU) experts on a private lane that starts as soon as the
 // routed ids reach the host, instead of after the layer's GPU work. Decode only.
 // ZEROMOE_GLM5NEXT_EARLY_READY controls execution, not which experts occupy VRAM:
@@ -258,7 +234,7 @@ int gpu_assist_slots() {
 // Which expert types are worth assisting: the codebook types (IQ1/IQ2/IQ3, Q2_0) are compute-bound on the CPU (11-26 GB/s of
 // weights) and small, so a PCIe copy costs about what the CPU saves. The K- and legacy 4-8 bit types stream at 50-60 GB/s on the
 // CPU, so the copy of their ~1.3-2x larger experts costs 2.8-3x the CPU time and assisting them slows the layer down (GSQ-RCO
-// Q2_K: assist 3 = 88 ms/token vs 70.6 without). ZEROMOE_GLM5NEXT_GPU_ASSIST_ANY_TYPE=1 lifts the filter.
+// Q2_K: assist 3 = 88 ms/token vs 70.6 without). Keep the validated type filter fixed.
 static bool gpu_assist_type_ok(int type) {
   switch (type) {
   case GGML_TYPE_IQ1_S:
@@ -276,9 +252,6 @@ static bool gpu_assist_type_ok(int type) {
 }
 
 bool gpu_assist_layer_ok(const FullGraph &g, int layer) {
-  static const bool any = zeromoe::graphsettings::active_settings().tun.gpu_assist_any_type.value != 0;
-  if (any)
-    return true;
   for (const char *stem : {"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"}) {
     const GGUFTensor *m = model_tensor(*g.engine, "blk." + std::to_string(layer) + "." + stem);
     if (!m || !gpu_assist_type_ok(static_cast<int>(m->type)))

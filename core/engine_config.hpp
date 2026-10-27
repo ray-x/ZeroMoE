@@ -67,6 +67,8 @@ struct GpuConfig {
 struct EngineConfig {
   // Root graph_* keys, collected verbatim and validated by the typed resolver.
   zeromoe::graphsettings::ConfigValues graph_settings;
+  // Graph settings supplied through --graph-<name>; applied after legacy env.
+  zeromoe::graphsettings::CliValues graph_cli_settings;
   bool serve_api = false;
   std::string api_host = "127.0.0.1";
   int api_port = 8080;

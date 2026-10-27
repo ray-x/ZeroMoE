@@ -66,7 +66,8 @@ std::expected<void, std::string> EngineRunner::load_model() {
     set_active_family(active);
     // Other is used separately by the shared phase cache, not an adapter.
     std::string error;
-    if (!validate_config(config.graph_settings, families, error))
+    if (!validate_config(config.graph_settings, families, error,
+                         config.graph_cli_settings))
       return std::unexpected(error);
   }
   const auto allow_unaligned_direct_io = [](const GGUFFile &file) {

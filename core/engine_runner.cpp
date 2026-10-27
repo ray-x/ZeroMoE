@@ -191,7 +191,7 @@ std::expected<void, std::string> EngineRunner::run() {
 }
 
 std::expected<void, std::string> EngineRunner::apply_engine_config() {
-  if (!config.graph_settings.empty()) {
+  if (!config.graph_settings.empty() || !config.graph_cli_settings.empty()) {
 #if !defined(ZEROMOE_USE_GGML_CUDA)
     return std::unexpected(
         "graph_* settings require a CUDA build (this binary is CPU-only)");
@@ -200,7 +200,8 @@ std::expected<void, std::string> EngineRunner::apply_engine_config() {
       return std::unexpected("graph_* settings require CUDA graph execution, not CPU-only mode");
   }
   try {
-    zeromoe::graphsettings::configure_settings(config.graph_settings);
+    zeromoe::graphsettings::configure_settings(config.graph_settings,
+                                               config.graph_cli_settings);
   } catch (const std::exception &e) {
     return std::unexpected(e.what());
   }
