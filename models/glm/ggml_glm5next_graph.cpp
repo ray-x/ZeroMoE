@@ -44,7 +44,7 @@ std::map<int, ggml_backend_buffer_t> g_hot1_buffers;
 
 } // namespace glm5next_graph
 
-bool glm5next_full_graph_enabled() { return env_enabled(); }
+bool glm5next_full_graph_enabled() { return true; }
 
 void glm5next_full_graph_set_vram_cache(GpuTopology *topology) {
   g_glm5next_vram_cache = topology;
@@ -115,7 +115,7 @@ bool glm5next_full_graph_bootstrap(StreamingEngine &engine) {
 }
 
 int glm5next_full_graph_device_expert_layers() {
-  return env_enabled() ? env_device_expert_layers() : 0;
+  return env_device_expert_layers();
 }
 
 void glm5next_full_graph_shutdown() {

@@ -104,8 +104,7 @@ These are model-specific. The model's own document (`docs/models/<model>.md`) is
 | `ZEROMOE_GLM5NEXT_PILOT_STAGE` | `0` | Number of next-layer cold experts the pilot stages into the VRAM ring per layer, clamped to 0–8. `0` disables pilot staging. |
 | `ZEROMOE_GLM5NEXT_PILOT_COPY` | `1` | Set `0` for prefetch-only mode: the pilot reads predicted experts into host memory in the background, nothing is copied into the VRAM ring, and the CPU computes every cold route as without staging. |
 | `ZEROMOE_GLM5NEXT_MODEL_DIRECT` | off | Read model tensors directly (`1` enables). |
-| `ZEROMOE_GLM5NEXT_OFFLOAD_SPLIT` | off | Split expert-offload reads across tiers (`1` enables; a leading `1` only). Alias of `graph_offload_split_reads`; the same switch is also `ZEROMOE_LING_OFFLOAD_SPLIT` for Ling. Not a size or ratio. |
-| `ZEROMOE_MIMO2_OFFLOAD_DDR_GIB` | `auto` | Host DDR budget for MiMo expert offload, in GiB, or `auto`. Alias of `graph_offload_ddr_gib`; a negative or `auto` value keeps the family default. The DSP/GLM equivalent is `ZEROMOE_LING_OFFLOAD_DDR_GIB` / `ZEROMOE_GLM5NEXT_OFFLOAD_DDR_GIB`. |
+| `ZEROMOE_GLM5NEXT_OFFLOAD_SPLIT` | off | Split expert-offload reads across tiers (`1` enables; a leading `1` only). Alias of `graph_offload_split_reads`, also inherited by Ling's shared GLM graph. Not a size or ratio. |
 
 ## Benchmark, diagnostic and test
 
@@ -117,5 +116,5 @@ These are model-specific. The model's own document (`docs/models/<model>.md`) is
 | `ZEROMOE_GENERATED_TOKEN_FILE` | Write each generated token id to this file, one per line (truncated at step 0). For numerical comparisons. |
 | `ZEROMOE_DECODE_LOGITS_DUMP` | Dump decode logits to this file. Diagnostic. |
 | `ZEROMOE_WUV_INT8` | Attention value-projection int8 path (`1` enables). Diagnostic; read in `core/attention_layer.cpp`. |
-| `ZEROMOE_GLM5NEXT_GRAPH_LAYER_TIMING`, `ZEROMOE_MIMO2_NODE_TRACE`, `ZEROMOE_GLM5NEXT_ROUTE_TRACE` | Per-layer or per-node timing and traces. Diagnostic. |
+| `ZEROMOE_GLM5NEXT_GRAPH_LAYER_TIMING`, `ZEROMOE_GLM5NEXT_ROUTE_TRACE` | Per-layer timing and traces. Diagnostic. |
 | `ZEROMOE_TEST_EXL3_CPU_ONLY`, `ZEROMOE_TEST_EXL3_ONLY` | Stop the native test harness early: after the CPU/EXL3 checks with `_CPU_ONLY`, after the CUDA kernel checks with `_ONLY` (the form `README.md` uses for the short CUDA check). |

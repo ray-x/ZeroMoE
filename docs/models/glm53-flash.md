@@ -9,13 +9,13 @@
 ## Canonical recipe
 
 ```bash
-echo "<prompt>" | CUDA_VISIBLE_DEVICES=0 ZEROMOE_GLM5NEXT_FULL_GRAPH=1 \
+echo "<prompt>" | CUDA_VISIBLE_DEVICES=0 \
   ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512 ZEROMOE_GLM5NEXT_CPU_THREADS=6 \
   scripts/run_capped.sh -- ./build_master/zeromoe \
   --config configs/bench/glm53flash_AJ_IQ2XXS_wholelayer8_cpu.toml --temp 0 --ngen 150 --force-start
 ```
 
-`ZEROMOE_GLM5NEXT_FULL_GRAPH=1` is REQUIRED — without it the legacy per-layer path runs ~6× slower.
+The registered GLM5Next graph is the default CUDA path; there is no layered-path environment switch.
 
 ## Frozen baseline
 

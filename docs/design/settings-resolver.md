@@ -67,9 +67,9 @@ common default  <  family override  <  profile pin  <  TOML  <  env  <  CLI
   `reason` string is mandatory. An override equal to the default is rejected at startup as redundant.
 * **Profile pin:** only the fields stored in the matched profile (§4). Beats a family override because
   it is measured for this exact key; losing this would let a code edit silently undo a measurement.
-* **TOML / env / CLI:** run-level tuning. Env keeps working through an alias table
-  `ZEROMOE_MIMO2_CPU_THREADS -> cpu_threads_decode` so existing scripts and docs stay valid. An alias
-  hit logs once as deprecated with the canonical name. Unknown `ZEROMOE_*` names are warned (a typo
+* **TOML / env / CLI:** run-level tuning. Remaining environment aliases are transitional; MiMo2
+  and Ling graph-setting aliases have been removed as maintained launchers moved to canonical TOML
+  and `--graph-*` options. A remaining alias hit logs once with the canonical name. Unknown `ZEROMOE_*` names are warned (a typo
   today is silently ignored).
 
 Capabilities are not layered: the family sets them in code, the resolver only reads them. They may
@@ -123,7 +123,7 @@ Step 1 moves these in with today's defaults, no change in value:
 
 | Field | MiMo today | Ling today | Source today |
 |---|---|---|---|
-| `cpu_threads_decode` | 10 | 10 | `ZEROMOE_MIMO2_CPU_THREADS` / Ling constant |
+| `cpu_threads_decode` | 10 | 10 | Qwen CPU-worker alias remains; MiMo2 uses `graph_cpu_threads_decode` / `--graph-cpu-threads-decode` |
 | `prefill_chunk` | 512 | per Ling code | `…_PREFILL_CHUNK` |
 | `prefill_min_batch` | 8 | 64 (base default) | `min_prefill_batch()` override |
 | `prefill_op_offload`, `prefill_offload_min_tokens` | auto, 256 | disabled in code | `…_PREFILL_OP_OFFLOAD`, `…_OFFLOAD_MIN` |
@@ -191,24 +191,22 @@ a rebase pass over all profiles.
 
 ## 9. Step 1 as built
 
-* Migrated: MiMo (CPU threads, prefill chunk and min batch, op-offload mode and threshold, DDR GiB,
-  pinned %, pin, assist slots, usage file, second GPU, verify/trace diagnostics) and Ling (prefill
-  chunk, min batch, offload first layer and async).
+* Migrated: MiMo graph settings and Ling's graph-specific settings are now canonical TOML/CLI fields;
+  their family-prefixed environment aliases were removed. GLM aliases remain and apply to Ling when
+  it uses the shared GLM graph.
 * `Family` names the model, not the graph implementation. `Family::Glm` covers GLM-5.x and
-  GLM-DSA; `Family::Ling` inherits the Glm row (aliases and family defaults) because Ling's
-  default and hybrid modes run the GLM graph. `ZEROMOE_LING_*` is tried first when that spelling
-  exists, then `ZEROMOE_GLM5NEXT_*`. The link is one-directional: a Glm run never reads Ling names
-  or Ling defaults.
+  GLM-DSA; `Family::Ling` inherits Glm family defaults and aliases because Ling's shared graph
+  uses the GLM implementation. Ling no longer has duplicate `ZEROMOE_LING_*` graph-tuning aliases.
 * Capability is declared per field (`Field::claims`), not inferred from aliases. TOML acceptance
   uses the model's active adapter list: a Ling run that uses the shared graph lists `Family::Glm`,
   while the native Ling graph does not claim the GLM offload knobs. Alias visibility for
   TOML/env resolution is tracked separately (`detail::reads`).
-* Env knobs keep their old parse (strict strtol, atoi, on-unless-0). Env names are scoped per family:
-  a `ZEROMOE_MIMO2_*` variable cannot change Ling.
+* Remaining environment aliases keep their old parse (strict strtol, atoi, on-unless-0). These aliases
+  are being retired in favor of the canonical TOML/CLI surface.
 * Not migrated: the `ZEROMOE_MIMO2_INGRAPH_MOE` / `_FULL_GRAPH` gates (feature gates, not tunables),
   GLM's other ~45 knobs, Ling's native/hybrid graph gates, `ZEROMOE_LING_NO_*_CACHE_ALIAS`.
-* Ling's chunk: an env value wins (as before, including 0); otherwise the engine's prefill batch or 2048.
-  The default stays 0 = "the model decides" because that fallback needs the engine.
+* Ling's chunk: TOML/CLI value wins; otherwise the engine's prefill batch or 2048. The default stays
+  0 = "the model decides" because that fallback needs the engine.
 * `defaults_table()` / `defaults_hash()` exist; `tests/graph_settings_defaults.snapshot` is diffed by the
   unit test. The drift check against a profile is not built (no profiles exist yet).
 * `moe_conformance` now fails on a direct `ZEROMOE_MIMO2_/LING_` tunable read in the MiMo graph and
@@ -219,9 +217,9 @@ a rebase pass over all profiles.
 
 ### Added after step 1
 
-* `usage_record_file` (diagnostic, outside the defaults hash): `ZEROMOE_MIMO2_USAGE_RECORD`, or
-  `ZEROMOE_LING_USAGE_RECORD` (`ZEROMOE_GLM5NEXT_USAGE_RECORD` for Glm, inherited by Ling's shared
-  graph). Turns on the shared route survey
+* `usage_record_file` (diagnostic, outside the defaults hash): canonical `graph_usage_record_file`;
+  `ZEROMOE_GLM5NEXT_USAGE_RECORD` remains for the GLM family and is inherited by Ling's shared
+  graph. Turns on the shared route survey
   (`models/graph/graph_route_survey.hpp`). Only the in-graph MoE path is tapped; MiMo's synchronous fallback
   (`ZEROMOE_MIMO2_INGRAPH_MOE=0`) and the layered path record nothing, so the file stays empty there.
 * One prefill-chunk model for graph families: env (`prefill_chunk` aliases) > the TOML's `prefill_batch_tokens` >

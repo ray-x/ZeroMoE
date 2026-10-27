@@ -84,7 +84,7 @@ PY
     stage) env+=(ZEROMOE_GLM5NEXT_PILOT_STAGE=1) ;;
     lane) env+=(ZEROMOE_GLM5NEXT_EARLY_READY=1) ;;  # CPU lane (step 4); baseline binary ignores it
   esac
-  printf '%s\n:q\n' "$PROMPT" | env -u ZEROMOE_GLM5NEXT_FULL_GRAPH "${env[@]}" \
+  printf '%s\n:q\n' "$PROMPT" | env "${env[@]}" \
       systemd-run --user --scope -q -p MemoryMax=80G -p MemorySwapMax=0 \
       "$bin" --config "$out/$tag.toml" --ngen 48 > "$out/$tag.stdout" 2>&1
   echo "$tag exit=$?"

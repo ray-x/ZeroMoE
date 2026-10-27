@@ -17,7 +17,7 @@ find_package(Threads REQUIRED)
 target_link_libraries(graph_settings_binding_test PRIVATE Threads::Threads)
 add_test(NAME graph_settings_binding COMMAND graph_settings_binding_test)
 set_tests_properties(graph_settings_binding PROPERTIES ENVIRONMENT_MODIFICATION
-    "ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=unset:;ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=unset:;ZEROMOE_PHASE_CACHE_MIB=unset:")
+    "ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=unset:;ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=unset:")
 
 add_executable(mtp_graph_contract_test EXCLUDE_FROM_ALL
     tests/test_mtp_graph_contract.cpp)

@@ -77,12 +77,10 @@ struct PackedGateUpMeta;
 struct RouteTap;
 
 // ---- function declarations (defined in ggml_qwen4exp_graph_*.cpp) ----
-bool env_enabled();
 bool graph_enabled_for(const StreamingEngine &engine);
 bool offload_async();
 int offload_first_layer();
 bool offload_layer(int layer);
-std::string offload_env(const char *name, const char *dflt = "");
 int pilot_stage_k();
 bool pilot_prefetch_on();
 bool pilot_copy_on();

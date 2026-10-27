@@ -48,10 +48,10 @@ native execution path, `--prompt` alone does not submit a REPL request.
 Check for competing model processes before running. The kernel cap includes
 `MemorySwapMax=0`; do not replace it with a RAM-only cap.
 
-`ZEROMOE_MIMO2_FULL_GRAPH=0` disables this family graph and fails the request;
-there is no compatible layered attention fallback.
-`ZEROMOE_MIMO2_PREFILL_CHUNK` sets the graph's maximum prompt chunk
-(default 16, range 1–256). Larger chunks increase workspace and cold expert
+The registered MiMo2 graph is the CUDA path and cannot be disabled into a
+request-time fallback. There is no compatible layered attention fallback.
+`graph_prefill_chunk` sets the graph's maximum prompt chunk (default 16,
+range 1–256); use `--graph-prefill-chunk` for a per-run override. Larger chunks increase workspace and cold expert
 fan-out; changing this is a tuning experiment after correctness validation.
 The BF16-router override above preserves original F32 routing for the initial
 comparison, rather than making a claim about the faster setting's accuracy.
@@ -183,7 +183,7 @@ Pitfalls found while bringing it up:
 - The offload store's row-size table needed MXFP4 (ggml type 39).
 - Aliased cache slots need row-aligned strides (engine pads them when MiMo's in-graph
   MoE is enabled); the engine RAM tier must not preload on top of the offload tier.
-- `ZEROMOE_MIMO2_NODE_TRACE=1|2|3|4` are debug aids; trace modes install an eval
+- `--graph-node-trace 1|2|3|4` is a debug aid; trace modes install an eval
   callback that disables the early-ready bridge, so never use them for timing.
 
 Next: run the dual-GPU config, freeze a surveyed usage profile, A/B the GPU-assist ring.
@@ -192,7 +192,8 @@ Next: run the dual-GPU config, freeze a surveyed usage profile, A/B the GPU-assi
 
 Config `configs/bench/mimo26_flash_gsq_rco_3bit_ingraph_dual.toml` (12 GiB / 14.5 GiB expert caches =
 1,317 + 1,592 hot experts), 80 GiB offload DDR tier, assist ring off, 10 CPU threads. Run via
-`ZEROMOE_MIMO2_*` env (see ggml_mimo2_graph.cpp). Placement preflight: coverage 12032/12032.
+registered `graph_*` TOML settings or generated `--graph-*` options. Placement
+preflight: coverage 12032/12032.
 
 | Prompt tokens | Prefill tok/s | Path | Decode tok/s (64 tok) |
 |---:|---:|---|---:|
@@ -203,7 +204,7 @@ Config `configs/bench/mimo26_flash_gsq_rco_3bit_ingraph_dual.toml` (12 GiB / 14.
 
 Decode: 0 store misses / 0 loads over the run (no SSD reads); the CPU lane's compute is ~40 ms/token.
 Prefill: GPU op-offload copies ~52 GiB of experts per chunk (nearly constant per chunk), so it pays
-off from ~256 tokens (auto threshold, `ZEROMOE_MIMO2_PREFILL_OFFLOAD_MIN`).
+off from ~256 tokens (auto threshold, `graph_prefill_offload_min_tokens`).
 
 Measured graph VRAM (`[MIMO2-VRAM]`): compute buffers ~0.004 GiB per GPU, KV 0.1 GiB at 512 context;
 the engine's fixed 6 GiB "graph overhead reserve" only affects automatic cache sizing.
@@ -260,7 +261,7 @@ prompt would test sliding-window layers beyond the window (4096 on this model is
 
 The in-graph path bypasses the engine's usage statistics (`freeze_usage_stats = false` records nothing there), so the
 profile is recorded from the graph: `bench/mimo_survey.sh survey <profile> <binary>` runs 20 varied prompts
-(`bench/mimo_survey_prompts.txt`) with `ZEROMOE_MIMO2_USAGE_RECORD`, a side tap that leaves the real route ids
+(`bench/mimo_survey_prompts.txt`) with `--graph-usage-record-file`, a side tap that leaves the real route ids
 alone and counts decode and prefill separately (`<profile>` is decode, `<profile>.prefill` is prefill; a 512-token
 prefill chunk has far more route slots than a decode step and would dominate a combined file).
 `bench/mimo_survey.sh eval <profile>` runs four held-out prompts (`bench/mimo_eval_prompts.txt`) for an A/B.

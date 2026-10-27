@@ -59,8 +59,9 @@ int main(int argc, char **argv) {
     CHECK(prefill_chunk_value(chunk.tun.prefill_chunk, 0, 512) == 512);
     chunk = resolve_settings(Family::Ling, env_of({}), nullptr, {{"prefill_chunk", "0"}});
     CHECK(prefill_chunk_value(chunk.tun.prefill_chunk, 0, 2048) == 2048);
-    chunk = resolve_settings(Family::MiMo2, env_of({{"ZEROMOE_MIMO2_PREFILL_CHUNK", "0"}}));
-    CHECK(prefill_chunk_value(chunk.tun.prefill_chunk, 128, 512) == 0);
+    chunk = resolve_settings(Family::MiMo2, env_of({}), nullptr, {},
+                             {{"prefill_chunk", "0"}});
+    CHECK(prefill_chunk_value(chunk.tun.prefill_chunk, 128, 512) == 128);
     for (const auto &value : {"auto", "true", "false"}) {
       ConfigValues values;
       error.clear();
@@ -80,9 +81,10 @@ int main(int argc, char **argv) {
     CHECK(r.tun.prefill_chunk.value == 256 && r.tun.offload_pin.value == 0);
     CHECK(r.tun.offload_ddr_gib.value == 24.5);
     CHECK(r.tun.cpu_threads_decode.origin == "graph_cpu_threads_decode");
-    auto legacy = resolve_settings(Family::MiMo2, env_of({{"ZEROMOE_MIMO2_CPU_THREADS", "8"}}), nullptr, config);
-    CHECK(legacy.tun.cpu_threads_decode.value == 8 && legacy.tun.cpu_threads_decode.src == Source::Env);
-    CHECK(legacy.warnings.size() == 1 && legacy.warnings[0].find("precedence") != std::string::npos);
+    auto cli = resolve_settings(Family::MiMo2, env_of({}), nullptr, config,
+                                {{"cpu_threads_decode", "8"}});
+    CHECK(cli.tun.cpu_threads_decode.value == 8 && cli.tun.cpu_threads_decode.src == Source::Cli);
+    CHECK(cli.warnings.empty());
     CHECK(r.warnings.empty());
     CHECK(format_settings(r).find("toml:graph_cpu_threads_decode") != std::string::npos);
     for (const auto &value : {"12x", "-1", "1.5", "99999999999999999999999999"}) {
@@ -160,14 +162,21 @@ int main(int argc, char **argv) {
     auto defaults = resolve_settings(f, env_of({}));
     CHECK(defaults.tun.phase_cache_mib.value == 0);
     CHECK(defaults.tun.phase_cache_reserve_mib.value == 512);
-    auto configured = resolve_settings(f, env_of({{"ZEROMOE_PHASE_CACHE_MIB", "1024"},
-                                                  {"ZEROMOE_PHASE_CACHE_RESERVE_MIB", "768"}}));
+    auto configured = resolve_settings(f, env_of({}), nullptr, {},
+                                      {{"phase_cache_mib", "1024"},
+                                       {"phase_cache_reserve_mib", "768"}});
     CHECK(configured.tun.phase_cache_mib.value == 1024);
     CHECK(configured.tun.phase_cache_reserve_mib.value == 768);
-    CHECK(configured.tun.phase_cache_mib.src == Source::Env);
+    CHECK(configured.tun.phase_cache_mib.src == Source::Cli);
   }
-  CHECK(!settings_findings(resolve_settings(Family::Other,
-      env_of({{"ZEROMOE_PHASE_CACHE_MIB", "-1"}}))).empty());
+  bool rejected_negative_cache = false;
+  try {
+    (void)resolve_settings(Family::Other, env_of({}), nullptr, {},
+                           {{"phase_cache_mib", "-1"}});
+  } catch (const std::invalid_argument &) {
+    rejected_negative_cache = true;
+  }
+  CHECK(rejected_negative_cache);
   // 1. Values the code used before the resolver existed (empty environment).
   {
     auto m = resolve_settings(Family::MiMo2, env_of({}), &err);
@@ -197,34 +206,27 @@ int main(int argc, char **argv) {
   }
   // 2. Legacy env semantics and family scoping.
   {
-    auto m = resolve_settings(Family::MiMo2,
-        env_of({{"ZEROMOE_MIMO2_PREFILL_CHUNK", "128"}, {"ZEROMOE_MIMO2_OFFLOAD_PIN", "0"},
-                {"ZEROMOE_MIMO2_OFFLOAD_DDR_GIB", "60"}, {"ZEROMOE_MIMO2_CPU_THREADS", "abc"}}));
-    CHECK(m.tun.prefill_chunk.value == 128 && m.tun.prefill_chunk.src == Source::Env);
+    auto m = resolve_settings(Family::MiMo2, env_of({}), nullptr, {},
+        {{"prefill_chunk", "128"}, {"offload_pin", "false"},
+         {"offload_ddr_gib", "60"}});
+    CHECK(m.tun.prefill_chunk.value == 128 && m.tun.prefill_chunk.src == Source::Cli);
     CHECK(m.tun.offload_pin.value == 0);
     CHECK(m.tun.offload_ddr_gib.value == 60.0);
-    CHECK(m.tun.cpu_threads_decode.value == 10);  // malformed strtol keeps the default
-    auto l = resolve_settings(Family::Ling, env_of({{"ZEROMOE_MIMO2_PREFILL_CHUNK", "128"}}));
-    CHECK(l.tun.prefill_chunk.value == 0);        // another family's knob does not leak
-    auto l2 = resolve_settings(Family::Ling, env_of({{"ZEROMOE_LING_PREFILL_CHUNK", "1024"}}));
-    CHECK(l2.tun.prefill_chunk.value == 1024);
+    CHECK(m.tun.cpu_threads_decode.value == 10); // MiMo uses the shared worker default
+    auto l2 = resolve_settings(Family::Ling, env_of({}), nullptr, {},
+                               {{"prefill_chunk", "1024"}});
+    CHECK(l2.tun.prefill_chunk.value == 1024 && l2.tun.prefill_chunk.src == Source::Cli);
     auto l3 = resolve_settings(Family::Ling, env_of({}), nullptr, {{"prefill_chunk", "1024"}});
     CHECK(l3.tun.prefill_chunk.value == 1024 && l3.tun.prefill_chunk.src == Source::Toml);
     auto a = resolve_settings(Family::Glm, env_of({{"ZEROMOE_GLM5NEXT_OFFLOAD_ASYNC", "1"}}));
     CHECK(a.tun.offload_async.value == 1);
-    auto f = resolve_settings(Family::Glm, env_of({{"ZEROMOE_LING_OFFLOAD_FIRST_LAYER", "3"},
-                                                   {"ZEROMOE_GLM5NEXT_OFFLOAD_FIRST_LAYER", "9"}}));
-    CHECK(f.tun.offload_first_layer.value == 9);  // Glm never reads Ling's names
-    auto fl = resolve_settings(Family::Ling, env_of({{"ZEROMOE_LING_OFFLOAD_FIRST_LAYER", "3"},
-                                                     {"ZEROMOE_GLM5NEXT_OFFLOAD_FIRST_LAYER", "9"}}));
-    CHECK(fl.tun.offload_first_layer.value == 3); // Ling's own name wins
-    auto fg = resolve_settings(Family::Ling, env_of({{"ZEROMOE_GLM5NEXT_OFFLOAD_FIRST_LAYER", "9"}}));
-    CHECK(fg.tun.offload_first_layer.value == 9); // and it inherits the Glm name
-    auto fa = resolve_settings(Family::Glm, env_of({{"ZEROMOE_LING_OFFLOAD_ASYNC", "1"}}));
-    CHECK(fa.tun.offload_async.value == 0);       // no reverse inheritance
-    auto ddr = resolve_settings(Family::MiMo2, env_of({{"ZEROMOE_MIMO2_OFFLOAD_DDR_GIB", "auto"}}));
+    auto fl = resolve_settings(Family::Ling, env_of({{"ZEROMOE_GLM5NEXT_OFFLOAD_FIRST_LAYER", "9"}}));
+    CHECK(fl.tun.offload_first_layer.value == 9); // Ling inherits the shared graph name
+    auto ddr = resolve_settings(Family::MiMo2, env_of({}), nullptr, {},
+                                {{"offload_ddr_gib", "auto"}});
     CHECK(ddr.tun.offload_ddr_gib.value < 0);
-    auto t = resolve_settings(Family::MiMo2, env_of({{"ZEROMOE_MIMO2_PREFILL_OP_OFFLOAD", "0"}}));
+    auto t = resolve_settings(Family::MiMo2, env_of({}), nullptr, {},
+                              {{"prefill_op_offload", "false"}});
     CHECK(t.tun.prefill_op_offload.value == 0);
   }
   // 2b. The GLM graph's offload tier (shared by GLM-5.x, GLM-DSA and Ling).
@@ -235,31 +237,28 @@ int main(int argc, char **argv) {
     CHECK(g.tun.offload_policy.value == "lru" && g.tun.offload_pin_dma.value == -1);
     CHECK(g.tun.offload_seed_gpu1_hot.value == 1 && g.tun.offload_thp.value == 0);
     auto e = resolve_settings(Family::Glm,
-        env_of({{"ZEROMOE_LING_OFFLOAD_PINNED", "0.7"}, {"ZEROMOE_GLM5NEXT_OFFLOAD_PINNED", "0.2"},
+        env_of({{"ZEROMOE_GLM5NEXT_OFFLOAD_PINNED", "0.2"},
                 {"ZEROMOE_GLM5NEXT_OFFLOAD_POLICY", "seg"}, {"ZEROMOE_GLM5NEXT_OFFLOAD_PIN", "2"},
                 {"ZEROMOE_GLM5NEXT_GPU_ASSIST", "0"}, {"ZEROMOE_GLM5NEXT_OFFLOAD_DDR_GIB", ""}}));
-    CHECK(e.tun.offload_pinned_fraction.value == 0.2);      // Glm ignores the Ling name
+    CHECK(e.tun.offload_pinned_fraction.value == 0.2);
     CHECK(e.tun.offload_policy.value == "seg");
     CHECK(e.tun.offload_pin_dma.value == 0);                // "== \"1\"" semantics: 2 is off
     CHECK(e.tun.gpu_assist_slots.value == 0 && e.tun.gpu_assist_slots.src == Source::Env);
     CHECK(e.tun.offload_ddr_gib.src == Source::Default);    // empty = unset
-    // Ling's own names win and the Glm names are inherited.
+    // Ling inherits the shared GLM alias values.
     auto le = resolve_settings(Family::Ling,
-        env_of({{"ZEROMOE_LING_OFFLOAD_PINNED", "0.7"}, {"ZEROMOE_GLM5NEXT_OFFLOAD_PINNED", "0.2"},
+        env_of({{"ZEROMOE_GLM5NEXT_OFFLOAD_PINNED", "0.2"},
                 {"ZEROMOE_GLM5NEXT_OFFLOAD_POLICY", "seg"}, {"ZEROMOE_GLM5NEXT_OFFLOAD_PIN", "2"},
                 {"ZEROMOE_GLM5NEXT_GPU_ASSIST", "0"}, {"ZEROMOE_GLM5NEXT_OFFLOAD_DDR_GIB", ""}}));
-    CHECK(le.tun.offload_pinned_fraction.value == 0.7);
+    CHECK(le.tun.offload_pinned_fraction.value == 0.2);
     CHECK(le.tun.offload_policy.value == "seg");
     CHECK(le.tun.offload_pin_dma.value == 0);
     CHECK(le.tun.gpu_assist_slots.value == 0 && le.tun.gpu_assist_slots.src == Source::Env);
     CHECK(le.tun.offload_ddr_gib.src == Source::Default);
     // MiMo's knobs do not see the GLM names, and the GLM graph does not see MiMo's.
-    auto m = resolve_settings(Family::MiMo2, env_of({{"ZEROMOE_GLM5NEXT_OFFLOAD_PINNED", "0.9"}, {"ZEROMOE_GLM5NEXT_GPU_ASSIST", "5"}}));
-    CHECK(m.tun.offload_pinned_fraction.value == 0.5 && m.tun.gpu_assist_slots.value == 0);
-    auto g2 = resolve_settings(Family::Glm, env_of({{"ZEROMOE_MIMO2_GPU_ASSIST", "5"}}));
-    CHECK(g2.tun.gpu_assist_slots.value == 3);
-    auto l2 = resolve_settings(Family::Ling, env_of({{"ZEROMOE_MIMO2_GPU_ASSIST", "5"}}));
-    CHECK(l2.tun.gpu_assist_slots.value == 3);              // Ling keeps the Glm default
+    auto m = resolve_settings(Family::MiMo2, env_of({}), nullptr, {},
+                              {{"gpu_assist_slots", "5"}});
+    CHECK(m.tun.offload_pinned_fraction.value == 0.5 && m.tun.gpu_assist_slots.value == 5);
   }
   // 2c. GLM lane/staging switches keep their legacy parses.
   {
@@ -296,16 +295,21 @@ int main(int argc, char **argv) {
   {
     for (Family f : {Family::MiMo2, Family::Ling, Family::Other, Family::Glm})
       CHECK(settings_findings(resolve_settings(f, env_of({}))).empty());
-    auto t = resolve_settings(Family::MiMo2, env_of({{"ZEROMOE_MIMO2_CPU_THREADS", "1"}}));
+    auto t = resolve_settings(Family::MiMo2, env_of({}), nullptr, {},
+                              {{"cpu_threads_decode", "1"}});
     CHECK(settings_findings(t).size() == 1);
-    auto p = resolve_settings(Family::MiMo2, env_of({{"ZEROMOE_MIMO2_OFFLOAD_PIN", "0"}}));
+    auto p = resolve_settings(Family::MiMo2, env_of({}), nullptr, {},
+                              {{"offload_pin", "false"}});
     CHECK(settings_findings(p).size() == 1);
-    auto p2 = resolve_settings(Family::MiMo2, env_of({{"ZEROMOE_MIMO2_OFFLOAD_PIN", "0"},
-                                                      {"ZEROMOE_MIMO2_PREFILL_OP_OFFLOAD", "0"}}));
+    auto p2 = resolve_settings(Family::MiMo2, env_of({}), nullptr, {},
+                               {{"offload_pin", "false"},
+                                {"prefill_op_offload", "false"}});
     CHECK(settings_findings(p2).empty());        // op-offload off: an unpinned arena is fine
-    auto c = resolve_settings(Family::MiMo2, env_of({{"ZEROMOE_MIMO2_PREFILL_CHUNK", "4"}}));
+    auto c = resolve_settings(Family::MiMo2, env_of({}), nullptr, {},
+                              {{"prefill_chunk", "4"}});
     CHECK(settings_findings(c).size() == 1);
-    auto st = resolve_settings(Family::Other, env_of({{"ZEROMOE_PREFLIGHT_STRICT", "1"}}));
+    auto st = resolve_settings(Family::Other, env_of({}), nullptr, {},
+                               {{"preflight_strict", "true"}});
     CHECK(st.diag.preflight_strict.value == 1);
   }
   // 4c. Run-time health findings.
@@ -332,17 +336,14 @@ int main(int argc, char **argv) {
   }
   // 4d. The route-survey record file: per-family alias, diagnostic (outside the defaults table).
   {
-    auto m = resolve_settings(Family::MiMo2, env_of({{"ZEROMOE_MIMO2_USAGE_RECORD", "/tmp/u"}, {"ZEROMOE_LING_USAGE_RECORD", "/x"}}));
+    auto m = resolve_settings(Family::MiMo2, env_of({}), nullptr, {},
+                              {{"usage_record_file", "/tmp/u"}});
     CHECK(m.diag.usage_record_file.value == "/tmp/u");
-    auto g = resolve_settings(Family::Glm, env_of({{"ZEROMOE_LING_USAGE_RECORD", "/l"}, {"ZEROMOE_GLM5NEXT_USAGE_RECORD", "/g"}, {"ZEROMOE_MIMO2_USAGE_RECORD", "/m"}}));
-    CHECK(g.diag.usage_record_file.value == "/g");          // Glm ignores the Ling name
-    auto l = resolve_settings(Family::Ling, env_of({{"ZEROMOE_LING_USAGE_RECORD", "/l"}, {"ZEROMOE_GLM5NEXT_USAGE_RECORD", "/g"}}));
-    CHECK(l.diag.usage_record_file.value == "/l");          // Ling's own name wins
-    auto li = resolve_settings(Family::Ling, env_of({{"ZEROMOE_GLM5NEXT_USAGE_RECORD", "/g"}}));
-    CHECK(li.diag.usage_record_file.value == "/g");         // inherited Glm name
-    auto gi = resolve_settings(Family::Glm, env_of({{"ZEROMOE_LING_USAGE_RECORD", "/l"}}));
-    CHECK(gi.diag.usage_record_file.value.empty());         // no reverse inheritance
-    CHECK(resolve_settings(Family::Other, env_of({{"ZEROMOE_MIMO2_USAGE_RECORD", "/m"}})).diag.usage_record_file.value.empty());
+    auto g = resolve_settings(Family::Glm, env_of({{"ZEROMOE_GLM5NEXT_USAGE_RECORD", "/g"}}));
+    CHECK(g.diag.usage_record_file.value == "/g");
+    auto l = resolve_settings(Family::Ling, env_of({{"ZEROMOE_GLM5NEXT_USAGE_RECORD", "/g"}}));
+    CHECK(l.diag.usage_record_file.value == "/g");          // Ling inherits the shared graph name
+    CHECK(resolve_settings(Family::Other, env_of({{"ZEROMOE_GLM5NEXT_USAGE_RECORD", "/g"}})).diag.usage_record_file.value.empty());
     CHECK(defaults_table().find("usage_record_file") == std::string::npos);   // diagnostics never enter the hash
   }
   // 4e. Capability is declared, not inferred from alias visibility.

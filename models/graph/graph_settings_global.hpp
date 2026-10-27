@@ -66,8 +66,8 @@ inline const ResolvedSettings &settings_for(Family fam) {
 
 // The concrete model family this process loaded. The GLM graph implementation
 // is shared by GLM-5.x, GLM-DSA and Ling, so resolving through this value keeps
-// Ling's ZEROMOE_LING_* aliases and family defaults out of GLM runs and vice
-// versa. Set once from the detected model family before graph initialization;
+// Ling's inherited GLM settings and family defaults out of unrelated runs.
+// Set once from the detected model family before graph initialization;
 // the cache is keyed by family, so a late change after the first resolution
 // would silently mix rows.
 namespace detail {
@@ -96,7 +96,7 @@ inline const ResolvedSettings &active_settings() {
 }
 
 // A preflight finding from a run-time check (graph_health.hpp): a warning, or an abort under
-// ZEROMOE_PREFLIGHT_STRICT=1. Empty findings are ignored.
+// the typed graph_preflight_strict setting. Empty findings are ignored.
 inline void report_preflight(const char *tag, Family fam, const std::string &finding) {
   if (finding.empty()) return;
   LOG_WARN("[PREFLIGHT] %s: %s\n", tag, finding.c_str());

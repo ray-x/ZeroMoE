@@ -123,14 +123,19 @@ export ZEROMOE_GLM5NEXT_GPU_ASSIST=${LING_GPU_ASSIST:-3}
 export ZEROMOE_GLM5NEXT_ASSIST2_SLOTS=${LING_ASSIST2_SLOTS:-1}
 export ZEROMOE_GLM5NEXT_CPU_THREADS=${LING_CPU_THREADS:-10}
 export ZEROMOE_GLM5NEXT_EARLY_READY=${LING_EARLY_READY:-1}
-export ZEROMOE_LING_OFFLOAD_FIRST_LAYER=4
-export ZEROMOE_LING_OFFLOAD_MODEL="$model"
-export ZEROMOE_LING_OFFLOAD_USAGE="$profile"
-export ZEROMOE_LING_OFFLOAD_DDR_GIB=${LING_DDR_GIB:-64}
-export ZEROMOE_LING_OFFLOAD_PINNED=${LING_OFFLOAD_PINNED:-0.5}
-export ZEROMOE_LING_OFFLOAD_BYTE_CAP=1
-export ZEROMOE_LING_OFFLOAD_PIN=1
-export ZEROMOE_LING_OFFLOAD_ASYNC=1
+prefill_op_offload=false
+[[ ${LING_PREFILL_OP_OFFLOAD:-0} == 1* ]] && prefill_op_offload=true
+graph_args=(
+  --graph-offload-first-layer 4
+  --graph-offload-model "$model"
+  --graph-offload-usage-file "$profile"
+  --graph-offload-ddr-gib "${LING_DDR_GIB:-64}"
+  --graph-offload-pinned-fraction "${LING_OFFLOAD_PINNED:-0.5}"
+  --graph-offload-byte-cap true
+  --graph-offload-pin-dma true
+  --graph-offload-async true
+  --graph-prefill-op-offload "$prefill_op_offload"
+)
 # Ling's batched prefill needs the patched negative-id skip once the prompt
 # grows past the two-token smoke case: the valid-dummy fallback aliases many
 # tokens onto expert 0 and ggml's batched id compaction then over-runs that
@@ -149,12 +154,12 @@ prompt_sha256=$(sha256sum -- "$prompt_file" | awk '{print $1}')
 printf '[RUN] prompt_file=%s; prompt_sha256=%s; context=%s; ngen=32; temp=0; config=%s; usage=%s; DDR=%s GiB OffloadStore; GPU cache=%s+%s GiB; pinned VRAM slots=%s; pinned DDR fraction=%s; GPU assist slots=%s+%s; early-ready=%s; batched-negative-skip=%s; MoE tensors alias cache; CPU threads=%s\n' "$prompt_file" "$prompt_sha256" "$context_size" "$config" "$profile" "${LING_DDR_GIB:-64}" "${LING_GPU0_CACHE_GIB:-3.0}" "${LING_GPU1_CACHE_GIB:-12.5}" "${LING_PINNED_VRAM_CAPACITY:-3700}" "${LING_OFFLOAD_PINNED:-0.5}" "${LING_GPU_ASSIST:-3}" "${LING_ASSIST2_SLOTS:-1}" "${LING_EARLY_READY:-1}" "${ZEROMOE_GLM5NEXT_BATCHED_NEGATIVE_SKIP}" "${LING_CPU_THREADS:-10}"
 export ZEROMOE_GLM5NEXT_ROUTE_TRACE="${log%.log}.routes"
 export ZEROMOE_GENERATED_TOKEN_FILE="${log%.log}.tokens"
-unset ZEROMOE_TEACHER_FORCE_TOKEN_FILE ZEROMOE_LING_PREFILL_OP_OFFLOAD GGML_OP_OFFLOAD_MIN_BATCH
+unset ZEROMOE_TEACHER_FORCE_TOKEN_FILE GGML_OP_OFFLOAD_MIN_BATCH
 if [[ -n "${LING_TOKEN_FILE:-}" ]]; then export ZEROMOE_TEACHER_FORCE_TOKEN_FILE="$LING_TOKEN_FILE"; fi
 if [[ "$freeze_usage_stats" =~ ^(0|false|no)$ ]]; then
   export ZEROMOE_GLM5NEXT_PREFILL_ROUTE_CAPTURE=1
 else
   unset ZEROMOE_GLM5NEXT_PREFILL_ROUTE_CAPTURE
 fi
-export ZEROMOE_GLM5NEXT_PREFILL_OP_OFFLOAD=${LING_PREFILL_OP_OFFLOAD:-0}
-exec "$worktree/scripts/run_capped.sh" --limit-gb "${LING_CAP_GIB:-95}" "$bin" --config "$config" --ngen 32 --temp 0 < "$prompt_file"
+exec "$worktree/scripts/run_capped.sh" --limit-gb "${LING_CAP_GIB:-95}" "$bin" \
+  --config "$config" --ngen 32 --temp 0 "${graph_args[@]}" < "$prompt_file"

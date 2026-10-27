@@ -293,7 +293,7 @@ run_glm53flash() {
   echo "--- glm53flash: wholelayer8, 150 tokens (single 3090) ---"
   echo "    metric: steady median (TOKEN-LOOP-DIAG, steps >= 20); baseline 7.275, floor 6.98"
   echo "Explain the difference between CPU and GPU architecture in terms of parallelism, memory hierarchy and scheduling, in detail." \
-    | env CUDA_VISIBLE_DEVICES=0 ZEROMOE_GLM5NEXT_FULL_GRAPH=1 \
+    | env CUDA_VISIBLE_DEVICES=0 \
         ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512 ZEROMOE_GLM5NEXT_CPU_THREADS=6 \
         ZEROMOE_TOKEN_LOOP_DIAG=1 \
         scripts/run_capped.sh -- "$BIN" \
@@ -347,10 +347,11 @@ if count != 1:
 Path(sys.argv[2]).write_text(text)
 PY
   echo "Explain what DNS is and how a domain name gets resolved to an IP address." \
-    | env CUDA_VISIBLE_DEVICES=0,1 ZEROMOE_DISABLE_ROUTER_BF16=1 ZEROMOE_MIMO2_OFFLOAD_DDR_GIB=100 \
-        ZEROMOE_MIMO2_OFFLOAD_USAGE="$PWD/bench/profiles/mimo26_combined.usage" \
+    | env CUDA_VISIBLE_DEVICES=0,1 ZEROMOE_DISABLE_ROUTER_BF16=1 \
         scripts/run_capped.sh --limit-gb 110 -- "$BIN" \
         --config "$config" \
+        --graph-offload-ddr-gib 100 \
+        --graph-offload-usage-file "$PWD/bench/profiles/mimo26_combined.usage" \
         --log-path "$eng" --temp 0 --ngen 64 > "$log" 2>&1 || rc=$?
   local before=$FAIL
   report mimo26 "$(grab_rate "$eng")" "$rc" "$log" "$(grab_tokens "$eng")" 64

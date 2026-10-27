@@ -1,6 +1,6 @@
 # MiMo V2.6 Flash 3-bit, in-graph hot/cold MoE, RTX 3090 (trunk) + RTX 5060 Ti (second hot set) (R2.1 conformance run).
 # Hot experts alias the 3090's VRAM expert cache; the rest live in the offload DDR tier
-# (ZEROMOE_MIMO2_OFFLOAD_DDR_GIB / _USAGE). The engine RAM tier stays small like Ling's.
+# (graph_offload_ddr_gib / graph_offload_usage_file). The engine RAM tier stays small like Ling's.
 # MiMo throughput investigation profile, modeled on GLM 5.3 Flash's
 # no-decode-time-SSD whole-layer baseline: fill DDR from the GGUF at startup,
 # keep only a bounded surveyed hot set pinned in VRAM, and leave VRAM LRU room.

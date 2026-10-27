@@ -2,7 +2,7 @@
 
 // Run-time preflight checks that need counters or measurements, the other half of the checks in
 // graph_settings.hpp (docs/design/model-family-framework.md s4.3). Pure: callers pass numbers and
-// decide what to do with the findings (warn, or abort under ZEROMOE_PREFLIGHT_STRICT=1).
+// decide what to do with the findings (warn, or abort under graph_preflight_strict=true).
 
 #include <cstdint>
 #include <cstdio>

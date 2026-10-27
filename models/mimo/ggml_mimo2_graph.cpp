@@ -170,7 +170,7 @@ bool configure_ingraph_moe(StreamingEngine &e, ModelState &m) {
   prof.async_loads = true;
   const int assist_slots = int(st.tun.gpu_assist_slots.value);
   // Page-locked arena slots let the DMA engine read host experts directly: needed for the GPU
-  // assist ring and for op-offloaded prefill copies. ZEROMOE_MIMO2_OFFLOAD_PIN=0 disables it.
+  // assist ring and for op-offloaded prefill copies. `graph_offload_pin=false` disables it.
   if (assist_slots > 0 || st.tun.offload_pin.value) {
     prof.pin_for_dma = true;
     prof.pin_fn = [](void *ptr, size_t bytes) {
@@ -577,11 +577,11 @@ std::unique_ptr<Graph> create_graph(StreamingEngine &e, int tokens) {
   g->graph = ggml_new_graph_custom(g->ctx, kNodes, false);
   ggml_backend_t backends[] = {g->cuda, g->model->gpu1 ? g->model->gpu1 : g->cpu, g->cpu};
   // Batched prefill can run the host-resident (cold) expert matmuls on the GPU by copying the
-  // routed experts across (ZEROMOE_MIMO2_PREFILL_OP_OFFLOAD=1). The scheduler needs events, or
+  // routed experts across (`graph_prefill_op_offload=true`). The scheduler needs events, or
   // every weight copy synchronizes the destination stream.
   // Automatic: the expert copies cost about the same per chunk whatever its size (~52 GiB over
   // PCIe), so only large chunks beat the CPU path (measured crossover: 146 tokens CPU 37.7 tok/s vs
-  // GPU 28.2; 516 tokens CPU 29.7 vs GPU 71.4). ZEROMOE_MIMO2_PREFILL_OP_OFFLOAD=0/1 forces it.
+  // GPU 28.2; 516 tokens CPU 29.7 vs GPU 71.4). `graph_prefill_op_offload` can force either mode.
   const long force_offload = st.tun.prefill_op_offload.value; // -1 auto
   g->op_offload = tokens > 1 && g_model->ingraph_moe &&
                   (force_offload >= 0 ? force_offload != 0
@@ -728,7 +728,7 @@ bool mimo2_ingraph_moe_enabled() {
 }
 
 bool mimo2_full_graph_enabled() {
-  return zeromoe::graphcfg::flag_unless_off("ZEROMOE_MIMO2_FULL_GRAPH");
+  return true;
 }
 
 void mimo2_full_graph_set_vram_cache(GpuTopology *topology) {

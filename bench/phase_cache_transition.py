@@ -62,11 +62,14 @@ def compare_requests(a, b):
 def prepare(model, model_path, directory, isolate_assist=False, gpu0_cache_gb=None):
     env = {k: v for k, v in os.environ.items() if not k.startswith("ZEROMOE_")}
     env["CUDA_VISIBLE_DEVICES"] = "0,1"
+    graph_cli = []
     if model == "mimo":
         text = (ROOT / "configs/bench/mimo26_flash_gsq_rco_3bit_ingraph_dual.toml").read_text()
         profile = ROOT / "bench/profiles/mimo26_combined.usage"
-        env.update(ZEROMOE_DISABLE_ROUTER_BF16="1", ZEROMOE_MIMO2_OFFLOAD_DDR_GIB="100",
-                   ZEROMOE_MIMO2_OFFLOAD_USAGE=str(profile), ZEROMOE_MIMO2_PREFILL_CHUNK="512")
+        env.update(ZEROMOE_DISABLE_ROUTER_BF16="1")
+        graph_cli = ["--graph-offload-ddr-gib", "100",
+                     "--graph-offload-usage-file", str(profile),
+                     "--graph-prefill-chunk", "512"]
         cap = 110
     else:
         text = (ROOT / "configs/bench/ling/reference-audit/config.toml").read_text()
@@ -76,12 +79,19 @@ def prepare(model, model_path, directory, isolate_assist=False, gpu0_cache_gb=No
                    ZEROMOE_FULL_GRAPH_USAGE_FILE=str(profile), ZEROMOE_GLM5NEXT_DYNAMIC_CACHE="0",
                    ZEROMOE_GLM5NEXT_GPU_ASSIST="3", ZEROMOE_GLM5NEXT_ASSIST2_SLOTS="1",
                    ZEROMOE_GLM5NEXT_CPU_THREADS="10", ZEROMOE_GLM5NEXT_EARLY_READY="1",
-                   ZEROMOE_LING_OFFLOAD_FIRST_LAYER="4", ZEROMOE_LING_OFFLOAD_DDR_GIB="64",
-                   ZEROMOE_LING_OFFLOAD_PINNED="0.5", ZEROMOE_LING_OFFLOAD_BYTE_CAP="1",
-                   ZEROMOE_LING_OFFLOAD_PIN="1", ZEROMOE_LING_OFFLOAD_ASYNC="1",
-                   ZEROMOE_LING_OFFLOAD_USAGE=str(profile), ZEROMOE_LING_PREFILL_CHUNK="256",
-                   ZEROMOE_GLM5NEXT_BATCHED_NEGATIVE_SKIP="1", ZEROMOE_GLM5NEXT_PREFILL_OP_OFFLOAD="0",
-                   ZEROMOE_LING_OFFLOAD_MODEL=str(model_path.resolve()))
+                   ZEROMOE_GLM5NEXT_BATCHED_NEGATIVE_SKIP="1")
+        graph_cli = [
+            "--graph-offload-first-layer", "4",
+            "--graph-offload-model", str(model_path.resolve()),
+            "--graph-offload-usage-file", str(profile),
+            "--graph-offload-ddr-gib", "64",
+            "--graph-offload-pinned-fraction", "0.5",
+            "--graph-offload-byte-cap", "true",
+            "--graph-offload-pin-dma", "true",
+            "--graph-offload-async", "true",
+            "--graph-prefill-chunk", "256",
+            "--graph-prefill-op-offload", "false",
+        ]
         cap = 95
         if isolate_assist:
             env["ZEROMOE_GLM5NEXT_GPU_ASSIST"] = "0"
@@ -110,8 +120,7 @@ def run_case(args, name, cache_mib, prompts, teacher_source=None, gpu0_cache_gb=
     directory = args.output / name
     directory.mkdir(parents=True, exist_ok=True)
     env, config, cap = prepare(args.model, args.model_path, directory, args.isolate_assist, gpu0_cache_gb)
-    env.update(ZEROMOE_PHASE_CACHE_MIB=str(cache_mib), ZEROMOE_PHASE_CACHE_RESERVE_MIB="512",
-               ZEROMOE_DECODE_LOGITS_DUMP=str(directory / "current.bin"),
+    env.update(ZEROMOE_DECODE_LOGITS_DUMP=str(directory / "current.bin"),
                ZEROMOE_GENERATED_TOKEN_FILE=str(directory / "current.tokens"))
     if teacher_source:
         teacher = directory / "teacher"
@@ -120,7 +129,9 @@ def run_case(args, name, cache_mib, prompts, teacher_source=None, gpu0_cache_gb=
             shutil.copyfile(teacher_source / f"request-{reference}.tokens", teacher / f"request-{index}.tokens")
         env["ZEROMOE_TEACHER_FORCE_REQUEST_DIR"] = str(teacher)
     command = [str(ROOT / "scripts/run_capped.sh"), "--limit-gb", str(cap), "--", str(args.binary),
-               "--config", str(config), "--ngen", str(args.ngen), "--temp", "0", "--log-path", str(directory / "engine.log")]
+               "--config", str(config), "--ngen", str(args.ngen), "--temp", "0", "--log-path", str(directory / "engine.log"),
+               "--graph-phase-cache-mib", str(cache_mib), "--graph-phase-cache-reserve-mib", "512",
+               *graph_cli]
     samples = []
     stop = threading.Event()
 

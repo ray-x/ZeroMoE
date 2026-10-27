@@ -710,7 +710,8 @@ void assign_gpu1_hot(FullGraph &g, double gib) {
   const char *uenv = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_GPU1_HOT_USAGE");
   const std::string usage_path = uenv && uenv[0]
                                      ? std::string(uenv)
-                                     : offload_env("ZEROMOE_GLM5NEXT_OFFLOAD_USAGE");
+                                     : zeromoe::graphsettings::active_settings()
+                                           .tun.offload_usage_file.value;
   auto [entries, max_count] = StreamingEngine::load_usage(usage_path);
   (void)max_count;
   std::vector<std::vector<uint8_t>> is_cold((size_t)c.n_layers);

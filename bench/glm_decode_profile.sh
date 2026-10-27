@@ -35,7 +35,7 @@ if model_count != 1 or log_count != 1:
     raise SystemExit("config must contain one model_path and one log_path")
 Path(sys.argv[2]).write_text(text)
 PY
-printf '%s\n:q\n' "$PROMPT" | env -u ZEROMOE_GLM5NEXT_FULL_GRAPH \
+printf '%s\n:q\n' "$PROMPT" | env \
   ZEROMOE_GLM5NEXT_OFFLOAD_FIRST_LAYER=3 ZEROMOE_GLM5NEXT_OFFLOAD_DDR_GIB=32 \
   ZEROMOE_GLM5NEXT_OFFLOAD_PINNED=0.5 ZEROMOE_GLM5NEXT_OFFLOAD_POLICY=lru \
   ZEROMOE_GLM5NEXT_OFFLOAD_STORE="$STORE" ZEROMOE_GLM5NEXT_OFFLOAD_MODEL="$MODEL" \

@@ -10,8 +10,8 @@ MiMo and the GLM/Ling in-graph path use the same allocation, copy, route-partiti
 Enable explicitly (MiB, not decimal GB):
 
 ```bash
-ZEROMOE_PHASE_CACHE_MIB=1024 ZEROMOE_PHASE_CACHE_RESERVE_MIB=512 \
-  scripts/run_capped.sh --limit-gb 110 -- build_mimo/zeromoe --config <model.toml>
+scripts/run_capped.sh --limit-gb 110 -- build_mimo/zeromoe --config <model.toml> \
+  --graph-phase-cache-mib 1024 --graph-phase-cache-reserve-mib 512
 ```
 
 The default extension is zero, so existing profiles retain their fixed placement. The requested extension is

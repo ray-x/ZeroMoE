@@ -211,10 +211,11 @@ mathematics (sigmoid + bias, top-k normalisation).
    knew none of the legacy quants, and GLM's MMQ list lacked MXFP4. Preflight: `settings_findings`
    (decode lane threads below 10, op-offload with an unpinned arena, chunk below the minimum batch),
    a model-level check (tensor type missing from the table, max chunk below the minimum batch), logged
-   as `[PREFLIGHT]` warnings; `ZEROMOE_PREFLIGHT_STRICT=1` aborts instead. Run-time checks (`models/graph/graph_health.hpp`, pure functions): expert coverage below 100 %,
+   as `[PREFLIGHT]` warnings; `graph_preflight_strict=true` in TOML (or
+   `--graph-preflight-strict true`) aborts instead. Run-time checks (`models/graph/graph_health.hpp`, pure functions): expert coverage below 100 %,
    expert loads during decode after the first measured window, and idle VRAM above 4 GiB after the decode
    graph is built. MiMo reports them as `[PREFLIGHT] mimo2:` warnings (abort under
-   `ZEROMOE_PREFLIGHT_STRICT=1`); the first real finding was 5.4 GiB idle on the 3090. Not wired yet for the
+   `graph_preflight_strict=true`); the first real finding was 5.4 GiB idle on the 3090. Not wired yet for the
    GLM graph.
 5. Attention/FFN/`LayerPlan` interfaces, prototyped on MiMo's attention (small, already near-isolated).
    **Prototype done on MiMo** (`models/graph/layer_plan.hpp`): `AttentionBlock` (`declare_inputs`,
@@ -240,7 +241,8 @@ mathematics (sigmoid + bias, top-k normalisation).
    **Settings boundary for the GLM graph (done):** the tunables of the supported Ling/GLM configurations
    (offload tier, GPU assist, lane and staging switches, DMA pinning, usage file) come from the resolver
    for the concrete model family (`Family::Glm` for GLM-5.x/DSA, `Family::Ling` for Ling; Ling inherits
-   the Glm row and reads `ZEROMOE_LING_*` before `ZEROMOE_GLM5NEXT_*`). 81 direct `ZEROMOE_GLM5NEXT_/LING_` env reads remain, all experimental or
+   the Glm row and uses the remaining `ZEROMOE_GLM5NEXT_*` graph aliases for the shared implementation).
+   Direct `ZEROMOE_GLM5NEXT_/LING_` environment reads remain in feature-specific experimental or
    diagnostic (dynamic-cache heat, pilot ridge/score/lookahead tuning, GPU1 hot-set usage and layers, prefill
    prefetch variants, dumps, traces, CPU thread counts); `moe_conformance` ratchets that count so it can only
    shrink. `ModelFamily` references in `core/` are ratcheted the same way (112: Qwen4Exp and

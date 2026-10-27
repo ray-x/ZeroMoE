@@ -418,7 +418,7 @@ class Glm5NextGraphModel final : public FullGraphModelBase<Glm5NextGraphModel> {
 
   bool enabled(const StreamingEngine &engine,
                ModelGraphPhase phase) const override {
-    if (engine.mtp_enabled || !glm5next_full_graph_enabled())
+    if (engine.mtp_enabled)
       return false;
     if (phase == ModelGraphPhase::Prefill) {
       // The batched sparse hot/cold MUL_MAT_ID split reaches a CUDA MMQ
@@ -754,7 +754,8 @@ std::vector<std::string> graph_preflight(const FullGraphModel &m, const Streamin
 void log_graph_capabilities(const FullGraphModel &m, const StreamingEngine &e) {
   for (const std::string &f : graph_preflight(m, e))
     LOG_WARN("[PREFLIGHT] %s: %s\n", m.name(), f.c_str());
-  if (zeromoe::graphcfg::flag_on("ZEROMOE_PREFLIGHT_STRICT") && !graph_preflight(m, e).empty()) {
+  if (zeromoe::graphsettings::active_settings().diag.preflight_strict.value &&
+      !graph_preflight(m, e).empty()) {
     LOG_ERROR("[PREFLIGHT] strict mode: refusing to run with the findings above\n");
     std::abort();
   }

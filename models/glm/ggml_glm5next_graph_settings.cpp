@@ -12,19 +12,10 @@ using namespace glm5next_graph;
 
 namespace glm5next_graph {
 
-bool env_enabled() {
-  static const bool enabled = [] {
-    // Full graph is the GLM5NEXT execution path; ZEROMOE_GLM5NEXT_FULL_GRAPH=0 opts out (legacy layered path).
-    const char *v = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_FULL_GRAPH");
-    return !v || !v[0] || v[0] != '0';
-  }();
-  return enabled;
-}
-
 bool graph_enabled_for(const StreamingEngine &engine) {
   if (engine.family_ops.family == ModelFamily::BailingMoE3)
     return ling_full_graph_enabled();
-  return glm5next_graph::glm_family(engine.family_ops.family) && env_enabled();
+  return glm5next_graph::glm_family(engine.family_ops.family);
 }
 
 // ZEROMOE_GLM5NEXT_OFFLOAD_ASYNC=1: the arena lock covers only bookkeeping; expert reads run outside it (see
@@ -48,21 +39,6 @@ int offload_first_layer() {
 bool offload_layer(int layer) {
   const int f = offload_first_layer();
   return f >= 0 && layer >= f;
-}
-
-std::string offload_env(const char *name, const char *dflt)  {
-  constexpr const char *prefix = "ZEROMOE_GLM5NEXT_";
-  if (zeromoe::graphsettings::active_family() ==
-          zeromoe::graphsettings::Family::Ling &&
-      std::strncmp(name, prefix, std::strlen(prefix)) == 0) {
-    const std::string ling_name =
-        std::string("ZEROMOE_LING_") + (name + std::strlen(prefix));
-    const char *ling = zeromoe::graphcfg::env(ling_name.c_str());
-    if (ling && ling[0])
-      return ling;
-  }
-  const char *v = zeromoe::graphcfg::env(name);
-  return v && v[0] ? v : dflt;
 }
 
 // ---------------------------------------------------------------------------

@@ -190,7 +190,7 @@ previous run still needs a captured gate log for verification.
 ### Defaults that affect VRAM and DDR
 * `embedding_device` (`auto|cpu|gpu`) defaults to CPU/DDR for every model unless a config forces GPU. A graph that uploads its own resident tensors (MiMo) must skip `token_embd.weight` too.
 * `moe_cache_reserve_gb` fits the expert cache to the free VRAM left after dense weights; an exhausted budget disables the cache, it does not mean "auto". Prefill-VRAM reuse is a common policy.
-* Phase cache (`ZEROMOE_PHASE_CACHE_MIB`, default 0, reserve `ZEROMOE_PHASE_CACHE_RESERVE_MIB`): an optional, separately releasable decode-hot extension (`models/graph/phase_expert_cache.hpp`, design in `docs/design/phase-cache.md`). Validate with `bench/phase_cache_transition.py`. Validated on MiMo; on Ling it costs about 2.5-3% decode and is not enabled by default.
+* Phase cache (`graph_phase_cache_mib`, default 0, reserve `graph_phase_cache_reserve_mib`): an optional, separately releasable decode-hot extension (`models/graph/phase_expert_cache.hpp`, design in `docs/design/phase-cache.md`). Override per run with the matching `--graph-phase-cache-*` flags. Validate with `bench/phase_cache_transition.py`. Validated on MiMo; on Ling it costs about 2.5-3% decode and is not enabled by default.
 
 ### Validating a model or an FFN change
 * Compare decode logits with llama.cpp: README section "Validating a new model, or a change to a model's FFN flow" and `scripts/validate_vs_llama.sh`. Teacher-forced, per-frame comparisons are required; a first-step match proves nothing about decode.

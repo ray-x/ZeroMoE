@@ -7,7 +7,7 @@
 # Env: LLAMA_SRC   llama.cpp source tree        (default ../llama.cpp)
 #      LLAMA_BUILD llama.cpp build with the libs (default $LLAMA_SRC/build-avx512-stock, an UNPATCHED build)
 #      DEVS        CUDA_VISIBLE_DEVICES for ZeroMoE (default 0,1)
-#      MS_ENV      extra env for ZeroMoE, e.g. "ZEROMOE_MIMO2_OFFLOAD_DDR_GIB=100"
+#      MS_ENV      extra environment-only controls for ZeroMoE; use CLI flags for graph settings
 # Needs the machine idle: llama.cpp loads the whole model on the CPU, ZeroMoE then runs it.
 set -euo pipefail
 cd "$(dirname "$0")/.."

@@ -3,13 +3,13 @@
 Started from the planning snapshot of 2026-10-26. This preserves the work so
 removal can resume after worktree integration. The removals that were actually
 applied are listed in [Removal log](#removal-log); everything else remains a
-proposal unless called out in the 2026-10-27 refresh below.
+proposal unless called out in the 2026-10-28 refresh below.
 
 ## Integration status
 
 The settings resolver and subsequent full-graph cleanup are integrated in the
 active checkout. The current scan below uses `/home/ray/Projects/ZeroMoE`,
-branch `master`, HEAD `92674a8b03433d8e94c2f8a8560fb65b72ba3a29`, plus its
+branch `master`, HEAD `ccd8ef8274ff3475319db93776ed3ec1d86bb418`, plus its
 working-tree changes. The detailed per-control tables and companion JSON still
 contain the earlier four-worktree snapshot; use the fresh counts and removal
 log below for current status, and treat old rows as candidates until their
@@ -312,6 +312,43 @@ appear in the inventory.
 | `ZEROMOE_GLM5NEXT_DYNAMIC_CACHE_UPLOADS_PER_TOKEN` (K0218) | environment | The reader returned `-1` when unset, selecting the adaptive upload budget; the hard-coded bootstrap and adaptive path already capped work to available layers and 128 uploads. No maintained launcher referenced the override. | Removed the fixed-budget escape hatch. Dynamic cache now always uses its existing adaptive budget policy. |
 | `ZEROMOE_GLM5NEXT_DYNAMIC_CACHE_SWAP_FRAC` (K0217) | environment | The reader returned `0.25` when unset; the adaptive controller multiplies measured compute time by this share to derive upload work. No maintained launcher referenced the override. | Removed the fraction override and fixed the existing default at 25% of observed compute time. |
 
+### 2026-10-28 — remove graph-only family opt-outs
+
+| Control | Surface | Evidence | Change |
+| --- | --- | --- | --- |
+| `ZEROMOE_GLM5NEXT_FULL_GRAPH` (K0223) | environment | The graph model is the registered GLM5Next CUDA execution path. Setting `0` selected the legacy layered decoder; the current model guide requires graph execution. Prefill has its own separate opt-in because of a documented CUDA route-compaction limitation. | Removed the decode opt-out. GLM5Next CUDA graph execution is unconditional; `ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL` remains unchanged. |
+| `ZEROMOE_MIMO2_FULL_GRAPH` (K0327) | environment | `mimo2_full_graph_enabled()` only used the value to disable the graph; the model has no compatible layered attention fallback and disabling it makes requests fail. | Removed the no-op failure switch. The registered MiMo2 graph remains the CUDA path. |
+
+### 2026-10-28 — move phase-cache controls to canonical CLI/TOML
+
+| Controls | Surface | Evidence | Change |
+| --- | --- | --- | --- |
+| `ZEROMOE_PHASE_CACHE_MIB`, `ZEROMOE_PHASE_CACHE_RESERVE_MIB` | environment | Both are registered graph settings with canonical TOML keys and generated `--graph-*` flags. The only maintained runtime harness set them through `bench/phase_cache_transition.py`. | Migrated the harness and phase-cache guide to CLI flags, then removed both environment aliases and the test's environment reset. |
+
+### 2026-10-28 — move MiMo diagnostic settings off environment aliases
+
+| Controls | Surface | Evidence | Change |
+| --- | --- | --- | --- |
+| `ZEROMOE_MIMO2_VERIFY_ALIAS`, `ZEROMOE_MIMO2_NODE_TRACE` | environment | Both diagnostics already have canonical `graph_verify_alias` / `graph_node_trace` TOML fields and generated `--graph-*` flags. No maintained launcher used the aliases. | Removed the environment aliases. Updated the MiMo guide and README to use the CLI setting. |
+
+### 2026-10-28 — move strict graph preflight to typed settings
+
+| Control | Surface | Evidence | Change |
+| --- | --- | --- | --- |
+| `ZEROMOE_PREFLIGHT_STRICT` | environment | The strict preflight decision is represented by the shared `graph_preflight_strict` diagnostic setting and both the graph-settings resolver and model-level preflight read it. | Removed the duplicate direct environment read and resolver alias. TOML `graph_preflight_strict` and `--graph-preflight-strict` are the supported controls. |
+
+### 2026-10-28 — remove MiMo2 graph environment aliases
+
+| Controls | Surface | Evidence | Change |
+| --- | --- | --- | --- |
+| The 12 `ZEROMOE_MIMO2_*` aliases for graph threads, prefill chunk/offload, expert placement, assist slots, offload budgets/usage, and route survey | environment | These fields already resolve from canonical TOML and generated CLI settings. The maintained regression, phase-cache, and survey launchers were migrated to `--graph-*`; no direct MiMo2 graph reader used the old variables. | Removed the MiMo2 alias entries, updated the model/configuration guides, and kept the independent `ZEROMOE_MIMO2_INGRAPH_MOE` feature gate. |
+
+### 2026-10-28 — remove Ling-prefixed graph aliases
+
+| Controls | Surface | Evidence | Change |
+| --- | --- | --- | --- |
+| 18 `ZEROMOE_LING_*` graph aliases for offload, prefill, and route survey | environment | Ling's shared-graph settings already inherit the GLM family row; maintaining a duplicate Ling prefix added another spelling for each setting. The maintained reference-audit and phase-cache harnesses now pass the canonical `--graph-*` values. | Removed the Ling alias namespace from the graph resolver. Shared-graph Ling still accepts the GLM alias during the remaining migration; native/hybrid graph feature gates are unchanged. |
+
 ### Metal on macOS (default on for Apple Silicon)
 
 macOS is forced to `ZEROMOE_CPU_ONLY=ON`, so none of the CUDA or ggml-cuda
@@ -450,7 +487,7 @@ These totals are deliberately broader than the earlier settings-only scan: they 
 Do not add these totals and call them independent user decisions. Tool references/forwarded arguments and capability macros are not necessarily configurable engine controls.
 The table is the pre-merge snapshot; the [removal log](#removal-log) lists the rows already deleted.
 
-### Current native-source inventory (2026-10-27)
+### Current native-source inventory (2026-10-28)
 
 Refreshed with `python3 tools/config_inventory.py --json` against the active
 ZeroMoE checkout. The scanner covers `core/`, `memory/`, `models/`,
@@ -462,7 +499,7 @@ proof that a setting is read on a normal run.
 
 | Surface | Names | Notes |
 | --- | ---: | --- |
-| Native environment names | 384 | Includes registered graph aliases and non-graph reads |
+| Native environment names | 362 | Includes remaining registered graph aliases and non-graph reads |
 | Root CMake options | 7 | `ZEROMOE_CPU_ONLY` also appears as a cached build variable |
 | Server CMake options | 1 | `ZEROMOE_SERVER_TESTS`, owned by the optional server subproject |
 | CMake cache variables | 5 | Includes internal build/dependency paths and revision pins |

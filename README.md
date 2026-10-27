@@ -562,7 +562,7 @@ How to read it:
 - Same graph, different placement: run once with everything on one GPU and once with the hot/cold split. If only
   one differs, the bug is in placement or the cold path, not the math (the MiMo NaN from a repeated placeholder id
   was found this way).
-- `ZEROMOE_MIMO2_NODE_TRACE=2` (MiMo) reports the first non-finite node; `trace_abort_on_nan = true` in the TOML
+- `--graph-node-trace 2` (MiMo) reports the first non-finite node; `trace_abort_on_nan = true` in the TOML
   (see `include/tensor_trace.hpp`) does it for the layered path. Do not time a run with a trace mode on: it
   disables the early-ready bridge.
 - Check tensor sizes first: `./quant_table_test` and the `[PREFLIGHT]` lines at startup flag a tensor type that is

@@ -30,16 +30,15 @@ def inventory(root=ROOT):
                     if kind == "environment" and match[1] in {
                         "ZEROMOE_LING_", "ZEROMOE_GLM5NEXT_"
                     }:
-                        # Prefixes used by ZEROMOE_LING_GLM_ALIAS are expanded
-                        # into concrete family aliases below.
+                        # Prefixes used by ZEROMOE_GLM_ALIAS are expanded
+                        # into concrete environment names below.
                         continue
                     line = text.count("\n", 0, match.start()) + 1
                     entries[kind, match[1]].add(f"{path.relative_to(root)}:{line}")
-            for match in re.finditer(r'ZEROMOE_LING_GLM_ALIAS\("([A-Z0-9_]+)"\)', text):
+            for match in re.finditer(r'ZEROMOE_GLM_ALIAS\("([A-Z0-9_]+)"\)', text):
                 line = text.count("\n", 0, match.start()) + 1
                 location = f"{path.relative_to(root)}:{line}"
                 suffix = match[1]
-                entries["environment", "ZEROMOE_LING_" + suffix].add(location)
                 entries["environment", "ZEROMOE_GLM5NEXT_" + suffix].add(location)
             for number, line in enumerate(text.splitlines(), 1):
                 if re.match(r"^\s*#\s*(?:if|ifdef|ifndef|elif)\b", line):

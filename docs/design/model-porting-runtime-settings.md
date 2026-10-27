@@ -2,7 +2,7 @@
 
 This guide complements [Full graph model design and onboarding](full-graph-model-onboarding.md). That guide covers architecture validation and graph lifecycle. This one covers the host assumptions, configuration sources, and environment-variable behavior that can make a correct port fail at startup or run far below expected speed.
 
-It describes the current code. The broader precedence stack proposed in [Settings resolver and sparse profile pins](settings-resolver.md) is not fully implemented: the typed graph-settings resolver currently resolves defaults, family overrides, and environment variables. It does not yet resolve graph settings from profiles, TOML, or CLI.
+It describes the current code. The typed graph-settings resolver resolves defaults, family overrides, root TOML settings, legacy environment aliases, and generated `--graph-*` CLI flags, in that precedence order. Profiles remain a proposal.
 
 ## 1. Record the target system before tuning
 
@@ -71,14 +71,14 @@ rg -n 'ZEROMOE_|std::getenv|graphcfg::|settings_for\(' \
   models/<family> models/graph/full_graph_models.cpp
 ```
 
-For every variable used in a recipe, document its owner, accepted values, default, family/phase scope, config overlap, and failure/fallback behavior. Separate feature gates from tunables and diagnostics. Prefer `graphsettings` for reusable typed tunables and `graphcfg` for legacy or feature-specific knobs; avoid adding another private parser without a reason.
+For every variable used in a recipe, document its owner, accepted values, default, family/phase scope, config overlap, and failure/fallback behavior. Separate feature gates from tunables and diagnostics. Prefer `graphsettings` for reusable typed tunables and `graphcfg` for feature-specific knobs; avoid adding another private parser without a reason.
 
 ## 4. Use startup logs to verify resolution
 
 Read startup output in this order:
 
-1. **`[PREFLIGHT]`**: topology or resource findings. `ZEROMOE_PREFLIGHT_STRICT=1` turns findings into a startup refusal.
-2. **`[SETTINGS]`**: typed graph settings, their resolved value, and whether the source was `default`, `family`, or a named environment alias.
+1. **`[PREFLIGHT]`**: topology or resource findings. `graph_preflight_strict=true` in TOML or `--graph-preflight-strict true` turns findings into a startup refusal.
+2. **`[SETTINGS]`**: typed graph settings, their resolved value, and whether the source was `default`, `family`, `toml`, `env`, or `cli`.
 3. **`[GRAPH-CAPS]`**: whether prefill/decode graph paths are enabled, CPU-lane support, graph-only status, device expert layer request/direction, and batch limits.
 4. **`[GRAPH-TUNING]`**: model-required host expert source and pin defaults, plus defaults applied by the common setup.
 5. **`[GRAPH-CONFIG]`**: `ZEROMOE_*` values known to the graph configuration registry, including names not read through that registry. A set value marked “not read yet” may belong to a later phase; at shutdown, `[GRAPH-CONFIG]` reports the knobs consulted over the run.
