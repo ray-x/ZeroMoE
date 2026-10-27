@@ -96,6 +96,32 @@ Wall decode rate (tok/s, includes one-time decode-graph/draft setup), promotion 
   only matter once the resident set carries over between requests or topics, which this implementation does not
   do yet (the decode graph, and so the policy, is rebuilt per request).
 
+## Refresh matrix with repeats (binary `b5eee36`, fused cold op on)
+
+`tools/bench_qwen4exp_mtp_suite.py`: six prompts, plain and MTP (3 drafts), fresh process each, exactly 256 generated
+tokens, 3 repeats, medians of decode-wall tok/s (includes ~240 ms of draft setup for MTP). RTX 3090 only, Q2_0,
+K=13,000, context 1536. Two configs: static hot set, and `qwen4exp_expert_promotion = "on"`. Raw logs, configs and
+manifests: `~/Projects/ZeroMoE-results/promotion-study/matrix-6751f3c/{static,promo}/` (binary SHA
+`af6bf5c7f11a...`, source `b5eee36`, ggml `8baabd53b`).
+
+| prompt | plain | plain + promo | MTP | MTP + promo | MTP+promo vs plain+promo | MTP accept | tok/cycle |
+|---|---|---|---|---|---|---|---|
+| palindrome | 48.0 | 46.0 | 60.5 | **62.5** | 1.36x | 79.6% | 3.37 |
+| code review | 49.5 | 48.0 | 55.4 | **59.8** | 1.25x | 68.7% | 3.05 |
+| btree | 45.8 | 49.3 | 50.6 | **60.0** | 1.22x | 69.4% | 3.08 |
+| leetcode | 43.2 | 44.3 | 52.7 | **57.2** | 1.29x | 84.3% | 3.51 |
+| math | 30.8 | 44.2 | 33.0 | **55.1** | 1.25x | 77.7% | 3.32 |
+| story | 25.6 | 44.8 | 18.9 | **42.9** | 0.96x | 50.3% | 2.51 |
+
+* Promotion helps MTP most where the static set misses most: +127% story, +67% math, +19% btree, +9% leetcode,
+  +8% code review, +3% palindrome (palindrome and leetcode are within noise).
+* MTP over plain, both with promotion: 1.22-1.36x on five prompts; story is 0.96x (acceptance 50%, 2.5 tokens
+  per window).
+* These 256-token medians are 5-8% below the best single runs of 463-500 tokens quoted earlier (67-68 tok/s on
+  palindrome and code review): short runs carry the fixed ~240 ms setup and the promotion warm-up, and single
+  runs pick up the +-4 tok/s noise. 60-62 tok/s is the honest figure for a 256-token reply on easy prompts.
+* Strata, measured by the user on this machine: ~68-70 tok/s (31 and 512 token decodes).
+
 ## Output check under promotion (teacher-forced, `tools/check_adaptive_placement_accuracy.py`)
 
 Static hot set (K=13,000) generates 256 tokens per prompt; the same tokens are forced through the same binary with
