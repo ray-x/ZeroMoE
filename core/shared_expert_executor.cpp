@@ -65,6 +65,20 @@ extern bool qwen4exp_copy_gdn_device_output_to_host(const void *device_output,
 #include "moe_pipeline_internal.hpp"
 #include "shared_expert_executor.hpp"
 
+namespace {
+
+// One reader for the debug flag: the host dump used to test mere presence, so
+// ZEROMOE_GGML_SHARED_DEBUG=0 still did the checksum work and logged.
+bool shared_debug_enabled() {
+  static const bool on = [] {
+    const char *e = std::getenv("ZEROMOE_GGML_SHARED_DEBUG");
+    return e && e[0] == '1';
+  }();
+  return on;
+}
+
+}  // namespace
+
 // Run Qwen4Exp's always-on shared expert against an already device-resident
 // routed result.  Keeping this as a small helper lets both the ordinary
 // host-route path and the all-resident device-route path use exactly the same
@@ -86,10 +100,7 @@ bool run_qwen4exp_shared_device(StreamingEngine &engine, int layer_idx,
               std::chrono::steady_clock::now() - submit_start)
               .count());
   };
-  static const bool debug = [] {
-    const char *e = std::getenv("ZEROMOE_GGML_SHARED_DEBUG");
-    return e && e[0] == '1';
-  }();
+  static const bool debug = shared_debug_enabled();
   if (combined_output)
     *combined_output = nullptr;
   static const bool force_host_decode = [] {
@@ -430,7 +441,7 @@ void run_qwen4exp_shared_host(StreamingEngine &engine, int layer_idx,
              nrm.first, nrm.second, gb.first, gb.second, ub.first, ub.second,
              db.first, db.second, gate.empty() ? 1.0f : gate[0]);
   }
-  if (std::getenv("ZEROMOE_GGML_SHARED_DEBUG") && S == 1) {
+  if (shared_debug_enabled() && S == 1) {
     double l2 = 0.0;
     for (int d = 0; d < D; ++d)
       l2 += (double)output[d] * output[d];

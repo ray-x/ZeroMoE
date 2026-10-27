@@ -469,7 +469,6 @@ static size_t dense_scratch_reserve_bytes() {
   }();
   return v;
 }
-#define kDenseScratchReserveBytes dense_scratch_reserve_bytes()
 
 void warm_mla_absorb_cache(StreamingEngine &engine) {
   const auto &c = engine.model_file.architecture_config;
@@ -523,8 +522,8 @@ void warm_mla_absorb_cache(StreamingEngine &engine) {
     size_t budget = 0;
     if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
       size_t cfg_cap = (size_t)(engine.attn_qabsorb_gpu_max_vram_gb * 1e9);
-      size_t usable_free = (free_b > kDenseScratchReserveBytes)
-                               ? (free_b - kDenseScratchReserveBytes)
+      size_t usable_free = (free_b > dense_scratch_reserve_bytes())
+                               ? (free_b - dense_scratch_reserve_bytes())
                                : 0;
       budget = std::min(usable_free, cfg_cap);
     } else {
@@ -588,8 +587,8 @@ void warm_mla_absorb_cache(StreamingEngine &engine) {
     size_t budget = 0;
     if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
       size_t cfg_cap = (size_t)(engine.attn_score_gpu_max_vram_gb * 1e9);
-      size_t usable_free = (free_b > kDenseScratchReserveBytes)
-                               ? (free_b - kDenseScratchReserveBytes)
+      size_t usable_free = (free_b > dense_scratch_reserve_bytes())
+                               ? (free_b - dense_scratch_reserve_bytes())
                                : 0;
       budget = std::min(usable_free, cfg_cap);
     } else {

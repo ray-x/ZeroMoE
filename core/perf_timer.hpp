@@ -68,7 +68,14 @@ inline bool is_mirror_fd(int fd) {
 }
 
 // Convenience macros
-#define PERF_SCOPE(counter) ScopedTimer _perf_timer_##__LINE__(perf().counter)
+// `##` suppresses expansion of its operands, so the old
+// `_perf_timer_##__LINE__` spelled the identifier `_perf_timer___LINE__` on
+// every call instead of a line-specific name: two PERF_SCOPE calls in one
+// scope were a redeclaration error. Expand the counter first, then paste.
+#define PERF_SCOPE_CAT_(a, b) a##b
+#define PERF_SCOPE_CAT(a, b) PERF_SCOPE_CAT_(a, b)
+#define PERF_SCOPE(counter) \
+  ScopedTimer PERF_SCOPE_CAT(_perf_timer_, __COUNTER__)(perf().counter)
 #define PERF_START(name) auto _perf_##name = std::chrono::high_resolution_clock::now()
 #define PERF_END(name, counter) do { \
     auto _perf_end = std::chrono::high_resolution_clock::now(); \

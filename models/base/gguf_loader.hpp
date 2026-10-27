@@ -3,6 +3,7 @@
 #include "quant_table.hpp"
 #include "logger.hpp"
 #include "perf_timer.hpp"  // register_mirror_fd -- per-drive read-byte attribution
+#include "posix_fadvise_compat.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <fcntl.h>
@@ -18,21 +19,6 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-
-#ifdef __APPLE__
-// macOS doesn't have posix_fadvise; provide a no-op stub. Guarded by the SAME
-// symbol (POSIX_FADV_WILLNEED) engine.hpp's own stub uses, and the function
-// definition lives INSIDE that guard (not after it, unconditionally) -- this
-// file and engine.hpp always land in the same translation unit (engine.hpp
-// includes this file first), so whichever is processed first fully defines
-// constants+function and the other's #ifndef skips cleanly.
-#ifndef POSIX_FADV_WILLNEED
-#define POSIX_FADV_WILLNEED 3
-#define POSIX_FADV_DONTNEED 4
-#define POSIX_FADV_RANDOM 1
-static inline int posix_fadvise(int, off_t, off_t, int) { return 0; }
-#endif
-#endif
 
 // GGML / GGUF tensor type IDs. These values MUST match the raw `type` field
 // stored in the GGUF tensor table (see ggml.h). calculate_size() below switches

@@ -3,6 +3,7 @@
 #include "gguf_loader.hpp"
 #include "direct_io.hpp"
 #include "io_uring_backend.hpp"
+#include "posix_fadvise_compat.hpp"
 #include "perf_timer.hpp"
 #include "logger.hpp"
 #include "memory_guard.hpp"  // MemoryGuard::allocation_blocked() -- see ensure_slab_capacity
@@ -23,21 +24,6 @@
 #include <numeric>
 #include <mutex>
 #include <chrono>
-
-#ifdef __APPLE__
-// macOS doesn't have posix_fadvise; provide no-op stubs. The function
-// definition must live INSIDE the same #ifndef as the constants (not after
-// it, unconditionally) -- gguf_loader.hpp (included above, transitively via
-// this file being included first almost everywhere) carries an identical
-// stub under the same POSIX_FADV_WILLNEED guard so the two can coexist in
-// one translation unit; leaving this one unconditional caused a duplicate-
-// definition build error the moment both headers landed together.
-#ifndef POSIX_FADV_WILLNEED
-#define POSIX_FADV_WILLNEED 3
-#define POSIX_FADV_DONTNEED 4
-static inline int posix_fadvise(int, off_t, off_t, int) { return 0; }
-#endif
-#endif
 
 class CudaManager;  // forward decl — defined in cuda_manager.hpp; engine holds a pointer
 class StreamingEngine;
