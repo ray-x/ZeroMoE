@@ -773,6 +773,13 @@ if(NOT ZEROMOE_CPU_ONLY)
         target_link_libraries(layer_plan_test PRIVATE ggml CUDA::cudart)
     endif()
     if(ZEROMOE_USE_GGML)
+        add_executable(cold_ffn_fused_test EXCLUDE_FROM_ALL tests/test_cold_ffn_fused.cpp
+            models/qwen/cold_ffn_fused.cpp)
+        target_include_directories(cold_ffn_fused_test PRIVATE models/qwen ${ZEROMOE_GGML_SRC_DIR}
+            ${ZEROMOE_GGML_SRC_DIR}/../include)
+        target_link_libraries(cold_ffn_fused_test PRIVATE ggml)
+    endif()
+    if(ZEROMOE_USE_GGML)
         add_executable(quant_table_test EXCLUDE_FROM_ALL tests/test_quant_table.cpp)
         target_include_directories(quant_table_test PRIVATE ${ZEROMOE_INCLUDE_DIRS}
             ${ZEROMOE_GGML_SRC_DIR})
