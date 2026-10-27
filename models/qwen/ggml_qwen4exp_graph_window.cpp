@@ -85,8 +85,8 @@ bool qwen4exp_full_graph_window_run(StreamingEngine &engine, int S, int pos_base
   engine.qwen4exp_full_graph_output_ready = true;
   const double ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - start).count();
-  if (zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_WINDOW_TIMING"))
-    LOG_INFO("[QWEN4EXP-WINDOW] pos=%d S=%d compute+readback=%.3f ms\n", pos_base, S, ms);
+  if (Logger::instance().would_log(LogLevel::DEBUG))
+    LOG_DEBUG("[QWEN4EXP-WINDOW] pos=%d S=%d compute+readback=%.3f ms\n", pos_base, S, ms);
   return true;
 }
 

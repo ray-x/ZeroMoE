@@ -334,9 +334,8 @@ bool qwen4exp_ram_cpu_moe_layer(const StreamingEngine &engine,
                                              : arena->stride;
   out.down_stride = arena->projection_compact ? arena->down_stride
                                                : arena->stride;
-  if (const char *debug = zeromoe::graphcfg::env("ZEROMOE_QWEN_DECODE_SCHED_DEBUG");
-      debug && debug[0] == '1' && layer_idx == 0) {
-    LOG_WARN("[QWEN-CPU-ARENA] layer=%d compact=%d arena_stride=%zu "
+  if (Logger::instance().would_log(LogLevel::DEBUG) && layer_idx == 0) {
+    LOG_DEBUG("[QWEN-CPU-ARENA] layer=%d compact=%d arena_stride=%zu "
              "planes=%p/%p/%p strides=%zu/%zu/%zu\n",
              layer_idx, out.projection_compact ? 1 : 0, out.expert_stride,
              out.gate_plane, out.up_plane, out.down_plane, out.gate_stride,
@@ -388,14 +387,10 @@ static bool qwen_cpu_gpu_combine_enabled() {
 // generic GGML scheduling overhead.  For the common UD-IQ1_M layout, the
 // selected experts can be addressed directly in the already-populated DDR
 // arena and grouped into one activation-quantization/dot pass per
-// projection.  Keep this behind an environment switch until a real hardware
-// A/B proves it; no other model family can reach this helper.
+// projection. No other model family can reach this helper; timing follows
+// DEBUG verbosity so it remains off in normal inference.
 static bool qwen_cpu_stage_timing_enabled() {
-  static const bool enabled = [] {
-    const char *env = zeromoe::graphcfg::env("ZEROMOE_QWEN_CPU_STAGE_TIMING");
-    return env && env[0] == '1';
-  }();
-  return enabled;
+  return Logger::instance().would_log(LogLevel::DEBUG);
 }
 
 static bool qwen_cpu_fused_iq1_iq4_enabled() {

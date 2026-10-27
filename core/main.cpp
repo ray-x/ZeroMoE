@@ -30,7 +30,6 @@
 #include "safetensors_adapter.hpp"
 #include "shutdown.hpp"
 #include "startup_preflight.hpp"
-#include "tensor_trace.hpp"
 
 #include "ggml.h"
 
@@ -200,14 +199,15 @@ void print_usage(bool all = false) {
         << "  --config <file>       Load a model recipe (recommended)\n"
         << "  --model <path>        Override the model file/directory\n"
         << "  --prompt <text>       Run one prompt instead of interactive input\n"
-        << "  --ctx <tokens>        Context window\n"
-        << "  --ngen <tokens>       Maximum generated tokens\n"
+        << "  -c, --ctx-size <tokens>  Context window\n"
+        << "  -n, --predict <tokens>   Maximum generated tokens\n"
         << "  --ram <GiB>           Host expert-memory budget\n"
-        << "  --gpu <id>            GPU for single-device mode\n"
+        << "  -t, --threads <N>     CPU thread limit\n"
+        << "  --main-gpu <id>       GPU for single-device mode\n"
         << "  --temp <number>       Temperature; 0 selects greedy sampling\n"
-        << "  --top_p <number>      Nucleus sampling threshold\n"
+        << "  --top-p <number>      Nucleus sampling threshold\n"
         << "  --system-prompt <s>   Conversation instructions\n"
-        << "  --log-level <level>   INFO (default), WARN, ERROR, DEBUG, VERBOSE\n"
+        << "  --verbosity <0..5>   llama.cpp-style log threshold\n"
         << "  --gen-config [file]   Write a configuration template\n"
         << "  --help-all            Advanced tuning, diagnostics and benchmarks\n"
         << "  --help-settings       Canonical graph settings and legacy aliases\n\n"
@@ -223,19 +223,24 @@ void print_usage(bool all = false) {
       << "  --serve          Serve OpenAI and Anthropic APIs (optional server build)\n"
       << "  --host <host>    API bind address (default: 127.0.0.1)\n"
       << "  --port <port>    API port (default: 8080)\n"
-      << "  --api-model <id> API model name (default: zeromoe)\n"
+      << "  --alias <id>     API model name (default: zeromoe)\n"
+      << "  --api-key <key>  API key (or ZEROMOE_API_KEY)\n"
       << "  --gen-config     Generate a sample config file and exit\n"
       << "  --model <path>   Path to GGUF model file or directory\n"
       << "  --ram <GB>       Strict RAM budget in GB (default: auto-detect 88% "
          "free)\n"
-      << "  --ctx <N>        Maximum context size token window (default: "
+      << "  -c, --ctx-size <N>  Maximum context size token window (default: "
          "4096)\n"
-      << "  --ngen <N>       Maximum new tokens to generate per response "
+      << "  -n, --predict <N>  Maximum new tokens to generate per response "
          "(default: 1024)\n"
+      << "  -t, --threads <N>  CPU thread limit (default: auto)\n"
       << "  --temp <F>       Sampling temperature. 0.0 for greedy decode "
          "(default: 0.7)\n"
-      << "  --top_p <F>      Nucleus sampling top-p threshold (default: 0.90)\n"
-      << "  --gpu <ID>       CUDA device ID for single-GPU mode (default: 0)\n"
+      << "  --top-p <F>      Nucleus sampling top-p threshold (default: 0.90)\n"
+      << "  --main-gpu <ID>  CUDA device ID for single-GPU mode (default: 0)\n"
+      << "  --spec-type <none|draft-mtp>  Speculative decoding mode\n"
+      << "  --spec-draft-model <path>     Optional external draft checkpoint\n"
+      << "  --spec-draft-n-max <N>        Maximum draft tokens (default: 3)\n"
       << "  --drop-pages     Drop expert pages from page cache after use\n"
       << "  --direct-io      O_DIRECT expert-slab reads (Linux only; requires "
          "a model\n"
@@ -252,8 +257,6 @@ void print_usage(bool all = false) {
          "unsupported)\n"
       << "  --prefetch-threads <N>  Concurrent async prefetcher worker threads "
          "(default: 2)\n"
-      << "  --verbose-moe    Log every MoE host-cache hit (high volume, debug "
-         "only)\n"
       << "  --promote-threshold <N>  Number of host re-hits before async H2D "
          "promote (default: 1)\n"
       << "  --pin-threshold <N>  VRAM-resident hit_count before pinning (never "
@@ -280,15 +283,9 @@ void print_usage(bool all = false) {
          "enabled\n"
       << "                   (default: max; enable_thinking=false selects "
          "direct answer).\n"
-      << "  --log-path <file>  Redirect logging to a file instead of stderr\n"
-      << "  --log-level <lvl>  VERBOSE | DEBUG | INFO (default) | WARN | "
-         "ERROR\n"
-      << "  --trace-filter <tags>  Comma-separated tags (requires --log-level "
-         "VERBOSE),\n"
-      << "                   e.g. --trace-filter \"HC,MLA\" -- see any "
-         "tensor-trace tag\n"
-      << "  --trace-abort-on-nan  Abort at the first tensor a NaN/Inf checker "
-         "flags\n"
+      << "  --log-file <file>  Redirect logging to a file instead of stderr\n"
+      << "  --verbosity <0..5> llama.cpp-style log threshold\n"
+      << "  --verbose          Enable all ZeroMoE log and trace messages\n"
       << "  --freeze-usage-stats  Don't overwrite pin_file/prefill_pin_file at "
          "shutdown\n"
       << "                   (still read at startup) -- for controlled A/B "
@@ -428,30 +425,19 @@ int main(int argc, char *argv[]) {
   int max_ctx = 4096;
   int max_new_tokens = 1024;
   int gpu_id = 0;
+  int threads_cli = -1;
+  bool gpu_cli_given = false;
   bool drop_pages = false;
   bool direct_io_cli = false;
   bool io_uring_cli = false;
-  // ctx_cli_given/ngen_cli_given: real bug found via a real test --
-  // --ctx (and --ngen) were parsed but only ever applied to
-  // config.context_size/max_new_tokens in the legacy --model-only
-  // startup branch below; the "CLI overrides always apply" block right
-  // after config-file loading never included them, so --ctx silently
-  // did nothing whenever --config was used (which is every TOML-based
-  // run this whole session). max_ctx/max_new_tokens keep their
-  // legacy-mode defaults (4096/1024) either way -- these bools track
-  // ONLY whether the flag was explicitly passed, so the override below
-  // doesn't clobber a --config file's own context_size/max_new_tokens
-  // with an unrequested default.
+  // Track explicit run overrides so recipe values are preserved otherwise.
   bool ctx_cli_given = false;
   bool ngen_cli_given = false;
-  bool verbose_moe = false;
   bool raw_prompt_cli = false;
   std::string system_prompt_cli;
   std::string reasoning_effort_cli;
   std::string log_path_cli;
   std::string log_level_cli;
-  std::string trace_filter_cli;
-  bool trace_abort_on_nan_cli = false;
   bool freeze_usage_stats_cli = false;
   bool collect_usage_stats_cli = false;
   float temp_cli = -1.0f, top_p_cli = -1.0f; // -1 sentinel = "not given" (0.0
@@ -467,7 +453,11 @@ int main(int argc, char *argv[]) {
   bool serve_api_cli = false;
   std::string api_host_cli = "127.0.0.1";
   std::string api_model_cli = "zeromoe";
+  std::string api_key_cli;
   int api_port_cli = 8080;
+  std::string spec_type_cli;
+  std::string spec_draft_model_cli;
+  int spec_draft_n_max_cli = -1;
   zeromoe::graphsettings::CliValues graph_cli_settings;
 
   for (int i = 1; i < argc; ++i) {
@@ -501,8 +491,10 @@ int main(int argc, char *argv[]) {
         std::cerr << "Error: --port must be in [1, 65535]\n";
         return 1;
       }
-    } else if (arg == "--api-model" && i + 1 < argc)
+    } else if (arg == "--alias" && i + 1 < argc)
       api_model_cli = argv[++i];
+    else if (arg == "--api-key" && i + 1 < argc)
+      api_key_cli = argv[++i];
     else if (arg == "--prompt" && i + 1 < argc)
       prompt_cli = argv[++i];
     else if (arg == "--gen-config") {
@@ -513,22 +505,30 @@ int main(int argc, char *argv[]) {
       model_path = argv[++i];
     else if (arg == "--ram" && i + 1 < argc)
       ram_budget_gb = std::stod(argv[++i]);
-    else if (arg == "--ctx" && i + 1 < argc) {
+    else if ((arg == "--ctx-size" || arg == "-c") && i + 1 < argc) {
       max_ctx = std::stoi(argv[++i]);
       ctx_cli_given = true;
-    } else if (arg == "--ngen" && i + 1 < argc) {
+    } else if ((arg == "--predict" || arg == "--n-predict" || arg == "-n") &&
+               i + 1 < argc) {
       max_new_tokens = std::stoi(argv[++i]);
       ngen_cli_given = true;
-    } else if (arg == "--gpu" && i + 1 < argc)
+    } else if (arg == "--main-gpu" && i + 1 < argc) {
       gpu_id = std::stoi(argv[++i]);
+      gpu_cli_given = true;
+    } else if ((arg == "--threads" || arg == "-t") && i + 1 < argc)
+      threads_cli = std::stoi(argv[++i]);
+    else if (arg == "--spec-type" && i + 1 < argc)
+      spec_type_cli = argv[++i];
+    else if (arg == "--spec-draft-model" && i + 1 < argc)
+      spec_draft_model_cli = argv[++i];
+    else if (arg == "--spec-draft-n-max" && i + 1 < argc)
+      spec_draft_n_max_cli = std::stoi(argv[++i]);
     else if (arg == "--drop-pages")
       drop_pages = true;
     else if (arg == "--direct-io")
       direct_io_cli = true;
     else if (arg == "--io-uring")
       io_uring_cli = true;
-    else if (arg == "--verbose-moe")
-      verbose_moe = true;
     else if (arg == "--raw-prompt")
       raw_prompt_cli = true;
     else if (arg == "--system-prompt" && i + 1 < argc)
@@ -545,21 +545,32 @@ int main(int argc, char *argv[]) {
       expert_fetch_threads_cli = std::stoi(argv[++i]);
     else if (arg == "--prefetch-threads" && i + 1 < argc)
       prefetch_worker_threads_cli = std::stoi(argv[++i]);
-    else if (arg == "--log-path" && i + 1 < argc)
+    else if (arg == "--log-file" && i + 1 < argc)
       log_path_cli = argv[++i];
-    else if (arg == "--log-level" && i + 1 < argc)
-      log_level_cli = argv[++i];
-    else if (arg == "--trace-filter" && i + 1 < argc)
-      trace_filter_cli = argv[++i];
-    else if (arg == "--trace-abort-on-nan")
-      trace_abort_on_nan_cli = true;
+    else if ((arg == "--verbosity" || arg == "--log-verbosity") &&
+             i + 1 < argc) {
+      try {
+        size_t end = 0;
+        const std::string value = argv[++i];
+        const int level = std::stoi(value, &end);
+        if (end != value.size() || level < 0 || level > 5)
+          throw std::invalid_argument("verbosity");
+        static const char *const levels[] = {
+            "ERROR", "ERROR", "WARN", "INFO", "VERBOSE", "DEBUG"};
+        log_level_cli = levels[level];
+      } catch (const std::exception &) {
+        std::cerr << "Error: --verbosity must be in [0, 5]\n";
+        return 1;
+      }
+    } else if (arg == "--verbose")
+      log_level_cli = "VERBOSE";
     else if (arg == "--freeze-usage-stats")
       freeze_usage_stats_cli = true;
     else if (arg == "--collect-usage-stats")
       collect_usage_stats_cli = true;
     else if (arg == "--temp" && i + 1 < argc)
       temp_cli = std::stof(argv[++i]);
-    else if (arg == "--top_p" && i + 1 < argc)
+    else if (arg == "--top-p" && i + 1 < argc)
       top_p_cli = std::stof(argv[++i]);
     else if (arg == "--bench")
       zeromoe::bench::plan().enabled = true;
@@ -596,6 +607,9 @@ int main(int argc, char *argv[]) {
     } else if (arg == "--help" || arg == "-h") {
       print_usage();
       return 0;
+    } else if (!arg.empty() && arg[0] == '-') {
+      std::cerr << "Error: unknown option " << arg << "\n";
+      return 1;
     }
   }
 
@@ -630,11 +644,47 @@ int main(int argc, char *argv[]) {
     return false;
   };
 
+  auto apply_spec_cli = [&]() -> bool {
+    if (!spec_type_cli.empty()) {
+      if (spec_type_cli == "none")
+        config.mtp_enabled = false;
+      else if (spec_type_cli == "draft-mtp")
+        config.mtp_enabled = true;
+      else {
+        std::cerr << "Error: --spec-type supports only none or draft-mtp in ZeroMoE\n";
+        return false;
+      }
+    }
+    if (!spec_draft_model_cli.empty())
+      config.mtp_model_path = spec_draft_model_cli;
+    if (spec_draft_n_max_cli != -1) {
+      if (spec_draft_n_max_cli < 1) {
+        std::cerr << "Error: --spec-draft-n-max must be positive\n";
+        return false;
+      }
+      config.mtp_draft_tokens = std::min(spec_draft_n_max_cli, 8);
+      if (spec_draft_n_max_cli > 8)
+        LOG_WARN("[CONFIG] --spec-draft-n-max=%d exceeds the bounded draft bridge; clamping to 8\n",
+                 spec_draft_n_max_cli);
+    }
+    return true;
+  };
+
   if (!config_path.empty()) {
     // Load from config file
     if (!config.load(config_path))
       return 1;
+    if (gpu_cli_given) {
+      if (config.gpus.size() != 1) {
+        std::cerr << "Error: --main-gpu applies to a single-device recipe; "
+                     "set multi-GPU topology in [[gpus]].\n";
+        return 1;
+      }
+      config.gpus.front().device_id = gpu_id;
+    }
     if (!resolve_model_path(config.model_path))
+      return 1;
+    if (!apply_spec_cli())
       return 1;
     if (!config.validate())
       return 1;
@@ -655,6 +705,8 @@ int main(int argc, char *argv[]) {
     gc.role = "dense+moe";
     config.gpus.push_back(gc);
 
+    if (!apply_spec_cli())
+      return 1;
     if (!config.validate())
       return 1;
   } else {
@@ -664,24 +716,25 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  // --ram / --verbose-moe always override the config file's values, if given
+  // --ram always overrides the config file's value, if given
   config.serve_api = serve_api_cli;
   config.api_host = api_host_cli;
   config.api_port = api_port_cli;
   config.api_model = api_model_cli;
+  config.api_key = api_key_cli;
   if (config.serve_api && (config.raw_prompt || raw_prompt_cli || zeromoe::bench::plan().enabled)) {
     std::cerr << "Error: --serve cannot be combined with raw prompt or benchmark mode\n";
     return 1;
   }
   if (config.serve_api && (config.api_model.empty() || config.api_host.empty())) {
-    std::cerr << "Error: --api-model and --host cannot be empty\n";
+    std::cerr << "Error: --alias and --host cannot be empty\n";
     return 1;
   }
   if (config.serve_api && config.api_host != "127.0.0.1" && config.api_host != "::1" &&
       config.api_host != "localhost") {
     const char *key = std::getenv("ZEROMOE_API_KEY");
-    if (!key || !key[0]) {
-      std::cerr << "Error: non-loopback --host requires ZEROMOE_API_KEY\n";
+    if (config.api_key.empty() && (!key || !key[0])) {
+      std::cerr << "Error: non-loopback --host requires --api-key or ZEROMOE_API_KEY\n";
       return 1;
     }
   }
@@ -689,8 +742,6 @@ int main(int argc, char *argv[]) {
     config.host_ram_gb = ram_budget_gb;
   if (!prompt_cli.empty())
     config.prompt = prompt_cli;
-  if (verbose_moe)
-    config.verbose_moe_log = true;
   if (raw_prompt_cli)
     config.raw_prompt = true;
   if (!system_prompt_cli.empty())
@@ -705,11 +756,13 @@ int main(int argc, char *argv[]) {
     config.io_uring = true;
   // ctx_cli_given/ngen_cli_given: see their own declaration comment --
   // these were completely missing from this override block before,
-  // meaning --ctx/--ngen had zero effect whenever --config was used.
+  // meaning --ctx-size/--predict had zero effect whenever --config was used.
   if (ctx_cli_given)
     config.context_size = max_ctx;
   if (ngen_cli_given)
     config.max_new_tokens = max_new_tokens;
+  if (threads_cli > 0)
+    config.omp_max_threads = threads_cli;
   if (promote_threshold_cli > 0)
     config.promote_hit_threshold = promote_threshold_cli;
   if (pin_threshold_cli >= 0)
@@ -724,10 +777,6 @@ int main(int argc, char *argv[]) {
     config.log_path = log_path_cli;
   if (!log_level_cli.empty())
     config.log_level = log_level_cli;
-  if (!trace_filter_cli.empty())
-    config.trace_filter = trace_filter_cli;
-  if (trace_abort_on_nan_cli)
-    config.trace_abort_on_nan = true;
   if (freeze_usage_stats_cli)
     config.freeze_usage_stats = true;
   if (collect_usage_stats_cli)
@@ -743,8 +792,6 @@ int main(int argc, char *argv[]) {
   bool allow_ggml_debug = config.log_level == "DEBUG" ||
                           config.log_level == "VERBOSE";
   ggml_log_set(zeromoe_ggml_log_callback, &allow_ggml_debug);
-  TraceFilter::instance().configure(config.trace_filter,
-                                    config.trace_abort_on_nan);
 
   std::cout << "  ZeroMoE Engine initializing (C++23 mode)...\n";
   std::cout << "----------------------------------------\n";
@@ -769,16 +816,16 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  // cpu_only (TOML `cpu_only = true` or ZEROMOE_CPU_ONLY env var) forces all
+  // cpu_only (TOML `cpu_only = true`) forces all
   // compute onto the CPU reference path. Enable it BEFORE run_engine so every
   // dense_proj / rmsnorm_proj / expert_ffn dispatch sees the flag.
   if (config.exl3_backend == "exllamav3") {
     std::vector<std::string> overrides{
-        "--ngen", std::to_string(config.max_new_tokens),
-        "--ctx", std::to_string(config.context_size),
+        "--predict", std::to_string(config.max_new_tokens),
+        "--ctx-size", std::to_string(config.context_size),
         "--threads", std::to_string(config.omp_max_threads > 0 ? config.omp_max_threads : 4),
         "--cuda-schedule", config.exllamav3_cuda_schedule,
-        "--temperature", std::to_string(config.temperature),
+        "--temp", std::to_string(config.temperature),
         "--top-p", std::to_string(config.top_p),
         config.raw_prompt ? "--raw-prompt" : "--no-raw-prompt",
         config.enable_thinking ? "--thinking" : "--no-thinking"};
@@ -813,9 +860,7 @@ int main(int argc, char *argv[]) {
   set_moe_ggml_planar_copies(config.moe_ggml_planar_copies);
   set_moe_ggml_gpu_router(config.moe_ggml_gpu_router);
   set_moe_ggml_device(config.moe_ggml_device);
-  set_ggml_hc_async_graph_reuse(config.ggml_async_graph_reuse);
   set_qwen_hc_async_readback(config.qwen4exp_hc_async_readback);
-  set_ggml_moe_async_graph_reuse(config.ggml_async_graph_reuse);
   LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp GGML shared expert: "
                     << (config.moe_ggml_shared_expert ? "ON" : "off")
                     << " (device routed+shared FFN)\n";
@@ -915,9 +960,6 @@ int main(int argc, char *argv[]) {
       << (config.qwen4exp_router_pilot_skip_prefetch_excluded_layers ? "ON"
                                                                      : "off")
       << "\n";
-  LOG_STREAM_INFO() << "[CONFIG] GGML async graph workspace reuse: "
-                    << (config.ggml_async_graph_reuse ? "ON" : "off")
-                    << " (shared backend stream ordering)\n";
   LOG_STREAM_INFO()
       << "[CONFIG] MoE prefill token-batching (group tokens by expert): "
       << (config.moe_prefill_batched ? "ON" : "off")

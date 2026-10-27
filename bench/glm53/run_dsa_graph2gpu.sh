@@ -32,7 +32,7 @@ if count != 1:
     raise SystemExit("config must contain exactly one model_path")
 Path(sys.argv[2]).write_text(text)
 PY
-(printf "%s\n:q\n" "$P" | timeout 1500 "${ZEROMOE_BIN:-./build/zeromoe}" --config "$run_config" --ngen "${NGEN:-48}" --temp 0 > logs/glm53_dsa_graph2gpu_tke.stdout 2>&1)
+(printf "%s\n:q\n" "$P" | timeout 1500 "${ZEROMOE_BIN:-./build/zeromoe}" --config "$run_config" --predict "${NGEN:-48}" --temp 0 > logs/glm53_dsa_graph2gpu_tke.stdout 2>&1)
 engine_rc=$?
 grep -E "Rates:|OFFLOAD|FULL-DECODE|WARN|ERROR" logs/glm53_dsa_graph2gpu_tke.log | cut -c1-220 | head -40 || true
 # Propagate the engine status: the gate must never treat a crashed candidate as a pass

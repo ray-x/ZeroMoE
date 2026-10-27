@@ -13,13 +13,13 @@ using namespace qwen4exp_graph;
 
 namespace qwen4exp_graph {
 
-// Opt-in memory telemetry for the experimental partial/staged graph.  This
+// Verbose memory telemetry for the partial/staged graph. This
 // intentionally samples both CUDA and Linux memory at the same boundary so a
 // failure can distinguish VRAM exhaustion from host/cgroup pressure.  It is
-// disabled unless ZEROMOE_QWEN4EXP_MEMORY_TRACE=1 is present; production
-// execution therefore pays no /proc or cudaMemGetInfo overhead.
+// disabled below VERBOSE logging, so normal execution pays no /proc or
+// cudaMemGetInfo overhead.
 bool qwen4exp_memory_trace_enabled() {
-  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_MEMORY_TRACE");
+  return Logger::instance().would_log(LogLevel::VERBOSE);
 }
 
 long qwen4exp_proc_kb(const char *path, const char *key) {
@@ -63,7 +63,7 @@ void qwen4exp_memory_snapshot(const char *tag, int device,
     return static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
   };
   if (cuda_status == cudaSuccess) {
-    LOG_INFO("[QWEN4EXP-MEM] tag=%s pid=%d dev=%d vram_free=%.3fGiB "
+    Logger::instance().log(LogLevel::VERBOSE, "[QWEN4EXP-MEM] tag=%s pid=%d dev=%d vram_free=%.3fGiB "
              "vram_total=%.3fGiB ram_available=%ldMiB ram_total=%ldMiB "
              "rss=%ldMiB peak=%ldMiB cgroup_current=%lld cgroup_max=%lld%s%s\n",
              tag ? tag : "unknown", static_cast<int>(getpid()), device,
@@ -72,7 +72,7 @@ void qwen4exp_memory_snapshot(const char *tag, int device,
              cgroup_current, cgroup_max, detail ? " detail=" : "",
              detail ? detail : "");
   } else {
-    LOG_ERROR("[QWEN4EXP-MEM-OOM?] tag=%s pid=%d dev=%d cuda_meminfo=%s "
+    Logger::instance().log(LogLevel::VERBOSE, "[QWEN4EXP-MEM-OOM?] tag=%s pid=%d dev=%d cuda_meminfo=%s "
               "ram_available=%ldMiB rss=%ldMiB cgroup_current=%lld "
               "cgroup_max=%lld%s%s\n",
               tag ? tag : "unknown", static_cast<int>(getpid()), device,
@@ -155,8 +155,8 @@ qwen4exp_cuda_gpu_stage_callback(void *user_data) {
                                  t_end - start)
                                  .count();
   ctx->last_callback_ms.store(callback_ms, std::memory_order_release);
-  if (zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_GPU_STAGE_TIMING"))
-    LOG_INFO("[QWEN4EXP-GPU-STAGE-TIMING] layer=%d gate_ms=%.4f up_ms=%.4f "
+  if (Logger::instance().would_log(LogLevel::DEBUG))
+    LOG_DEBUG("[QWEN4EXP-GPU-STAGE-TIMING] layer=%d gate_ms=%.4f up_ms=%.4f "
              "down_ms=%.4f callback_body_ms=%.4f\n",
              ctx->layer_index, gate_ms, up_ms, down_ms, callback_ms);
   if (!ok)
@@ -259,8 +259,8 @@ void CUDART_CB qwen4exp_cuda_usage_track_callback(void *user_data) {
                         std::chrono::steady_clock::now() - start)
                         .count();
   ctx->last_callback_ms.store(ms, std::memory_order_release);
-  if (zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_USAGE_TRACK_TIMING"))
-    LOG_INFO("[QWEN4EXP-USAGE-TRACK-TIMING] callback_body_ms=%.4f\n", ms);
+  if (Logger::instance().would_log(LogLevel::DEBUG))
+    LOG_DEBUG("[QWEN4EXP-USAGE-TRACK-TIMING] callback_body_ms=%.4f\n", ms);
 }
 
 // Enqueues the single D2H + host-callback sequence for the usage-track flush
@@ -319,7 +319,7 @@ bool env_host_node_keep_cpu_prologue() {
 }
 
 bool qwen4exp_host_node_timing_enabled() {
-  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_HOST_NODE_TIMING");
+  return Logger::instance().would_log(LogLevel::DEBUG);
 }
 
 } // namespace qwen4exp_graph
@@ -347,7 +347,7 @@ extern "C" void zeromoe_qwen4exp_host_node_cpu_wait() {
   g_qwen4exp_host_node_cpu_gate_wait_ns.fetch_add(
       wait_ns, std::memory_order_relaxed);
   if (wait_ns >= 50000 && qwen4exp_host_node_timing_enabled()) {
-    LOG_INFO("[DIAG-SCHEDULER] CPU split blocked for %.3f ms "
+    LOG_DEBUG("[DIAG-SCHEDULER] CPU split blocked for %.3f ms "
              "waiting on host-node\n",
              static_cast<double>(wait_ns) / 1000000.0);
   }
@@ -512,7 +512,7 @@ void CUDART_CB qwen4exp_cuda_host_node_callback(void *user_data) {
         std::fill_n(ctx->host_output,
                     ctx->output_bytes / sizeof(float), 0.0f);
       } else if (qwen4exp_host_node_timing_enabled()) {
-        LOG_INFO("[QWEN4EXP-PARTIAL-CLASSIFY] layer=%d routes=%zu "
+        LOG_DEBUG("[QWEN4EXP-PARTIAL-CLASSIFY] layer=%d routes=%zu "
                  "resident=%zu staged=%zu cpu=%zu cpu_compute=%s "
                  "generation=%llu\n",
                  ctx->layer_index, ctx->route_classification.size(),

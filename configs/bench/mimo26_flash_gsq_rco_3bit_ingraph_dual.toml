@@ -12,7 +12,7 @@ temperature = 0.0
 top_p = 1.0
 enable_thinking = false
 reasoning_effort = "low"
-mtp_enabled = false
+spec_type = "none"
 prompt_cache = false
 log_level = "INFO"
 

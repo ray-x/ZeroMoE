@@ -281,7 +281,7 @@ bool test_gdn_conv_fused() {
 // suspicious exact stride-4 expert-ID pattern (e292,e288,e284,...), pointing
 // at a buffer-aliasing/overwrite bug rather than the missing-sync race first
 // suspected (that race was real too -- see run()'s own ggml_backend_synchronize
-// fix -- but re-testing after it still aborts under trace_abort_on_nan).
+// fix -- but re-testing after it still reports the non-finite tensor.
 // This test calls ensure_layer()+run() across MANY synthetic "layers" in a
 // loop (mimicking the real model's per-layer weight-swap pattern) checking
 // EVERY iteration against a hand-computed CPU oracle, specifically to see

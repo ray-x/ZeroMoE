@@ -291,15 +291,15 @@ run_qwen38() {
 run_glm53flash() {
   local log="$LOG_DIR/glm53flash.$STAMP.log" eng="$LOG_DIR/glm53flash.$STAMP.engine.log" rc=0
   echo "--- glm53flash: wholelayer8, 150 tokens (single 3090) ---"
-  echo "    metric: steady median (TOKEN-LOOP-DIAG, steps >= 20); baseline 7.275, floor 6.98"
+  echo "    metric: steady median from DEBUG token timing (steps >= 20); baseline 7.275, floor 6.98"
   echo "Explain the difference between CPU and GPU architecture in terms of parallelism, memory hierarchy and scheduling, in detail." \
     | env CUDA_VISIBLE_DEVICES=0 \
         ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512 ZEROMOE_GLM5NEXT_CPU_THREADS=6 \
-        ZEROMOE_TOKEN_LOOP_DIAG=1 \
-        scripts/run_capped.sh -- "$BIN" \
+        \
+        scripts/run_capped.sh -- "$BIN" --verbosity 5 \
         --config configs/bench/glm53flash_AJ_IQ2XXS_wholelayer8_cpu.toml \
-        --log-path "$eng" \
-        --temp 0 --ngen 150 --force-start > "$log" 2>&1 || rc=$?
+        --log-file "$eng" \
+        --temp 0 --predict 150 --force-start > "$log" 2>&1 || rc=$?
   report glm53flash "$(grab_metric glm53flash "$eng")" "$rc" "$log" "$(grab_tokens "$eng")" 150
 }
 
@@ -352,7 +352,7 @@ PY
         --config "$config" \
         --graph-offload-ddr-gib 100 \
         --graph-offload-usage-file "$PWD/bench/profiles/mimo26_combined.usage" \
-        --log-path "$eng" --temp 0 --ngen 64 > "$log" 2>&1 || rc=$?
+        --log-file "$eng" --temp 0 --predict 64 > "$log" 2>&1 || rc=$?
   local before=$FAIL
   report mimo26 "$(grab_rate "$eng")" "$rc" "$log" "$(grab_tokens "$eng")" 64
   (( FAIL > before )) && return
@@ -382,10 +382,10 @@ run_dsv41() {
   echo "--- dsv41: DNS prompt, 64 tokens (dual GPU) ---"
   echo "Explain what DNS is and how a domain name gets resolved to an IP address." \
     | env CUDA_VISIBLE_DEVICES=0,1 \
-        scripts/run_capped.sh -- "$BIN" \
+        scripts/run_capped.sh -- "$BIN" --verbosity 5 \
         --config configs/bench/deepseek_v41_100gib_ddr_17gib_vram_dual_gpu.toml \
-        --log-path "$eng" \
-        --temp 0 --ngen 64 --force-start > "$log" 2>&1 || rc=$?
+        --log-file "$eng" \
+        --temp 0 --predict 64 --force-start > "$log" 2>&1 || rc=$?
   report dsv41 "$(grab_rate "$eng")" "$rc" "$log" "$(grab_tokens "$eng")" 64
 }
 

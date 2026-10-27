@@ -50,7 +50,7 @@ def make_config(base: str, path: Path, log: Path, mode: str,
     lines = base.splitlines()
     if mode == "plain":
         lines = [line for line in lines
-                 if not re.match(r"^\s*mtp_[A-Za-z0-9_]+\s*=", line)]
+                 if not re.match(r"^\s*(?:mtp_[A-Za-z0-9_]+|spec_type|spec_draft_[A-Za-z0-9_]+)\s*=", line)]
     text = "\n".join(lines) + "\n"
     text = set_root_key(text, "log_path", json.dumps(str(log.resolve())))
     text = set_root_key(text, "max_new_tokens", str(tokens))
@@ -60,10 +60,10 @@ def make_config(base: str, path: Path, log: Path, mode: str,
     if context is not None:
         text = set_root_key(text, "context_size", str(context))
     if mode == "mtp":
-        text = set_root_key(text, "mtp_enabled", "true")
+        text = set_root_key(text, "spec_type", json.dumps("draft-mtp"))
         text = set_root_key(text, "mtp_graph", "true")
-        text = set_root_key(text, "mtp_draft_tokens", str(drafts))
-        text = set_root_key(text, "mtp_model_path", json.dumps(str(mtp_model.resolve())))
+        text = set_root_key(text, "spec_draft_n_max", str(drafts))
+        text = set_root_key(text, "spec_draft_model", json.dumps(str(mtp_model.resolve())))
     return text
 
 
@@ -251,7 +251,6 @@ def main() -> int:
                     run_dir = prompt_out / f"rep-{rep+1:02d}" / mode
                     run_dir.mkdir(parents=True)
                     env = base_env.copy()
-                    if mode == "mtp": env["ZEROMOE_MTP_PROFILE"] = "1"
                     log = run_dir / "engine.log"
                     stdout = run_dir / "stdout.txt"
                     token_file = run_dir / "generated.tokens"

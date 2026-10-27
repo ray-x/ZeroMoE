@@ -8,7 +8,7 @@
 # (one triplet per layer, for the LAST token of the prefill batch).
 #
 # The [TRACE] lines are gated on log_level VERBOSE (the norm is only even
-# computed at that level), so --log-level VERBOSE is required. If your config
+# computed at that level), so --verbosity 4 is required. If your config
 # file forces a different log_level, this CLI flag must win — if no TRACE lines
 # appear in the output, check the config isn't pinning log_level below VERBOSE.
 set -euo pipefail
@@ -18,12 +18,12 @@ BINARY="${ZEROMOE_BIN:-./build/zeromoe}"
 PROMPT="${1:-Hello}"
 OUT="${2:-ms_trace.log}"
 
-# --ngen 1 : generate one token, then stdin EOF exits the REPL cleanly.
+# --predict 1 : generate one token, then stdin EOF exits the REPL cleanly.
 # --temp 0 : greedy / argmax — deterministic, no sampling noise.
 # The diff script takes the FIRST occurrence of each (layer, stage), i.e. the
 # prefill pass, so the single decode step's trace lines are ignored.
 printf '%s\n' "$PROMPT" | "$BINARY" --config "$CONFIG" \
-    --ngen 1 --temp 0 --log-level VERBOSE --log-path "$OUT" >&2
+    --predict 1 --temp 0 --verbosity 4 --log-file "$OUT" >&2
 
 n=$(grep -c 'TRACE l=' "$OUT" || true)
 echo "ZeroMoE trace -> $OUT ($n trace lines)" >&2

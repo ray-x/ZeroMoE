@@ -30,24 +30,6 @@ bool type_ok(uint32_t t) {
          ggml_is_quantized(g);
 }
 
-// Diagnostic only.  The device handoff path is intended to remain fully
-// asynchronous, but this switch lets us distinguish a graph lifetime/reuse
-// race from a bad GDN graph or HC consumer without changing the default
-// runtime behaviour.
-bool debug_sync_full_gdn() {
-  static const bool enabled = [] {
-    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_DEBUG_SYNC_FULL_GDN");
-  }();
-  return enabled;
-}
-
-bool debug_device_sync_full_gdn() {
-  static const bool enabled = [] {
-    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_DEBUG_DEVICE_SYNC_FULL_GDN");
-  }();
-  return enabled;
-}
-
 bool gdn_diag_enabled() {
   static const bool enabled = [] {
     const char *v = zeromoe::graphcfg::env("ZEROMOE_GDN_DIAG_DUMP");
@@ -1463,17 +1445,7 @@ bool GgmlGdnProjRunner::run_full_device_impl(
     // This is the only host wait in the ring. With eight slots it can happen
     // at most once per eight GDN layers, allowing the device pipeline to fill
     // instead of draining at every layer boundary.
-    if (debug_device_sync_full_gdn()) {
-      const cudaError_t e = cudaDeviceSynchronize();
-      if (e != cudaSuccess) {
-        LOG_ERROR("[GGML-GDN-FULL] diagnostic device synchronize failed: %s\n",
-                  cudaGetErrorString(e));
-        ggml_free(ctx);
-        return false;
-      }
-    } else {
-      ggml_backend_event_synchronize((ggml_backend_event_t)slot.done_event);
-    }
+    ggml_backend_event_synchronize((ggml_backend_event_t)slot.done_event);
     slot.in_flight = false;
   }
   if (!slot.galloc ||
@@ -1544,20 +1516,6 @@ bool GgmlGdnProjRunner::run_full_device_impl(
   ggml_backend_event_record((ggml_backend_event_t)slot.done_event,
                             (ggml_backend_t)backend_);
   slot.in_flight = true;
-  if (debug_sync_full_gdn()) {
-    ggml_backend_synchronize((ggml_backend_t)backend_);
-    slot.in_flight = false;
-  }
-  if (debug_device_sync_full_gdn()) {
-    const cudaError_t e = cudaDeviceSynchronize();
-    if (e != cudaSuccess) {
-      LOG_ERROR("[GGML-GDN-FULL] diagnostic device synchronize failed: %s\n",
-                cudaGetErrorString(e));
-      ggml_free(ctx);
-      return false;
-    }
-    slot.in_flight = false;
-  }
   if (diag) {
     // The extra roots make these reads valid even though the ordinary path
     // keeps the graph asynchronous and returns the device output immediately.

@@ -43,5 +43,5 @@ printf '%s\n:q\n' "$PROMPT" | env \
   ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512 ZEROMOE_GLM5NEXT_CPU_THREADS=8 \
   CUDA_VISIBLE_DEVICES=0 ZEROMOE_BENCH_IGNORE_STOP=1 "$@" \
   systemd-run --user --scope -q -p MemoryMax=${GLM_MEMMAX:-80G} -p MemorySwapMax=0 \
-  "$bin" --config "$out/$tag.toml" --ngen "${NGEN:-48}" > "$out/$tag.stdout" 2>&1
+  "$bin" --config "$out/$tag.toml" --predict "${NGEN:-48}" > "$out/$tag.stdout" 2>&1
 echo "exit=$?"; grep -h 'decode=' "$out/$tag.engine.log" | tail -1 | sed -E 's/.*(decode=[0-9.]+ tok\/s).*/\1/'

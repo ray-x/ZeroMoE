@@ -59,7 +59,7 @@ class GgmlMoeTransferManager {
   bool backend_weight_buffer_in_use_[kWeightBuffers] = {};
   int backend_weight_event_next_ = 0;
   int weight_buffer_index_ = 0;
-  bool backend_stream_copies_ = false;
+  static constexpr bool backend_stream_copies_ = false;
   int weight_buffer_count_ = 1;
   bool raw_d2d_pending_ = false;
   bool batch_d2d_unpack_ = false;

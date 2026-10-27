@@ -114,7 +114,7 @@ bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
     std::map<std::string, std::pair<double, int>> agg;
     ggml_backend_sched_t sched = nullptr;
   } op;
-  const bool op_prof_on = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_OP_PROFILE") != nullptr;
+  const bool op_prof_on = Logger::instance().would_log(LogLevel::DEBUG);
   if (op_prof_on) {
     // Debug: per-op wall time, attributed to the op that just finished (the callback also splits the graph per node).
     ggml_backend_sched_set_eval_callback(

@@ -179,7 +179,6 @@ bool glm_mtp_forward(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
   if (S == 1 && pos_base == 0 && gdn_full_ggml())
     GgmlGdnProjRunner::instance().reset_full_device_states();
   if (S == 1)
-    RAMSafetyManager::set_current_decode_token_idx((uint64_t)pos_base);
   const int layer_idx = c.n_layers;
   if (fam == ModelFamily::GLM5NEXT && glm5next_is_kda_layer(c, layer_idx)) {
     return false; // graph_initializer rejects this, keep the runtime guard too
@@ -271,11 +270,11 @@ bool glm_mtp_forward(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
   // DIAGNOSTIC (2026-09-09): per-call L2 norms through the NextN block's own
   // residual stream, added while chasing an abnormally low MTP acceptance
   // rate. Compares directly against the real trunk's own [TRACE-HIDDEN]
-  // norms (layers_forward_gguf, same file) at trace_filter="MLA,TRACE-
+  // norms (layers_forward_gguf, same file) at verbose log level.
   // HIDDEN" -- a norm wildly out of the real layers' own range would
   // localize the bug to this block specifically rather than the draft/
   // verify math in mtp_speculative.cpp. Cheap (one sqrt-sum per call, S is
-  // always tiny here) and unconditional, no trace_filter gate, so it
+  // always tiny here) and unconditional, so it
   // survives into the next debugging session without a rebuild.
   // Matches layers_forward_gguf's own l2norm lambda EXACTLY (raw sqrt-sum,
   // not RMS) so these numbers are directly comparable against its
@@ -996,12 +995,6 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
   // for why active-layer promotion gates on this (2026-08-12).
   if (ram_mgr.vram_cache)
     ram_mgr.vram_cache->in_prefill = (S > 1);
-  // EngineConfig::ram_grace_period_tokens (2026-09-04): only advance the
-  // grace-period clock on a real single-token DECODE step, not a prefill
-  // batch -- see RAMSafetyManager::current_decode_token_idx_ref's own
-  // comment for why leaving it untouched during prefill is deliberate.
-  if (S == 1)
-    RAMSafetyManager::set_current_decode_token_idx((uint64_t)pos_base);
 
   // Measurement only (expert_fetch_tracker.hpp) -- one call to this
   // function IS one token's worth of processing (prefill's single S>1

@@ -80,7 +80,6 @@ def main():
         "ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS": "0",
         "ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING": "1",
         "ZEROMOE_QWEN_CPU_THREADS": str(args.threads),
-        "ZEROMOE_TOKEN_LOOP_DIAG": "1",
         "ZEROMOE_BENCH_IGNORE_STOP": "1",
     })
     env["GGML_CUDA_BF16_MMVF_CUBLAS"] = "1" if args.bf16_cublas else "0"
@@ -132,7 +131,7 @@ def main():
         started = time.monotonic()
         if not reuse:
             with (out / f"{tag}.stdout").open("w") as stdout:
-                subprocess.run([str(engine), "--config", str(cfg), "--ngen", str(args.ngen)],
+                subprocess.run([str(engine), "--verbosity", "5", "--config", str(cfg), "--predict", str(args.ngen)],
                                input=args.prompt + "\n:q\n", text=True, cwd=ROOT, env=runtime,
                                stdout=stdout, stderr=subprocess.STDOUT, check=True)
         contents = log.read_text()

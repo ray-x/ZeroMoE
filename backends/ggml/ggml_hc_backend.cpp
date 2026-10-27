@@ -69,22 +69,11 @@ bool dequant_q8_0_rows(const GgmlHcWeightRef &src,
   return true;
 }
 
-// Diagnostic only.  The normal path relies on the shared backend stream and
-// allocator events.  A full device barrier after each HC graph distinguishes
-// a missing dependency/lifetime edge from a numerical problem in the HC math.
 bool debug_sync_hc() {
-  static const bool enabled = [] {
-    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_DEBUG_SYNC_HC");
-  }();
-  return qwen_hc_async_readback_override || enabled;
+  return qwen_hc_async_readback_override;
 }
 
-bool debug_check_hc_state() {
-  static const bool enabled = [] {
-    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_DEBUG_CHECK_HC_STATE");
-  }();
-  return enabled;
-}
+
 
 // Diagnostic only: force the S=1 HC pre graph to be rebuilt at every bracket.
 // This separates a persistent-graph retarget/replay problem from a numerical
@@ -105,10 +94,7 @@ bool hc_no_external_weights() {
 }
 
 bool debug_external_weight_rebind() {
-  static const bool enabled = [] {
-    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_HC_DIAG_EXTERNAL");
-  }();
-  return enabled;
+  return Logger::instance().would_log(LogLevel::DEBUG);
 }
 
 uint64_t fnv64_bytes(const void *data, size_t bytes) {
@@ -141,11 +127,6 @@ size_t count_nonfinite(const std::vector<T> &values) {
   return bad;
 }
 }  // namespace
-
-void set_ggml_hc_async_graph_reuse(bool) {
-  // HC graphs always keep the conservative per-graph event waits; the knob is
-  // consumed by the routed-MoE graphs (set_ggml_moe_async_graph_reuse).
-}
 
 void set_qwen_hc_async_readback(bool enabled) {
   qwen_hc_async_readback_override = enabled;
@@ -851,7 +832,7 @@ bool GgmlHcRunner::ensure_weights(int layer, int sub_block,
       if (ggml_backend_buffer_init_tensor(t->buffer, t) != GGML_STATUS_SUCCESS)
         return;
       if (debug_external_weight_rebind() && old != t->data) {
-        LOG_INFO("[GGML-HC-EXT] rebind layer=%d sub=%d %s old=%p new=%p\n",
+        LOG_DEBUG("[GGML-HC-EXT] rebind layer=%d sub=%d %s old=%p new=%p\n",
                  layer, sub_block, name, old, t->data);
       }
     };
@@ -976,12 +957,12 @@ bool GgmlHcRunner::ensure_weights(int layer, int sub_block,
           const cudaError_t e = cudaMemcpy(copy.data(), t->data, bytes,
                                            cudaMemcpyDeviceToHost);
           if (e != cudaSuccess) {
-            LOG_INFO("[GGML-HC-EXT] %s copy failed: %s\n", name,
+            LOG_DEBUG("[GGML-HC-EXT] %s copy failed: %s\n", name,
                      cudaGetErrorString(e));
             cudaGetLastError();
             return;
           }
-          LOG_INFO("[GGML-HC-EXT] layer=0 sub=1 %s ptr=%p bytes=%zu "
+          LOG_DEBUG("[GGML-HC-EXT] layer=0 sub=1 %s ptr=%p bytes=%zu "
                    "host_fnv=0x%016llx device_fnv=0x%016llx\n",
                    name, t->data, bytes,
                    (unsigned long long)fnv64_bytes(ref.host_data,
@@ -1045,11 +1026,9 @@ bool GgmlHcRunner::ensure_weights(int layer, int sub_block,
   b.ready = true;
   const size_t weight_bytes = ggml_nbytes(tn) + ggml_nbytes(td) +
                               ggml_nbytes(tu) + ggml_nbytes(ti);
-  static const bool log_types = [] {
-    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_HC_DEBUG_TYPES");
-  }();
+  const bool log_types = Logger::instance().would_log(LogLevel::DEBUG);
   if (log_types) {
-    LOG_INFO("[GGML-HC-MEM] types: layer=%d sub=%d norm=%u down=%u up=%u "
+    LOG_DEBUG("[GGML-HC-MEM] types: layer=%d sub=%d norm=%u down=%u up=%u "
              "inject=%u external=%s\n",
              layer, sub_block, norm.type, (unsigned)down_ggml_type,
              (unsigned)up_ggml_type, inject.type,
@@ -1124,13 +1103,13 @@ bool GgmlHcRunner::pre_mix(int layer, int sub_block, int S, float *out_hidden,
                                              cudaMemcpyDeviceToHost)
                                 : sync;
       if (e == cudaSuccess) {
-        LOG_INFO("[GGML-HC-EXT] replay layer=0 sub=1 %s ptr=%p bytes=%zu "
+        LOG_DEBUG("[GGML-HC-EXT] replay layer=0 sub=1 %s ptr=%p bytes=%zu "
                  "fnv=0x%016llx nb1=%zu alloc=%zu\n",
                  name, t->data, bytes,
                  (unsigned long long)fnv64_bytes(copy.data(), bytes),
                  t->nb[1], ggml_backend_buft_get_alloc_size(t->buffer->buft, t));
       } else {
-        LOG_INFO("[GGML-HC-EXT] replay layer=0 sub=1 %s copy failed: %s\n",
+        LOG_DEBUG("[GGML-HC-EXT] replay layer=0 sub=1 %s copy failed: %s\n",
                  name, cudaGetErrorString(e));
         cudaGetLastError();
       }
@@ -1139,14 +1118,6 @@ bool GgmlHcRunner::pre_mix(int layer, int sub_block, int S, float *out_hidden,
     log_replay_hash("down", b.down);
     log_replay_hash("up", b.up);
     log_replay_hash("inject", b.inject);
-  }
-  if (S == 1) {
-    // In Qwen device-HC decode, GgmlMoeRunner's direct-input optimization
-    // aliases its reusable graph input to t_mixed_.  The previous layer's
-    // MoE graph may still be reading that tensor when this pre-mix graph is
-    // about to overwrite it.  Publish the dependency on the shared backend
-    // stream instead of synchronizing the host at every layer.
-    GgmlMoeRunner::queue_input_reuse_dependency();
   }
   // A Qwen CPU-routed layer may have published the previous HC update from
   // CUDA stream 0 (the fused post-combine path below). Import that fence into
@@ -1257,40 +1228,7 @@ bool GgmlHcRunner::pre_mix(int layer, int sub_block, int S, float *out_hidden,
   }
   if (debug_sync_hc())
     ggml_backend_synchronize((ggml_backend_t)backend_);
-  if (debug_check_hc_state()) {
-    cudaDeviceSynchronize();
-    static thread_local std::vector<float> check;
-    const size_t n = (size_t)S * d_model_;
-    check.resize(n);
-    const cudaError_t e = cudaMemcpy(
-        check.data(), ((ggml_tensor *)t_mixed_)->data,
-        n * sizeof(float), cudaMemcpyDeviceToHost);
-    double max_abs = 0.0;
-    if (e == cudaSuccess) {
-      for (float v : check) {
-        if (std::isfinite(v)) max_abs = std::max(max_abs, std::abs((double)v));
-      }
-    }
-    LOG_INFO("[GGML-HC-DEBUG] pre layer=%d sub=%d finite=%zu/%zu bad=%zu\n",
-             layer, sub_block, e == cudaSuccess ? n - count_nonfinite(check) : 0,
-             n, e == cudaSuccess ? count_nonfinite(check) : n);
-    LOG_INFO("[GGML-HC-DEBUG] pre layer=%d sub=%d max_abs=%g\n", layer,
-             sub_block, max_abs);
-    static thread_local std::vector<float> inject_check;
-    const size_t inject_n = (size_t)S * hc_;
-    inject_check.resize(inject_n);
-    const cudaError_t inject_e = cudaMemcpy(
-        inject_check.data(), ((ggml_tensor *)t_inject_)->data,
-        inject_n * sizeof(float), cudaMemcpyDeviceToHost);
-    LOG_INFO("[GGML-HC-DEBUG] inject layer=%d sub=%d finite=%zu/%zu bad=%zu\n",
-             layer, sub_block,
-             inject_e == cudaSuccess ? inject_n - count_nonfinite(inject_check) : 0,
-             inject_n,
-             inject_e == cudaSuccess ? count_nonfinite(inject_check) : inject_n);
-    if (e != cudaSuccess) {
-      return false;
-    }
-  }
+
   if (out_hidden) {
     const size_t bytes = (size_t)S * d_model_ * sizeof(float);
     if (qwen_hc_async_readback() &&
@@ -1549,22 +1487,7 @@ bool GgmlHcRunner::post_combine_impl(int layer, int sub_block, int S,
     if (!src_view) {
       return false;
     }
-    if (debug_check_hc_state()) {
-      cudaDeviceSynchronize();
-      static thread_local std::vector<float> source_check;
-      const size_t n = (size_t)S * d_model_;
-      source_check.resize(n);
-      const cudaError_t e = cudaMemcpy(
-          source_check.data(), src_view->data, n * sizeof(float),
-          cudaMemcpyDeviceToHost);
-      LOG_INFO("[GGML-HC-DEBUG] input layer=%d sub=%d finite=%zu/%zu bad=%zu\n",
-               layer, sub_block,
-               e == cudaSuccess ? n - count_nonfinite(source_check) : 0,
-               n, e == cudaSuccess ? count_nonfinite(source_check) : n);
-      if (e != cudaSuccess) {
-        return false;
-      }
-    }
+
     ggml_backend_tensor_copy_async((ggml_backend_t)backend_,
                                    (ggml_backend_t)backend_, src_view,
                                    so_flat);
@@ -1581,27 +1504,12 @@ bool GgmlHcRunner::post_combine_impl(int layer, int sub_block, int S,
   post_fused_in_flight_ = false;
   if (debug_sync_hc())
     ggml_backend_synchronize((ggml_backend_t)backend_);
-  if (debug_check_hc_state()) {
-    cudaDeviceSynchronize();
-    static thread_local std::vector<float> check;
-    const size_t n = (size_t)S * hc_ * d_model_;
-    check.resize(n);
-    const cudaError_t e = cudaMemcpy(
-        check.data(), ((ggml_tensor *)t_streams_)->data,
-        n * sizeof(float), cudaMemcpyDeviceToHost);
-    LOG_INFO("[GGML-HC-DEBUG] post layer=%d sub=%d finite=%zu/%zu bad=%zu\n",
-             layer, sub_block, e == cudaSuccess ? n - count_nonfinite(check) : 0,
-             n, e == cudaSuccess ? count_nonfinite(check) : n);
-    if (e != cudaSuccess) {
-      return false;
-    }
-  }
+
   return true;
 }
 
 #else  // !ZEROMOE_USE_GGML_CUDA
 
-void set_ggml_hc_async_graph_reuse(bool) {}
 void set_qwen_hc_async_readback(bool) {}
 
 bool GgmlHcRunner::compiled_in() { return false; }

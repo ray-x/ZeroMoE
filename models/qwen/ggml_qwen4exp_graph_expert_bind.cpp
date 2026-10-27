@@ -311,68 +311,6 @@ bool bind_device_expert_gather(FullGraph &g, ggml_tensor *t,
   return true;
 }
 
-// Projection-compact counterpart of bind_device_expert_gather(). Gate and up
-// are separate host planes, so copy the two source slices into each compact
-// VRAM expert record. This is a startup-only graph construction operation; it
-// avoids rebuilding a large interleaved DDR copy merely to preserve the GPU
-// gate/up fusion.
-// Uniform-stride counterpart to bind_device_expert_gather_gate_up() below --
-// same interleaved-destination contract (dst holds [gate_e|up_e] per expert,
-// compact), but the two sources are each one uniform-stride run
-// (gate_base+e*gate_stride, up_base+e*up_stride) rather than arbitrary
-// per-expert pointers, so each plane's whole transfer is one cudaMemcpy2D
-// call instead of n_experts separate ones (same rationale as
-// bind_device_expert_strided() above -- measured real win on this model's
-// expert count).
-bool bind_device_expert_strided_gate_up(FullGraph &g, ggml_tensor *t,
-                                        const void *gate_base,
-                                        size_t gate_stride, size_t gate_bytes,
-                                        const void *up_base, size_t up_stride,
-                                        size_t up_bytes, int n_experts) {
-  if (!g.expert.buffer || !t || !gate_base || !up_base ||
-      gate_bytes == 0 || up_bytes == 0 || n_experts <= 0 ||
-      gate_stride < gate_bytes || up_stride < up_bytes ||
-      gate_bytes > SIZE_MAX - up_bytes)
-    return false;
-  const size_t per_expert_bytes = gate_bytes + up_bytes;
-  if (static_cast<size_t>(n_experts) > SIZE_MAX / per_expert_bytes)
-    return false;
-  const size_t total_bytes =
-      per_expert_bytes * static_cast<size_t>(n_experts);
-  if (total_bytes < ggml_nbytes(t))
-    return false;
-  const std::string key =
-      "strided_gate_up:" + expert_ptr_text(gate_base) + ":" +
-      std::to_string(gate_stride) + ":" + std::to_string(gate_bytes) + ":" +
-      expert_ptr_text(up_base) + ":" + std::to_string(up_stride) +
-      ":" + std::to_string(up_bytes) + ":" + std::to_string(n_experts);
-  void *addr = nullptr;
-  bool new_allocation = false;
-  if (!bind_or_allocate_expert(g, t, key, &addr, &new_allocation))
-    return false;
-  if (!new_allocation)
-    return true;
-  const auto t_memcpy_start = std::chrono::steady_clock::now();
-  cudaError_t err =
-      cudaMemcpy2D(addr, per_expert_bytes, gate_base, gate_stride, gate_bytes,
-                  static_cast<size_t>(n_experts), cudaMemcpyHostToDevice);
-  if (err == cudaSuccess)
-    err = cudaMemcpy2D(static_cast<uint8_t *>(addr) + gate_bytes,
-                       per_expert_bytes, up_base, up_stride, up_bytes,
-                       static_cast<size_t>(n_experts), cudaMemcpyHostToDevice);
-  g.expert_upload_ms_total += std::chrono::duration<double, std::milli>(
-                                  std::chrono::steady_clock::now() -
-                                  t_memcpy_start)
-                                  .count();
-  ++g.expert_upload_calls;
-  if (err != cudaSuccess) {
-    LOG_ERROR("[GGML-QWEN-FULL] compact gate/up strided upload failed: %s\n",
-              cudaGetErrorString(err));
-    return false;
-  }
-  return true;
-}
-
 ggml_tensor *load_full_weight(FullGraph &g, ggml_context *ctx,
                               const std::string &name,
                               bool device_resident)  {
@@ -425,14 +363,8 @@ ggml_tensor *load_full_weight(FullGraph &g, ggml_context *ctx,
   // Fixed by transferring straight from the arena into VRAM via
   // bind_device_expert_strided() (one cudaMemcpy2D per tensor, since the
   // arena's per-plane expert stride is uniform), skipping the host
-  // round-trip entirely instead of just skipping the disk read. A first cut
-  // used a per-expert cudaMemcpy loop (matching expert_gate_up_weight()'s
-  // pre-existing bind_device_expert_gather() mechanism) but measured WORSE
-  // than the disk-read baseline at this model's expert count -- n_experts
-  // separate CUDA API calls cost more than the read they replaced;
-  // expert_gate_up_weight()'s own device_resident branch had the same
-  // per-call-overhead problem and was converted to
-  // bind_device_expert_strided()/bind_device_expert_strided_gate_up() too.
+  // round-trip entirely instead of just skipping the disk read. The uniform
+  // arena stride lets this use one cudaMemcpy2D per tensor.
   {
     void *ram_ptr = nullptr;
     size_t ram_bytes = 0;
@@ -632,107 +564,6 @@ ggml_tensor *expert_weight(FullGraph &g, ggml_context *ctx, int layer,
                            const char *stem) {
   return load_full_weight(g, ctx, "blk." + std::to_string(layer) + "." + stem,
                           graph_expert_projection_resident(g, layer, stem));
-}
-
-// When gate and up have the same quantized row layout, expose them as one
-// [cols, 2*rows, n_expert] MUL_MAT_ID weight. GPU graph layers retain this
-// merge by gathering the two compact host planes into their final VRAM tensor.
-// CPU graph layers use separate views: gate and up are separate planes in the
-// projection-compact arena, and making a merged host tensor would recreate the
-// large duplicate this layout is intended to remove.
-ggml_tensor *expert_gate_up_weight(FullGraph &g, ggml_context *ctx, int layer,
-                                   bool device_resident) {
-  const std::string base = "blk." + std::to_string(layer) + ".";
-  const GGUFTensor *gate = model_tensor(
-      *g.engine, base + "ffn_gate_exps.weight");
-  const GGUFTensor *up =
-      model_tensor(*g.engine, base + "ffn_up_exps.weight");
-  const int n_experts = g.engine->model_file.architecture_config.n_experts;
-  if (!gate || !up || n_experts <= 0 || gate->type != up->type ||
-      gate->shape.size() != 3 || up->shape != gate->shape ||
-      gate->shape[2] != static_cast<uint64_t>(n_experts) ||
-      gate->size_bytes == 0 || gate->size_bytes != up->size_bytes ||
-      gate->size_bytes % static_cast<uint64_t>(n_experts) != 0)
-    return nullptr;
-
-  const auto *arena = g.engine->graph_ram_arena(layer);
-  if (!arena || !g.engine->graph_ram_layer_ready(layer) || !arena->base ||
-      arena->n_experts != n_experts || arena->gate_bytes == 0 ||
-      arena->gate_bytes != arena->up_bytes ||
-      arena->gate_bytes !=
-          static_cast<size_t>(gate->size_bytes) /
-              static_cast<size_t>(n_experts) ||
-      arena->up_bytes !=
-              static_cast<size_t>(up->size_bytes) /
-              static_cast<size_t>(n_experts) ||
-      arena->gate_bytes > SIZE_MAX - arena->up_bytes)
-    return nullptr;
-
-  if (!device_resident && arena->projection_compact)
-    return nullptr;
-
-  const size_t plane_bytes = arena->gate_bytes + arena->up_bytes;
-  if (plane_bytes == 0)
-    return nullptr;
-  const size_t legacy_view_bytes =
-      arena->stride != 0 &&
-              static_cast<size_t>(n_experts - 1) <=
-                  (SIZE_MAX - plane_bytes) / arena->stride
-          ? arena->stride * static_cast<size_t>(n_experts - 1) + plane_bytes
-          : 0;
-  if (!arena->projection_compact &&
-      (arena->stride < plane_bytes || legacy_view_bytes == 0 ||
-       legacy_view_bytes > arena->bytes))
-    return nullptr;
-
-  std::vector<int64_t> shape;
-  shape.reserve(gate->shape.size());
-  for (uint64_t d : gate->shape)
-    shape.push_back(static_cast<int64_t>(d));
-  if (shape[1] > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) /
-                       2)
-    return nullptr;
-  shape[1] *= 2;
-  ggml_tensor *t = new_tensor(ctx, static_cast<ggml_type>(gate->type), shape);
-  if (!t || t->ne[0] != static_cast<int64_t>(gate->shape[0]) ||
-      t->ne[1] != static_cast<int64_t>(gate->shape[1]) * 2 ||
-      t->ne[2] != n_experts)
-    return nullptr;
-
-  if (device_resident) {
-    // Keep ggml's default compact expert-axis strides here; using a DDR
-    // arena stride on this descriptor would make ggml_nbytes(t) include the
-    // skipped down plane/padding and reject the valid VRAM allocation.
-    if (arena->projection_compact) {
-      if (!bind_device_expert_strided_gate_up(
-              g, t, arena->base + arena->gate_offset, arena->gate_stride,
-              arena->gate_bytes, arena->base + arena->up_offset,
-              arena->up_stride, arena->up_bytes, n_experts))
-        return nullptr;
-    } else {
-      // Uniform expert-axis stride -- same shape bind_device_expert_strided()
-      // (load_full_weight()'s own device_resident arena path) already
-      // handles with one cudaMemcpy2D instead of an n_experts-call loop.
-      if (!bind_device_expert_strided(g, t, arena->base, arena->stride,
-                                      plane_bytes, n_experts))
-        return nullptr;
-    }
-  } else {
-    // The host view aliases the interleaved DDR arena, so its expert-axis
-    // stride must skip the following down projection and any alignment
-    // padding in each source slab.
-    t->nb[2] = arena->stride;
-    t->nb[3] = arena->stride * static_cast<size_t>(n_experts);
-    if (!bind_host(g, t, arena->base, legacy_view_bytes,
-                   GGML_BACKEND_BUFFER_USAGE_WEIGHTS))
-      return nullptr;
-    g.host_ram_alias_bytes += arena->bytes;
-    ++g.host_ram_alias_tensors;
-  }
-  ggml_set_name(t, (base + "ffn_gate_up_exps.weight").c_str());
-  if (!device_resident)
-    bind_host_expert_scheduler_backend(g, t);
-  return t;
 }
 
 // Builds the [cols,rows,M] VRAM-resident tensor for a genuinely split layer

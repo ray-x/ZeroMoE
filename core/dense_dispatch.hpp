@@ -25,17 +25,16 @@
 #include <mutex>
 #include <omp.h>  // omp_get_max_threads -- attn_score_threads()'s fallback
 
-// Diagnostic kill-switch: forces every dense matmul, norm, and expert FFN onto
+// Runtime CPU mode: forces every dense matmul, norm, and expert FFN onto
 // the CPU reference path (libggml dequant + f32 matmul), bypassing ALL GPU
-// dispatch. Enabled by EITHER the ZEROMOE_CPU_ONLY env var OR a TOML
-// `cpu_only = true` (main.cpp calls enable_cpu_only_mode() after config load).
+// dispatch. Enabled by the typed TOML `cpu_only = true` setting.
 // Used to isolate whether garbage output comes from a GPU-side issue
 // (async-upload race, device/stream, offload corruption, a fused kernel) vs a
 // CPU math bug. If output becomes coherent with this set, the GPU path is the
 // culprit; if still garbage, the bug is in the CPU math (attention/MoE/
 // embedding) and is independent of where compute runs.
 inline bool& cpu_only_flag() {
-    static bool v = (zeromoe::graphcfg::env("ZEROMOE_CPU_ONLY") != nullptr);
+    static bool v = false;
     return v;
 }
 inline bool cpu_only_mode() { return cpu_only_flag(); }
@@ -1248,10 +1247,8 @@ inline void dense_proj(StreamingEngine& engine, const std::string& wname,
   const bool ple_projection =
       wname == "blk.1.ple_key.weight" ||
       wname == "blk.1.ple_value.weight";
-  const char* ple_diag_env =
-      zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PLE_PATH_DIAG");
-  const bool ple_path_diag = ple_projection && ple_diag_env &&
-                             ple_diag_env[0] == '1';
+  const bool ple_path_diag = ple_projection &&
+      Logger::instance().would_log(LogLevel::DEBUG);
   const char* ple_cpu_env =
       zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PLE_FORCE_CPU");
   const bool ple_force_cpu = ple_path_diag && ple_cpu_env &&
@@ -1312,30 +1309,6 @@ inline void dense_proj(StreamingEngine& engine, const std::string& wname,
         LOG_ERROR("[DENSE] %s type=%u: CPU dequant unavailable — some outputs zeroed\n",
                   wname.c_str(), (unsigned)W.meta.type);
     }
-}
-
-// Narrow Qwen4Exp shared-expert bridge.  The normal dense_proj() contract is
-// intentionally unchanged: every call owns its activation upload.  These
-// helpers are used only by run_qwen4exp_shared_host() for the three
-// projections which read the same normed activation.  A false return means
-// "use dense_proj normally" (BF16 fast path, missing device tensor, or a
-// dispatch failure), never "the projection was completed".
-inline bool dense_upload_shared_input(StreamingEngine& engine,
-                                      const float* x, int S, int I) {
-    if (cpu_only_mode() || !engine.gpu || !x) return false;
-    return engine.gpu->dense_matmul_host_upload_input(x, S, I);
-}
-
-inline bool dense_proj_from_shared_input(StreamingEngine& engine,
-                                         const std::string& wname,
-                                         float* y, int S, int I, int O) {
-    auto it = engine.resident_layers.find(wname);
-    if (it == engine.resident_layers.end() || !it->second.host_ptr ||
-        cpu_only_mode() || !engine.gpu || !it->second.device_ptr ||
-        it->second.gpu_fast_ptr)
-        return false;
-    return engine.gpu->dense_matmul_host_reuse_input(
-        it->second.meta.type, it->second.device_ptr, y, S, I, O);
 }
 
 // F32 RMSNorm via GPU (norm weights are offloaded to VRAM), CPU rmsnorm fallback.

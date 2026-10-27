@@ -40,8 +40,8 @@ run() { # name rep
   done
   echo "$PROMPT" | env CUDA_VISIBLE_DEVICES=$GPU \
     ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0 \
-    ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 ZEROMOE_TOKEN_LOOP_DIAG=1 ZEROMOE_BENCH_IGNORE_STOP=1 \
-    ../moestream-build-upstream-master/moestream --config "$cfg" --ngen "$NGEN" > "logs/$tag.stdout" 2>&1
+    ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 ZEROMOE_BENCH_IGNORE_STOP=1 \
+    ../moestream-build-upstream-master/moestream --verbosity 5 --config "$cfg" --ngen "$NGEN" > "logs/$tag.stdout" 2>&1
   grep TOKEN-LOOP-DIAG "logs/$tag.engine.log" 2>/dev/null |
     sed -E 's/.*step=([0-9]+) iter_total=([0-9.]+)ms.*/\1 \2/' |
     awk -v n="$n" -v r="$r" -v expected="$((NGEN - 3))" '$1>=3{s+=$2;c++} END{ if(c==expected && s>0) printf "%s %s %.2f\n", n, r, 1000/(s/c); else {printf "%s %s incomplete: %d/%d timed steps\n", n, r, c, expected > "/dev/stderr"; exit 1} }'

@@ -263,7 +263,7 @@ struct Server::Impl {
         : backend(backend), model(std::move(model)), options(std::move(options)) {
         if (this->options.host != "127.0.0.1" && this->options.host != "::1" &&
             this->options.host != "localhost" && this->options.api_key.empty())
-            throw ApiError(400, "non-loopback binding requires ZEROMOE_API_KEY");
+            throw ApiError(400, "non-loopback binding requires --api-key or ZEROMOE_API_KEY");
         if (!this->options.queue_capacity || this->options.response_buffer_bytes < 4096 ||
             !this->options.body_limit_bytes || this->options.host.empty() ||
             this->options.timeout_seconds <= 0 || this->options.http_threads < 2 ||

@@ -926,7 +926,7 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       env_qwen4exp_host_node_enabled() &&
       g.engine->qwen4exp_cpu_offload_layer_enabled(layer) &&
       split_planned_for_layer && qwen4exp_host_node_timing_enabled()) {
-    LOG_INFO("[QWEN4EXP-HOST-NODE] layer=%d bypassed whole-layer marker "
+    LOG_DEBUG("[QWEN4EXP-HOST-NODE] layer=%d bypassed whole-layer marker "
              "because a static GPU hot/cold split is planned\n",
              layer);
   }

@@ -73,6 +73,7 @@ struct EngineConfig {
   std::string api_host = "127.0.0.1";
   int api_port = 8080;
   std::string api_model = "zeromoe";
+  std::string api_key;
   // Model paths
   std::string model_path; // Primary model GGUF (experts + architecture)
   std::string model_format = "gguf";
@@ -508,13 +509,14 @@ struct EngineConfig {
   // StreamingEngine::PromptStateCache. Default off.
   bool prompt_cache = false;
 
-  // Optional GLM5NEXT NextN/MTP speculative decoding.  The target trunk
+  // Optional GLM5NEXT NextN/MTP speculative decoding.  Public names follow
+  // llama.cpp: spec_type, spec_draft_model, spec_draft_n_max. The target trunk
   // remains authoritative; keep this disabled unless the model/config has a
   // validated draft block.
   bool mtp_enabled = false;
   int mtp_draft_tokens = 3;
-  // Qwen4Exp only: run MTP on the full-graph target with a graph-native draft
-  // and target-verified speculation (requires mtp_enabled and mtp_model_path).
+  // ZeroMoE-specific: Qwen4Exp MTP on the full-graph target with a
+  // graph-native draft (requires spec_type="draft-mtp").
   // Replaces the layered Qwen4ExpMtpSpeculator; never falls back to it.
   bool mtp_graph = false;
 
@@ -841,7 +843,7 @@ struct EngineConfig {
   // VERIFIED ON REAL HARDWARE, default flipped to true (2026-08-30): 2x2
   // real A/B on a 16-token prompt (freeze_usage_stats=true + a real
   // prefill_pin_file, so both sides read the identical frozen startup
-  // state -- no usage-file-drift confound between runs), --ngen 0 so only
+  // state -- no usage-file-drift confound between runs), --predict 0 so only
   // prefill is measured. Consistent, reproducible win both repeats:
   //   prefill wall   16.49s/16.62s -> 14.92s/14.88s  (~9% faster)
   //   tok/s          0.97/0.96     -> 1.07/1.08       (~11% higher)
@@ -1020,58 +1022,6 @@ struct EngineConfig {
   // Halve every stamp when a request ends, so a later prompt's real demand
   // can outrank an earlier prompt's stale stamps without a bulk purge.
   bool prefill_retention_decay = true;
-
-  // Grace period for a freshly-(re)loaded RAM-tier slot: for
-  // ram_grace_period_tokens DECODE tokens after a slot is genuinely
-  // loaded (not just re-hit), eviction_score gets +ram_grace_period_bonus
-  // added on top of its normal recency+frequency terms. Motivation, from
-  // a real 2026-09-04 investigation: RAMSafetyManager's own recency term
-  // (last_used_clock) is a raw operation-tick counter, not a token
-  // counter -- during a burst of many loads within ONE token (this
-  // model's multiple speculative predictors -- DEPTH-1, ATTN-PILOT,
-  // prefetch_pilot_k's wide hint-push -- can each trigger several RAM
-  // loads per layer transition), a slot loaded a few ticks ago can
-  // already look "stale" relative to slots loaded microseconds later in
-  // the SAME token, well before it ever got a real chance to be reused.
-  // A real run showed the RAM tier (5702-6740 slots) absorbing 5800-8100
-  // evictions across a single 56-token request -- close to a full,
-  // sometimes more-than-full, turnover within ONE request. This gives a
-  // freshly-loaded slot a token-counted (not tick-counted, so immune to
-  // intra-token burst effects) floor of protection instead.
-  //
-  // 0 (DEFAULT) = OFF, strict no-op: eviction_score is byte-identical to
-  // its pre-2026-09-04 form. Deliberately ADDITIVE, not a hard exemption
-  // (unlike ram_loading/ram_temp_pin_count/copy_still_pending, which DO
-  // hard-block eviction) -- a small per-layer pool (as few as 30-40
-  // slots) receiving 8+ speculative loads in one token could otherwise
-  // deadlock (every slot grace-protected, nothing left to evict) if this
-  // were a hard floor; additive-only means it strongly biases the
-  // ordering without ever making a slot un-evictable, matching this
-  // project's own established, repeatedly-validated "bias, don't block"
-  // philosophy (see prefill_retention_weight's own comment above).
-  // Scale reference: FREQ_BONUS_TICKS is 64 (one real cache hit).
-  //
-  // 2026-09-04 REAL A/B, TESTED AND NEGATIVE -- keep OFF. Same prompt,
-  // three arms (off / tokens=10,bonus=256 / tokens=20,bonus=1000 -- a 4x
-  // stronger dial): RAM tier evictions 5864 / 5859 / 5862, waste 42.1% /
-  // 42.3% / 42.2%, decode-only tok/s 1.109 / 1.112 / 1.104 -- all flat
-  // within noise, even at 4x the bonus and 2x the window. Root cause:
-  // this same session's RAM tier touched ~6045 DISTINCT experts against
-  // only 5702 total slots -- the working set already exceeds capacity,
-  // so a meaningful share of eviction is mathematically forced regardless
-  // of which slot a scoring bias picks as the victim first. This mirrors
-  // the 2026-08-27 dynamic-pin-swap finding for the VRAM active-layer
-  // pool above (also ruled out for the identical reason: "the real
-  // constraint is the working set itself being too large and too flat...
-  // not a targeting inefficiency a smarter algorithm could fix"). A
-  // grace period can only reorder WHO gets evicted, not reduce the total
-  // COUNT -- don't re-attempt this without first growing real capacity
-  // (host_ram_gb / ram_cache_layer_adaptive), which is the only lever
-  // that could actually change this math.
-  int ram_grace_period_tokens = 0;
-  // Bonus added to eviction_score while a slot is within its grace
-  // window. No effect if ram_grace_period_tokens <= 0.
-  int ram_grace_period_bonus = 0;
 
   // How many candidate experts the Phase 1 pilot router pushes as
   // speculative prefetch hints per layer transition (execution_layer.cpp's
@@ -1515,11 +1465,6 @@ struct EngineConfig {
   // (see bench/dsv41_pack_cold_mirror.py); every other expert reads from the
   // primary alone. Empty = the mirror is a complete copy.
   std::string mirror_coverage_file;
-
-  // Log every host RAM cache HIT for the MoE expert cache (high volume —
-  // one line per routed expert per token). MISS/LOAD and VRAM PROMOTE/READY
-  // events are always logged regardless of this flag since they're rare.
-  bool verbose_moe_log = false;
 
   // How many host-cache re-hits before triggering an async H2D promotion
   // into the GPU expert cache. Lower values promote earlier (lower latency),
@@ -2012,11 +1957,6 @@ struct EngineConfig {
   // host router for a clean A/B.
   bool moe_ggml_gpu_router = false;
 
-  // Qwen4Exp device pipeline validation switch. Enables stream-ordered reuse
-  // of the HC/MoE GGML workspaces after the producer/consumer chain has been
-  // queued on the shared backend. Keep false for conservative A/B runs.
-  bool ggml_async_graph_reuse = false;
-
   // GPU for the ggml MoE graph. -1 = auto (most free VRAM), which is usually
   // the WRONG card on this box -- see dense_dispatch.hpp's own accessor.
   int moe_ggml_device = -1;
@@ -2360,19 +2300,6 @@ struct EngineConfig {
   std::string log_path;
   std::string log_level = "INFO";
 
-  // Tensor-trace debugging (include/tensor_trace.hpp), a llama.cpp
-  // eval-callback analog for this engine's imperative forward pass.
-  // trace_filter is a comma-separated list of tags (e.g. "HC,MLA") matched
-  // as an anchored regex prefix against each VERBOSE trace call site's own
-  // tag ("HC", "MLA", "EXPERT-GPU", "SILU-TRACE-GPU", ...); empty (default)
-  // matches every tag, i.e. no filtering beyond log_level=VERBOSE itself.
-  // trace_abort_on_nan hard-aborts the process at the FIRST tensor a
-  // NaN/Inf checker flags, instead of logging an error and continuing --
-  // useful for stopping right where a numerical bug originates rather than
-  // scrolling through pages of downstream fallout.
-  std::string trace_filter;
-  bool trace_abort_on_nan = false;
-
   // GPU configuration
   std::vector<GpuConfig> gpus;
 
@@ -2596,6 +2523,18 @@ inline Document parse_file(const std::string &path) {
 // ============================================================
 inline bool EngineConfig::load(const std::string &path) {
   auto doc = toml::parse_file(path);
+  const std::pair<const char *, const char *> removed_spec_keys[] = {
+      {"mtp_enabled", "spec_type"},
+      {"mtp_model_path", "spec_draft_model"},
+      {"mtp_draft_tokens", "spec_draft_n_max"},
+  };
+  for (const auto &[old_key, new_key] : removed_spec_keys) {
+    if (doc.root.has(old_key)) {
+      std::cerr << "[CONFIG] " << old_key << " was renamed to " << new_key
+                << "\n";
+      return false;
+    }
+  }
   std::string settings_error;
   if (!zeromoe::graphsettings::collect_config(doc, graph_settings, settings_error)) {
     std::cerr << "[CONFIG] " << settings_error;
@@ -2638,7 +2577,7 @@ inline bool EngineConfig::load(const std::string &path) {
   exl3_cpu_expert_int8_vnni =
       doc.root.get_bool("exl3_cpu_expert_int8_vnni", exl3_cpu_expert_int8_vnni);
   dense_model_path = doc.root.get_str("dense_model_path");
-  mtp_model_path = doc.root.get_str("mtp_model_path");
+  mtp_model_path = doc.root.get_str("spec_draft_model");
   context_size = doc.root.get_int("context_size", context_size);
   max_new_tokens = doc.root.get_int("max_new_tokens", max_new_tokens);
   temperature = doc.root.get_float("temperature", temperature);
@@ -2764,20 +2703,6 @@ inline bool EngineConfig::load(const std::string &path) {
       doc.root.get_double("prefill_retention_peaky_cut", prefill_retention_peaky_cut);
   prefill_retention_decay =
       doc.root.get_bool("prefill_retention_decay", prefill_retention_decay);
-  ram_grace_period_tokens =
-      doc.root.get_int("ram_grace_period_tokens", ram_grace_period_tokens);
-  ram_grace_period_bonus =
-      doc.root.get_int("ram_grace_period_bonus", ram_grace_period_bonus);
-  if (ram_grace_period_tokens < 0) {
-    LOG_WARN("[CONFIG] ram_grace_period_tokens must be >= 0 (got %d) -- "
-             "clamping to 0 (feature off)\n", ram_grace_period_tokens);
-    ram_grace_period_tokens = 0;
-  }
-  if (ram_grace_period_bonus < 0) {
-    LOG_WARN("[CONFIG] ram_grace_period_bonus must be >= 0 (got %d) -- "
-             "clamping to 0\n", ram_grace_period_bonus);
-    ram_grace_period_bonus = 0;
-  }
   if (prefill_retention_weight < 0) {
     LOG_WARN("[CONFIG] prefill_retention_weight must be >= 0 (got %d) -- clamping to 0 "
              "(feature off)\n", prefill_retention_weight);
@@ -2991,9 +2916,20 @@ inline bool EngineConfig::load(const std::string &path) {
   if (qwen4exp_cpu_offload_ring_slots > 4)
     qwen4exp_cpu_offload_ring_slots = 4;
   prompt_cache = doc.root.get_bool("prompt_cache", prompt_cache);
-  mtp_enabled = doc.root.get_bool("mtp_enabled", mtp_enabled);
+  {
+    const std::string spec_type = doc.root.get_str("spec_type", "none");
+    if (spec_type == "none")
+      mtp_enabled = false;
+    else if (spec_type == "draft-mtp")
+      mtp_enabled = true;
+    else {
+      std::cerr << "[CONFIG] spec_type must be \"none\" or \"draft-mtp\" for this runtime\n";
+      return false;
+    }
+  }
   mtp_graph = doc.root.get_bool("mtp_graph", mtp_graph);
-  mtp_draft_tokens = (int)doc.root.get_int("mtp_draft_tokens", mtp_draft_tokens);
+  mtp_draft_tokens =
+      (int)doc.root.get_int("spec_draft_n_max", mtp_draft_tokens);
   if (mtp_draft_tokens < 1) mtp_draft_tokens = 1;
   if (mtp_draft_tokens > 8) {
     LOG_WARN("[CONFIG] mtp_draft_tokens=%d is too large for the bounded GLM "
@@ -3062,7 +2998,6 @@ inline bool EngineConfig::load(const std::string &path) {
       doc.root.get_bool("ram_pin_eager_preregister", ram_pin_eager_preregister);
   ram_preload_seed_hit_count = doc.root.get_bool(
       "ram_preload_seed_hit_count", ram_preload_seed_hit_count);
-  verbose_moe_log = doc.root.get_bool("verbose_moe_log", verbose_moe_log);
   promote_hit_threshold =
       doc.root.get_int("promote_hit_threshold", promote_hit_threshold);
   pin_threshold = doc.root.get_int("pin_threshold", pin_threshold);
@@ -3101,8 +3036,6 @@ inline bool EngineConfig::load(const std::string &path) {
       doc.root.get_bool("moe_ggml_planar_copies", moe_ggml_planar_copies);
   moe_ggml_gpu_router =
       doc.root.get_bool("moe_ggml_gpu_router", moe_ggml_gpu_router);
-  ggml_async_graph_reuse =
-      doc.root.get_bool("ggml_async_graph_reuse", ggml_async_graph_reuse);
   moe_ggml_device = (int)doc.root.get_int("moe_ggml_device", moe_ggml_device);
   hc_ggml = doc.root.get_bool("hc_ggml", hc_ggml);
 gdn_proj_ggml = doc.root.get_bool("gdn_proj_ggml", gdn_proj_ggml);
@@ -3219,9 +3152,6 @@ gdn_proj_ggml = doc.root.get_bool("gdn_proj_ggml", gdn_proj_ggml);
   reasoning_effort = doc.root.get_str("reasoning_effort", reasoning_effort);
   log_path = doc.root.get_str("log_path", log_path);
   log_level = doc.root.get_str("log_level", log_level);
-  trace_filter = doc.root.get_str("trace_filter", trace_filter);
-  trace_abort_on_nan =
-      doc.root.get_bool("trace_abort_on_nan", trace_abort_on_nan);
 
   for (auto &gt : doc.gpu_tables) {
     GpuConfig gc;
@@ -3693,13 +3623,7 @@ inline void EngineConfig::print() const {
            "(shares ram_vram_promote_dynamic_* tiers below, judged against "
            "ATTN-PILOT's own per-layer accuracy)\n";
   }
-  if (ram_grace_period_tokens > 0) {
-    LOG_STREAM_INFO()
-        << "[CONFIG] RAM-tier load grace period: " << ram_grace_period_tokens
-        << " decode token(s), +" << ram_grace_period_bonus
-        << " eviction_score bonus (additive bias, not a hard exemption -- "
-           "see ram_grace_period_tokens's own comment)\n";
-  }
+
   if (cpu_only)
     LOG_STREAM_INFO()
         << "[CONFIG] CPU-only mode: ON (all GPU dispatch disabled)\n";
@@ -4003,14 +3927,8 @@ inline void EngineConfig::print() const {
     LOG_STREAM_INFO()
         << "[CONFIG] Raw prompt mode: ON -- REPL will NOT apply the chat "
            "template, stdin content is tokenized verbatim\n";
-  LOG_STREAM_INFO() << "[CONFIG] Verbose MoE cache logging: "
-                    << (verbose_moe_log ? "on" : "off") << "\n";
   LOG_STREAM_INFO() << "[CONFIG] Log level: " << log_level << " | Log path: "
                     << (log_path.empty() ? "(stderr)" : log_path) << "\n";
-  LOG_STREAM_INFO() << "[CONFIG] Trace filter: "
-                    << (trace_filter.empty() ? "(all)" : trace_filter)
-                    << " | Trace abort-on-nan: "
-                    << (trace_abort_on_nan ? "on" : "off") << "\n";
   for (size_t i = 0; i < gpus.size(); ++i) {
     const auto &g = gpus[i];
     LOG_STREAM_INFO() << "[CONFIG] GPU " << g.device_id << " (" << g.name
@@ -4038,9 +3956,11 @@ model_path = "/models/GLM-5.2-UD-IQ2_M/"
 model_format = "gguf"       # "gguf" or "exl3"
 model_load_only = false      # EXL3 metadata/payload load smoke; no inference
 # dense_model_path = "/models/GLM-5.2-Q4_K/"  # optional: separate dense weights
-# mtp_model_path = "/models/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf"  # optional: a
+# spec_type = "none"           # or "draft-mtp"
+# spec_draft_model = "/models/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf"  # optional: a
 #   standalone "shared" MTP/NextN checkpoint (Qwen4Exp convention) -- omits
 #   token_embd.weight/output.weight, which are reused from model_path.
+# spec_draft_n_max = 3         # llama.cpp-compatible speculative draft length
 
 context_size   = 131072   # max context window (tokens)
 max_new_tokens = 4096
@@ -4416,7 +4336,6 @@ host_ram_gb    = 0
 # all MoE layers. 0 = automatic byte-aware capacity; host_ram_gb remains the
 # hard safety limit.
 ram_cache_total_experts = 0
-verbose_moe_log = false
 promote_hit_threshold = 1
 
 # Phase A VRAM expert residency, not reactive-only eviction.
@@ -4747,15 +4666,7 @@ active_layer_upload_worker_threads = 0
 log_level = "INFO"
 
 # Tensor-trace debugging (a llama.cpp eval-callback analog for this engine's
-# imperative forward pass). Requires log_level = "VERBOSE" to have any
-# effect. trace_filter narrows VERBOSE tensor-trace output to specific tags
-# (comma-separated, matched as an anchored prefix regex against each trace
-# call site's own tag, e.g. "HC", "MLA", "EXPERT-GPU", "SILU-TRACE-GPU") --
-# empty (default) shows every tag. trace_abort_on_nan hard-aborts the
-# process at the FIRST tensor a NaN/Inf checker flags, instead of logging
-# and continuing.
-# trace_filter = "HC,MLA"
-trace_abort_on_nan = false
+# imperative forward pass). Enable all registered trace tags with --verbosity 4.
 
 # GPU 0: Core Engine — Dense layers + KV cache
 [[gpus]]

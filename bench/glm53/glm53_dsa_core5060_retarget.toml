@@ -546,7 +546,6 @@ host_ram_gb = 100.0
 # THAT is the real lever to revisit if long-running popularity drift is the
 # concern, not this one. See pinned_vram_capacity's own comment.
 ram_pinned_budget_gb = 80.0
-verbose_moe_log      = false
 promote_hit_threshold = 6
 promote_h2d_threshold = 6
 

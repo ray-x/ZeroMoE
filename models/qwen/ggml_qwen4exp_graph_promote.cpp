@@ -10,7 +10,7 @@
 #include "moe_partial_route.hpp"
 #include "nvtx_range.hpp"
 #include <algorithm>
-#include <cstdio>
+#include <sstream>
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
 
@@ -106,14 +106,6 @@ struct PredictStats {
 };
 PredictStats g_pred;
 
-FILE *promo_trace_file() {
-  static FILE *f = [] {
-    const char *path = std::getenv("ZEROMOE_PROMO_TRACE");
-    return path && path[0] ? std::fopen(path, "w") : nullptr;
-  }();
-  return f;
-}
-
 }  // namespace
 
 // Call after a run has completed (device idle) and `tokens` of its tokens are committed.
@@ -136,18 +128,20 @@ void qwen4exp_promotion_step(FullGraph &g, int tokens) {
   g.promo_ids_host.resize(row * static_cast<size_t>(g.S));
   ggml_backend_tensor_get(g.usage_track_ids, g.promo_ids_host.data(), 0,
                           g.promo_ids_host.size() * sizeof(int32_t));
-  FILE *trace = promo_trace_file();
   const int ntok = std::min(tokens, g.S);
   for (int t = 0; t < ntok; ++t)
     for (int l = 0; l < g.n_layers; ++l) {
       if (policy.slots(l) == 0) continue;
       const int32_t *ids = &g.promo_ids_host[static_cast<size_t>(t) * row + static_cast<size_t>(l) * c.topk];
-      if (trace) {
-        std::fprintf(trace, "%llu %d %d", static_cast<unsigned long long>(g.promo_steps + static_cast<uint64_t>(t)), t, l);
-        for (int k = 0; k < c.topk; ++k)
-          std::fprintf(trace, " %d:%d", ids[k], ids[k] >= 0 && ids[k] < c.n_experts && policy.resident(l, ids[k]) ? 1 : 0);
-        std::fputc('\n', trace);
-      }
+      if (Logger::instance().would_log(LogLevel::DEBUG)) {
+  std::ostringstream line;
+  line << "[PROMO-TRACE] "
+       << (g.promo_steps + static_cast<uint64_t>(t)) << ' ' << t << ' ' << l;
+  for (int k = 0; k < c.topk; ++k)
+    line << ' ' << ids[k] << ':'
+         << (ids[k] >= 0 && ids[k] < c.n_experts && policy.resident(l, ids[k]) ? 1 : 0);
+  LOG_DEBUG("%s\n", line.str().c_str());
+}
       // next-layer prediction (early-ready lane): layer l's lane predicted layer l+1's routing for each of its tokens
       {
         const auto lane = g.early_ready.find(l);
@@ -177,7 +171,6 @@ void qwen4exp_promotion_step(FullGraph &g, int tokens) {
       for (int k = 0; k < c.topk; ++k)
         if (ids[k] >= 0 && ids[k] < c.n_experts) policy.note_routed(l, ids[k]);
     }
-  if (trace) std::fflush(trace);
 
   // 2. copies that have landed make their experts resident
   if (!g.promo_pending.empty()) {

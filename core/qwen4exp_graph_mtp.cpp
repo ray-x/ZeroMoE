@@ -44,17 +44,12 @@ struct MtpGraphPrefetchState {
   std::future<MtpGraphPrefetchResult> future;
 };
 
-// Optional per-phase accounting (ZEROMOE_MTP_PROFILE=1): milliseconds spent in
-// each phase of graph-native MTP, reported with the [MTP-GRAPH] line.
+// Per-phase accounting for graph-native MTP, reported at DEBUG verbosity.
 struct MtpProfile {
   double embed_ms = 0, prepare_ms = 0, run_ms = 0, copy_ms = 0, commit_ms = 0, draft_ms = 0;
   uint64_t windows = 0, drafts = 0;
 };
 MtpProfile g_profile;
-bool profile_enabled() {
-  static const bool on = [] { const char *v = std::getenv("ZEROMOE_MTP_PROFILE"); return v && v[0] == '1'; }();
-  return on;
-}
 double since_ms(std::chrono::steady_clock::time_point t0) {
   return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
@@ -139,8 +134,7 @@ class GraphTarget final : public SpecTarget {
   std::vector<float> hidden_;
 };
 
-// Times the draft's steps for ZEROMOE_MTP_PROFILE without touching the shared
-// GraphMtpDraft.
+// Times the draft's steps without touching the shared GraphMtpDraft.
 class TimedDraft final : public SpecDraft {
  public:
   explicit TimedDraft(SpecDraft &inner) : inner_(inner) {}
@@ -348,66 +342,6 @@ bool qwen4exp_graph_mtp_run(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       size_t(std::max(engine.max_t, 1)), n + size_t(max_new_tokens) + size_t(max_draft) + 2));
 
 
-  // Timing probe (ZEROMOE_MTP_WINDOW_PROBE=S): what does a window of S
-  // consecutive tokens cost compared with one? Runs the last S prompt tokens
-  // as a window at the same position repeatedly (idempotent state writes), so
-  // routing is text-like. Not a generation path; always returns false.
-  if (const char *probe_env = std::getenv("ZEROMOE_MTP_WINDOW_PROBE")) {
-    const int S = std::clamp(std::atoi(probe_env), 1, 8);
-    engine.qwen4exp_decode_window = S;
-    std::vector<int> tokens(prompt_ids.end() - std::min<size_t>(S, n), prompt_ids.end());
-    while (int(tokens.size()) < S) tokens.push_back(tokens.back());
-    const int pos = int(n);
-    if (!qwen4exp_full_graph_decode_prepare(engine, pos, tokens.data())) {
-      error = "probe: window decode graph could not be built";
-      return false;
-    }
-    std::vector<float> hidden(size_t(S) * D);
-    for (int i = 0; i < S; ++i)
-      if (!base.embed(tokens[size_t(i)], hidden.data() + size_t(i) * D)) {
-        error = "probe: embedding failed";
-        return false;
-      }
-    hc_expand_embedding(engine, hidden.data(), S, int(D));
-    std::vector<float> plogits(size_t(S) * V), pwide(size_t(S) * W);
-    const int reps = 40;
-    int checkpoint = 0;
-    if (!qwen4exp_full_graph_state_save(engine, checkpoint)) {
-      error = "probe: state checkpoint failed";
-      return false;
-    }
-    double total = 0.0, best = 1e30;
-    for (int r = 0; r < reps + 5; ++r) {
-      if (!qwen4exp_full_graph_decode_prepare(engine, pos, tokens.data())) {
-        error = "probe: window prepare failed";
-        return false;
-      }
-      const auto t0 = std::chrono::steady_clock::now();
-      if (!qwen4exp_full_graph_window_run(engine, S, pos, tokens.data(), plogits.data(),
-                                          pwide.data())) {
-        error = "probe: window run failed";
-        return false;
-      }
-      const double ms = std::chrono::duration<double, std::milli>(
-          std::chrono::steady_clock::now() - t0).count();
-      if (r >= 5) { total += ms; best = std::min(best, ms); }
-      if (!qwen4exp_full_graph_state_restore(engine, checkpoint)) {
-        error = "probe: state restore failed";
-        return false;
-      }
-    }
-    qwen4exp_full_graph_state_release(checkpoint);
-    std::vector<int> amax;
-    for (int i = 0; i < S; ++i) {
-      const float *row = plogits.data() + size_t(i) * V;
-      amax.push_back(int(std::max_element(row, row + V) - row));
-    }
-    LOG_INFO("[MTP-WINDOW-PROBE] S=%d mean=%.2f ms best=%.2f ms (reps=%d) argmax[0]=%d\n", S,
-             total / reps, best, reps, amax[0]);
-    error = "window probe finished";
-    return false;
-  }
-
   // Admission order matters: the target's decode graph must be resident BEFORE
   // the draft claims device memory, otherwise the draft starves the decode
   // build (which needs a safety floor of free VRAM), the build is declined, and
@@ -507,9 +441,9 @@ bool qwen4exp_graph_mtp_run(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       [&](int token) { return base.emit_token(sequence, token, eos_id, emit); },
       stats, error, greedy);
 
-  if (profile_enabled()) {
+  if (Logger::instance().would_log(LogLevel::DEBUG)) {
     const double total = since_ms(speculate_begin);
-    LOG_INFO("[MTP-PROFILE] speculate=%.0fms windows=%llu: embed+expand=%.0f prepare=%.0f run=%.0f "
+    LOG_DEBUG("[MTP-PROFILE] speculate=%.0fms windows=%llu: embed+expand=%.0f prepare=%.0f run=%.0f "
              "copy+finite=%.0f commit=%.0f | draft steps=%llu %.0f ms | other (sampling, driver)=%.0f ms\n",
              total, (unsigned long long)g_profile.windows, g_profile.embed_ms,
              g_profile.prepare_ms, g_profile.run_ms, g_profile.copy_ms, g_profile.commit_ms,

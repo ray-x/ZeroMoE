@@ -98,13 +98,6 @@ bool type_supported(uint32_t t) {
   return ggml_is_quantized(gt);
 }
 
-bool qwen_decode_sched_debug() {
-  static const bool enabled = [] {
-    return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN_DECODE_SCHED_DEBUG");
-  }();
-  return enabled;
-}
-
 // Route IDs and weights are compact host-visible outputs.  GGML's CUDA VMM
 // allocations are valid device pointers, but this machine's CUDA runtime
 // rejects the D2H route-table copy when its destination is pageable memory.
@@ -186,157 +179,22 @@ bool copy_router_tensor_to_host(int device, const ggml_tensor *tensor,
   return true;
 }
 
-bool backend_stream_copy_override = false;
-
-// H2D-queued-on-shared-GGML-stream mode (the ggml_async_graph_reuse override
-// above). TRIED earlier this session: gave no measurable improvement over the
-// plain copy_stream_ path (61.70 vs 62.72 tok/s baseline) -- left OFF by
-// default. RE-VERIFIED 2026-09-10 against the current, materially faster
-// post-fix baseline (RAM/VRAM tier independence fix + vram_preload_prefix_layers
-// + the GgmlQwenSharedRunner device_x fix): same 574-token real-text prompt,
-// prefill= from the shutdown report's Rates line -- ON: 86.01 tok/s, vs the
-// same-config OFF baseline's 79.84/86.37/85.66 tok/s (mean 83.96) -- squarely
-// inside the OFF spread, not a separate cluster. Conclusion unchanged: still no
-// real effect, confirmed against the current baseline too. The independent
-// ZEROMOE_GGML_BACKEND_STREAM_COPY environment alias was retired 2026-10-27;
-// the mode is reachable only through the config-driven override.
-bool use_backend_stream_copies() {
-  return backend_stream_copy_override;
-}
-
-// The HC runner and the router share the same CUDA backend.  In the normal
-// path the router copies HC's [D,S] result into one persistent input tensor
-// before every route graph.  llama.cpp's full graph passes the preceding activation
-// directly to the router node, so the copy is unnecessary when the producer
-// tensor is already on this device.  Keep this as an A/B switch until the
-// direct-input lifetime and numerical result have been verified on the real
-// Qwen prefill.
-bool use_direct_router_input() {
-  static const bool enabled = [] {
-    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_ROUTER_DIRECT_INPUT");
-  }();
-  return enabled;
-}
-
 bool moe_ggml_planar_copies_override = false;
 
-// The packed transfer path is the experimental optimization under test. Keep
-// a runtime escape hatch to the old three-planar-copy path so correctness can
-// be bisected without rebuilding the engine or changing the GGML graph.
+// Keep the supported planar-copy choice in the typed EngineConfig. There is
+// no environment override for this transfer-layout setting.
 bool use_packed_transfer() {
-  static const bool enabled = [] {
-    return !zeromoe::graphcfg::flag_on("ZEROMOE_GGML_PLANAR_COPIES");
-  }();
-  return enabled && !moe_ggml_planar_copies_override;
-}
-
-bool trace_pure_h2d() {
-  static const bool enabled = [] {
-    return zeromoe::graphcfg::flag_on("ZEROMOE_TRACE_PURE_H2D");
-  }();
-  return enabled;
-}
-
-bool async_moe_graph_reuse_override = false;
-
-// The backend-stream copy experiment originally forced a full backend
-// synchronize after every MoE graph because this runner reused one graph
-// allocator and one output tensor. GGML's allocator reset only rewinds its
-// host-side virtual allocator; it does not clear device bytes, and all graph
-// work is ordered on the shared backend stream. Once HC has queued its
-// producer-output copy on that same stream, the next graph can reuse those
-// addresses without a CPU wait. Keep this opt-in until it is validated on the
-// real Qwen prompt; the default remains the established conservative path.
-bool use_async_moe_graph_reuse() {
-  static const bool enabled = [] {
-    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_MOE_ASYNC_GRAPH_REUSE");
-  }();
-  return enabled || async_moe_graph_reuse_override;
-}
-
-// Qwen4Exp's shared-expert graph consumes two tensors produced immediately
-// before it on this same shared GGML CUDA backend: the HC mixed input and the
-// routed-MoE result.  In async graph-reuse mode, retargeting the graph-input
-// tensor data pointers is safe because all three graphs are ordered on the
-// same backend stream.  It removes two device-to-device copies per layer and
-// lets the caller queue HC post-combine behind this graph without a host
-// synchronization.  Keep an explicit escape hatch for bisecting correctness;
-// the default follows the already opt-in async graph-reuse setting.
-bool use_direct_shared_inputs() {
-  static const bool enabled = [] {
-    const char *env = zeromoe::graphcfg::env("ZEROMOE_GGML_SHARED_DIRECT_INPUT");
-    if (env) return env[0] == '1';
-    return use_async_moe_graph_reuse();
-  }();
-  return enabled && use_async_moe_graph_reuse();
-}
-
-// Qwen4Exp's device-HC handoff calls the MoE runner with an F32 ggml_tensor
-// produced by the immediately preceding HC graph.  In async graph-reuse mode
-// both graphs use this same shared CUDA backend stream, so the reusable MoE
-// input tensor can consume the producer's data pointer directly.  Keep an
-// explicit override because the copy path is useful for bisecting stream or
-// lifetime problems.  The public tensor-input entry point is only used by the
-// Qwen device-HC handoff; raw-pointer callers retain their existing path.
-bool use_direct_moe_input() {
-  static const bool enabled = [] {
-    const char *env = zeromoe::graphcfg::env("ZEROMOE_GGML_MOE_DIRECT_INPUT");
-    if (env) return env[0] == '1';
-    return use_async_moe_graph_reuse();
-  }();
-  return enabled && use_async_moe_graph_reuse();
-}
-
-bool debug_sync_route_inputs() {
-  static const bool enabled = [] {
-    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_DEBUG_SYNC_ROUTE");
-  }();
-  return enabled;
-}
-
-bool debug_device_sync() {
-  static const bool enabled = [] {
-    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_DEBUG_DEVICE_SYNC");
-  }();
-  return enabled;
-}
-
-bool debug_copy_sync() {
-  static const bool enabled = [] {
-    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_DEBUG_COPY_SYNC");
-  }();
-  return enabled;
+  return !moe_ggml_planar_copies_override;
 }
 
 bool trace_backend_calls() {
-  static const bool enabled = [] {
-    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_TRACE_BACKEND_CALLS");
-  }();
-  return enabled;
-}
-
-bool debug_check_device_output() {
-  static const bool enabled = [] {
-    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_DEBUG_CHECK_DEVICE_OUTPUT");
-  }();
-  return enabled;
+  return Logger::instance().would_log(LogLevel::DEBUG);
 }
 
 }  // namespace
 
 void set_moe_ggml_planar_copies(bool enabled) {
   moe::detail::moe_ggml_planar_copies_override = enabled;
-}
-
-void set_ggml_moe_async_graph_reuse(bool enabled) {
-  moe::detail::async_moe_graph_reuse_override = enabled;
-  // The async graph mode is only safe and useful when expert weights are
-  // double-buffered and copied through the backend's ordered copy path. The
-  // legacy raw-copy mode has one compact weight buffer and must synchronize
-  // before every layer reuses it, which silently defeats this configuration.
-  // The backend-stream-copy experiment has no independent environment alias;
-  // this config-driven override is its only remaining switch.
-  moe::detail::backend_stream_copy_override = enabled;
 }
 
 void *ggml_shared_backend(int device) {
@@ -414,7 +272,6 @@ bool ggml_moe_test_download_tensor(int device, const void *tensor,
 // ---------------------------------------------------------------------------
 #else  // !ZEROMOE_USE_GGML_CUDA
 void set_moe_ggml_planar_copies(bool) {}
-void set_ggml_moe_async_graph_reuse(bool) {}
 
 bool ggml_moe_test_make_device_tensor(int, int64_t, int64_t, const float *,
                                       void **, void **, void **) {

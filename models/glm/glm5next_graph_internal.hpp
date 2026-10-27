@@ -325,7 +325,7 @@ struct FullGraph : zeromoe::graph::GraphCore {
   std::vector<std::pair<int, ggml_tensor *>> dsv41_engram_embeddings;
   std::vector<std::pair<int, std::vector<float>>> dsv41_engram_host_rows;
   std::vector<ggml_tensor *> dsv4_layer_outputs;
-  // Decode-only per-layer timing marks (ZEROMOE_GLM5NEXT_GRAPH_LAYER_TIMING=1):
+  // Decode-only per-layer timing marks (enabled at DEBUG verbosity):
   // node -> {layer, 0=after attention, 1=after FFN}.
   std::unordered_map<const ggml_tensor *, std::pair<int, int>> layer_marks;
   std::vector<std::pair<std::string, ggml_tensor *>> dsv4_stage_outputs;

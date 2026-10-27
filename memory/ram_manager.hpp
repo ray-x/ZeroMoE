@@ -262,7 +262,6 @@ public:
   // When true, logs every host-cache HIT (very high volume — one line per
   // routed expert per token). MISS/LOAD and VRAM PROMOTE events are always
   // logged since they're comparatively rare (disk I/O, one-time promotion).
-  bool verbose_cache_log = false;
 
   // How many host-cache re-hits before triggering an async H2D promotion
   // into the VRAM expert cache. Default 1 (promote on first re-hit).
@@ -863,31 +862,6 @@ public:
     prefill_retention_peaky_cut_ref() = peaky_cut;
   }
 
-  // EngineConfig::ram_grace_period_tokens/ram_grace_period_bonus
-  // (2026-09-04). eviction_score is static (no `this`), so -- same reason
-  // prefill_retention_weight_ref() above is a function-local static
-  // rather than a member field -- current_decode_token_idx_ref() mirrors
-  // that pattern instead of threading a parameter through eviction_
-  // score's many call sites. Updated once per DECODE token (S==1) from
-  // layers_forward_gguf (execution_layer.cpp), right alongside the
-  // existing ram_mgr.in_prefill = (S > 1) assignment; left untouched
-  // during prefill (S>1) calls, which has a gentle, deliberate side
-  // effect: anything loaded during prefill has load_token_idx==0 (or
-  // whatever the LAST decode step was, if this is a later turn), so it
-  // is naturally grace-protected only for the first ram_grace_period_
-  // tokens decode steps of the request that follows -- not a permanent
-  // bonus for the whole prefill phase.
-  static uint64_t &ram_grace_period_tokens_ref() { static uint64_t v = 0; return v; }
-  static uint64_t &ram_grace_period_bonus_ref()  { static uint64_t v = 0; return v; }
-  static uint64_t &current_decode_token_idx_ref() { static uint64_t v = 0; return v; }
-  static void set_ram_grace_period(uint64_t tokens, uint64_t bonus) {
-    ram_grace_period_tokens_ref() = tokens;
-    ram_grace_period_bonus_ref() = bonus;
-  }
-  static void set_current_decode_token_idx(uint64_t idx) {
-    current_decode_token_idx_ref() = idx;
-  }
-
   static uint64_t eviction_score(const MoEExpertBlock &b) {
     // prefill->decode retention handoff: an expert THIS REQUEST's prefill
     // actually routed to is far more likely to be wanted again during the
@@ -904,21 +878,6 @@ public:
     // regressions already have (see pinned_vram_capacity's tuning history).
     uint64_t score = b.last_used_clock + (uint64_t)b.hit_count * FREQ_BONUS_TICKS +
                      (uint64_t)b.prefill_demand * prefill_retention_weight_ref();
-    // Grace-period bonus: last_used_clock above is a raw operation-tick
-    // counter, not a token counter -- a burst of several loads within ONE
-    // decode token (this model's multiple speculative predictors can each
-    // trigger a RAM load per layer transition) can make a slot look
-    // "stale" relative to slots loaded microseconds later in the SAME
-    // token, before it ever got a real chance to be reused. This term is
-    // token-counted instead, so it is immune to that intra-token burst
-    // effect. See ram_grace_period_tokens's own comment (engine_config.hpp)
-    // for why this is additive, not a hard exemption.
-    uint64_t grace_tokens = ram_grace_period_tokens_ref();
-    if (grace_tokens > 0) {
-      uint64_t now = current_decode_token_idx_ref();
-      uint64_t age = (now >= b.load_token_idx) ? (now - b.load_token_idx) : 0;
-      if (age < grace_tokens) score += ram_grace_period_bonus_ref();
-    }
     return score;
   }
 
@@ -2142,7 +2101,6 @@ public:
         false; // synchronous salvage, already fully populated above
     victim.last_used_clock = ++global_clock;
     victim.hit_count = 0;
-    victim.load_token_idx = current_decode_token_idx_ref();
     ram_swap_stats[swap_key(layer, expert_id)].swap_in++;
     ram_expert_index[swap_key(layer, expert_id)] = victim_idx;
     perf().n_vram_evict_demoted.fetch_add(1, std::memory_order_relaxed);
@@ -2498,10 +2456,8 @@ public:
         return {RamClaimStatus::Hit, &slot, (size_t)idx};
       }
 
-      if (verbose_cache_log) {
-        LOG_DEBUG("[MOE-CACHE] HIT   layer=%d expert=%d hit_count=%u\n", layer,
-                  expert_id, slot.hit_count);
-      }
+      LOG_DEBUG("[MOE-CACHE] HIT   layer=%d expert=%d hit_count=%u\n", layer,
+                expert_id, slot.hit_count);
 
       // Async, non-blocking promotion to VRAM -- decode-thread-only
       // side effect (see this function's CRITICAL rule above). Same
@@ -2657,8 +2613,6 @@ public:
     ram_expert_index[swap_key(layer, expert_id)] = (size_t)lru_idx;
     victim.last_used_clock = ++global_clock;
     victim.hit_count = 0;
-    victim.load_token_idx = current_decode_token_idx_ref();
-
     perf().n_expert_cache_miss.fetch_add(1, std::memory_order_relaxed);
     if (in_prefill)
       perf().n_expert_cache_miss_prefill.fetch_add(1,
@@ -3174,7 +3128,6 @@ public:
     MoEExpertBlock &slot = layer_slots[slot_idx];
     slot.last_used_clock = ++global_clock;
     slot.hit_count = seed_hit_count;
-    slot.load_token_idx = current_decode_token_idx_ref();
     slot.ram_loading = false;
     ram_expert_index[swap_key(layer, expert_id)] = slot_idx;
   }
@@ -3822,7 +3775,6 @@ public:
                 ram_expert_index[swap_key(layer, candidate_id)] = slot_idx;
                 pv.last_used_clock = ++global_clock;
                 pv.hit_count = 0;
-                pv.load_token_idx = current_decode_token_idx_ref();
                 pv.from_padding = true;
                 claimed_candidate_ids.push_back(candidate_id);
               }

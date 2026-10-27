@@ -9,7 +9,7 @@ ggml=${1:-${GGML_ROOT:-$root/../llama.cpp/ggml}}
 build=${2:-$root/build_native}
 cmake -S "$root" -B "$build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="86;120" \
   -DZEROMOE_GGML_ROOT="$ggml" -DZEROMOE_GGML_PREBUILT_DIR= \
-  -DZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES=ON -DZEROMOE_ENABLE_CUDA_GRAPHS=ON \
-  -DGGML_AVX512=ON -DGGML_AVX512_VNNI=ON -DGGML_CUDA_GRAPHS=ON
+  -DZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES=ON \
+  -DGGML_AVX512=ON -DGGML_AVX512_VNNI=ON
 cmake --build "$build" --target zeromoe -j"$(nproc)"
 echo "built: $build/zeromoe"

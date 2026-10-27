@@ -101,7 +101,7 @@ ZEROMOE_QWEN4EXP_FULL_GRAPH=1
 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1
 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0        # expert residency comes from the global pool, not from a layer count
 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1
-ZEROMOE_TOKEN_LOOP_DIAG=1                      # per-step iter_total, the metric source
+--verbosity 5                                  # current equivalent of the per-step iter_total diagnostic used then
 ZEROMOE_BENCH_IGNORE_STOP=1
 ```
 

@@ -65,7 +65,7 @@ the [configuration guide](docs/configuration.md).
 
 AVX-512 VNNI is enabled by default for CPU performance. On a CPU without
 AVX-512 VNNI, compiling with it enabled may cause an illegal-instruction
-failure. Configure with `-DZEROMOE_ENABLE_AVX512_VNNI=OFF` to disable VNNI in
+failure. Configure with `-DGGML_AVX512_VNNI=OFF` to disable VNNI in
 both ZeroMoE and ggml CPU kernels.
 
 ### OpenAI and Anthropic APIs
@@ -135,7 +135,7 @@ cmake -S . -B build
 cmake --build build -j$(nproc)
 ```
 
-`ZEROMOE_ENABLE_CUDA_GRAPHS` (default **ON**) enables ggml's CUDA graph capture/replay for this path. ggml's own default for `GGML_CUDA_GRAPHS` is OFF for any consumer other than llama.cpp itself, so without this, a plain CUDA build silently compiles out CUDA graph capture — every decode step then falls back to launching each graph node's kernel individually instead of replaying one captured graph per split. Measured impact on this project's Qwen4Exp full-graph decode: **~20 tok/s with graphs enabled vs. ~8 tok/s silently disabled**, on identical hardware/model/config. Opt out with `-DZEROMOE_ENABLE_CUDA_GRAPHS=OFF` if you need to A/B against the non-graph path.
+CUDA builds always enable ggml CUDA graph capture/replay. ggml's own default for `GGML_CUDA_GRAPHS` is OFF for consumers other than llama.cpp, which silently removes the captured-graph path and regresses this project's measured Qwen4Exp decode from about 20 tok/s to 8 tok/s. CMake now forces the required setting ON; it is not a user-selectable build mode.
 
 CUDA architecture selection defaults to automatic detection from
 `nvidia-smi` before any CUDA targets, including ggml-cuda, are configured.
@@ -177,7 +177,7 @@ Qwen GGUF. Its GGUF weight payloads are not used for EXL3 inference.
 
 ```bash
 ./build_ggmlcuda/zeromoe --config configs/testing/qwen4exp_exl3_decode.toml \
-    --prompt "Hello" --ngen 8
+    --prompt "Hello" --predict 8
 ```
 
 `configs/testing/qwen4exp_exl3_load.toml` retains the catalog/payload smoke mode.
@@ -185,7 +185,7 @@ For GPU projections, use a CUDA build and `configs/testing/qwen4exp_exl3_gpu.tom
 
 ```bash
 ./build_ggmlcuda/zeromoe --config configs/testing/qwen4exp_exl3_gpu.toml \
-    --prompt "Hello" --ngen 8
+    --prompt "Hello" --predict 8
 ```
 
 `exl3_gpu = true` enables direct packed `mul1` CUDA matmul with 128-wide
@@ -345,7 +345,7 @@ Launch the standalone engine directly by pointing it at your local GGUF model, e
 ```bash
 ./build/zeromoe --config configs/single_gpu.toml
 # or, legacy CLI flags:
-./build/zeromoe --model /nvme/glm-5.2-iq2_m.gguf --ram 48.0 --ctx 4096
+./build/zeromoe --model /nvme/glm-5.2-iq2_m.gguf --ram 48.0 --ctx-size 4096
 ```
 
 #### Command-Line Arguments
@@ -371,26 +371,27 @@ checks warm prefill and matched first-to-last decode performance against Bee.
 | `--gen-config [output.toml]` | Generate a sample config file (default `zeromoe_config.toml`) and exit. |
 | `--model <path>` | Path to a GGUF model file or directory (legacy CLI mode, used without `--config`). |
 | `--ram <GB>` | Strict RAM budget in GB (default: auto-detect 88% of free system memory). |
-| `--ctx <N>` | Maximum context size / token window (default: 4096). |
-| `--ngen <N>` | Maximum new tokens to generate per response (default: 1024). |
+| `-c, --ctx-size <N>` | Maximum context size / token window (default: 4096). |
+| `-n, --predict <N>` | Maximum new tokens to generate per response (default: 1024). |
+| `-t, --threads <N>` | CPU thread limit (default: automatic). |
 | `--temp <F>` | Sampling temperature; `0.0` for greedy decode (default: 0.7). |
-| `--top_p <F>` | Nucleus sampling top-p threshold (default: 0.90). |
-| `--gpu <ID>` | CUDA device ID for single-GPU mode (default: 0). |
+| `--top-p <F>` | Nucleus sampling top-p threshold (default: 0.90). |
+| `--main-gpu <ID>` | CUDA device ID for single-GPU mode (default: 0). |
+| `--spec-type <none|draft-mtp>` | Speculative mode supported by ZeroMoE. |
+| `--spec-draft-model <path>` | Optional external draft checkpoint. |
+| `--spec-draft-n-max <N>` | Maximum speculative draft length (default: 3). |
 | `--drop-pages` | Drop expert pages from the OS page cache after use. |
 | `--direct-io` | `O_DIRECT` expert-slab reads (Linux only; requires a model repacked with `tools/gguf_tool pack`). Falls back to buffered reads automatically if unsupported/unaligned. (`unpacked_expert_format` is TOML-config-only — see `--config`.) |
 | `--io-uring` | Batch the async prefetcher's per-expert reads through `io_uring` (Linux only, kernel ≥ 5.6; independent of `--direct-io`). Falls back to sequential `pread`s automatically if unsupported. |
 | `--prefetch-threads <N>` | Concurrent async prefetcher worker threads (default: 2). |
-| `--verbose-moe` | Log every MoE host-cache hit (high volume, debug only). |
 | `--promote-threshold <N>` | Number of host re-hits before an async host→device (H2D) promote (default: 1). |
 | `--pin-threshold <N>` | VRAM-resident hit-count before permanently pinning an expert (never evicted; default: 8, `0` = off). |
 | `--pin-file <file>` | Usage-frequency file for VRAM hot-set preload at startup (default: `.zeromoe_usage`). |
 | `--expert-fetch-threads <N>` | OMP threads for parallel disk reads of a layer's top-k cache misses (default: 4). |
 | `--raw-prompt` | Skip the chat-template wrap; tokenize stdin verbatim. Needed by `api_server.py` (which already applies its own formatting) and useful for token-count-fair benchmarking against other engines. |
 | `--system-prompt <text>` | Prepend a system-role message ahead of the user turn (chat-template modes only; ignored with `--raw-prompt`). Empty by default — ZeroMoE never invents one on its own. Use this to steer behavior/language, e.g. `--system-prompt "Respond in English unless asked otherwise."` |
-| `--log-path <file>` | Redirect logging to a file instead of stderr. |
-| `--log-level <lvl>` | `VERBOSE` \| `DEBUG` \| `INFO` (default) \| `WARN` \| `ERROR`. |
-| `--trace-filter <tags>` | Comma-separated tag prefixes (e.g. `HC,MLA`) restricting VERBOSE tensor tracing to just those checkpoints; requires `--log-level VERBOSE`. Empty (default) traces everything. See `core/tensor_trace.hpp` / CLAUDE.md §5. |
-| `--trace-abort-on-nan` | Abort the process at the first NaN/Inf caught by a tensor-trace checkpoint, instead of continuing. Off by default. |
+| `--log-file <file>` | Redirect logging to a file instead of stderr (llama.cpp-compatible name). |
+| `--verbosity <0..5>` | Set log threshold (llama.cpp-compatible numeric verbosity). |
 | `--help`, `-h` | Show the CLI help interface. |
 
 > Most of these flags have a matching TOML key of the same name (e.g. `raw_prompt`, `system_prompt`, `pin_threshold`) for use with `--config`; a config file's values are used unless the equivalent CLI flag is also passed, in which case the CLI flag wins. Run `--gen-config` to see the full set of TOML-only options (e.g. `unpacked_expert_format`, `pin_strategy`) that have no CLI-flag equivalent.
@@ -562,9 +563,8 @@ How to read it:
 - Same graph, different placement: run once with everything on one GPU and once with the hot/cold split. If only
   one differs, the bug is in placement or the cold path, not the math (the MiMo NaN from a repeated placeholder id
   was found this way).
-- `--graph-node-trace 2` (MiMo) reports the first non-finite node; `trace_abort_on_nan = true` in the TOML
-  (see `include/tensor_trace.hpp`) does it for the layered path. Do not time a run with a trace mode on: it
-  disables the early-ready bridge.
+- `--graph-node-trace 2` (MiMo) reports the first non-finite node. Use `--verbosity 4` for tensor traces;
+  capture to a file and filter the resulting log after the run.
 - Check tensor sizes first: `./quant_table_test` and the `[PREFLIGHT]` lines at startup flag a tensor type that is
   missing from `memory/quant_table.hpp`.
 

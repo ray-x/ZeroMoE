@@ -300,13 +300,6 @@ std::expected<void, std::string> EngineRunner::init_ram_tier() {
       std::max(1, config.prefill_retention_min_demand),
       config.prefill_retention_flat_cut, config.prefill_retention_peaky_cut);
 
-  // RAM-tier load grace period (2026-09-04). 0 tokens = off (default), in
-  // which case eviction_score is byte-identical to its prior form.
-  RAMSafetyManager::set_ram_grace_period(
-      (uint64_t)std::max(0, config.ram_grace_period_tokens),
-      (uint64_t)std::max(0, config.ram_grace_period_bonus));
-
-
   // vram_evict_demote_to_ram: wired here (after calculate_safe_cache_capacity
   // has set a real ram_mgr.slots_per_layer, and before anything -- including
   // the [PIN] preload block right below -- can trigger a real VRAM eviction)

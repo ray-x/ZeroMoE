@@ -103,7 +103,7 @@ Keep the complete launch command with each baseline. For example, a Qwen4Exp gra
 
 ```sh
 CUDA_VISIBLE_DEVICES=0 \
-./build/zeromoe --config configs/testing/qwen4exp_3090_only_decode_batched.toml --ngen 8
+./build/zeromoe --config configs/testing/qwen4exp_3090_only_decode_batched.toml --predict 8
 ```
 
 That command illustrates the default graph path, not a portable placement or memory recipe. Choose the profile and placement values for the target hardware, then verify the resolved values and actual arena in the logs.

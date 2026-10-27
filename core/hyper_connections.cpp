@@ -103,7 +103,6 @@ static bool check_finite_hc(const char* label, int layer_idx, const float* data,
     }
     if (nan_count > 0 || inf_count > 0) {
         LOG_ERROR("[HC] %s layer=%d: %d/%zu NaN, %d/%zu Inf.\n", label, layer_idx, nan_count, n, inf_count, n);
-        trace_abort_if_nan("HC", true);
         return false;
     }
     if (row_width > 0 && trace_gate("HC")) {
@@ -994,8 +993,8 @@ bool qwen4exp_hc_post_combine_device(StreamingEngine &engine, int layer_idx,
                                       int sub_block, int S, int D,
                                       const void *device_sub_block_out,
                                       const void *producer_event) {
-  if (zeromoe::graphcfg::env("ZEROMOE_HC_PATH_TRACE")) {
-    LOG_ERROR("[HC-PATH-TRACE] entry layer=%d sub=%d S=%d g_hc_ggml_live=%d "
+  if (Logger::instance().would_log(LogLevel::DEBUG)) {
+    LOG_DEBUG("[HC-PATH-TRACE] entry layer=%d sub=%d S=%d g_hc_ggml_live=%d "
               "device_out=%p producer_event=%p\n",
               layer_idx, sub_block, S, g_hc_ggml_live ? 1 : 0,
               device_sub_block_out, producer_event);
@@ -1020,8 +1019,8 @@ bool qwen4exp_hc_post_combine_device(StreamingEngine &engine, int layer_idx,
                          layer_idx, /*runner_sub_block=*/0, S,
                          device_sub_block_out, producer_event);
     if (layer_idx == 11 && sub_block == 1 &&
-        zeromoe::graphcfg::env("ZEROMOE_HC_PATH_TRACE")) {
-      LOG_ERROR("[HC-PATH-TRACE] layer=%d sub=%d S=%d try_fused=%d "
+        Logger::instance().would_log(LogLevel::DEBUG)) {
+      LOG_DEBUG("[HC-PATH-TRACE] layer=%d sub=%d S=%d try_fused=%d "
                 "fused_ok=%d\n",
                 layer_idx, sub_block, S, try_fused ? 1 : 0, fused_ok ? 1 : 0);
     }

@@ -40,7 +40,7 @@ echo ">> generating $N greedy tokens from each engine (temp=0)..."
 # --- ZeroMoE (greedy). Pipe the prompt into the REPL; --temp 0 = greedy. ---
 # TODO: if zeromoe lacks a non-interactive prompt mode, this pipes one line
 # then ':q'. Strip the "Output:" / banner lines to get raw generation.
-printf '%s\n:q\n' "$PROMPT" | "$ZEROMOE" --config "$CONFIG" --temp 0 --ngen "$N" \
+printf '%s\n:q\n' "$PROMPT" | "$ZEROMOE" --config "$CONFIG" --temp 0 --predict "$N" \
     >"$TMP/moe.raw" 2>"$TMP/moe_err.txt" || true
 
 # Normalize: keep only the generated text (drop ZeroMoE banner/log lines).

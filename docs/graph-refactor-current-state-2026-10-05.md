@@ -527,8 +527,9 @@ banks and epoch metadata remain per layer to preserve consumer lifetimes.
 
 ## Experimental staged-graph memory telemetry
 
-The staged graph now has an opt-in memory trace controlled by
-`ZEROMOE_QWEN4EXP_MEMORY_TRACE=1`. It records CUDA free/total VRAM,
+At the time of this 2026-10-05 record, the staged graph memory trace was
+selected by `ZEROMOE_QWEN4EXP_MEMORY_TRACE=1`. Current code emits the same
+telemetry at VERBOSE logging (`--verbosity 4`). It records CUDA free/total VRAM,
 `MemAvailable`, process RSS/peak RSS, cgroup memory usage, graph-construction
 mode, storage completion, completion-graph submission, conditional graph
 instantiation and graph launch. CUDA allocation, graph-instantiation and

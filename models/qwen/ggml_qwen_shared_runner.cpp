@@ -300,9 +300,7 @@ bool GgmlQwenSharedRunner::ensure_layer(
     int layer, const GgmlSharedWeightRef &gate,
     const GgmlSharedWeightRef &up, const GgmlSharedWeightRef &down,
     const GgmlSharedWeightRef *gate_inp) {
-  const bool debug = [] {
-    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_SHARED_DEBUG");
-  }();
+  const bool debug = Logger::instance().would_log(LogLevel::DEBUG);
   auto fail = [&](const char *reason) {
     if (debug)
       LOG_ERROR("[GGML-SHARED-DEBUG] ensure_layer=%d rejected: %s "
@@ -473,9 +471,7 @@ bool GgmlQwenSharedRunner::ensure_layer(
 bool GgmlQwenSharedRunner::run(int layer, const void *device_x,
                                const void *routed_output,
                                const void **combined_output) {
-  const bool debug = [] {
-    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_SHARED_DEBUG");
-  }();
+  const bool debug = Logger::instance().would_log(LogLevel::DEBUG);
   auto fail = [&](const char *reason, const ggml_tensor *input,
                   const ggml_tensor *routed_src) {
     if (debug) {
@@ -492,12 +488,11 @@ bool GgmlQwenSharedRunner::run(int layer, const void *device_x,
                std::to_string((uintptr_t)t->buffer);
       };
       LOG_WARN("[GGML-SHARED-DEBUG] run layer=%d rejected: %s input={%s} "
-               "routed={%s} graph_input={%s} graph_routed={%s} ready=%d "
-               "direct=%d\n",
+               "routed={%s} graph_input={%s} graph_routed={%s} ready=%d\n",
                layer, reason, dump(input).c_str(), dump(routed_src).c_str(),
                dump((ggml_tensor *)x_).c_str(),
                dump((ggml_tensor *)routed_).c_str(),
-               graph_ready_ ? 1 : 0, use_direct_shared_inputs() ? 1 : 0);
+               graph_ready_ ? 1 : 0);
     }
     return false;
   };
@@ -574,33 +569,17 @@ bool GgmlQwenSharedRunner::run(int layer, const void *device_x,
                 static_cast<std::streamsize>(host.size() * sizeof(float)));
   };
   dump_device_f32("routed_in", src);
-  const bool direct_inputs = use_direct_shared_inputs();
-  if (direct_inputs) {
-    // Match GgmlRouterRunner's already-validated direct-input optimization.
-    // Keep each graph input's original buffer association intact; ggml-cuda
-    // uses the data pointer for the actual read, while the buffer continues
-    // to describe the allocator/backend that owns the graph tensor.
-    x->data = hc_in->data;
-    r->data = src->data;
-    static bool logged_direct = false;
-    if (!logged_direct) {
-      logged_direct = true;
-      LOG_INFO("[GGML-SHARED] direct HC/MoE inputs active: removing two "
-               "per-layer D2D copies and host sync\n");
-    }
-  } else {
-    cudaSetDevice(device_);
-    const size_t bytes = (size_t)d_model_ * n_tokens_ * sizeof(float);
-    if (cudaMemcpy(x->data, hc_in->data, bytes, cudaMemcpyDeviceToDevice) !=
-        cudaSuccess)
-      return fail("HC device copy", hc_in, src);
-    // The routed result is produced by GgmlMoeRunner's graph.  Copy that
-    // producer tensor into this graph's independent input; copying the
-    // destination tensor to itself would leave stale routed data after the
-    // first layer and change all subsequent routing decisions.
-    ggml_backend_tensor_copy_async((ggml_backend_t)backend_,
-                                   (ggml_backend_t)backend_, src, r);
-  }
+  cudaSetDevice(device_);
+  const size_t bytes = (size_t)d_model_ * n_tokens_ * sizeof(float);
+  if (cudaMemcpy(x->data, hc_in->data, bytes, cudaMemcpyDeviceToDevice) !=
+      cudaSuccess)
+    return fail("HC device copy", hc_in, src);
+  // The routed result is produced by GgmlMoeRunner's graph. Copy that
+  // producer tensor into this graph's independent input; copying the
+  // destination tensor to itself would leave stale routed data after the
+  // first layer and change all subsequent routing decisions.
+  ggml_backend_tensor_copy_async((ggml_backend_t)backend_,
+                                 (ggml_backend_t)backend_, src, r);
   if (ggml_backend_graph_compute_async((ggml_backend_t)backend_,
                                        (ggml_cgraph *)graph_) !=
       GGML_STATUS_SUCCESS)
@@ -649,14 +628,7 @@ bool GgmlQwenSharedRunner::run(int layer, const void *device_x,
   dump_device_f32("shared_gated", (const ggml_tensor *)shared_);
   if (dump_ffn)
     dump_device_f32("combined_out", (const ggml_tensor *)output_);
-  // In the conservative mode, preserve the old request-local completion
-  // fence.  In direct-input/async-reuse mode the next operation is HC
-  // post-combine on this same backend, so its queued tensor copy is the
-  // consumer-side dependency and a host wait would only serialize the graph
-  // pipeline.  A later host readback still synchronizes through GGML's normal
-  // tensor-get path.
-  if (!direct_inputs)
-    ggml_backend_synchronize((ggml_backend_t)backend_);
+  ggml_backend_synchronize((ggml_backend_t)backend_);
   if (debug) {
     cudaSetDevice(device_);
     cudaDeviceSynchronize();
@@ -683,9 +655,7 @@ bool GgmlQwenSharedRunner::run(int layer, const void *device_x,
 bool GgmlQwenSharedRunner::run_host_routed(int layer, const void *device_x,
                                            const float *host_routed,
                                            const void **combined_output) {
-  const bool debug = [] {
-    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_SHARED_DEBUG");
-  }();
+  const bool debug = Logger::instance().would_log(LogLevel::DEBUG);
   if (combined_output)
     *combined_output = nullptr;
   if (!backend_ || !graph_ready_ || layer < 0 || !device_x || !host_routed ||
@@ -708,25 +678,17 @@ bool GgmlQwenSharedRunner::run_host_routed(int layer, const void *device_x,
       !routed_owned_data_)
     return false;
 
-  // A previous direct-input run may have pointed the graph input at another
-  // runner's output. Restore the persistent allocation before tensor_set_async
-  // so the upload cannot overwrite a producer-owned buffer.
+  // Restore the graph inputs to their owned allocations before the next
+  // producer copies data into them.
   r->data = routed_owned_data_;
   x->data = x_owned_data_;
   if (!r->data || !x->data)
     return false;
 
-  const bool direct_inputs = use_direct_shared_inputs();
-  if (direct_inputs) {
-    // HC is already on the shared backend. The routed result is the only
-    // host-originating input; queue its H2D into the persistent graph input.
-    x->data = hc_in->data;
-  } else {
-    cudaSetDevice(device_);
-    if (cudaMemcpy(x->data, hc_in->data, bytes, cudaMemcpyDeviceToDevice) !=
-        cudaSuccess)
-      return false;
-  }
+  cudaSetDevice(device_);
+  if (cudaMemcpy(x->data, hc_in->data, bytes, cudaMemcpyDeviceToDevice) !=
+      cudaSuccess)
+    return false;
   ggml_backend_tensor_set_async((ggml_backend_t)backend_, r, host_routed, 0,
                                 bytes);
   if (ggml_backend_graph_compute_async((ggml_backend_t)backend_,
@@ -789,8 +751,7 @@ bool GgmlQwenSharedRunner::run_host_routed(int layer, const void *device_x,
       }
     }
   }
-  if (!direct_inputs)
-    ggml_backend_synchronize((ggml_backend_t)backend_);
+  ggml_backend_synchronize((ggml_backend_t)backend_);
   *combined_output = output_;
   return true;
 }
@@ -815,18 +776,10 @@ bool GgmlQwenSharedRunner::run_shared_only(int layer, const void *device_x,
     return false;
 
   const size_t bytes = (size_t)d_model_ * (size_t)n_tokens_ * sizeof(float);
-  const bool direct_inputs = use_direct_shared_inputs();
-  if (direct_inputs) {
-    // The HC producer and this graph are ordered on the same GGML backend
-    // stream.  Retargeting the persistent input removes the blocking D2D
-    // copy and lets the CPU worker start while CUDA computes the shared FFN.
-    x->data = hc_in->data;
-  } else {
-    cudaSetDevice(device_);
-    if (cudaMemcpy(x->data, hc_in->data, bytes, cudaMemcpyDeviceToDevice) !=
-        cudaSuccess)
-      return false;
-  }
+  cudaSetDevice(device_);
+  if (cudaMemcpy(x->data, hc_in->data, bytes, cudaMemcpyDeviceToDevice) !=
+      cudaSuccess)
+    return false;
   r->data = zero_routed_data_;
   if (ggml_backend_graph_compute_async(
           (ggml_backend_t)backend_, (ggml_cgraph *)graph_) !=
@@ -834,8 +787,7 @@ bool GgmlQwenSharedRunner::run_shared_only(int layer, const void *device_x,
     return false;
   if (!record_output_event())
     return false;
-  if (!direct_inputs)
-    ggml_backend_synchronize((ggml_backend_t)backend_);
+  ggml_backend_synchronize((ggml_backend_t)backend_);
   *shared_output = output_;
   return true;
 }
@@ -853,9 +805,8 @@ bool GgmlQwenSharedRunner::run_host_routed_add(
   auto *shared = (ggml_tensor *)overlap_shared_input_;
   routed->data = overlap_routed_owned_data_;
   // output_ is the shared-only result because run_shared_only() fed the
-  // normal graph a zero routed input.  Preserve this graph input's original
-  // buffer association while retargeting only its data pointer, exactly like
-  // the established direct-input path above.
+  // normal graph a zero routed input. Preserve this graph input's original
+  // buffer association while selecting the shared result as its input.
   shared->data = ((ggml_tensor *)output_)->data;
 
   const size_t bytes = (size_t)d_model_ * (size_t)n_tokens_ * sizeof(float);
@@ -867,8 +818,7 @@ bool GgmlQwenSharedRunner::run_host_routed_add(
     return false;
   if (!record_output_event())
     return false;
-  if (!use_direct_shared_inputs())
-    ggml_backend_synchronize((ggml_backend_t)backend_);
+  ggml_backend_synchronize((ggml_backend_t)backend_);
   *combined_output = overlap_combined_;
   return true;
 }

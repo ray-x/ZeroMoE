@@ -757,26 +757,6 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     ggml_tensor *layer_ids_for_usage = nullptr;
     ggml_tensor **ids_out_param =
         ids_tap ? &layer_ids_for_usage : partial_ids_out;
-    if (!moe && !split_planned && env_merged_gate_up_enabled()) {
-      const auto t_wlookup_start = std::chrono::steady_clock::now();
-      const bool gate_up_device =
-          graph_expert_projection_resident(g, l, "ffn_gate_exps.weight");
-      ggml_tensor *gate_up =
-          expert_gate_up_weight(g, g.ctx, l, gate_up_device);
-      ggml_tensor *down = expert_weight(g, g.ctx, l,
-                                        "ffn_down_exps.weight");
-      g.moe_weight_lookup_ms_total +=
-          std::chrono::duration<double, std::milli>(
-              std::chrono::steady_clock::now() - t_wlookup_start)
-              .count();
-      if (gate_up && down) {
-        moe = build_moe(g, g.ctx, ffn_in, l, router, bias, nullptr, nullptr,
-                        down, nullptr, nullptr, nullptr, nullptr, gate_up,
-                        ids_out_param, partial_probs_out, false,
-                        nullptr, nullptr);
-      }
-    }
-
     if (!moe) {
       if (g.exl3_bridge_failed)
         return false;
@@ -1238,62 +1218,6 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       return false;
     }
   }
-  // Safe allocator-size probe for diagnosing unexpectedly large graph
-  // workspaces. reserve_size() performs GGML's no_alloc sizing pass, but it
-  // also rebuilds the scheduler's internal split graph. Do not reuse this
-  // FullGraph for a real allocation/compute after probing; decline it and let
-  // the owning prepare path destroy it. This is intentionally opt-in because
-  // it disables the full-graph instance for the diagnostic run.
-  const char *reserve_diag =
-      zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_GRAPH_RESERVE_DIAG");
-  const bool reserve_diag_enabled =
-      reserve_diag &&
-      ((std::strcmp(reserve_diag, "1") == 0 ||
-        std::strcmp(reserve_diag, "all") == 0) ||
-       (std::strcmp(reserve_diag, "decode") == 0 && g.S == 1));
-  if (reserve_diag_enabled) {
-    const int n_backends = ggml_backend_sched_get_n_backends(g.sched);
-    std::vector<size_t> backend_sizes(static_cast<size_t>(n_backends), 0);
-    ggml_backend_sched_reserve_size(g.sched, g.graph, backend_sizes.data());
-    LOG_WARN("[GGML-QWEN-FULL-RESERVE-DIAG] no-allocation sizing only; "
-             "declining this graph instance (S=%d splits=%d copies=%d)\n",
-             g.S, ggml_backend_sched_get_n_splits(g.sched),
-             ggml_backend_sched_get_n_copies(g.sched));
-    {
-      // Largest intermediate tensors of the graph, to see what the workspace is made of.
-      std::vector<std::pair<size_t, int>> big;
-      for (int i = 0; i < ggml_graph_n_nodes(g.graph); ++i) {
-        ggml_tensor *n = ggml_graph_node(g.graph, i);
-        if (n && n->op != GGML_OP_NONE && n->op != GGML_OP_VIEW && n->op != GGML_OP_RESHAPE &&
-            n->op != GGML_OP_PERMUTE && n->op != GGML_OP_TRANSPOSE)
-          big.push_back({ggml_nbytes(n), i});
-      }
-      std::sort(big.rbegin(), big.rend());
-      double total = 0;
-      for (auto &b : big) total += (double)b.first;
-      LOG_WARN("[GGML-QWEN-FULL-RESERVE-DIAG] %zu non-view nodes, sum of their sizes %.2f GiB (S=%d)\n", big.size(),
-               total / (1024.0 * 1024.0 * 1024.0), g.S);
-      for (size_t k = 0; k < big.size() && k < 14; ++k) {
-        ggml_tensor *n = ggml_graph_node(g.graph, big[k].second);
-        LOG_WARN("[GGML-QWEN-FULL-RESERVE-DIAG] top%zu node %d %.3f GiB op=%s name=%s type=%s ne=[%lld,%lld,%lld,%lld] src0=%s\n", k,
-                 big[k].second, (double)big[k].first / (1024.0 * 1024.0 * 1024.0), ggml_op_name(n->op), n->name,
-                 ggml_type_name(n->type), (long long)n->ne[0], (long long)n->ne[1], (long long)n->ne[2],
-                 (long long)n->ne[3], n->src[0] ? n->src[0]->name : "-");
-      }
-    }
-    for (int i = 0; i < n_backends; ++i) {
-      ggml_backend_t backend = ggml_backend_sched_get_backend(g.sched, i);
-      ggml_backend_buffer_type_t buft =
-          ggml_backend_sched_get_buffer_type(g.sched, backend);
-      const double gib = static_cast<double>(backend_sizes[i]) /
-                         (1024.0 * 1024.0 * 1024.0);
-      LOG_WARN("[GGML-QWEN-FULL-RESERVE-DIAG] backend=%s buffer=%s "
-               "required=%.3f GiB (%zu bytes)\n",
-               ggml_backend_name(backend), ggml_backend_buft_name(buft), gib,
-               backend_sizes[i]);
-    }
-    return false;
-  }
   const double t_construction_ms = std::chrono::duration<double, std::milli>(
                                        std::chrono::steady_clock::now() -
                                        t_build_graph_start)
@@ -1432,7 +1356,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
                         : 0) /
                (1024.0 * 1024.0),
            (double)g.graph_bytes / (1024.0 * 1024.0 * 1024.0));
-  if (zeromoe::graphcfg::env("ZEROMOE_GRAPH_OP_HISTOGRAM")) {
+  if (Logger::instance().would_log(LogLevel::DEBUG)) {
     // Which operations make up the graph (kernel launches dominate a window's host time).
     std::map<std::string, int> ops;
     const int nn = ggml_graph_n_nodes(g.graph);
@@ -1448,7 +1372,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     std::sort(sorted.rbegin(), sorted.rend());
     std::string line;
     for (size_t i = 0; i < sorted.size() && i < 16; ++i) line += " " + sorted[i].second + "=" + std::to_string(sorted[i].first);
-    LOG_INFO("[GRAPH-OPS] %s S=%d: %d nodes (%d view-only):%s\n", g.decode_mode ? "decode" : "prefill", g.S, nn, views, line.c_str());
+    LOG_DEBUG("[GRAPH-OPS] %s S=%d: %d nodes (%d view-only):%s\n", g.decode_mode ? "decode" : "prefill", g.S, nn, views, line.c_str());
   }
   g.ready = true;
   return true;

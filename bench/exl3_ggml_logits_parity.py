@@ -73,8 +73,8 @@ def run_decode(engine, config, out_dir, label, prompt, tokens, extra_env,
     log_path = out_dir / f"{label}.log"
     stdout_path = out_dir / f"{label}.stdout"
     command = [
-        str(engine), "--config", str(config), "--ngen", str(tokens),
-        "--raw-prompt", "--log-path", str(log_path),
+        str(engine), "--config", str(config), "--predict", str(tokens),
+        "--raw-prompt", "--log-file", str(log_path),
     ]
     try:
         with stdout_path.open("w") as stdout:

@@ -79,7 +79,7 @@ struct BlockQ4_KV {
 // per-token dispatch loop -- runs during BOTH prefill's S>1 loop and decode's S=1
 // loop, so MainThread does NOT mean "this happened during decode", despite the
 // name this replaced; see this enum's own git history / CLAUDE.md for the
-// "why is claimed-by-decode nonzero during a --ngen 0, decode-never-ran prefill
+// "why is claimed-by-decode nonzero during a --predict 0, decode-never-ran prefill
 // run" investigation that motivated the rename), or a LockFreePrefetcher worker
 // thread's speculative claim. Gating behavior on this is a hard correctness
 // requirement, not a style choice: claim_or_wait's Hit branch may only run its
@@ -126,17 +126,7 @@ struct MoEExpertBlock {
     bool slab_from_shared_arena = false;
     uint64_t last_used_clock = 0;
     uint32_t hit_count = 0;  // frequency signal for eviction scoring (power-law routing)
-    // EngineConfig::ram_grace_period_tokens (2026-09-04): the DECODE token
-    // index (RAMSafetyManager::current_decode_token_idx_ref, NOT the raw
-    // operation-tick last_used_clock above) at which this slot was last
-    // genuinely (re)loaded with a NEW expert -- set only at the real load
-    // sites (RAMSafetyManager::claim_or_wait's Claimed branch, the
-    // demote_from_vram salvage-into-RAM path, disk_batch_padding's
-    // speculative fill, and preload_ram_slot), never on a plain re-hit or
-    // a slot-vacate/free. 0 by default -- harmless even with the feature
-    // off, since eviction_score only reads it when ram_grace_period_
-    // tokens > 0.
-    uint64_t load_token_idx = 0;
+
 
     // True for a lightweight "shadow" block populated by
     // StreamingEngine::populate_vram_shadow (execution_layer.cpp's
@@ -1130,7 +1120,7 @@ public:
             // pointer here was a real, confirmed bug -- compute-sanitizer
             // flagged 861 cudaErrorInvalidValue ("invalid argument")
             // errors from this exact line on a real GLM-5.3 shutdown
-            // (reproducible in ~17s via a no-prompt/--ngen 0 run, since
+            // (reproducible in ~17s via a no-prompt/--predict 0 run, since
             // this fires purely from model load + teardown, no generation
             // needed) -- harmless in practice (cudaFree on an invalid
             // pointer is a no-op past logging the error, and dense_pool's
@@ -1260,7 +1250,7 @@ public:
             if (is_small_critical) {
                 mlock(qt.host_ptr, t_meta.size_bytes);
             }
-            
+
             resident_layers[name] = qt;
         }
         PERF_END(dense_load, t_dense_load);
@@ -2569,7 +2559,7 @@ public:
             uint64_t gate_expert_offset = gM->offset + (uint64_t)expert_id * gb;
             uint64_t up_expert_offset   = uM->offset + (uint64_t)expert_id * ub;
             uint64_t down_expert_offset = dM->offset + (uint64_t)expert_id * db;
-            
+
             bool is_interleaved = (up_expert_offset == gate_expert_offset + gb) &&
                                   (down_expert_offset == up_expert_offset + ub);
 

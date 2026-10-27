@@ -86,7 +86,7 @@ PY
   esac
   printf '%s\n:q\n' "$PROMPT" | env "${env[@]}" \
       systemd-run --user --scope -q -p MemoryMax=80G -p MemorySwapMax=0 \
-      "$bin" --config "$out/$tag.toml" --ngen 48 > "$out/$tag.stdout" 2>&1
+      "$bin" --config "$out/$tag.toml" --predict 48 > "$out/$tag.stdout" 2>&1
   echo "$tag exit=$?"
 }
 

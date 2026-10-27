@@ -39,10 +39,6 @@
 #include <cstdint>
 #include <vector>
 
-// Retained for the shared `ggml_async_graph_reuse` config key. HC graphs keep
-// the conservative per-graph event waits; routed-MoE graphs consume the value.
-void set_ggml_hc_async_graph_reuse(bool enabled);
-
 // Qwen-only opt-in for the pinned host staging/readback path used when a
 // device-HC result must feed a CPU-routed MoE layer. The default is false;
 // callers must enable it only after comparing the complete decode path.

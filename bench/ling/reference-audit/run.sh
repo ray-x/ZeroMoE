@@ -162,4 +162,4 @@ else
   unset ZEROMOE_GLM5NEXT_PREFILL_ROUTE_CAPTURE
 fi
 exec "$worktree/scripts/run_capped.sh" --limit-gb "${LING_CAP_GIB:-95}" "$bin" \
-  --config "$config" --ngen 32 --temp 0 "${graph_args[@]}" < "$prompt_file"
+  --config "$config" --predict 32 --temp 0 "${graph_args[@]}" < "$prompt_file"

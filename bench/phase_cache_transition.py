@@ -129,7 +129,7 @@ def run_case(args, name, cache_mib, prompts, teacher_source=None, gpu0_cache_gb=
             shutil.copyfile(teacher_source / f"request-{reference}.tokens", teacher / f"request-{index}.tokens")
         env["ZEROMOE_TEACHER_FORCE_REQUEST_DIR"] = str(teacher)
     command = [str(ROOT / "scripts/run_capped.sh"), "--limit-gb", str(cap), "--", str(args.binary),
-               "--config", str(config), "--ngen", str(args.ngen), "--temp", "0", "--log-path", str(directory / "engine.log"),
+               "--config", str(config), "--predict", str(args.ngen), "--temp", "0", "--log-file", str(directory / "engine.log"),
                "--graph-phase-cache-mib", str(cache_mib), "--graph-phase-cache-reserve-mib", "512",
                *graph_cli]
     samples = []

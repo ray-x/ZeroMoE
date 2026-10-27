@@ -54,8 +54,8 @@ void verify_cuda_graphs_compiled_in(ggml_backend_t cuda_backend) {
              "run every node as an individual cudaLaunchKernel instead of "
              "one batched cudaGraphLaunch per token -- previously measured "
              "cost: ~20 tok/s -> ~8 tok/s on this same decode path. Rebuild "
-             "with -DZEROMOE_ENABLE_CUDA_GRAPHS=ON (the CMakeLists.txt "
-             "default) and verify with a fresh 'cmake -B <dir>' configure, "
+             "with the current ZeroMoE CMakeLists.txt and verify with a "
+             "fresh 'cmake -B <dir>' configure, "
              "not just an incremental build in a stale build directory.\n");
   }
 }
@@ -109,7 +109,7 @@ bool layer_timing_eval_callback(struct ggml_tensor *t, bool ask,
     if (vtag_it != g->layer_timing_layer_of.end())
       std::snprintf(tag_buf, sizeof(tag_buf), "L%d/%s",
                     vtag_it->second.first, vtag_it->second.second);
-    LOG_INFO("[GGML-QWEN-FULL-LAYER-TIMING-VERBOSE] ask=%d name=%s op=%s "
+    LOG_DEBUG("[GGML-QWEN-FULL-LAYER-TIMING-VERBOSE] ask=%d name=%s op=%s "
              "backend=%s tag=%s since_last=%.4fms\n",
              ask ? 1 : 0, ggml_get_name(t), ggml_op_name(t->op), be_name,
              tag_buf, gap_ms);

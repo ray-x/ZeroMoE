@@ -27,12 +27,9 @@ The required graph-capture build settings are:
 ```text
 CMAKE_BUILD_TYPE=Release
 CUDA target=sm_86
-ZEROMOE_ENABLE_CUDA_GRAPHS=ON
-GGML_CUDA_GRAPHS=ON
 GGML_NATIVE=ON
 GGML_OPENMP=ON
-ZEROMOE_GGML_OPENMP=ON
-ZEROMOE_ENABLE_AVX512_VNNI=ON
+GGML_AVX512_VNNI=ON
 ```
 
 The CUDA compile invocation used the SM86 code target and the ggml graph
@@ -44,11 +41,10 @@ checkout's full `compile_commands.json` was in the deleted temporary build
 tree, so this list records the flags captured during the run rather than a
 reconstructed command for every translation unit.
 
-`ZEROMOE_ENABLE_CUDA_GRAPHS=ON` is propagated to ggml as
-`GGML_CUDA_GRAPHS=ON`, which compiles `GGML_CUDA_USE_GRAPHS`. The runtime log
-must say `[CUDA-GRAPHS-CHECK] compiled in: yes`. Without that compile-time
-macro, ggml launches graph nodes individually and this decode path is much
-slower.
+ZeroMoE CMake now forces `GGML_CUDA_GRAPHS=ON`, which compiles
+`GGML_CUDA_USE_GRAPHS`. The runtime log must say
+`[CUDA-GRAPHS-CHECK] compiled in: yes`. Without that compile-time macro, ggml
+launches graph nodes individually and this decode path is much slower.
 
 The source build command used for the measured binary was:
 

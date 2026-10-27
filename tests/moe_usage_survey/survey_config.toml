@@ -476,7 +476,6 @@ mirror_model_path = "/data/models/GLM-5.3-GGUF-align"   # 2026-08-15: 2nd copy o
 # this fundamental math (e.g. genuinely shrinking the working set, not
 # just re-targeting which slice of it gets pinned).
 ram_pinned_budget_gb = 45.0
-verbose_moe_log      = false
 promote_hit_threshold = 6
 promote_h2d_threshold = 6
 

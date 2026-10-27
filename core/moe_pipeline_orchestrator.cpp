@@ -186,17 +186,12 @@ uint64_t diag_get_decode_qwen_cpu_offload_fence_failures() {
   return g_diag_decode_qwen_cpu_offload_fence_failures;
 }
 
-// Per-layer decode timing is intentionally opt-in.  It updates several
+// Per-layer decode timing follows DEBUG verbosity. It updates several
 // counters once per layer call, so leaving it enabled in a production decode
 // would measure the instrumentation itself (and can materially lower the
-// single-token throughput).  Enable it only for a diagnostic run with
-// ZEROMOE_QWEN_DECODE_LAYER_TIMING=1.
+// single-token throughput), so DEBUG runs should not be used for benchmarks.
 static bool qwen4exp_decode_layer_timing_enabled() {
-  static const bool enabled = [] {
-    const char *e = zeromoe::graphcfg::env("ZEROMOE_QWEN_DECODE_LAYER_TIMING");
-    return e && e[0] == '1';
-  }();
-  return enabled;
+  return Logger::instance().would_log(LogLevel::DEBUG);
 }
 // Decode-only, per-layer wall timer.  The existing aggregate counters tell
 // us that the request is slow, but they cannot answer which layers are worth

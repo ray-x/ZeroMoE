@@ -22,7 +22,7 @@ case $MODE in
     env "${COMMON[@]}" \
       scripts/run_capped.sh --limit-gb 110 -- "$BIN" --config "$CONFIG" \
       --graph-offload-ddr-gib 100 --graph-offload-usage-file "$PWD/$BASE_PROFILE" \
-      --graph-usage-record-file "$PWD/$PROFILE" --ngen 96 --temp 0.7 \
+      --graph-usage-record-file "$PWD/$PROFILE" --predict 96 --temp 0.7 \
       < bench/mimo_survey_prompts.txt > "logs/mimo_survey_$(date +%H%M%S).log" 2>&1
     wc -l "$PROFILE" "$PROFILE.prefill" ;;
   eval|long)
@@ -33,7 +33,7 @@ case $MODE in
     sed -e "s|^pin_file = .*|pin_file = \"$PWD/$PROFILE\"|" ${EMBED:+-e "s|^freeze_usage_stats = .*|&\nembedding_device = \"$EMBED\"|"} "$CONFIG" > "$cfg"
     env "${COMMON[@]}" \
       scripts/run_capped.sh --limit-gb 110 -- "$BIN" --config "$cfg" \
-      --graph-offload-ddr-gib 100 --graph-offload-usage-file "$PWD/$PROFILE" --ngen $NGEN --temp 0 \
+      --graph-offload-ddr-gib 100 --graph-offload-usage-file "$PWD/$PROFILE" --predict $NGEN --temp 0 \
       < $PROMPTS > "logs/mimo_${TAG}.log" 2>&1 || true
     rm -f "$cfg"
     echo "$TAG: decode $(grep -a REQUEST-DECODE-OUTPUT logs/mimo_${TAG}.log | grep -o 'rate=[0-9.]*' | tr '\n' ' ') prefill $(grep -a 'PREFILL-DONE\] [0-9]' logs/mimo_${TAG}.log | grep -o '([0-9.]* tok/s)' | tr '\n' ' ')" ;;

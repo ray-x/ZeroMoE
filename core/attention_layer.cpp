@@ -149,11 +149,7 @@ static bool force_gdn_full_host() {
 }
 
 static bool gdn_full_stats_enabled() {
-  static const bool enabled = [] {
-    const char *v = zeromoe::graphcfg::env("ZEROMOE_GGML_GDN_FULL_STATS");
-    return v && v[0] == '1';
-  }();
-  return enabled;
+  return Logger::instance().would_log(LogLevel::DEBUG);
 }
 
 static void log_gdn_full_stats(const char *label, int layer_idx,
@@ -178,7 +174,7 @@ static void log_gdn_full_stats(const char *label, int layer_idx,
       max_row = s;
     }
   }
-  LOG_INFO("[GDN-FULL-STATS] %s layer=%d bad=%d max_abs=%g max_row=%d\n", label,
+  LOG_DEBUG("[GDN-FULL-STATS] %s layer=%d bad=%d max_abs=%g max_row=%d\n", label,
            layer_idx, bad, max_abs, max_row);
 }
 
@@ -213,7 +209,6 @@ static bool check_finite_attn(const char *label, int layer_idx,
   if (nan_count > 0 || inf_count > 0) {
     LOG_ERROR("[MLA] %s layer=%d: %d/%zu NaN, %d/%zu Inf.\n", label, layer_idx,
               nan_count, n, inf_count, n);
-    trace_abort_if_nan("MLA", true);
     return false;
   }
   if (row_width > 0 && trace_gate("MLA")) {

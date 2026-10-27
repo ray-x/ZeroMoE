@@ -94,7 +94,7 @@ cd /tmp/reverify_wt
 echo "Explain what a binary search tree is and give a short example in Python." | \
 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0 \
 ZEROMOE_BENCH_IGNORE_STOP=1 CUDA_VISIBLE_DEVICES=0 ZEROMOE_CUDA_SCHEDULE=auto \
-./build_ggmlcuda/zeromoe --config path/to/config.toml --ngen 40
+./build_ggmlcuda/zeromoe --config path/to/config.toml --predict 40
 ```
 
 `ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS` is the `X` for whichever row
@@ -192,7 +192,7 @@ path can produce a *faster*, not slower, number.
 Build used: `ZEROMOE_GGML_ROOT=/home/ray/Projects/llama.cpp-moestream-integration/ggml`
 (not beellama's ggml as in step 2), `build dir ../moestream-build-upstream-master`.
 Result for `configs/testing/qwen4exp_option_b_rightsize_split44_x0_baseline.toml`, prompt
-"write a python program to print hello world", `--ngen 40`: **34.9-35.8 tok/s**
+"write a python program to print hello world", `--predict 40`: **34.9-35.8 tok/s**
 (8+ runs), same output text as the recorded baseline; hot-set hit rate ~90%.
 
 **Required: the linked ggml must export `ggml_cpu_mul_mat_id_negative_skip()`.**
@@ -243,15 +243,15 @@ Findings with `host-node` CPU layers (`ZEROMOE_QWEN4EXP_HOST_NODE=1`, `qwen4exp_
      are `cudaLaunchHostFunc` callbacks) and CUDA does not allow host nodes in a conditional body graph. Not fixable by config.
 - Fixed: a failed build step no longer leaves a sticky CUDA error (it used to abort the engine on the next kernel
   launch) and is no longer retried every token; it logs one `[QWEN4EXP-MASTER-GRAPH] disabled for this session` warning.
-- `ZEROMOE_QWEN4EXP_GRAPH_REPLAY_TIMING=1` crashes the Phase 2 host-node path (`CUDA error: invalid argument`, event
-  timing inside captured graphs); use `ZEROMOE_TOKEN_LOOP_DIAG=1` for timing.
+- The old replay timing ledger was removed. Use `--verbosity 5` for the remaining Qwen per-layer timing diagnostics;
+  they add synchronization overhead and should not be used for throughput measurements.
 - To make a conditional body valid, it must contain only kernels/memcpys (e.g. just the split layer's GPU hot-expert MoE),
   with the CPU host node left outside the body and gated by a flag the predicate writes.
 
 ## 11. Split-layer progression, upstream integration ggml, fixed build (2026-10-02)
 
 "Conditional node" in the user's sense = an Option-B split layer (hot experts resident in VRAM, cold on CPU, per-layer
-hot/cold route tables), grown from one layer to 44. Same prompt/method as section 9 (`--ngen 40`, warm-up + 2 reps):
+hot/cold route tables), grown from one layer to 44. Same prompt/method as section 9 (`--predict 40`, warm-up + 2 reps):
 
 | config | GPU layers / split / plain CPU | tok/s (rep1, rep2) |
 |---|---|---|
@@ -275,7 +275,7 @@ the extra time is non-kernel overhead); that explains the 17.7 tok/s of the sect
 Config = plain 22/26 full graph (`configs/cpu_affinity_test_tmp/mixed_dl22.toml`) + `qwen4exp_gpu_stage_enabled = true` and
 `qwen4exp_gpu_stage_layers = [...]` (root keys, before the first `[[gpus]]`). Per token a host callback gathers the layer's
 top-10 routed experts (~16 MB) from the DDR arena into a compact VRAM buffer, then ordinary GPU MUL_MAT_ID computes them.
-Prompt "What is the meaning of life?", 80 tokens, `ZEROMOE_TOKEN_LOOP_DIAG=1`:
+Prompt "What is the meaning of life?", 80 tokens; the historical run used `ZEROMOE_TOKEN_LOOP_DIAG=1`, now replaced by `--verbosity 5`:
 
 | staged layers | ms/token | tok/s |
 |---|---|---|
@@ -312,7 +312,7 @@ Standalone benchmark of one split's graph (3x MUL_MAT_ID gate/up IQ1_M + down IQ
   (ideal on 6 cores ~125 us); 10 valid = 3837 -> 840 us. Single-thread speed matches the dot kernels (~3.8 GB/s/core).
 - In the tight CPU-only loop passive OpenMP wait is 27% faster (286 vs 395 us) and fused gate+up 12% faster (346 us), BUT neither carries over:
   end-to-end on 0/44/4 (3 reps x 5 settings, interleaved, machine idle): default 34.31 tok/s, passive 30.43 (-11%), GOMP_SPINCOUNT=1000
-  32.27 (-6%), fused gate+up (`ZEROMOE_QWEN4EXP_GRAPH_MERGED_GATE_UP=1`) 34.88 (+1.7%, noise), passive+fused 31.27 (-9%).
+  32.27 (-6%), fused gate+up (retired after a 34.88 tok/s result, +1.7% within noise), passive+fused 31.27 (-9%).
   Threads idle during GPU phases between splits, so waking them every split costs more than spinning saves. Keep spin (default).
 - Remaining headroom is ~3x thread-scaling inefficiency inside mul_mat_id for 1-3 experts (barrier-separated short phases); not a config change.
 - Process hygiene: another session's `llama-bench`/compile on this box inflated or blocked runs three times; check
@@ -328,14 +328,14 @@ quantization + barrier to the plain loop reproduced the loss, and quantizing on 
 Change (integration ggml `ggml-cpu.c`, also in `patches/ggml-mul-mat-id-negative-skip.patch`): when `ggml_nelements(src1) <= 16384` and nth > 1,
 thread 0 quantizes all of src1; the existing barrier after the row grouping publishes it. `ZEROMOE_MMID_PARALLEL_QUANT=1` restores the old path.
 - Exact: output bit-identical old vs new at 1/4/12 threads for IQ1_M, IQ4_NL (ne11=10), Q8_0, IQ2_XXS (`bench/mmid_exact_check.cpp`); end-to-end output hash identical.
-- 0/44/4 (hello-world prompt, `--ngen 40`, 4 interleaved pairs, idle machine): old 35.49 (+ one 31.43 outlier) -> new 37.00 tok/s (36.77-37.15): +4.0% (+7.3% with the outlier).
+- 0/44/4 (hello-world prompt, `--predict 40`, 4 interleaved pairs, idle machine): old 35.49 (+ one 31.43 outlier) -> new 37.00 tok/s (36.77-37.15): +4.0% (+7.3% with the outlier).
 - Plain 22/26 (80 tokens, 3 interleaved pairs): old 26.91 -> new 27.95 tok/s: +3.9%; every new run beat its paired old run.
 - Prefill is unaffected (src1 larger than the threshold keeps the per-thread path). Spin policy still must stay default (section 14).
 
 ## 16. Host-node mode re-measured: the MUL_MAT_ID fix does not apply, but a thread-contention fix does (+24%), 2026-10-02
 
 Config: plain 22/26 + `qwen4exp_cpu_offload = true` for all 26 CPU layers + `ZEROMOE_QWEN4EXP_HOST_NODE=1` (CPU MoE as CUDA host callbacks),
-80-token prompt, `ZEROMOE_TOKEN_LOOP_DIAG=1`, idle machine, interleaved reps.
+80-token prompt, idle machine, interleaved reps; the historical run used `ZEROMOE_TOKEN_LOOP_DIAG=1` (now `--verbosity 5`).
 - Serial-quantization fix (section 15) on host-node mode: 18.27 -> 18.41 tok/s (+0.8%, noise). Host-node was 66% of plain speed (28.00).
 - Cause of the slowness: the CPU callback runs on a CUDA driver thread as OpenMP team master while the generation thread spins in
   `cudaStreamSynchronize` (CUDA schedule Auto = spin), so ~13 runnable threads share 12 logical CPUs and stragglers stall every barrier.
@@ -351,7 +351,7 @@ Config: plain 22/26 + `qwen4exp_cpu_offload = true` for all 26 CPU layers + `ZER
 ## 17. Q2_0 (VNNI) measurements and a default-change regression, 2026-10-02 (evening)
 
 Q2_0 (`/data/sdb/models/qwen3.8-flash-next/Q2_0`, 37.6 GB), upstream integration ggml with the Q2_0 VNNI dot kernels (`vpdpbusd` present in `ggml_vec_dot_q2_0_q8_0`),
-hello-world prompt, `--ngen 40`, current tree, `ZEROMOE_QWEN4EXP_DECODE_RECREATE_GRAPH_ARENA=1` (see warning below):
+hello-world prompt, `--predict 40`, current tree, `ZEROMOE_QWEN4EXP_DECODE_RECREATE_GRAPH_ARENA=1` (see warning below):
 - All 48 layers' experts on the CPU (scratch config = `qwen4exp_q2_0_fullgraph_22_26.toml` with `cpu_affinity_layers` = 0..47, `PRELOAD_LAYERS=0`): **18.81 tok/s** (53 ms/token), coherent. CPU-only > 10 tok/s confirmed.
 - Plain 22 GPU / 26 CPU (`qwen4exp_q2_0_fullgraph_22_26.toml`): 27.74 tok/s.
 - Option B 0/44/4 (`qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml`, hot=256 cold=256): **32.03 tok/s**, coherent; the older "Q2_0 + Option-B DDR staging bug" does not reproduce.
@@ -383,7 +383,7 @@ Opt-outs: `ZEROMOE_QWEN4EXP_DECODE_RECREATE_GRAPH_ARENA=1` (no borrowing), `ZERO
 ## 19. Host-node gap investigation: it was thread placement, not the signaling (2026-10-02, late)
 
 Host-node mode (CPU MoE as CUDA host callbacks) ran at 22.7 tok/s vs 28.0 for plain 22/26 splits. Findings, in the order they were established:
-- Per-call breakdown of the runner (`ZEROMOE_QWEN_CPU_GRAPH_TIMING_REPORT_CALLS`): input copy 0.9 us, metadata 0.08 us, output copy 1 us, **compute 1146 us**. The body is entirely the ggml graph compute, ~30% slower than the same layer as a plain scheduler split (~0.87 ms).
+- Historical per-call breakdown of the runner (the `ZEROMOE_QWEN_CPU_GRAPH_TIMING_REPORT_CALLS` diagnostic was later removed): input copy 0.9 us, metadata 0.08 us, output copy 1 us, **compute 1146 us**. The body is entirely the ggml graph compute, ~30% slower than the same layer as a plain scheduler split (~0.87 ms).
 - Handoff overhead measured two ways is small: an `nsys` trace gives D2H-end -> H2D-start = 1555 us vs callback body 1495 us, i.e. ~60 us per layer; a standalone CUDA benchmark (`handoff.cu`-style: D2H + `cudaLaunchHostFunc` + H2D in a captured graph) gives 29 us per handoff at the real ~10 KB payload.
 - Signal/doorbell alternative (GPU kernel posts a flag in mapped host memory, persistent CPU thread spins, GPU wait-kernel spins on the reply): 4.6 us (256 B), 12.8 us (10 KB), 38 us (40 KB) per handoff vs 23.5 / 29.3 / 35.1 us for the host callback. At the real payload that saves ~16 us/layer, ~0.4 ms/token over 26 layers, so it is NOT the main lever.
 - CPU weighted-reduce tail on the CPU (mul + 10 views + 9 adds + cont, 25 nodes vs 4): only ~37 us/layer (barrier ~1.8 us/node). The runner's `output_per_expert` mode (GPU does the reduce) could save ~1 ms/token.

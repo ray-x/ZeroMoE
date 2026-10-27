@@ -4,9 +4,9 @@ Status: the standalone draft graph is parity-validated against llama.cpp, and
 target-verified speculative generation is available as an **opt-in**
 (`mtp_graph = true`), correctness-validated path on the Qwen4Exp full graph.
 It is exact (output identical to plain decoding) but **not yet faster**: the
-target verifies one token per step. The startup rejection of `mtp_enabled`
-with the full-graph-only trunk stays for every configuration that does not set
-`mtp_graph`.
+target verifies one token per step. MTP uses the llama.cpp-compatible
+`spec_type = "draft-mtp"` setting; Qwen's `mtp_graph = true` selects its
+graph-native implementation.
 
 ## Real-weight runtime smoke (2026-10-26)
 
@@ -291,8 +291,9 @@ teacher-forced validation remain, and the production startup guard stays.
 
 ## Graph-native generation (2026-10-27)
 
-Enable with `mtp_enabled = true`, `mtp_graph = true`, `mtp_model_path`, and
-`mtp_draft_tokens` in the TOML, with the full graph required as usual. The
+Enable with `spec_type = "draft-mtp"`, `mtp_graph = true`,
+`spec_draft_model = "…"` when using a separate shared checkpoint, and
+`spec_draft_n_max` in TOML. The full graph remains required. The
 pieces:
 
 - `core/qwen4exp_graph_mtp.cpp` adapts the engine to the driver in
@@ -325,7 +326,7 @@ target runs in a different configuration with different numerics.
 Validation (Qwen3.8-Flash-Next UD-IQ1_M target, shared Q4_K_M MTP sidecar,
 RTX 3090, greedy, 48 tokens, 18 resident expert layers):
 
-- Output is byte-identical to plain decoding for `mtp_draft_tokens` = 1, 2, 3,
+- Output is byte-identical to plain decoding for `spec_draft_n_max` = 1, 2, 3,
   4 and 5 (acceptance 62%, 49%, 36%, 31%, 30%; 11-18 state restores per run).
 - Logits fingerprints: every position on the committed path is bit-identical to
   plain decoding for K = 1, 3, 5. `plain` is reproducible run to run.

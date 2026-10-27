@@ -1093,33 +1093,33 @@ void Exl3GpuExecutor::routed_ffn_device_external(
   uint64_t graph_id = 0;
   bool graph_use_registered = false;
   const bool trace_graph_capture =
-      zeromoe::graphcfg::present("ZEROMOE_EXL3_GRAPH_TRACE");
+      Logger::instance().would_log(LogLevel::DEBUG);
   const auto capture_and_launch = [&] {
     cudaGraph_t captured_graph = nullptr;
     cudaGraphExec_t executable = nullptr;
     bool capture_started = false;
     try {
       if (trace_graph_capture)
-        std::fprintf(stderr, "[EXL3-GRAPH-TRACE] begin capture routes=%zu\n",
+        LOG_DEBUG("[EXL3-GRAPH-TRACE] begin capture routes=%zu\n",
                      route_count);
       check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
             "begin external routed FFN capture");
       capture_started = true;
       enqueue_sequence();
       if (trace_graph_capture)
-        std::fprintf(stderr, "[EXL3-GRAPH-TRACE] enqueued routes=%zu\n",
+        LOG_DEBUG("[EXL3-GRAPH-TRACE] enqueued routes=%zu\n",
                      route_count);
       const cudaError_t capture_status =
           cudaStreamEndCapture(stream, &captured_graph);
       capture_started = false;
       check(capture_status, "end external routed FFN capture");
       if (trace_graph_capture)
-        std::fprintf(stderr, "[EXL3-GRAPH-TRACE] ended capture\n");
+        LOG_DEBUG("[EXL3-GRAPH-TRACE] ended capture\n");
       check(cudaGraphInstantiate(&executable, captured_graph, nullptr, nullptr,
                                  0),
             "instantiate external routed FFN graph");
       if (trace_graph_capture)
-        std::fprintf(stderr, "[EXL3-GRAPH-TRACE] instantiated graph\n");
+        LOG_DEBUG("[EXL3-GRAPH-TRACE] instantiated graph\n");
       graph_id = impl_->store_external_graph(
           std::move(graph_key), std::move(graph_site_key), captured_graph,
           executable);
@@ -1135,12 +1135,12 @@ void Exl3GpuExecutor::routed_ffn_device_external(
       if (stored == impl_->external_routed_graphs.end())
         throw std::runtime_error("stored EXL3 routed graph disappeared");
       if (trace_graph_capture)
-        std::fprintf(stderr, "[EXL3-GRAPH-TRACE] stored graph=%llu\n",
+        LOG_DEBUG("[EXL3-GRAPH-TRACE] stored graph=%llu\n",
                      static_cast<unsigned long long>(graph_id));
       check(cudaGraphLaunch(stored->executable, stream),
             "launch captured external routed FFN graph");
       if (trace_graph_capture)
-        std::fprintf(stderr, "[EXL3-GRAPH-TRACE] launched graph=%llu\n",
+        LOG_DEBUG("[EXL3-GRAPH-TRACE] launched graph=%llu\n",
                      static_cast<unsigned long long>(graph_id));
     } catch (...) {
       if (capture_started) {
@@ -1166,7 +1166,7 @@ void Exl3GpuExecutor::routed_ffn_device_external(
         graph_id = captured->id;
         graph_use_registered = true;
         if (trace_graph_capture)
-          std::fprintf(stderr, "[EXL3-GRAPH-TRACE] replay graph=%llu\n",
+          LOG_DEBUG("[EXL3-GRAPH-TRACE] replay graph=%llu\n",
                        static_cast<unsigned long long>(graph_id));
         check(cudaGraphLaunch(captured->executable, stream),
               "replay external routed FFN graph");

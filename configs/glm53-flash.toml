@@ -66,8 +66,8 @@ glm5next_dense_prefill_fusion = true
 dense_bf16_prefill_gemm = true
 dense_bf16_kquant = false
 
-mtp_enabled = false
-mtp_draft_tokens = 3
+spec_type = "none"
+spec_draft_n_max = 3
 moe_prefill_batched = false
 expert_gpu_activation = true
 moe_gpu_accum = true

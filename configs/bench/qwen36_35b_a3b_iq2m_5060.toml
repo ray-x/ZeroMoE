@@ -15,7 +15,7 @@ max_new_tokens = 400
 temperature = 0.0
 top_p = 1.0
 enable_thinking = false
-mtp_enabled = false
+spec_type = "none"
 prompt_cache = false
 
 host_ram_gb = 64.0

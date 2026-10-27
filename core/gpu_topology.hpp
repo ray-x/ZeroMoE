@@ -912,7 +912,7 @@ public:
             // (many synchronous cudaStreamSynchronize calls interleaved with
             // CPU-contended OMP dequant work), and that finding still holds
             // there. But on the full-graph Qwen4Exp decode path (ggml CUDA
-            // graph capture/replay, see ZEROMOE_ENABLE_CUDA_GRAPHS),
+            // graph capture/replay, which ZeroMoE requires for CUDA builds),
             // BlockingSync's per-call OS wake-up/context-switch latency
             // (~40us median) was directly measured -- via nsys cuda_api_sum,
             // matched 22/48-GPU-resident-layer config against llama.cpp's own

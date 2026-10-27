@@ -20,6 +20,7 @@
 #include "quant_table.hpp"
 #include "expert_cache.hpp"
 #include "graph_config.hpp"
+#include "logger.hpp"
 
 #include <array>
 #include <filesystem>
@@ -915,9 +916,9 @@ public:
     Ensure r;
     const auto t0 = std::chrono::steady_clock::now();
     load_transient(layer, to_load, r);
-    if (graphcfg::present("ZEROMOE_OFFLOAD_DEBUG_PREFETCH"))
-      std::fprintf(stderr, "[PREFETCH] layer=%d experts=%zu errors=%d %.1f ms\n", layer, to_load.size(), r.errors,
-                   std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    if (Logger::instance().would_log(LogLevel::DEBUG))
+      LOG_DEBUG("[PREFETCH] layer=%d experts=%zu errors=%d %.1f ms\n", layer, to_load.size(), r.errors,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     return r.errors;
   }
 

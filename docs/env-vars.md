@@ -29,8 +29,8 @@ Settings are read when the process starts, and graph settings are cached per mod
 | --- | --- | --- |
 | `ZEROMOE_CPU_ONLY` | OFF | Build without CUDA. Forced ON on macOS. |
 | `ZEROMOE_METAL` | ON on Apple Silicon | Dispatch prefill-sized F32 matmuls (`S>=32`) to Metal/MPS in the CPU backend. Ignored elsewhere. Decode stays on NEON. |
-| `ZEROMOE_ENABLE_CUDA_GRAPHS` | ON | Enable ggml CUDA graph capture and replay. Every CUDA build links ggml-cuda. |
-| `ZEROMOE_ENABLE_AVX512_VNNI` | ON | Compile with AVX-512 VNNI. Set OFF on a CPU without VNNI, or the binary fails with an illegal instruction. |
+| `GGML_AVX512_VNNI` | ON on ZeroMoE x86 builds | llama.cpp/GGML option shared by ZeroMoE and ggml CPU kernels. Set OFF on CPUs without VNNI. |
+| `GGML_OPENMP` | ON | llama.cpp/GGML CPU backend OpenMP setting. OFF selects ggml's persistent threadpool. |
 | `ZEROMOE_GGML_COMMIT` | `8baabd53b…` | llama.cpp commit whose `ggml/` directory is built. Changing it changes the numerics; re-validate. |
 | `ZEROMOE_GGML_ROOT` | empty | Use a local ggml source tree instead of the submodule. |
 
@@ -39,6 +39,12 @@ Settings are read when the process starts, and graph settings are cached per mod
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `ZEROMOE_MODEL_PATH` | unset | Model file or shard directory. Used when the config's `model_path` is a placeholder (`/path/to/…` or `path_to_…`) and no `--model` is given. Precedence: `--model`, then a real `model_path` in the config, then this variable. If none is set, the engine stops with a message. |
+
+## API authentication
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `ZEROMOE_API_KEY` | unset | Bearer/API-key secret for non-loopback API serving. The CLI equivalent is `--api-key`. The variable keeps the ZeroMoE project namespace; do not log its value. |
 
 ## Qwen 3.8 Flash full graph
 
@@ -116,5 +122,5 @@ These are model-specific. The model's own document (`docs/models/<model>.md`) is
 | `ZEROMOE_GENERATED_TOKEN_FILE` | Write each generated token id to this file, one per line (truncated at step 0). For numerical comparisons. |
 | `ZEROMOE_DECODE_LOGITS_DUMP` | Dump decode logits to this file. Diagnostic. |
 | `ZEROMOE_WUV_INT8` | Attention value-projection int8 path (`1` enables). Diagnostic; read in `core/attention_layer.cpp`. |
-| `ZEROMOE_GLM5NEXT_GRAPH_LAYER_TIMING`, `ZEROMOE_GLM5NEXT_ROUTE_TRACE` | Per-layer timing and traces. Diagnostic. |
+| `ZEROMOE_GLM5NEXT_ROUTE_TRACE` | Write routed expert IDs to a trace file. Diagnostic. Per-layer timing follows `--verbosity 5`. |
 | `ZEROMOE_TEST_EXL3_CPU_ONLY`, `ZEROMOE_TEST_EXL3_ONLY` | Stop the native test harness early: after the CPU/EXL3 checks with `_CPU_ONLY`, after the CUDA kernel checks with `_ONLY` (the form `README.md` uses for the short CUDA check). |

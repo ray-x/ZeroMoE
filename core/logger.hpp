@@ -1,7 +1,7 @@
 // logger.hpp — leveled logging, optionally redirected to a file.
 //
 // Default behavior (no config) is unchanged from before: everything still
-// goes to stderr. Setting `log_path` in the TOML config (or --log-path on
+// goes to stderr. Setting `log_path` in the TOML config (or --log-file on
 // the CLI) redirects it to a file instead; `log_level` filters by severity
 // so routine per-token/per-expert diagnostics (cache hits/misses, VRAM
 // promotions, CPU dequant fallback notices) don't flood the terminal during

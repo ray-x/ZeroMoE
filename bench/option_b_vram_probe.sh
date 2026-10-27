@@ -24,8 +24,8 @@ SP=$!
 echo "Explain briefly the key concepts of neural networks and gradient descent in plain English." | env \
   CUDA_VISIBLE_DEVICES=$GPU \
   ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
-  ZEROMOE_TOKEN_LOOP_DIAG=1 ZEROMOE_BENCH_IGNORE_STOP=1 \
-  ../moestream-build-upstream-master/moestream --config "$TMP/cfg.toml" --ngen "$NGEN" > "logs/$TAG.stdout" 2>&1 || true
+  ZEROMOE_BENCH_IGNORE_STOP=1 \
+  ../moestream-build-upstream-master/moestream --verbosity 5 --config "$TMP/cfg.toml" --ngen "$NGEN" > "logs/$TAG.stdout" 2>&1 || true
 kill $SP 2>/dev/null || true
 python3 - "$TAG" <<'EOF'
 import re, statistics as st, sys

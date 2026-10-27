@@ -113,7 +113,6 @@ def cmake_cache_values(build_dir: Path | None) -> dict[str, str]:
         "GGML_CUDA",
         "GGML_CUDA_GRAPHS",
         "GGML_OPENMP",
-        "ZEROMOE_GGML_DEBUG_PATCHES",
         "ZEROMOE_GGML_ROOT",
         "ZEROMOE_GGML_PREBUILT_DIR",
     )
@@ -141,11 +140,9 @@ def ggml_base_from(root: Path | None, explicit: str | None) -> str:
     return "unknown"
 
 
-def patch_manifest(repo: Path, include_debug: bool) -> tuple[str, list[str]]:
+def patch_manifest(repo: Path) -> tuple[str, list[str]]:
     candidates = [repo / "patches" / "README.md"]
     directories = ["ggml", "ggml-host-node"]
-    if include_debug:
-        directories.append("debug")
     for dirname in directories:
         folder = repo / "patches" / dirname
         if folder.is_dir():
@@ -181,8 +178,7 @@ def stamp(args: argparse.Namespace) -> int:
             snapshot["source_snapshot_sha256"] != args.expected_source_snapshot_sha256):
         raise RuntimeError("source worktree changed after CMake configure and before post-build stamping")
     cmake = cmake_cache_values(args.build_dir.resolve() if args.build_dir else None)
-    debug_on = cmake.get("ZEROMOE_GGML_DEBUG_PATCHES", "OFF").upper() in {"ON", "TRUE", "1"}
-    patch_hash, patch_files = patch_manifest(repo, debug_on)
+    patch_hash, patch_files = patch_manifest(repo)
     ggml_root = args.ggml_root.resolve() if args.ggml_root else None
     info = {
         "schema": 1,

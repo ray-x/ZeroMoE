@@ -49,19 +49,20 @@ already allocated memory budget.
 
 ```bash
 export ZEROMOE_API_KEY='replace-with-a-long-random-value'
+# Or pass --api-key KEY directly to the server process.
 ./build/zeromoe --config /path/to/model.toml --serve \
-  --host 127.0.0.1 --port 8080 --api-model zeromoe
+  --host 127.0.0.1 --port 8080 --alias zeromoe
 ```
 
 For the supported CPU backend:
 
 ```bash
 ./build-cpu/zeromoe_cpu --config /path/to/qwen.toml --serve \
-  --host 127.0.0.1 --port 8080 --api-model zeromoe
+  --host 127.0.0.1 --port 8080 --alias zeromoe
 ```
 
 `max_new_tokens` in the config is both the default output limit and the maximum
-allowed per request (`--ngen` can override it). Set it high enough for agent tool
+allowed per request (`--predict` can override it). Set it high enough for agent tool
 responses and reasoning. Requests exceeding the model context or output limit
 fail rather than truncating history. Thinking mode is set by the engine config,
 not a per-request reasoning parameter. Raw-prompt mode is incompatible with
@@ -109,7 +110,7 @@ curl -N http://127.0.0.1:8080/v1/messages \
 
 For an OpenAI-compatible client use base URL `http://127.0.0.1:8080/v1`.
 For an Anthropic-compatible client use `http://127.0.0.1:8080`.
-Set the model to the `--api-model` value; no model alias lookup is performed.
+Set the model to the `--alias` value; no model alias lookup is performed.
 OpenAI streaming usage is opt-in with
 `"stream_options":{"include_usage":true}`.
 

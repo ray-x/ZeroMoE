@@ -135,10 +135,7 @@ bool type_ok(GGUFType type) {
 }
 
 bool layer_timing_env() {
-  static const bool on = [] {
-    return zeromoe::graphcfg::flag_on("ZEROMOE_GLM5NEXT_GRAPH_LAYER_TIMING");
-  }();
-  return on;
+  return Logger::instance().would_log(LogLevel::DEBUG);
 }
 
 // Run each layer's cold (CPU) experts on a private lane that starts as soon as the

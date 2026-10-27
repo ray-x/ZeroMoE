@@ -55,24 +55,11 @@ option(ZEROMOE_CPU_ONLY "Disable CUDA and build CPU-only components" OFF)
 # path: full-graph decode dropped from a verified ~20 tok/s (graphs enabled)
 # to ~8 tok/s (graphs silently absent) on identical hardware/model/config --
 # this was mistaken for a correctness or scheduling regression for an entire
-# investigation before the missing compile define was found. Default ON here
-# so every CUDA build gets it without the caller having to know this
-# ggml-specific gotcha; still overridable with -DGGML_CUDA_GRAPHS=OFF.
-option(ZEROMOE_ENABLE_CUDA_GRAPHS
-       "Enable ggml CUDA graph capture/replay (GGML_CUDA_GRAPHS) for full-graph decode/prefill"
-       ON)
-option(ZEROMOE_ENABLE_AVX512_VNNI
-       "Compile ZeroMoE and ggml CPU kernels with AVX-512 VNNI (set OFF on CPUs without VNNI)"
-       ON)
-option(ZEROMOE_GGML_OPENMP
-       "Build ggml's CPU backend with OpenMP (OFF uses its persistent threadpool)"
-       ON)
+# investigation before the missing compile define was found. CUDA graph
+# capture is mandatory for ZeroMoE CUDA builds and is always enabled below.
 option(ZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES
        "Apply GGML CUDA/CPUOffload host-node integration patches"
        ON)
-option(ZEROMOE_GGML_DEBUG_PATCHES
-       "Also apply the debug/profiling ggml patches in patches/debug (not part of the main series)"
-       OFF)
 # Metal/MPS is the only GPU path on macOS, so default it on for Apple Silicon.
 # Everywhere else the option is inert (and warns if forced ON below).
 set(_ZEROMOE_METAL_DEFAULT OFF)
@@ -171,11 +158,27 @@ endif()
 # later at these exact source files with a clearer compiler error instead
 # of a silent miscompile. Deliberately NOT -mavx512vnni: the source
 # already compile-time-gates its VNNI fast path (#if
-# defined(__AVX512VNNI__)).  Keep VNNI opt-in because forcing that flag here
-# would risk a SIGILL at runtime on a real AVX-512 CPU that lacks VNNI
-# specifically (some early Skylake-X/Cascade Lake parts).
+# defined(__AVX512VNNI__)). Keep this separate from the base AVX-512 target:
+# an AVX-512 CPU without VNNI can disable the upstream GGML_AVX512_VNNI option
+# to avoid a SIGILL while retaining the required AVX-512 baseline.
+if(NOT DEFINED GGML_AVX512_VNNI)
+    # Match llama.cpp's option name while keeping ZeroMoE's validated x86
+    # default. Apple Silicon uses NEON and must not inherit the x86 setting.
+    if(ZEROMOE_APPLE_SILICON)
+        set(_zeromoe_vnni_default OFF)
+    else()
+        set(_zeromoe_vnni_default ON)
+    endif()
+    set(GGML_AVX512_VNNI ${_zeromoe_vnni_default} CACHE BOOL "ggml: enable AVX512-VNNI")
+endif()
+if(ZEROMOE_APPLE_SILICON AND GGML_AVX512_VNNI)
+    message(FATAL_ERROR "GGML_AVX512_VNNI is x86-only; set it OFF on Apple Silicon")
+endif()
 set(ZEROMOE_AVX512_FLAGS "")
 if(NOT ZEROMOE_APPLE_SILICON)
+    # ZeroMoE's x86 CPU kernels require the AVX-512 baseline. VNNI remains a
+    # separate upstream option because some AVX-512 CPUs do not implement it.
+    set(GGML_AVX512 ON CACHE BOOL "" FORCE)
     include(CheckCXXCompilerFlag)
     check_cxx_compiler_flag("-mavx512f -mavx512cd -mavx512bw -mavx512dq -mavx512vl -mf16c" ZEROMOE_HAS_AVX512_FLAGS)
     if(ZEROMOE_HAS_AVX512_FLAGS)
@@ -185,11 +188,11 @@ if(NOT ZEROMOE_APPLE_SILICON)
                          "kernels_cpu.cpp/attention_layer.cpp/execution_layer.cpp require "
                          "AVX-512 (see CLAUDE.md) and may fail to build without them")
     endif()
-    if(ZEROMOE_ENABLE_AVX512_VNNI)
+    if(GGML_AVX512_VNNI)
         check_cxx_compiler_flag("-mavx512vnni" ZEROMOE_HAS_AVX512_VNNI_FLAG)
         if(NOT ZEROMOE_HAS_AVX512_VNNI_FLAG)
             message(FATAL_ERROR
-                    "ZeroMoE: ZEROMOE_ENABLE_AVX512_VNNI=ON, but the compiler "
+                    "ZeroMoE: GGML_AVX512_VNNI=ON, but the compiler "
                     "does not accept -mavx512vnni")
         endif()
         list(APPEND ZEROMOE_AVX512_FLAGS -mavx512vnni)
@@ -199,6 +202,10 @@ endif()
 # ---------------------------------------------------------------------------
 # OpenMP (used by CPU kernels and some reference loops)
 # ---------------------------------------------------------------------------
+if(NOT DEFINED GGML_OPENMP)
+    # Keep llama.cpp's GGML_OPENMP name and default it on for ZeroMoE builds.
+    set(GGML_OPENMP ON CACHE BOOL "ggml: use OpenMP")
+endif()
 find_package(OpenMP)
 
 # ---------------------------------------------------------------------------
@@ -213,45 +220,19 @@ set(ZEROMOE_GGML_ROOT "" CACHE PATH "Path to a local ggml checkout (fetched auto
 # follows the derived ZEROMOE_USE_GGML_CUDA and must be set BEFORE the
 # subproject is configured.
 set(GGML_CUDA        ${ZEROMOE_USE_GGML_CUDA} CACHE BOOL "" FORCE)
-set(GGML_CUDA_GRAPHS ${ZEROMOE_ENABLE_CUDA_GRAPHS} CACHE BOOL "" FORCE)
-# Loud, impossible-to-miss configure-time confirmation of the exact
-# setting that silently regressed full-graph decode from ~20 tok/s to
-# ~8 tok/s once already (see ZEROMOE_ENABLE_CUDA_GRAPHS's own comment
-# above). A default is not a guarantee -- print the resolved value on
-# every configure, and fail outright if CUDA is on but graphs got
-# turned off without an explicit, informed override.
-if(ZEROMOE_USE_GGML_CUDA AND NOT ZEROMOE_ENABLE_CUDA_GRAPHS)
-    message(WARNING
-        "CUDA build with ZEROMOE_ENABLE_CUDA_GRAPHS=OFF: "
-        "full-graph decode will silently run WITHOUT CUDA graph capture/"
-        "replay (every node becomes an individual cudaLaunchKernel). "
-        "This previously cost ~20 tok/s -> ~8 tok/s and was mistaken for "
-        "a correctness/scheduling bug for an entire investigation. Only "
-        "disable this deliberately for a real A/B; the runtime "
-        "[CUDA-GRAPHS-CHECK] log line will also confirm this at every "
-        "process start regardless of this setting.")
-else()
-    message(STATUS "ZeroMoE: GGML_CUDA_GRAPHS=${GGML_CUDA_GRAPHS} "
-                   "(verified again at runtime via [CUDA-GRAPHS-CHECK])")
-endif()
+set(GGML_CUDA_GRAPHS ON CACHE BOOL "" FORCE)
+message(STATUS "ZeroMoE: GGML_CUDA_GRAPHS=ON (required for CUDA full-graph runtime)")
 set(GGML_HIPBLAS     OFF CACHE BOOL "" FORCE)
 set(GGML_VULKAN      OFF CACHE BOOL "" FORCE)
 set(GGML_SYCL        OFF CACHE BOOL "" FORCE)
-if(ZEROMOE_GGML_OPENMP AND NOT OpenMP_CXX_FOUND)
-    message(WARNING "ZEROMOE_GGML_OPENMP=ON requested, but OpenMP was not found; ggml CPU backend will use its native threadpool")
+if(GGML_OPENMP AND NOT OpenMP_CXX_FOUND)
+    message(WARNING "GGML_OPENMP=ON requested, but OpenMP was not found; ggml CPU backend will use its native threadpool")
 endif()
-set(GGML_OPENMP      ${ZEROMOE_GGML_OPENMP} CACHE BOOL "" FORCE)
-message(STATUS "ZeroMoE: GGML_OPENMP=${GGML_OPENMP} (ZEROMOE_GGML_OPENMP=${ZEROMOE_GGML_OPENMP})")
-# Keep ggml's CPU backend on the same ISA choice as ZeroMoE's CPU
-# kernels.  This is the single opt-out for older CPUs: setting
-# ZEROMOE_ENABLE_AVX512_VNNI=OFF also disables VNNI in ggml, including
-# when reconfiguring a build directory that previously had it enabled.
-set(GGML_AVX512_VNNI ${ZEROMOE_ENABLE_AVX512_VNNI} CACHE BOOL "" FORCE)
-if(ZEROMOE_ENABLE_AVX512_VNNI)
-    set(GGML_AVX512       ON CACHE BOOL "" FORCE)
-endif()
+message(STATUS "ZeroMoE: GGML_OPENMP=${GGML_OPENMP}")
+# Keep ggml and ZeroMoE CPU kernels on the same VNNI ISA choice. The upstream
+# GGML_AVX512_VNNI cache variable is the single setting for both.
 message(STATUS
-    "ZeroMoE: AVX-512 VNNI=${ZEROMOE_ENABLE_AVX512_VNNI} (ZeroMoE and ggml CPU kernels)")
+    "ZeroMoE: GGML_AVX512_VNNI=${GGML_AVX512_VNNI} (ZeroMoE and ggml CPU kernels)")
 
 # ZeroMoE's macOS engine never creates a ggml backend or scheduler; it uses
 # ggml only for reference dequantization, so ggml's Metal backend would be

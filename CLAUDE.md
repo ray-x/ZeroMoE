@@ -115,12 +115,12 @@ ZeroMoE utilizes a hybrid execution model, favoring the GPU but falling back to 
 
 ## 5. Debugging & Tensor Tracing
 
-`core/tensor_trace.hpp` provides unified VERBOSE tracing and NaN detection across model layers.
+`core/tensor_trace.hpp` provides unified VERBOSE tracing and finite-value diagnostics across model layers.
 
 ### Usage & Setup
-* **Enable:** Set `log_level = "VERBOSE"` in the TOML configuration.
-* **Filtering (`trace_filter`):** Specify tag prefixes (e.g., `trace_filter = "HC,MLA"`). Matches as anchored regex.
-* **Abort on NaN (`trace_abort_on_nan = true`):** Immediately invokes `std::abort()` upon detecting non-finite values (NaN/Inf).
+* **Enable:** Set `log_level = "VERBOSE"` in TOML or use `--verbosity 4`.
+* All registered trace tags are emitted at this level; capture with `--log-file` and filter the resulting text after the run.
+* Non-finite values are logged as errors. Tensor tracing has no tag-filter or abort-mode setting.
 
 ### Tag Categories
 * `MLA` (Attention checks)
@@ -135,7 +135,6 @@ ZeroMoE utilizes a hybrid execution model, favoring the GPU but falling back to 
 if (trace_gate("MY-TAG")) {
     trace_row("MY-TAG", layer_idx, "label", data_ptr, size, row_width);
 }
-trace_abort_if_nan("MY-TAG", contains_nan);
 ```
 
 ---
@@ -184,7 +183,7 @@ previous run still needs a captured gate log for verification.
 ### Builds
 * Always configure with `-DCMAKE_BUILD_TYPE=Release` (an unset build type compiles without `-O`).
 * Builds that use the unmodified ggml series live in the main checkout: `build_master` (engine) and `build_master_ggml` (patched ggml). Builds that need branch-only ggml patches live in the worktree that carries the patches and may be deleted after it is merged. A worktree build links its ggml libraries by absolute path, so copying the binary out of it does not work; rebuild in the main checkout instead.
-* The ggml patch recipe is `docs/build-ggml.md`, `scripts/build_ggml.sh`, `scripts/build_with_ggml.sh`. `patches/ggml`, `patches/ggml-host-node` and `patches/debug` are applied; `patches/experimental` and `patches/obsolete` never are.
+* The ggml patch recipe is `docs/build-ggml.md`, `scripts/build_ggml.sh`, `scripts/build_with_ggml.sh`. `patches/ggml` and `patches/ggml-host-node` are applied; `patches/experimental` and `patches/obsolete` are not part of builds.
 * Benchmark only a binary with native CUDA kernels for the target GPU (for an RTX 5060 Ti, verify `sm_120a` with `cuobjdump --list-elf`); a build containing only `sm_86` is not a valid 5060 performance result. Separate first graph build/upload from steady decode timing.
 
 ### Defaults that affect VRAM and DDR

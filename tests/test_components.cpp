@@ -24,7 +24,6 @@
 #include "exl3_model_loader.hpp"
 #include "exllamav3_backend.hpp"
 #include "cpu_config.hpp"
-#include "tensor_trace.hpp" // TraceFilter (pure C++, no CUDA deps -- see logger.hpp)
 #include "qwen4exp_gdn.hpp" // the REAL Qwen4Exp GDN delta-rule step (no CUDA deps)
 #include "ple_hash.hpp" // the REAL PLE n-gram hash (no CUDA deps)
 #include "moe_decode_batch.hpp" // decode-gap prototype: grouped per-token expert dispatch (no CUDA deps)
@@ -2407,46 +2406,6 @@ void test_route_usage() {
   std::cout << " PASSED\n";
 }
 
-void test_trace_filter() {
-  std::cout << "[TEST] TraceFilter configure/matches/abort_on_nan..."
-            << std::flush;
-
-  TraceFilter& tf = TraceFilter::instance();
-
-  // Empty pattern list (the default, unset trace_filter config) matches
-  // every tag -- existing VERBOSE behavior must be unchanged unless a user
-  // explicitly opts into filtering.
-  tf.configure("", false);
-  assert(tf.matches("HC"));
-  assert(tf.matches("EXPERT-GPU"));
-  assert(!tf.abort_on_nan());
-
-  // A configured tag matches itself and any tag it's a PREFIX of (mirrors
-  // llama.cpp's own "^"-anchored convention), but not an unrelated tag.
-  tf.configure("HC,EXPERT", true);
-  assert(tf.matches("HC"));
-  assert(tf.matches("EXPERT-GPU")); // "EXPERT" is a prefix of "EXPERT-GPU"
-  assert(!tf.matches("MLA"));
-  assert(!tf.matches("SILU-TRACE-GPU"));
-  assert(tf.abort_on_nan());
-
-  // Re-configuring resets both the pattern list and abort_on_nan -- no
-  // state leaks from a prior configure() call.
-  tf.configure("MLA", false);
-  assert(tf.matches("MLA"));
-  assert(!tf.matches("HC"));
-  assert(!tf.abort_on_nan());
-
-  // An invalid regex token must not throw or crash configure() -- it's
-  // logged and skipped, and any other valid token in the same CSV list
-  // still takes effect.
-  tf.configure("[invalid,MLA", false);
-  assert(tf.matches("MLA"));
-  assert(!tf.matches("HC"));
-
-  std::cout << " PASSED\n";
-}
-
 void test_safetensors_adapter() {
   std::cout << "[TEST] safetensors_adapter DFlash/DSpark normalization..." << std::flush;
 
@@ -2616,7 +2575,7 @@ void test_exllamav3_backend_launch() {
   const std::string prompt = "Spaces; $(touch never-execute) 'quoted'";
   const auto arguments = exllamav3_backend_arguments(
       config_path.string(), "../runtime/bin/python", "../tools/run_exllamav3.py",
-      {"--prompt", prompt, "--ngen", "128"});
+      {"--prompt", prompt, "--predict", "128"});
   assert(arguments.size() == 8);
   assert(arguments[0] == (config_path.parent_path().parent_path() / "runtime/bin/python").string());
   assert(arguments[1] == (config_path.parent_path().parent_path() / "tools/run_exllamav3.py").string());
@@ -3407,7 +3366,6 @@ int main(int argc, char **argv) {
       {"cpu_silu", test_cpu_silu},
       {"cpu_elem_mul", test_cpu_elem_mul},
       {"route_usage", test_route_usage},
-      {"trace_filter", test_trace_filter},
       // NOTE: registered BEFORE safetensors_adapter on purpose -- that test
       // currently aborts (assert) on a pre-existing, unrelated failure, and
       // registration order is execution order here.

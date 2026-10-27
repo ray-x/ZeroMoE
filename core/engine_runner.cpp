@@ -2,13 +2,12 @@
 // Split from the former run_engine() in src/main.cpp; bodies are unchanged except where
 // a former local became an EngineRunner member of the same name.
 #include "engine_runner.hpp"
-#include "graph_config.hpp"
 #include "graph_settings_global.hpp"
 #include <cstdlib>
 
 std::expected<void, std::string> EngineRunner::apply_graph_tuning() {
   const FullGraphModel *model = engine.family_ops.graph_model;
-  const bool cpu_only = config.cpu_only || zeromoe::graphcfg::env("ZEROMOE_CPU_ONLY");
+  const bool cpu_only = config.cpu_only;
   const bool cuda_moe = !cpu_only && !gpu.topology.devices.empty() &&
                         engine.model_file.architecture_config.n_experts > 0;
   engine.cuda_moe_graph_policy_applies = cuda_moe;
@@ -68,7 +67,7 @@ std::expected<void, std::string> EngineRunner::apply_graph_tuning() {
 
 std::expected<void, std::string>
 EngineRunner::resolve_cuda_moe_graph_policy() {
-  const bool cpu_only = config.cpu_only || zeromoe::graphcfg::env("ZEROMOE_CPU_ONLY");
+  const bool cpu_only = config.cpu_only;
   const bool cuda_moe = !cpu_only && !gpu.topology.devices.empty() &&
                         engine.model_file.architecture_config.n_experts > 0;
   engine.cuda_moe_graph_policy_applies = cuda_moe;
@@ -196,7 +195,7 @@ std::expected<void, std::string> EngineRunner::apply_engine_config() {
     return std::unexpected(
         "graph_* settings require a CUDA build (this binary is CPU-only)");
 #endif
-    if (config.cpu_only || zeromoe::graphcfg::env("ZEROMOE_CPU_ONLY"))
+    if (config.cpu_only)
       return std::unexpected("graph_* settings require CUDA graph execution, not CPU-only mode");
   }
   try {
@@ -394,7 +393,6 @@ std::expected<void, std::string> EngineRunner::init_host_and_gpu() {
   ram_mgr.promote_hit_threshold = (uint32_t)config.promote_hit_threshold;
   ram_mgr.reactive_promote_gpu1_every_n = config.reactive_promote_gpu1_every_n;
   ram_mgr.pin_threshold = (uint32_t)std::max(0, config.pin_threshold);
-  ram_mgr.verbose_cache_log = config.verbose_moe_log;
   ram_mgr.expert_fetch_threads = std::max(1, config.expert_fetch_threads);
   ram_mgr.move_on_promotion = config.move_on_promotion;
   ram_mgr.ram_copy_reclaim_threshold = config.ram_copy_reclaim_threshold;

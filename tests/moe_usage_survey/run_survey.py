@@ -413,12 +413,12 @@ def run_one(idx, category, slug, text):
             str(ZEROMOE),
             "--config",
             str(CONFIG),
-            "--ngen",
+            "--predict",
             str(NGEN),
             "--collect-usage-stats",
         ]
         if ENGINE_LOG_PATH:
-            command += ["--log-path", ENGINE_LOG_PATH]
+            command += ["--log-file", ENGINE_LOG_PATH]
         survey_pin_file = os.environ.get("ZEROMOE_SURVEY_PIN_FILE")
         if survey_pin_file:
             command += ["--pin-file", survey_pin_file]
@@ -481,12 +481,12 @@ def run_persistent(items):
         str(ZEROMOE),
         "--config",
         str(CONFIG),
-        "--ngen",
+        "--predict",
         str(NGEN),
         "--collect-usage-stats",
     ]
     if ENGINE_LOG_PATH:
-        command += ["--log-path", ENGINE_LOG_PATH]
+        command += ["--log-file", ENGINE_LOG_PATH]
     survey_pin_file = os.environ.get("ZEROMOE_SURVEY_PIN_FILE")
     if survey_pin_file:
         command += ["--pin-file", survey_pin_file]
@@ -608,7 +608,7 @@ def main():
         help="engine TOML config (default: %(default)s)",
     )
     parser.add_argument(
-        "--ngen",
+        "--predict",
         type=int,
         default=NGEN,
         help="maximum generated tokens per prompt (default: %(default)s)",

@@ -81,13 +81,10 @@ int qwen_cpu_grouped_threads() {
 
 // Keep the fused-path stage clock behind the same Qwen-only diagnostic switch
 // as the non-fused grouped path.  This file cannot use execution_layer.cpp's
-// private helper, so mirror the read-only environment check locally rather
-// than adding a process-wide timing cost to every CPU kernel.
+// private helper, so mirror the read-only logging-threshold check locally
+// rather than adding a process-wide timing cost to every CPU kernel.
 static bool qwen_cpu_stage_timing_enabled_local() {
-  static const bool enabled = [] {
-    return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN_CPU_STAGE_TIMING");
-  }();
-  return enabled;
+  return Logger::instance().would_log(LogLevel::DEBUG);
 }
 
 static void qwen_cpu_stage_add(std::atomic<double> &counter,

@@ -68,14 +68,8 @@ extern bool qwen4exp_copy_gdn_device_output_to_host(const void *device_output,
 
 namespace {
 
-// One reader for the debug flag: the host dump used to test mere presence, so
-// ZEROMOE_GGML_SHARED_DEBUG=0 still did the checksum work and logged.
 bool shared_debug_enabled() {
-  static const bool on = [] {
-    const char *e = zeromoe::graphcfg::env("ZEROMOE_GGML_SHARED_DEBUG");
-    return e && e[0] == '1';
-  }();
-  return on;
+  return Logger::instance().would_log(LogLevel::DEBUG);
 }
 
 }  // namespace
@@ -116,7 +110,7 @@ bool run_qwen4exp_shared_device(StreamingEngine &engine, int layer_idx,
       (routed_output && host_routed) || !combined_output ||
       c.n_expert_shared <= 0 || !moe_ggml_shared_expert()) {
     if (debug)
-      LOG_WARN("[GGML-SHARED-DEBUG] layer=%d S=%d rejected: missing input, "
+      LOG_DEBUG("[GGML-SHARED-DEBUG] layer=%d S=%d rejected: missing input, "
                "output, result pointer, or shared flag\n",
                layer_idx, S);
     return false;
@@ -188,7 +182,7 @@ bool run_qwen4exp_shared_device(StreamingEngine &engine, int layer_idx,
                           : 0.0f;
   if (!gate || !up || !down) {
     if (debug)
-      LOG_WARN("[GGML-SHARED-DEBUG] layer=%d S=%d missing shared weight "
+      LOG_DEBUG("[GGML-SHARED-DEBUG] layer=%d S=%d missing shared weight "
                "reference gate=%d up=%d down=%d\n",
                layer_idx, S, gate.has_value(), up.has_value(),
                down.has_value());
@@ -197,7 +191,7 @@ bool run_qwen4exp_shared_device(StreamingEngine &engine, int layer_idx,
   if (!runner.ensure(shared_device, D, shared_inter, S, gate_inp.has_value(),
                      clamp)) {
     if (debug)
-      LOG_WARN("[GGML-SHARED-DEBUG] layer=%d S=%d runner ensure failed "
+      LOG_DEBUG("[GGML-SHARED-DEBUG] layer=%d S=%d runner ensure failed "
                "device=%d D=%d inter=%d gate=%d\n",
                layer_idx, S, shared_device, D, shared_inter,
                gate_inp.has_value());
@@ -206,7 +200,7 @@ bool run_qwen4exp_shared_device(StreamingEngine &engine, int layer_idx,
   if (!runner.ensure_layer(layer_idx, *gate, *up, *down,
                            gate_inp ? &*gate_inp : nullptr)) {
     if (debug)
-      LOG_WARN("[GGML-SHARED-DEBUG] layer=%d S=%d runner ensure_layer failed\n",
+      LOG_DEBUG("[GGML-SHARED-DEBUG] layer=%d S=%d runner ensure_layer failed\n",
                layer_idx, S);
     return false;
   }
@@ -225,7 +219,7 @@ bool run_qwen4exp_shared_device(StreamingEngine &engine, int layer_idx,
                                              routed_output, combined_output);
   if (!run_ok) {
     if (debug)
-      LOG_WARN("[GGML-SHARED-DEBUG] layer=%d S=%d runner %s failed input=%p "
+      LOG_DEBUG("[GGML-SHARED-DEBUG] layer=%d S=%d runner %s failed input=%p "
                "routed=%p host_routed=%p\n",
                layer_idx, S,
                shared_only ? "shared-only run"
@@ -302,53 +296,14 @@ void run_qwen4exp_shared_host(StreamingEngine &engine, int layer_idx,
              layer_idx);
     return;
   }
-  // The Qwen shared expert reads normed three times: gate, up, and the
-  // optional scalar gate-input projection.  With host-staged GPU dense
-  // dispatch, each ordinary dense_proj() uploads that same activation again.
-  // Keep this opt-in until the exact-output A/B is complete; the helper is
-  // Qwen-only and falls back to the old self-contained call for every
-  // unsupported weight/path.
-  static const bool reuse_shared_input = [] {
-    const char *e = zeromoe::graphcfg::env("ZEROMOE_QWEN_SHARED_INPUT_REUSE");
-    return e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y' ||
-                 e[0] == 't' || e[0] == 'T');
-  }();
-  // Do not mix this sequence with the BF16 fast-path.  That path uses a
-  // separate d_x_bf16 buffer and its event-ordered upload; interleaving it
-  // with an explicit d_x preload would reuse the shared copy event while a
-  // previous record could still be in flight.  Requiring every normed-input
-  // projection in this small group to use the original device-resident
-  // dispatch keeps the stream/event ordering identical and makes a failed
-  // capability check fall back to the old path before any upload is issued.
-  auto original_gpu_projection = [&](const std::string &wname) {
-    auto it = engine.resident_layers.find(wname);
-    return it != engine.resident_layers.end() && it->second.host_ptr &&
-           it->second.device_ptr && !it->second.gpu_fast_ptr &&
-           it->second.meta.type != GGUFType::BF16;
-  };
   const std::string gate_name = prefix + "ffn_gate_shexp.weight";
   const std::string up_name = prefix + "ffn_up_shexp.weight";
   const std::string gate_inp_name = prefix + "ffn_gate_inp_shexp.weight";
-  const bool reuse_capable =
-      original_gpu_projection(gate_name) &&
-      original_gpu_projection(up_name) &&
-      (!engine.resident_layers.count(gate_inp_name) ||
-       original_gpu_projection(gate_inp_name));
-  const bool reuse_this_call = reuse_shared_input && reuse_capable;
   const bool force_cpu_shared = [] {
     const char *e = zeromoe::graphcfg::env("ZEROMOE_QWEN_SHARED_CPU_ORACLE");
     return e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y' ||
                  e[0] == 't' || e[0] == 'T');
   }();
-  if (reuse_this_call) {
-    static bool logged_reuse = false;
-    if (!logged_reuse) {
-      logged_reuse = true;
-      LOG_INFO("[QWEN-SHARED] reusing one uploaded normed activation for "
-               "gate/up/gate-input projections\n");
-    }
-  }
-  bool shared_input_uploaded = false;
   auto shared_dense_proj = [&](const std::string &wname, const float *x,
                                float *y, int in, int out) {
     if (force_cpu_shared) {
@@ -356,14 +311,6 @@ void run_qwen4exp_shared_host(StreamingEngine &engine, int layer_idx,
       if (it != engine.resident_layers.end() && it->second.host_ptr &&
           cpu_quant_matmul(it->second.meta.type, it->second.host_ptr, x, y,
                            S, in, out))
-        return;
-    }
-    if (reuse_this_call && x == normed && in == D) {
-      if (!shared_input_uploaded)
-        shared_input_uploaded =
-            dense_upload_shared_input(engine, normed, S, D);
-      if (shared_input_uploaded &&
-          dense_proj_from_shared_input(engine, wname, y, S, D, out))
         return;
     }
     dense_proj(engine, wname, x, y, S, in, out);
@@ -402,8 +349,6 @@ void run_qwen4exp_shared_host(StreamingEngine &engine, int layer_idx,
     for (float &g : gate)
       g = 1.0f / (1.0f + std::exp(-g));
   }
-  if (shared_input_uploaded && engine.gpu)
-    engine.gpu->dense_matmul_host_release_input();
   if (diag) {
     std::vector<float> gated((size_t)S * D);
     for (int s = 0; s < S; ++s)
@@ -422,7 +367,7 @@ void run_qwen4exp_shared_host(StreamingEngine &engine, int layer_idx,
   dump_diag("host_shared_combined", output, (size_t)S * D);
   if (diag)
     diag_dumped.store(true, std::memory_order_relaxed);
-  if (zeromoe::graphcfg::env("ZEROMOE_QWEN_SHARED_REUSE_DEBUG") && S == 1) {
+  if (Logger::instance().would_log(LogLevel::DEBUG) && S == 1) {
     auto checksum = [](const float *p, size_t n) {
       double sum = 0.0;
       double abs_sum = 0.0;
@@ -436,9 +381,9 @@ void run_qwen4exp_shared_host(StreamingEngine &engine, int layer_idx,
     const auto gb = checksum(scratch.gate_buf.data(), (size_t)shared_inter);
     const auto ub = checksum(scratch.up_buf.data(), (size_t)shared_inter);
     const auto db = checksum(scratch.down_buf.data(), (size_t)D);
-    LOG_WARN("[QWEN-SHARED-REUSE-DEBUG] layer=%d reuse=%d normed=(%.9g,%.9g) "
+    LOG_DEBUG("[QWEN-SHARED-DEBUG] layer=%d normed=(%.9g,%.9g) "
              "gate=(%.9g,%.9g) up=(%.9g,%.9g) down=(%.9g,%.9g) gate0=%.9g\n",
-             layer_idx, reuse_this_call ? 1 : 0,
+             layer_idx,
              nrm.first, nrm.second, gb.first, gb.second, ub.first, ub.second,
              db.first, db.second, gate.empty() ? 1.0f : gate[0]);
   }
@@ -446,7 +391,7 @@ void run_qwen4exp_shared_host(StreamingEngine &engine, int layer_idx,
     double l2 = 0.0;
     for (int d = 0; d < D; ++d)
       l2 += (double)output[d] * output[d];
-    LOG_WARN("[GGML-SHARED-DEBUG] host output layer=%d S=%d l2=%g "
+    LOG_DEBUG("[GGML-SHARED-DEBUG] host output layer=%d S=%d l2=%g "
              "first=%g,%g,%g,%g\n",
              layer_idx, S, std::sqrt(l2), output[0], output[1], output[2],
              output[3]);

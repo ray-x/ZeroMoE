@@ -135,11 +135,8 @@ bool env_decode_borrow_prefill_arenas();
 int env_device_expert_layers();
 bool env_device_expert_trailing();
 bool env_layer_timing_enabled();
-bool env_phase_timing_enabled();
 bool env_qwen4exp_host_node_enabled();
 bool env_layer_timing_verbose();
-bool env_graph_replay_timing_enabled();
-bool env_merged_gate_up_enabled();
 int env_host_node_diag_layer();
 bool env_host_node_transport_diag_enabled(int layer);
 int env_partial_layer();
@@ -194,10 +191,8 @@ bool bind_or_allocate_expert(FullGraph &g, ggml_tensor *t, const std::string &ke
 bool bind_device_expert(FullGraph &g, ggml_tensor *t, const void *host, size_t bytes, const std::string &source_tag = std::string());
 bool bind_device_expert_strided(FullGraph &g, ggml_tensor *t, const void *base, size_t src_stride, size_t per_expert_bytes, int n_experts);
 bool bind_device_expert_gather(FullGraph &g, ggml_tensor *t, const std::vector<const void *> &src_ptrs, size_t per_expert_bytes);
-bool bind_device_expert_strided_gate_up(FullGraph &g, ggml_tensor *t, const void *gate_base, size_t gate_stride, size_t gate_bytes, const void *up_base, size_t up_stride, size_t up_bytes, int n_experts);
 ggml_tensor *load_full_weight(FullGraph &g, ggml_context *ctx, const std::string &name, bool device_resident = false);
 ggml_tensor *expert_weight(FullGraph &g, ggml_context *ctx, int layer, const char *stem);
-ggml_tensor *expert_gate_up_weight(FullGraph &g, ggml_context *ctx, int layer, bool device_resident);
 ggml_tensor *build_split_gpu_tensor(FullGraph &g, ggml_context *ctx, const std::string &name, const GGUFTensor &m, const std::vector<int> &hot_ids);
 SplitExpertWeight expert_weight_split(FullGraph &g, ggml_context *ctx, int layer, const char *stem);
 ggml_tensor *dense_weight(FullGraph &g, ggml_context *ctx, int layer, const char *stem);
@@ -572,7 +567,7 @@ std::vector<std::tuple<int, ggml_tensor *>> layer_input_taps;
   double attn_construction_ms_total = 0.0;
   double moe_construction_ms_total = 0.0;
   // Finer split of moe_construction_ms_total: time inside the weight-tensor
-  // lookup calls (expert_weight_split/expert_weight/expert_gate_up_weight --
+  // lookup calls (expert_weight_split/expert_weight --
   // model_tensor lookup + preloaded_ram_expert_source + bind_host/
   // bind_device_expert*) vs build_moe()'s own ggml graph-node creation.
   double moe_weight_lookup_ms_total = 0.0;

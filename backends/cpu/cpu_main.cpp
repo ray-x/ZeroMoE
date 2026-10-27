@@ -16,13 +16,16 @@ static void stop_cpu_api(int) { cpu_api_stop = 1; }
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <initializer_list>
 #include <string>
 #include <vector>
 
 static void print_usage(const char *argv0) {
   std::cerr << "Usage: " << argv0
-            << " --config <path.toml> [--prompt \"<text>\"] [--ngen N]\n"
-            << "  --serve [--host 127.0.0.1] [--port 8080] [--api-model zeromoe]\n"
+            << " --config <path.toml> [--prompt \"<text>\"] [--ctx-size N] [--predict N] [--threads N]\n"
+            << "  --serve [--host 127.0.0.1] [--port 8080] [--alias zeromoe]\n"
+            << "       --api-key KEY (or ZEROMOE_API_KEY)\n"
+            << "  --temp F --top-p F  Sampling parameters\n"
             << "  --api-cache-mib N  Opt-in CPU prompt checkpoints (default: 0, disabled)\n";
 }
 
@@ -46,6 +49,31 @@ static int parse_int_arg(int argc, char **argv, const std::string &flag,
   } catch (...) {
     std::cerr << "[CPU-MAIN] Invalid integer for " << flag << ": " << value
               << "\n";
+    return def;
+  }
+}
+
+static int parse_int_arg_any(int argc, char **argv,
+                             std::initializer_list<const char *> flags,
+                             int def) {
+  for (const char *flag : flags) {
+    const std::string value = parse_arg(argc, argv, flag, "");
+    if (!value.empty()) return parse_int_arg(argc, argv, flag, def);
+  }
+  return def;
+}
+
+static float parse_float_arg(int argc, char **argv, const char *flag,
+                             float def) {
+  const std::string value = parse_arg(argc, argv, flag, "");
+  if (value.empty()) return def;
+  try {
+    size_t end = 0;
+    const float parsed = std::stof(value, &end);
+    if (end != value.size()) throw std::invalid_argument("trailing characters");
+    return parsed;
+  } catch (const std::exception &) {
+    std::cerr << "[CPU-MAIN] Invalid number for " << flag << ": " << value << "\n";
     return def;
   }
 }
@@ -81,14 +109,15 @@ int main(int argc, char **argv) {
       };
       api_options.host = value("--host", "127.0.0.1");
       api_options.port = integer("--port", 8080, 1, 65535);
-      api_model = value("--api-model", "zeromoe");
+      api_model = value("--alias", "zeromoe");
       api_cache_bytes = static_cast<size_t>(integer("--api-cache-mib", 0, 0, 4096)) * 1024 * 1024;
       if (api_options.host.empty() || api_model.empty())
-        throw std::invalid_argument("--host and --api-model cannot be empty");
-      if (const char *key = std::getenv("ZEROMOE_API_KEY")) api_options.api_key = key;
+        throw std::invalid_argument("--host and --alias cannot be empty");
+      const char *env_key = std::getenv("ZEROMOE_API_KEY");
+      api_options.api_key = value("--api-key", env_key ? env_key : "");
       if (api_options.host != "127.0.0.1" && api_options.host != "::1" &&
           api_options.host != "localhost" && api_options.api_key.empty())
-        throw std::invalid_argument("non-loopback binding requires ZEROMOE_API_KEY");
+        throw std::invalid_argument("non-loopback binding requires --api-key or ZEROMOE_API_KEY");
     } catch (const std::exception &e) {
       std::cerr << "[CPU-API] " << e.what() << "\n";
       return 1;
@@ -105,6 +134,14 @@ int main(int argc, char **argv) {
     std::cerr << "[CPU-MAIN] Failed to load config: " << config_path << "\n";
     return 1;
   }
+  cfg.context_size = parse_int_arg_any(argc, argv, {"--ctx-size", "-c"},
+                                       cfg.context_size);
+  cfg.max_new_tokens = parse_int_arg_any(
+      argc, argv, {"--predict", "--n-predict", "-n"}, cfg.max_new_tokens);
+  cfg.omp_max_threads = parse_int_arg_any(argc, argv, {"--threads", "-t"},
+                                          cfg.omp_max_threads);
+  cfg.temperature = parse_float_arg(argc, argv, "--temp", cfg.temperature);
+  cfg.top_p = parse_float_arg(argc, argv, "--top-p", cfg.top_p);
 
   Logger::instance().init(cfg.log_path, cfg.log_level);
   cfg.print();
@@ -116,11 +153,11 @@ int main(int argc, char **argv) {
     }
     if (cfg.exl3_backend == "exllamav3") {
       std::vector<std::string> overrides{
-          "--ngen", std::to_string(parse_int_arg(argc, argv, "--ngen", cfg.max_new_tokens)),
-          "--ctx", std::to_string(cfg.context_size),
+          "--predict", std::to_string(cfg.max_new_tokens),
+          "--ctx-size", std::to_string(cfg.context_size),
           "--threads", std::to_string(cfg.omp_max_threads > 0 ? cfg.omp_max_threads : 4),
           "--cuda-schedule", cfg.exllamav3_cuda_schedule,
-          "--temperature", std::to_string(cfg.temperature),
+          "--temp", std::to_string(cfg.temperature),
           "--top-p", std::to_string(cfg.top_p),
           cfg.raw_prompt ? "--raw-prompt" : "--no-raw-prompt",
           cfg.enable_thinking ? "--thinking" : "--no-thinking"};
@@ -140,7 +177,7 @@ int main(int argc, char **argv) {
         .metadata_model_path = cfg.metadata_model_path,
         .prompt = parse_arg(argc, argv, "--prompt", ""),
         .context_size = cfg.context_size,
-        .max_new_tokens = parse_int_arg(argc, argv, "--ngen", cfg.max_new_tokens),
+        .max_new_tokens = cfg.max_new_tokens,
         .threads = cfg.omp_max_threads > 0 ? cfg.omp_max_threads : 4,
         .temperature = cfg.temperature,
         .top_p = cfg.top_p,
@@ -162,10 +199,6 @@ int main(int argc, char **argv) {
 
   CPUEngine engine;
   engine.config = std::move(cfg);
-  const int requested_new_tokens =
-      parse_int_arg(argc, argv, "--ngen", engine.config.max_new_tokens);
-  if (requested_new_tokens >= 0)
-    engine.config.max_new_tokens = requested_new_tokens;
 
   const bool is_safetensors =
       engine.config.model_path.size() >= 12 &&

@@ -119,7 +119,7 @@ The full-model comparison can be repeated in a quiet resource window:
 python3 bench/quant_decode_compare.py \
   --engine logs/option_b_validation_engine_20261003/zeromoe \
   --out-dir logs/quant_decode_compare_quiet_new \
-  --threads 10 --ngen 64 --reps 6 --teacher-force --history Q2
+  --threads 10 --predict 64 --reps 6 --teacher-force --history Q2
 ```
 
 The tested engine hash is

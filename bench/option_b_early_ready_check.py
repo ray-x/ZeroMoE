@@ -103,11 +103,10 @@ def main():
                ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS='0',
                ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING='1',
                ZEROMOE_QWEN_CPU_THREADS=str(args.threads),
-               ZEROMOE_BENCH_IGNORE_STOP='1', ZEROMOE_TOKEN_LOOP_DIAG='1',
+               ZEROMOE_BENCH_IGNORE_STOP='1',
                ZEROMOE_PROMPT_TOKEN_INPUT_FILE=str(args.prompt_ids.resolve()))
     env.pop('ZEROMOE_DECODE_LOGITS_DUMP', None)
     env.pop('ZEROMOE_TEACHER_FORCE_TOKEN_FILE', None)
-    env.pop('ZEROMOE_QWEN4EXP_GRAPH_LAYER_TIMING', None)
     if not args.free_running:
         env['ZEROMOE_TEACHER_FORCE_TOKEN_FILE'] = str(args.continuation.resolve())
     hashes = {str(f): hashlib.sha256(f.read_bytes()).hexdigest()
@@ -202,7 +201,7 @@ def main():
             print(f'Running {tag}', flush=True)
             with (out / f'{tag}.stdout').open('w') as output:
                 run_engine = baseline_engine if arm == 'baseline' else engine
-                process = subprocess.Popen([str(run_engine), '--config', str(cfg), '--ngen', str(ngen)],
+                process = subprocess.Popen([str(run_engine), '--verbosity', '5', '--config', str(cfg), '--predict', str(ngen)],
                                stdin=subprocess.PIPE, text=True, cwd=ROOT, env=runtime,
                                stdout=output, stderr=subprocess.STDOUT)
                 prompt = 'Explain briefly the key concepts of neural networks and gradient descent in plain English.\n:q\n'

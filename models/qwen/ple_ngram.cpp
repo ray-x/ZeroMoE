@@ -54,11 +54,7 @@
 namespace {
 
 bool ple_timing_enabled() {
-  static const bool enabled = [] {
-    const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_TIMING");
-    return v && v[0] == '1';
-  }();
-  return enabled;
+  return Logger::instance().would_log(LogLevel::DEBUG);
 }
 
 // Opt-in A/A snapshots for the host PLE implementation.  These use the same
@@ -402,7 +398,7 @@ bool qwen4exp_ple_gather_rows(StreamingEngine &engine,
     const double ms = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - start)
                           .count();
-    LOG_INFO("[PLE-TIME] rows=%zu unique=%zu gather=%.3f ms ok=%s cache_hits=%llu cache_misses=%llu\n",
+    LOG_DEBUG("[PLE-TIME] rows=%zu unique=%zu gather=%.3f ms ok=%s cache_hits=%llu cache_misses=%llu\n",
              rows.size(), unique_rows, ms, ok ? "yes" : "no",
              (unsigned long long)g_ple_row_cache_hits.load(std::memory_order_relaxed),
              (unsigned long long)g_ple_row_cache_misses.load(std::memory_order_relaxed));

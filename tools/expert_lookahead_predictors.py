@@ -1,24 +1,43 @@
 #!/usr/bin/env python3
 """Offline study: how well can the cold experts of token i be predicted from earlier tokens?
 
-Input: a ZEROMOE_PROMO_TRACE file. Each line: "<token> <t_in_window> <layer> e:r e:r ..." where r = 1 if the
-expert was resident (GPU) when the token ran, 0 if it was computed on the CPU (a cold evaluation).
+Input: an engine log containing DEBUG lines tagged [PROMO-TRACE]. Each record is
+"<token> <t_in_window> <layer> e:r e:r ..." where r = 1 if resident on GPU,
+0 if computed on CPU. Historical raw trace files with this record format also work.
 Predictors propose, per layer, a set of experts; they are scored on the cold evaluations of the next token:
   recall    = cold evaluations whose expert was in the proposed set
   precision = proposed experts that the next token routed to (cold or not), a lower bound on usefulness
   size      = proposed experts per layer
-Usage: expert_lookahead_predictors.py TRACE
+Usage: expert_lookahead_predictors.py ENGINE_LOG
 """
 import sys, collections
 
 def load(path):
-    toks = collections.defaultdict(dict)   # token -> layer -> list of (expert, resident)
+    toks = collections.defaultdict(dict)   # token -> layer -> list (expert, resident)
     win_pos = {}
-    for line in open(path):
-        f = line.split()
-        t, w, l = int(f[0]), int(f[1]), int(f[2])
-        toks[t][l] = [(int(x.split(':')[0]), int(x.split(':')[1])) for x in f[3:]]
-        win_pos[t] = w
+    with open(path, errors="replace") as stream:
+        for raw in stream:
+            if "[PROMO-TRACE]" in raw:
+                line = raw.split("[PROMO-TRACE]", 1)[1].strip()
+            else:
+                # Accept historical plain-text trace files as well as engine logs.
+                fields = raw.split()
+                if len(fields) < 3 or not fields[0].lstrip("-").isdigit():
+                    continue
+                line = raw
+            fields = line.split()
+            if len(fields) < 3:
+                continue
+            try:
+                token, window_pos, layer = map(int, fields[:3])
+                routes = [(int(item.split(":", 1)[0]), int(item.split(":", 1)[1]))
+                          for item in fields[3:]]
+            except (ValueError, IndexError):
+                continue
+            toks[token][layer] = routes
+            win_pos[token] = window_pos
+    if not toks:
+        raise ValueError(f"no [PROMO-TRACE] records found in {path}")
     return toks, win_pos
 
 def main(path):

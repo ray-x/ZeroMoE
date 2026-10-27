@@ -270,8 +270,8 @@ void prefetch_issue(PrefetchRing *ring, PrefetchLayer *lp, OffloadState *o) {
   if (second.joinable())
     second.join();
   prefetch_record(*ring, *lp);
-  if (zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PREFETCH_DEBUG"))
-    LOG_INFO("[GGML-GLM5NEXT-PREFETCH] issue layer %d chunk=%d chunks=%d/%d issued in %.1f ms\n", lp->layer, chunk, ch[0].n,
+  if (Logger::instance().would_log(LogLevel::DEBUG))
+    LOG_DEBUG("[GGML-GLM5NEXT-PREFETCH] issue layer %d chunk=%d chunks=%d/%d issued in %.1f ms\n", lp->layer, chunk, ch[0].n,
              ch[1].n, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - issue_t0).count());
   for (int part = 0; part < ring->n_parts; ++part) {
     cudaSetDevice(ring->parts[part].device);
@@ -286,7 +286,7 @@ void prefetch_issue(PrefetchRing *ring, PrefetchLayer *lp, OffloadState *o) {
 void prefetch_service(OffloadState &o, int layer, std::vector<int32_t> &ids) {
   PrefetchRing &ring = *g_ring;
   PrefetchLayer &lp = ring.layers.at(layer);
-  static const bool dbg = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PREFETCH_DEBUG") != nullptr;
+  const bool dbg = Logger::instance().would_log(LogLevel::DEBUG);
   const auto t0 = std::chrono::steady_clock::now();
   if (lp.worker.valid())
     lp.worker.get();
@@ -486,7 +486,7 @@ bool prefetch_prepare(FullGraph &g, OffloadState &o) {
     ring->parts[part].events = events[part];
   }
   cudaSetDevice(ring->parts[0].device);
-  if (zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PREFETCH_DEBUG")) {
+  if (Logger::instance().would_log(LogLevel::DEBUG)) {
     unsigned long long id[4] = {0, 0, 0, 0};
     cudaStreamGetId(ring->parts[0].stream, &id[0]);
     if (ring->n_parts > 1)
@@ -494,7 +494,7 @@ bool prefetch_prepare(FullGraph &g, OffloadState &o) {
     cudaStreamGetId(zeromoe_ggml_backend_cuda_get_stream(g.cuda), &id[2]);
     if (g.gpu1)
       cudaStreamGetId(zeromoe_ggml_backend_cuda_get_stream(g.gpu1), &id[3]);
-    LOG_INFO("[GGML-GLM5NEXT-PREFETCH] stream ids: copy %llu/%llu backend %llu/%llu\n", id[0], id[1], id[2], id[3]);
+    LOG_DEBUG("[GGML-GLM5NEXT-PREFETCH] stream ids: copy %llu/%llu backend %llu/%llu\n", id[0], id[1], id[2], id[3]);
   }
   LOG_INFO("[GGML-GLM5NEXT-PREFETCH] %zu layers, %d sets, buffers %.2f GiB on the main GPU + %.2f GiB on the second\n",
            ring->layers.size(), ring->sets, (double)total[0] / (1024.0 * 1024.0 * 1024.0),
@@ -611,12 +611,12 @@ void offload_miss_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
     for (int64_t i0 = 0; i0 < a->ne[0]; ++i0)
       ids.push_back(*(const int32_t *)((const char *)a->data + i1 * a->nb[1] +
                                        i0 * a->nb[0]));
-  static const bool dbg = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_OFFLOAD_DEBUG") != nullptr;
+  const bool dbg = Logger::instance().would_log(LogLevel::DEBUG);
   static std::atomic<int> dbg_lines{0};
   if (dbg && !site->prefill)
     for (size_t k = 0; k < ids.size(); ++k)
       if (ids[k] >= 0 && !o.cache->resident({site->layer, ids[k]}) && dbg_lines.fetch_add(1) < 40)
-        LOG_INFO("[OFFLOAD-DEBUG] miss layer=%d expert=%d S=%lld k=%zu\n", site->layer, ids[k],
+        LOG_DEBUG("[OFFLOAD-DEBUG] miss layer=%d expert=%d S=%lld k=%zu\n", site->layer, ids[k],
                  (long long)a->ne[1], k);
   zeromoe::offload::ExpertResidency::Ensure r;
   if (site->prefill) {
@@ -678,12 +678,12 @@ void offload_miss_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
   const auto cb_t_ensured = std::chrono::steady_clock::now();
   if (site->prefetch && g_ring)
     prefetch_service(o, site->layer, ids);
-  static const bool cb_dbg = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PREFETCH_DEBUG") != nullptr;
+  const bool cb_dbg = Logger::instance().would_log(LogLevel::DEBUG);
   if (cb_dbg && site->prefill) {
     static auto last_cb = std::chrono::steady_clock::time_point{};
     const auto now = std::chrono::steady_clock::now();
     const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
-    LOG_INFO("[GGML-GLM5NEXT-MISSCB] layer %d period=%.1f ensure=%.1f service=%.1f ms\n", site->layer,
+    LOG_DEBUG("[GGML-GLM5NEXT-MISSCB] layer %d period=%.1f ensure=%.1f service=%.1f ms\n", site->layer,
              last_cb.time_since_epoch().count() ? ms(last_cb, cb_t0) : 0.0, ms(cb_t0, cb_t_ensured),
              ms(cb_t_ensured, now));
     last_cb = now;

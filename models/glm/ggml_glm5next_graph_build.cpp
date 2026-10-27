@@ -166,9 +166,9 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   if (partial_weights && !partial_weights->cold.empty() &&
       ((!gate_up && (!ge || !ue)) || !de))
     return nullptr;
-  if (partial_weights && zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_DEBUG_PARTIAL")) {
+  if (partial_weights && Logger::instance().would_log(LogLevel::DEBUG)) {
     const bool ready = partial_layer_ram_ready(g, layer);
-    LOG_WARN(
+    LOG_DEBUG(
         "[PARTIAL-DEBUG] layer=%d n_experts=%d hot=%zu cold=%zu ready=%d "
         "vram_slots=%zu de_ne2=%lld ge_ne2=%lld ue_ne2=%lld gate_up_ne2=%lld "
         "hot_down_ne2=%lld\n",
@@ -234,8 +234,8 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     return nullptr;
   if (g.partial_expert_residency && !prepare_partial_hot1(g, ctx, layer))
     return nullptr;
-  if (partial_weights && zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_DEBUG_PARTIAL")) {
-    LOG_WARN(
+  if (partial_weights && Logger::instance().would_log(LogLevel::DEBUG)) {
+    LOG_DEBUG(
         "[PARTIAL-DEBUG-HOT] layer=%d hot=%zu vram_slots=%zu "
         "hot_gate_ne2=%lld hot_up_ne2=%lld hot_down_ne2=%lld "
         "hot_gate_up_ne2=%lld\n",
@@ -1220,29 +1220,7 @@ bool build_graph(FullGraph &g) {
     }
     LOG_INFO("[GGML-GLM5NEXT-FULL] non-CUDA nodes: %s\n", detail.c_str());
   }
-  if (const char *dl = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_SPLIT_DUMP")) {
-    // Debug: print the backend of every node of one MoE layer (from the previous layer's end to this layer's end).
-    const std::string tag = std::string("_") + dl; // node names of the layer end with _<layer>
-    int first = -1, last = -1;
-    for (int i = 0; i < ggml_graph_n_nodes(g.graph); ++i) {
-      const char *nm = ggml_get_name(ggml_graph_node(g.graph, i));
-      if (std::strstr(nm, ("stage_miss" + tag).c_str()) || std::strstr(nm, ("offload_stage_ids" + tag).c_str()) || std::strstr(nm, ("stage_pred" + tag).c_str()))
-        if (first < 0) first = i;
-    }
-    if (first >= 0) {
-      const int lo = std::max(0, first - 60), hi = std::min(ggml_graph_n_nodes(g.graph), first + 160);
-      std::string prev;
-      for (int i = lo; i < hi; ++i) {
-        ggml_tensor *t = ggml_graph_node(g.graph, i);
-        ggml_backend_t b = ggml_backend_sched_get_tensor_backend(g.sched, t);
-        const std::string bn = b ? ggml_backend_name(b) : "none";
-        LOG_INFO("[SPLIT-DUMP] %5d %s %-14s %s\n", i, bn == prev ? "  " : "->", ggml_op_name(t->op), ggml_get_name(t));
-        prev = bn;
-        (void)last;
-      }
-    }
-  }
-  if (zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_WS_DUMP")) {
+  if (Logger::instance().would_log(LogLevel::DEBUG)) {
     // Debug: intermediate-tensor liveness over graph order; prints the live-set peak and its largest members.
     const int n = ggml_graph_n_nodes(g.graph);
     std::unordered_map<const ggml_tensor *, int> idx;
@@ -1287,11 +1265,11 @@ bool build_graph(FullGraph &g) {
       if (!t->view_src && std::max(last[i], i) >= peak_i) members.push_back({ggml_nbytes(t), i});
     }
     std::sort(members.rbegin(), members.rend());
-    LOG_INFO("[WS-DUMP] nodes=%d live-set peak=%.1f MiB at node %d (%s)\n", n, peak / 1048576.0, peak_i,
+    LOG_DEBUG("[WS-DUMP] nodes=%d live-set peak=%.1f MiB at node %d (%s)\n", n, peak / 1048576.0, peak_i,
              ggml_get_name(ggml_graph_node(g.graph, peak_i)));
     for (size_t k = 0; k < members.size() && k < 15; ++k) {
       const ggml_tensor *t = ggml_graph_node(g.graph, members[k].second);
-      LOG_INFO("[WS-DUMP]   %8.1f MiB  %-12s %-5s ne=%lld,%lld,%lld,%lld %s (node %d..%d)\n", members[k].first / 1048576.0,
+      LOG_DEBUG("[WS-DUMP]   %8.1f MiB  %-12s %-5s ne=%lld,%lld,%lld,%lld %s (node %d..%d)\n", members[k].first / 1048576.0,
                ggml_op_name(t->op), ggml_type_name(t->type), (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2],
                (long long)t->ne[3], ggml_get_name(t), members[k].second, last[members[k].second]);
     }
@@ -1301,7 +1279,7 @@ bool build_graph(FullGraph &g) {
     std::sort(all.rbegin(), all.rend());
     for (size_t k = 0; k < all.size() && k < 12; ++k) {
       const ggml_tensor *t = ggml_graph_node(g.graph, all[k].second);
-      LOG_INFO("[WS-DUMP] biggest %8.1f MiB %-12s %-5s %s\n", all[k].first / 1048576.0, ggml_op_name(t->op), ggml_type_name(t->type), ggml_get_name(t));
+      LOG_DEBUG("[WS-DUMP] biggest %8.1f MiB %-12s %-5s %s\n", all[k].first / 1048576.0, ggml_op_name(t->op), ggml_type_name(t->type), ggml_get_name(t));
     }
   }
   LOG_INFO("[GGML-GLM5NEXT-FULL] graph built layers=%d nodes=%d splits=%d "

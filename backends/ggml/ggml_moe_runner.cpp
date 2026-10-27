@@ -108,23 +108,6 @@ void GgmlMoeRunner::finish_all_h2d() {
     if (pool[i].backend_) pool[i].finish_h2d();
 }
 
-void GgmlMoeRunner::queue_input_reuse_dependency() {
-  GgmlMoeRunner *pool = runner_pool();
-  for (int i = 0; i < kMoeRunnerPoolSize; ++i) {
-    GgmlMoeRunner &runner = pool[i];
-    if (!runner.backend_ || !runner.graph_in_flight_ ||
-        !runner.graph_done_event_)
-      continue;
-    // The HC runner and every Qwen MoE runner borrow the same shared GGML
-    // backend.  Queueing this event wait on that backend orders the next
-    // pre-mix write after the prior MoE graph's reads of graph_x_->data,
-    // without turning the layer boundary into a CPU wait.
-    ggml_backend_event_wait(
-        (ggml_backend_t)runner.backend_,
-        (ggml_backend_event_t)runner.graph_done_event_);
-  }
-}
-
 void GgmlMoeRunner::collect_all_h2d(double &seconds, size_t &bytes) {
   GgmlMoeTransferStats stats;
   collect_all_transfer_stats(stats);
@@ -187,16 +170,6 @@ void GgmlMoeRunner::shutdown() {
       chunk_scatter_done_events_[i] = nullptr;
     }
   }
-  if (route_ids_pinned_) {
-    cudaFreeHost(route_ids_pinned_);
-    route_ids_pinned_ = nullptr;
-  }
-  if (route_weights_pinned_) {
-    cudaFreeHost(route_weights_pinned_);
-    route_weights_pinned_ = nullptr;
-  }
-  route_stage_capacity_ = 0;
-  route_stage_index_ = 0;
   free_chunk_state();
   if (galloc_) {
     ggml_gallocr_free((ggml_gallocr_t)galloc_);
@@ -245,56 +218,6 @@ void GgmlMoeRunner::shutdown() {
   weight_d_model_ = weight_d_ff_ = 0;
   weight_gate_type_ = weight_up_type_ = weight_down_type_ = 0;
   weight_external_ = false;
-}
-
-bool GgmlMoeRunner::ensure_route_stage(size_t route_count) {
-  if (route_count == 0)
-    return true;
-  if (route_ids_pinned_ && route_weights_pinned_ &&
-      route_stage_capacity_ >= route_count)
-    return true;
-
-  // A larger request may require reallocating the pinned ring.  The previous
-  // ring can still be the source of an asynchronous H2D queued on the shared
-  // backend, so drain it before releasing or reusing that storage.  This is a
-  // request-shape change, not a per-layer synchronization point.
-  if (backend_)
-    ggml_backend_synchronize((ggml_backend_t)backend_);
-  if (route_ids_pinned_) {
-    cudaFreeHost(route_ids_pinned_);
-    route_ids_pinned_ = nullptr;
-  }
-  if (route_weights_pinned_) {
-    cudaFreeHost(route_weights_pinned_);
-    route_weights_pinned_ = nullptr;
-  }
-  route_stage_capacity_ = 0;
-  route_stage_index_ = 0;
-
-  if (route_count > std::numeric_limits<size_t>::max() /
-                          (size_t)NROUTE_STAGE ||
-      route_count * (size_t)NROUTE_STAGE >
-          std::numeric_limits<size_t>::max() / sizeof(int32_t))
-    return false;
-  const size_t entries = route_count * (size_t)NROUTE_STAGE;
-  if (cudaHostAlloc((void **)&route_ids_pinned_,
-                    entries * sizeof(int32_t), cudaHostAllocPortable) !=
-          cudaSuccess ||
-      cudaHostAlloc((void **)&route_weights_pinned_,
-                    entries * sizeof(float), cudaHostAllocPortable) !=
-          cudaSuccess) {
-    if (route_ids_pinned_) {
-      cudaFreeHost(route_ids_pinned_);
-      route_ids_pinned_ = nullptr;
-    }
-    if (route_weights_pinned_) {
-      cudaFreeHost(route_weights_pinned_);
-      route_weights_pinned_ = nullptr;
-    }
-    return false;
-  }
-  route_stage_capacity_ = route_count;
-  return true;
 }
 
 void GgmlMoeRunner::invalidate_graph() {
@@ -551,16 +474,9 @@ bool GgmlMoeRunner::ensure_backend(int device) {
     return false;
   }
   device_ = device;
-  // Planar copies use GGML's CUDA tensor-copy backend. Packed copies still
-  // use the raw copy stream because their destination is an external packed
-  // allocation followed by a CUDA unpack kernel; there is no GGML tensor for
-  // that intermediate buffer. The backend-stream flag nevertheless remains
-  // enabled for packed transfers: the raw stream records the same GGML event
-  // bridge below, so the compute stream and HC consumer cannot observe the
-  // unpacked planes before the copy/unpack work is complete. Disabling this
-  // bridge made the packed path appear faster under diagnostic readback while
-  // occasionally exposing stale/partial down-projection bytes to HC.
-  backend_stream_copies_ = use_backend_stream_copies();
+  // The backend-stream copy experiment showed no separate decode benefit and
+  // was removed. Keep the conservative copy-stream handoff and one weight
+  // buffer; packed copies use that same stream before their unpack kernel.
   // The graph's weight tensor descriptors are retargeted by begin_layer().
   // Keep a single live allocation until each in-flight layer has its own
   // descriptor set; allocating two buffers alone would not make that graph
@@ -582,7 +498,6 @@ bool GgmlMoeRunner::ensure_backend(int device) {
       ggml_gallocr_free((ggml_gallocr_t)galloc_);
       galloc_ = nullptr;
       backend_ = nullptr;
-      backend_stream_copies_ = false;
       return false;
     }
     LOG_INFO("[GGML-MOE] backend-stream expert copies enabled; staged "
@@ -1292,7 +1207,7 @@ bool GgmlMoeRunner::run_layer_device_impl(const float *host_x,
     return false;
   cudaSetDevice(device_);
   if (trace_backend_calls())
-    LOG_INFO("[GGML-MOE-TRACE] enter tokens=%d external=%d backend_stream=%d "
+    LOG_DEBUG("[GGML-MOE-TRACE] enter tokens=%d external=%d backend_stream=%d "
              "device_tensor=%d device_route=%d pending=%d,%d\n",
              plan_.n_tokens, weight_external_ ? 1 : 0,
              backend_stream_copies_ ? 1 : 0, device_tensor ? 1 : 0,
@@ -1306,8 +1221,7 @@ bool GgmlMoeRunner::run_layer_device_impl(const float *host_x,
   // overwriting the tensors for the next layer.  H2D copies remain on the
   // separate copy backend and can overlap the host-side routing/staging work
   // that leads up to this boundary.
-  if (backend_stream_copies_ && graph_in_flight_ &&
-      !use_async_moe_graph_reuse()) {
+  if (backend_stream_copies_ && graph_in_flight_) {
     ggml_backend_synchronize((ggml_backend_t)backend_);
     graph_in_flight_ = false;
   }
@@ -1335,107 +1249,25 @@ bool GgmlMoeRunner::run_layer_device_impl(const float *host_x,
       LOG_ERROR("[GGML-MOE] device tensor input has unexpected layout\n");
       return false;
     }
-    const bool direct_input = use_direct_moe_input();
-    if (direct_input) {
-      // The producer and consumer are ordered on the same shared backend
-      // stream.  Retarget only the reusable tensor's data pointer; preserve
-      // its original buffer association so graph allocation/lifetime remains
-      // unchanged.  The source is contiguous by the validation above, and
-      // graph_x_'s fixed shape limits the read to this graph's S rows.  Do
-      // not manufacture a ggml view here: graph_ctx_ is deliberately kept
-      // alive across layers, and allocating one metadata object per decode
-      // layer eventually exhausts its small context even though the data
-      // pointer itself is perfectly valid.
-      ((ggml_tensor *)graph_x_)->data = src->data;
-      // t_x is a reshape of graph_x_; GGML stores the data pointer in both
-      // tensor objects when the graph is built, rather than dereferencing the
-      // parent at execution time.  Updating only graph_x_ leaves MUL_MAT_ID
-      // reading the allocator-owned buffer and produces deterministic but
-      // nonsensical decode output.
-      if (graph_x_input_)
-        ((ggml_tensor *)graph_x_input_)->data = src->data;
-      static std::atomic<bool> logged_direct_input{false};
-      bool expected = false;
-      if (logged_direct_input.compare_exchange_strong(
-              expected, true, std::memory_order_relaxed)) {
-        LOG_INFO("[GGML-MOE] direct HC input active: removing one per-layer "
-                 "MoE D2D copy\n");
-      }
-      if (trace_backend_calls())
-        LOG_INFO("[GGML-MOE-TRACE] input tensor direct\n");
+    // Keep a stable graph input allocation and enqueue the producer copy on
+    // the shared GGML backend stream before this graph.
+    ggml_tensor *src_view = (ggml_tensor *)graph_source_view_;
+    if (!src_view) {
+      src_view = ggml_view_2d((ggml_context *)graph_ctx_, src, D, S,
+                              src->nb[1], 0);
+      graph_source_view_ = src_view;
     } else {
-      // Conservative fallback: queue the HC -> MoE dependency on GGML's
-      // shared CUDA stream, where it is ordered after the producer graph and
-      // before the MUL_MAT_ID graph.
-      ggml_tensor *src_view = (ggml_tensor *)graph_source_view_;
-      if (!src_view) {
-        src_view = ggml_view_2d((ggml_context *)graph_ctx_, src, D, S,
-                                src->nb[1], 0);
-        graph_source_view_ = src_view;
-      } else {
-        // The source tensor is normally the persistent HC tensor, but refresh
-        // both fields so this helper remains correct for another producer.
-        src_view->data = src->data;
-        src_view->buffer = src->buffer;
-        src_view->nb[1] = src->nb[1];
-      }
-      if (!src_view) return false;
-      ggml_backend_tensor_copy_async((ggml_backend_t)backend_,
-                                     (ggml_backend_t)backend_, src_view,
-                                     (ggml_tensor *)graph_x_);
-      if (trace_backend_calls())
-        LOG_INFO("[GGML-MOE-TRACE] input tensor copy queued\n");
+      // Refresh the persistent view when another producer supplies the input.
+      src_view->data = src->data;
+      src_view->buffer = src->buffer;
+      src_view->nb[1] = src->nb[1];
     }
-    // Diagnostic only: verify the exact bytes handed to MUL_MAT_ID before
-    // trying to explain a bad expert result.  A finite HC source can still be
-    // published incorrectly if the view/copy path mishandles the [D,S]
-    // prefix of HC's persistent [D,S_cap] tensor.  Use the same opt-in flag
-    // as the output checker so normal runs pay nothing here.
-    if (debug_check_device_output()) {
-      cudaDeviceSynchronize();
-      const size_t n = (size_t)S * D;
-      static thread_local std::vector<float> src_check;
-      static thread_local std::vector<float> dst_check;
-      src_check.resize(n);
-      dst_check.resize(n);
-      const cudaError_t src_e = cudaMemcpy(
-          src_check.data(), src->data, n * sizeof(float),
-          cudaMemcpyDeviceToHost);
-      const cudaError_t dst_e = cudaMemcpy(
-          dst_check.data(), ((ggml_tensor *)graph_x_)->data,
-          n * sizeof(float), cudaMemcpyDeviceToHost);
-      size_t src_bad = 0;
-      size_t dst_bad = 0;
-      size_t first_diff = n;
-      double max_diff = 0.0;
-      double src_max = 0.0;
-      double dst_max = 0.0;
-      if (src_e == cudaSuccess && dst_e == cudaSuccess) {
-        for (size_t i = 0; i < n; ++i) {
-          const float sv = src_check[i];
-          const float dv = dst_check[i];
-          if (!std::isfinite(sv)) ++src_bad;
-          if (!std::isfinite(dv)) ++dst_bad;
-          if (std::isfinite(sv))
-            src_max = std::max(src_max, std::abs((double)sv));
-          if (std::isfinite(dv))
-            dst_max = std::max(dst_max, std::abs((double)dv));
-          const double diff = std::abs((double)sv - (double)dv);
-          if (diff > max_diff) {
-            max_diff = diff;
-            first_diff = i;
-          }
-        }
-      }
-      LOG_INFO("[GGML-MOE-DEBUG] input S=%d src_finite=%zu/%zu "
-               "dst_finite=%zu/%zu src_max=%g dst_max=%g max_diff=%g "
-               "first_diff=%s\n",
-               plan_.n_tokens, src_e == cudaSuccess ? n - src_bad : 0, n,
-               dst_e == cudaSuccess ? n - dst_bad : 0, n, src_max, dst_max,
-               max_diff,
-               first_diff == n ? "none" : std::to_string(first_diff).c_str());
-      if (src_e != cudaSuccess || dst_e != cudaSuccess) return false;
-    }
+    if (!src_view) return false;
+    ggml_backend_tensor_copy_async((ggml_backend_t)backend_,
+                                   (ggml_backend_t)backend_, src_view,
+                                   (ggml_tensor *)graph_x_);
+    if (trace_backend_calls())
+      LOG_DEBUG("[GGML-MOE-TRACE] input tensor copy queued\n");
   } else if (device_x) {
     // The producer graph has completed before this function is called. A
     // synchronous device-to-device copy is intentional here: unlike a host
@@ -1477,63 +1309,10 @@ bool GgmlMoeRunner::run_layer_device_impl(const float *host_x,
                                    (ggml_backend_t)backend_, src_weights,
                                    (ggml_tensor *)graph_w_);
     if (trace_backend_calls())
-      LOG_INFO("[GGML-MOE-TRACE] device route copies queued\n");
-  } else if (use_async_moe_graph_reuse() && !debug_sync_route_inputs()) {
-    // Route tables are tiny, but this path is exercised once per MoE layer.
-    // The old synchronous setter made each pair a blocking cudaMemcpy.  Use
-    // a persistent pinned ring so GGML can queue both writes on its shared
-    // CUDA stream; that stream already orders them before this layer's graph.
-    if (!ensure_route_stage(route_count)) {
-      LOG_WARN("[GGML-MOE] pinned route-table staging unavailable; "
-               "falling back to synchronous route copies\n");
-      ggml_backend_tensor_set((ggml_tensor *)graph_ids_, ids, 0,
-                              route_count * sizeof(int32_t));
-      ggml_backend_tensor_set((ggml_tensor *)graph_w_, w, 0,
-                              route_count * sizeof(float));
-    } else {
-      static std::atomic<bool> logged_async_route_stage{false};
-      bool expected = false;
-      if (logged_async_route_stage.compare_exchange_strong(
-              expected, true, std::memory_order_relaxed)) {
-        LOG_INFO("[GGML-MOE] async pinned route-table staging active\n");
-      }
-      if (route_stage_index_ >= NROUTE_STAGE) {
-        // The normal request path consumes fewer than NROUTE_STAGE slots.
-        // Keep wrap-around safe for long-lived interactive sessions without
-        // adding a synchronization to ordinary layer dispatch.
-        ggml_backend_synchronize((ggml_backend_t)backend_);
-        route_stage_index_ = 0;
-      }
-      const int slot = route_stage_index_++;
-      int32_t *route_ids = route_ids_pinned_ +
-                           (size_t)slot * route_stage_capacity_;
-      float *route_weights = route_weights_pinned_ +
-                             (size_t)slot * route_stage_capacity_;
-      std::memcpy(route_ids, ids, route_count * sizeof(int32_t));
-      std::memcpy(route_weights, w, route_count * sizeof(float));
-      ggml_backend_tensor_set_async((ggml_backend_t)backend_,
-                                     (ggml_tensor *)graph_ids_, route_ids, 0,
-                                     route_count * sizeof(int32_t));
-      ggml_backend_tensor_set_async((ggml_backend_t)backend_,
-                                    (ggml_tensor *)graph_w_, route_weights, 0,
-                                    route_count * sizeof(float));
-    }
-  } else if (backend_stream_copies_ && use_async_moe_graph_reuse() &&
-             debug_sync_route_inputs()) {
-    // Diagnostic isolation: a synchronous device write removes both the
-    // host-source lifetime question and the backend copy-stream ordering
-    // question for the tiny route tables. If this arm is correct while the
-    // persistent asynchronous arm is not, the remaining fault is in route
-    // table publication rather than expert weights or graph execution.
-    ggml_backend_tensor_set((ggml_tensor *)graph_ids_, ids, 0,
-                            route_count * sizeof(int32_t));
-    ggml_backend_tensor_set((ggml_tensor *)graph_w_, w, 0,
-                            route_count * sizeof(float));
+      LOG_DEBUG("[GGML-MOE-TRACE] device route copies queued\n");
   } else {
-    // The non-backend-stream path has the same pageable-source lifetime
-    // problem as the branch above. The route tables are only S*K integers and
-    // floats, so use the synchronous setter here as well rather than handing
-    // caller-owned vectors to GGML's raw cudaMemcpyAsync entry point.
+    // Route tables are small; the synchronous setter keeps the caller-owned
+    // host vectors alive through the transfer.
     ggml_backend_tensor_set((ggml_tensor *)graph_ids_, ids, 0,
                             route_count * sizeof(int32_t));
     ggml_backend_tensor_set((ggml_tensor *)graph_w_, w, 0,
@@ -1544,29 +1323,20 @@ bool GgmlMoeRunner::run_layer_device_impl(const float *host_x,
   // side dependency on the compute backend immediately before the graph so
   // the host does not wait for the full transfer batch.
   if (backend_stream_copies_) {
-    if (debug_copy_sync() && copy_stream_) {
-      const cudaError_t e =
-          cudaStreamSynchronize((cudaStream_t)copy_stream_);
-      if (e != cudaSuccess) {
-        LOG_ERROR("[GGML-MOE] diagnostic copy-stream synchronize failed: %s\n",
-                  cudaGetErrorString(e));
-        return false;
-      }
-    }
     for (int i = 0; i < NBUF; ++i) {
       if (!pending_[i]) continue;
       if (trace_backend_calls())
-        LOG_INFO("[GGML-MOE-TRACE] waiting for stage event buf=%d\n", i);
+        LOG_DEBUG("[GGML-MOE-TRACE] waiting for stage event buf=%d\n", i);
       ggml_backend_event_wait(
           (ggml_backend_t)backend_,
           (ggml_backend_event_t)backend_stage_event_[i]);
       if (trace_backend_calls())
-        LOG_INFO("[GGML-MOE-TRACE] stage event queued buf=%d\n", i);
+        LOG_DEBUG("[GGML-MOE-TRACE] stage event queued buf=%d\n", i);
     }
   }
 
   if (trace_backend_calls())
-    LOG_INFO("[GGML-MOE-TRACE] graph compute begin\n");
+    LOG_DEBUG("[GGML-MOE-TRACE] graph compute begin\n");
 
   // Keep the result on the shared GGML CUDA stream.  The device consumer
   // (Qwen4Exp HC post-combine) queues its D2D handoff on this same backend,
@@ -1582,7 +1352,7 @@ bool GgmlMoeRunner::run_layer_device_impl(const float *host_x,
     return false;
   }
   if (trace_backend_calls())
-    LOG_INFO("[GGML-MOE-TRACE] graph compute returned\n");
+    LOG_DEBUG("[GGML-MOE-TRACE] graph compute returned\n");
 
   // Protect this graph's temporary allocator workspace until the next shape
   // change forces ensure_graph() to rebuild it.
@@ -1590,7 +1360,7 @@ bool GgmlMoeRunner::run_layer_device_impl(const float *host_x,
                             (ggml_backend_t)backend_);
   graph_in_flight_ = true;
   if (trace_backend_calls())
-    LOG_INFO("[GGML-MOE-TRACE] graph completion event recorded\n");
+    LOG_DEBUG("[GGML-MOE-TRACE] graph completion event recorded\n");
 
   if (backend_stream_copies_ && !weight_external_) {
     // Protect the compact weight buffer from the next layer's H2D overwrite.
@@ -1604,7 +1374,7 @@ bool GgmlMoeRunner::run_layer_device_impl(const float *host_x,
     backend_weight_event_next_ =
         (backend_weight_event_next_ + 1) % NWEIGHT_EVENTS;
     if (trace_backend_calls())
-      LOG_INFO("[GGML-MOE-TRACE] weight completion event recorded\n");
+      LOG_DEBUG("[GGML-MOE-TRACE] weight completion event recorded\n");
   }
 
   // Opt-in Layer-0 A/A diagnostic.  The first runner invocation in the
@@ -1645,139 +1415,12 @@ bool GgmlMoeRunner::run_layer_device_impl(const float *host_x,
     }
   }
 
-  // Diagnostic only. The asynchronous path normally lets the next layer
-  // discover CUDA failures at a later API call; this opt-in sync pins the
-  // error to the first MoE graph that produced it.
-  static const bool debug_sync = [] {
-    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_DEBUG_SYNC");
-  }();
-  if (debug_sync || debug_device_sync() || (backend_stream_copies_ &&
-                     !use_async_moe_graph_reuse())) {
-    // The default backend-stream mode keeps the old finite/correct behavior.
-    // The opt-in asynchronous mode relies on same-stream ordering: HC queues
-    // its copy of graph_out_ before the next graph reuses the allocator.
+  if (backend_stream_copies_) {
     ggml_backend_synchronize((ggml_backend_t)backend_);
-    if (debug_device_sync()) {
-      const cudaError_t e = cudaDeviceSynchronize();
-      if (e != cudaSuccess) {
-        LOG_ERROR("[GGML-MOE] diagnostic cudaDeviceSynchronize failed: %s\n",
-                  cudaGetErrorString(e));
-        return false;
-      }
-    }
     graph_in_flight_ = false;
   }
 
-  if (debug_check_device_output()) {
-    const size_t n = (size_t)plan_.n_tokens * plan_.d_model;
-    static thread_local std::vector<float> check;
-    check.resize(n);
-    const cudaError_t e = cudaMemcpy(check.data(),
-                                     ((ggml_tensor *)graph_out_)->data,
-                                     n * sizeof(float),
-                                     cudaMemcpyDeviceToHost);
-    size_t bad = 0;
-    size_t first_bad = n;
-    if (e == cudaSuccess) {
-      for (size_t i = 0; i < n; ++i) {
-        if (!std::isfinite(check[i])) {
-          if (first_bad == n) first_bad = i;
-          ++bad;
-        }
-      }
-    }
-    static int call = 0;
-    LOG_INFO("[GGML-MOE-DEBUG] output call=%d finite=%zu/%zu bad=%zu copy=%s\n",
-             call++, e == cudaSuccess ? n - bad : 0, n, bad,
-             e == cudaSuccess ? "ok" : cudaGetErrorString(e));
-    if (first_bad != n) {
-      LOG_INFO("[GGML-MOE-DEBUG] first_bad linear=%zu token=%zu d=%zu value=%g\n",
-               first_bad, first_bad / (size_t)plan_.d_model,
-               first_bad % (size_t)plan_.d_model, (double)check[first_bad]);
-    }
-    if (e != cudaSuccess) return false;
 
-    // If the final reduction is bad, inspect the first internal tensor that
-    // went bad.  This separates an IQ1_M/IQ4_NL projection failure from a
-    // later SwiGLU, routed-weight reduction, or top-k weighting failure.  The
-    // tensors are retained only as debug handles; normal executions do not
-    // copy or scan these intermediates.
-    if (bad > 0) {
-      auto check_intermediate = [&](const char *name, void *opaque) -> size_t {
-        ggml_tensor *t = (ggml_tensor *)opaque;
-        if (!t || t->type != GGML_TYPE_F32 || !t->data) return (size_t)-1;
-        const size_t count = (size_t)ggml_nelements(t);
-        static thread_local std::vector<float> values;
-        values.resize(count);
-        const cudaError_t ce = cudaMemcpy(values.data(), t->data,
-                                           count * sizeof(float),
-                                           cudaMemcpyDeviceToHost);
-        size_t nonfinite = 0;
-        size_t first = count;
-        double max_abs = 0.0;
-        if (ce == cudaSuccess) {
-          for (size_t i = 0; i < count; ++i) {
-            if (!std::isfinite(values[i])) {
-              if (first == count) first = i;
-              ++nonfinite;
-            } else {
-              max_abs = std::max(max_abs, std::abs((double)values[i]));
-            }
-          }
-        }
-        LOG_INFO("[GGML-MOE-DEBUG] %s finite=%zu/%zu bad=%zu max_abs=%g "
-                 "first=%s\n",
-                 name, ce == cudaSuccess ? count - nonfinite : 0, count,
-                 nonfinite, max_abs,
-                 first == count ? "none" : std::to_string(first).c_str());
-        return first;
-      };
-      check_intermediate("gate", graph_gate_out_);
-      check_intermediate("up", graph_up_out_);
-      check_intermediate("act", graph_act_out_);
-      const size_t down_first = check_intermediate("down", graph_down_out_);
-
-      // The first bad output is laid out as [d, topk-slot, token].  For a
-      // down projection this identifies one exact compact expert and one
-      // exact quantized weight row, allowing us to tell an invalid transferred
-      // IQ4_NL scale from a numerical reduction problem.
-      if (down_first != (size_t)-1 && graph_ids_ && t_down_ && w_down_base_) {
-        const size_t down_plane = (size_t)plan_.d_model * plan_.topk;
-        const size_t token = down_first / down_plane;
-        const size_t rem = down_first % down_plane;
-        const size_t k = rem / (size_t)plan_.d_model;
-        const size_t d = rem % (size_t)plan_.d_model;
-        std::vector<int32_t> route_ids((size_t)plan_.topk * plan_.n_tokens);
-        const cudaError_t id_e = cudaMemcpy(
-            route_ids.data(), ((ggml_tensor *)graph_ids_)->data,
-            route_ids.size() * sizeof(int32_t), cudaMemcpyDeviceToHost);
-        const int32_t slot = id_e == cudaSuccess
-                                 ? route_ids[token * (size_t)plan_.topk + k]
-                                 : -1;
-        const size_t row_bytes =
-            ggml_row_size((ggml_type)plan_.down_type, plan_.d_ff);
-        std::vector<uint8_t> weight_row(row_bytes);
-        const size_t weight_offset =
-            slot >= 0 ? (size_t)slot * down_exp_bytes_ + d * row_bytes : 0;
-        const cudaError_t weight_e =
-            slot >= 0 && slot < plan_.n_expert_slots
-                ? cudaMemcpy(weight_row.data(), w_down_base_ + weight_offset,
-                             row_bytes, cudaMemcpyDeviceToHost)
-                : cudaErrorInvalidValue;
-        const uint16_t scale_bits =
-            weight_row.size() >= 2
-                ? (uint16_t)weight_row[0] | ((uint16_t)weight_row[1] << 8)
-                : 0;
-        LOG_INFO("[GGML-MOE-DEBUG] bad down token=%zu d=%zu k=%zu "
-                 "compact_slot=%d id_copy=%s row_bytes=%zu scale_bits=0x%04x "
-                 "weight_copy=%s\n",
-                 token, d, k, slot,
-                 id_e == cudaSuccess ? "ok" : cudaGetErrorString(id_e),
-                 row_bytes, (unsigned)scale_bits,
-                 weight_e == cudaSuccess ? "ok" : cudaGetErrorString(weight_e));
-      }
-    }
-  }
 
   *device_output = graph_out_;
   return true;
@@ -1892,111 +1535,7 @@ bool GgmlMoeRunner::run_chunk_device_input_tensor(
   // a bounded diagnostic here so a bad value can be attributed to the graph
   // itself before either consumer is involved.  This is intentionally opt-in
   // because it synchronizes and copies every inspected intermediate.
-  static int debug_chunks = 0;
-  const bool debug_this_chunk = debug_check_device_output() && debug_chunks < 512;
-  if (debug_this_chunk) {
-      ++debug_chunks;
-      ggml_backend_synchronize((ggml_backend_t)backend_);
-      auto check_f32 = [&](const char *name, void *opaque) -> size_t {
-        ggml_tensor *t = (ggml_tensor *)opaque;
-        if (!t || t->type != GGML_TYPE_F32 || !t->data) return (size_t)-1;
-        const size_t n = (size_t)ggml_nelements(t);
-        static thread_local std::vector<float> values;
-        values.resize(n);
-        const cudaError_t ce = cudaMemcpy(values.data(), t->data,
-                                          n * sizeof(float),
-                                          cudaMemcpyDeviceToHost);
-        size_t bad = 0;
-        size_t first = n;
-        double max_abs = 0.0;
-        if (ce == cudaSuccess) {
-          for (size_t i = 0; i < n; ++i) {
-            if (!std::isfinite(values[i])) {
-              if (first == n) first = i;
-              ++bad;
-            } else {
-              max_abs = std::max(max_abs, std::abs((double)values[i]));
-            }
-          }
-        }
-        LOG_INFO("[GGML-MOE-CHUNK-DEBUG] chunk=%d %s finite=%zu/%zu "
-                 "bad=%zu max_abs=%g copy=%s first=%s\n",
-                 debug_chunks - 1, name,
-                 ce == cudaSuccess ? n - bad : 0, n, bad, max_abs,
-                 ce == cudaSuccess ? "ok" : cudaGetErrorString(ce),
-                 first == n ? "none" : std::to_string(first).c_str());
-        return first;
-      };
-      auto check_i32 = [&](const char *name, void *opaque) {
-        ggml_tensor *t = (ggml_tensor *)opaque;
-        if (!t || t->type != GGML_TYPE_I32 || !t->data) return;
-        const size_t n = (size_t)ggml_nelements(t);
-        static thread_local std::vector<int32_t> values;
-        values.resize(n);
-        const cudaError_t ce = cudaMemcpy(values.data(), t->data,
-                                          n * sizeof(int32_t),
-                                          cudaMemcpyDeviceToHost);
-        int32_t lo = 0, hi = 0;
-        if (ce == cudaSuccess && n > 0) {
-          lo = hi = values[0];
-          for (size_t i = 1; i < n; ++i) {
-            lo = std::min(lo, values[i]);
-            hi = std::max(hi, values[i]);
-          }
-        }
-        LOG_INFO("[GGML-MOE-CHUNK-DEBUG] chunk=%d %s n=%zu range=%d..%d "
-                 "copy=%s\n",
-                 debug_chunks - 1, name, n, (int)lo, (int)hi,
-                 ce == cudaSuccess ? "ok" : cudaGetErrorString(ce));
-      };
-      check_f32("input", graph_x_);
-      check_i32("token_ids", graph_token_ids_);
-      check_i32("expert_ids", graph_ids_);
-      check_f32("weights", graph_w_);
-      check_f32("gate", graph_gate_out_);
-      check_f32("up", graph_up_out_);
-      check_f32("act", graph_act_out_);
-      const size_t down_first = check_f32("down", graph_down_out_);
-      check_f32("output", graph_out_);
 
-      if (down_first != (size_t)-1 &&
-          down_first < (size_t)ggml_nelements((ggml_tensor *)graph_down_out_)) {
-        const size_t down_plane = (size_t)plan_.d_model * plan_.topk;
-        const size_t token = down_first / down_plane;
-        const size_t rem = down_first % down_plane;
-        const size_t k = rem / (size_t)plan_.d_model;
-        const size_t d = rem % (size_t)plan_.d_model;
-        std::vector<int32_t> route_ids((size_t)plan_.n_tokens * plan_.topk);
-        const cudaError_t id_e = cudaMemcpy(
-            route_ids.data(), ((ggml_tensor *)graph_ids_)->data,
-            route_ids.size() * sizeof(int32_t), cudaMemcpyDeviceToHost);
-        const int32_t slot =
-            id_e == cudaSuccess
-                ? route_ids[token * (size_t)plan_.topk + k]
-                : -1;
-        const size_t row_bytes =
-            ggml_row_size((ggml_type)plan_.down_type, plan_.d_ff);
-        std::vector<uint8_t> row(row_bytes);
-        const size_t weight_offset =
-            slot >= 0 ? (size_t)slot * down_exp_bytes_ + d * row_bytes : 0;
-        const cudaError_t weight_e =
-            slot >= 0 && slot < plan_.n_expert_slots
-                ? cudaMemcpy(row.data(), w_down_base_ + weight_offset,
-                             row_bytes, cudaMemcpyDeviceToHost)
-                : cudaErrorInvalidValue;
-        const uint16_t first_bits =
-            row.size() >= 2
-                ? (uint16_t)row[0] | ((uint16_t)row[1] << 8)
-                : 0;
-        LOG_INFO("[GGML-MOE-CHUNK-DEBUG] bad down chunk=%d token=%zu "
-                 "d=%zu k=%zu slot=%d id_copy=%s row_bytes=%zu "
-                 "first_bits=0x%04x weight_copy=%s\n",
-                 debug_chunks - 1, token, d, k, slot,
-                 id_e == cudaSuccess ? "ok" : cudaGetErrorString(id_e),
-                 row_bytes, (unsigned)first_bits,
-                 weight_e == cudaSuccess ? "ok" : cudaGetErrorString(weight_e));
-      }
-  }
 
   // The graph has produced a weighted [D,pairs] chunk. Bridge to the default
   // CUDA stream for the existing scatter kernel, then publish that completion
@@ -2027,33 +1566,7 @@ bool GgmlMoeRunner::run_chunk_device_input_tensor(
   if (cudaEventRecord((cudaEvent_t)chunk_scatter_done_events_[copy_buf], 0) !=
       cudaSuccess)
     return false;
-  if (debug_this_chunk) {
-    cudaStreamSynchronize(0);
-    const size_t n = (size_t)plan_.source_tokens * plan_.d_model;
-    static thread_local std::vector<float> accum_values;
-    accum_values.resize(n);
-    const cudaError_t ce = cudaMemcpy(accum_values.data(), chunk_accum_,
-                                      n * sizeof(float),
-                                      cudaMemcpyDeviceToHost);
-    size_t bad = 0;
-    size_t first = n;
-    double max_abs = 0.0;
-    if (ce == cudaSuccess) {
-      for (size_t i = 0; i < n; ++i) {
-        if (!std::isfinite(accum_values[i])) {
-          if (first == n) first = i;
-          ++bad;
-        } else {
-          max_abs = std::max(max_abs, std::abs((double)accum_values[i]));
-        }
-      }
-    }
-    LOG_INFO("[GGML-MOE-CHUNK-DEBUG] chunk=%d accumulator finite=%zu/%zu "
-             "bad=%zu max_abs=%g copy=%s first=%s\n",
-             debug_chunks - 1, ce == cudaSuccess ? n - bad : 0, n, bad,
-             max_abs, ce == cudaSuccess ? "ok" : cudaGetErrorString(ce),
-             first == n ? "none" : std::to_string(first).c_str());
-  }
+
 
   ggml_backend_event_record(
       (ggml_backend_event_t)chunk_weight_done_events_[copy_buf],
@@ -2179,7 +1692,6 @@ GgmlMoeRunner &GgmlMoeRunner::instance_for(uint32_t, uint32_t, uint32_t) {
 }
 GgmlMoeRunner &GgmlMoeRunner::active_instance() { return instance(); }
 void GgmlMoeRunner::finish_all_h2d() {}
-void GgmlMoeRunner::queue_input_reuse_dependency() {}
 void GgmlMoeRunner::collect_all_h2d(double &s, size_t &b) {
   s = 0.0;
   b = 0;

@@ -46,7 +46,6 @@ inline void check_hidden_finite(const char* label, const float* data, size_t n) 
     if (nan_count > 0 || inf_count > 0) {
         LOG_ERROR("[HIDDEN] %s: hidden_states corrupted -- %d/%zu NaN, %d/%zu Inf.\n",
                   label, nan_count, n, inf_count, n);
-        trace_abort_if_nan("HIDDEN", true);
         return;
     }
     if (trace_gate("HIDDEN")) trace_row("HIDDEN", -1, label, data, n);
@@ -554,10 +553,8 @@ inline void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GG
         const char *env = zeromoe::graphcfg::env("ZEROMOE_BENCH_SILENT");
         return env && env[0] == '1';
     }();
-    const bool token_loop_diag_enabled = [] {
-        const char *env = zeromoe::graphcfg::env("ZEROMOE_TOKEN_LOOP_DIAG");
-        return env && env[0] == '1';
-    }();
+const bool token_loop_diag_enabled =
+    Logger::instance().would_log(LogLevel::DEBUG);
     if (bench_ignore_stop) {
         LOG_STREAM_INFO() << "[BENCH] ZEROMOE_BENCH_IGNORE_STOP=1: "
                              "EOS/stop tokens will not end this bounded decode\n";
@@ -1621,7 +1618,7 @@ inline void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GG
         double diag_vramlog_delta_ms = diag_vramlog_ms - diag_vramlog_ms_prev;
         diag_vramlog_ms_prev = diag_vramlog_ms;
         if (token_loop_diag_enabled && !bench_silent) {
-            LOG_INFO("[TOKEN-LOOP-DIAG] step=%d iter_total=%.3fms preproc(sample+decode+print)=%.3fms "
+            LOG_DEBUG("[TOKEN-LOOP-DIAG] step=%d iter_total=%.3fms preproc(sample+decode+print)=%.3fms "
                      "embed=%.3fms core(hc+forward)=%.3fms vramlog=%.3fms tail=%.3fms\n",
                      step, diag_loop_iter_ms, diag_preproc_ms, diag_embed_ms, token_wall_ms,
                      diag_vramlog_delta_ms,

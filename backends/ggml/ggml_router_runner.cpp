@@ -289,27 +289,10 @@ bool GgmlRouterRunner::run_tensor_view(int layer, const void *src_view_ptr,
     return false;
   }
 
-  if (use_direct_router_input()) {
-    // l.x is a graph input.  Its backing allocation remains owned by the
-    // router graph allocator, but the CUDA kernels read the tensor's current
-    // data pointer. Retargeting it to HC's persistent device tensor removes
-    // one [D,S] D2D copy per layer and preserves the graph's existing output
-    // and workspace allocations. Each layer has its own router input tensor;
-    // the shared HC state is reused only after the queued graph dependency has
-    // advanced to the next layer on the same backend stream.
-    ((ggml_tensor *)l.x)->data = src_view->data;
-    static bool logged_direct = false;
-    if (!logged_direct) {
-      logged_direct = true;
-      LOG_INFO("[GGML-ROUTER] direct HC input active: route graph consumes "
-               "the producer tensor without a D2D input copy\n");
-    }
-  } else {
-    ggml_backend_tensor_copy_async((ggml_backend_t)backend_,
-                                   (ggml_backend_t)backend_,
-                                   const_cast<ggml_tensor *>(src_view),
-                                   (ggml_tensor *)l.x);
-  }
+  ggml_backend_tensor_copy_async((ggml_backend_t)backend_,
+                                 (ggml_backend_t)backend_,
+                                 const_cast<ggml_tensor *>(src_view),
+                                 (ggml_tensor *)l.x);
   const ggml_status st =
       ggml_backend_graph_compute_async((ggml_backend_t)backend_,
                                         (ggml_cgraph *)l.graph);

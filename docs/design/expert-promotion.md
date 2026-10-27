@@ -184,7 +184,7 @@ eviction score, with a switch that freezes the hot set for validation.
 * The host expert arena is pinned: Qwen4Exp registers it with `cudaHostRegister` by default (startup log
   `[GRAPH-RAM] layer N arena: ... pinned`); the code records pageable 4.9 GB/s vs pinned 10.6 GB/s.
 * One expert is gate+up+down = 3 x 460,800 B = **1.38 MB** (24,576 experts = 34 GB, matching Strata's Q2_0 figure).
-* Copy interference (`ZEROMOE_PROMO_PROBE_N`, story prompt = 51% static misses, plain S=1 decode, 500 tokens,
+* Historical copy-interference probe (the `ZEROMOE_PROMO_PROBE_N` test control has since been removed; story prompt = 51% static misses, plain S=1 decode, 500 tokens,
   N experts copied host->device on a side stream after every token, no late waits in any run):
 
   | promotions/token | MB/token | decode tok/s | vs baseline |

@@ -110,7 +110,7 @@ def main() -> None:
         env["ZEROMOE_DEEPSEEK_V41_TRACE_POS"] = str(args.trace_pos)
     print("starting model run", flush=True)
     command = [str(args.binary.resolve()), "--config", str(run_config),
-               "--raw-prompt", "--ngen", str(args.ngen)]
+               "--raw-prompt", "--predict", str(args.ngen)]
     proc = None
     emergency_stop = False
     started = time.monotonic()

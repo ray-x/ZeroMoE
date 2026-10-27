@@ -118,7 +118,8 @@ std::expected<void, std::string> EngineRunner::run_api() {
     Options options;
     options.host = config.api_host;
     options.port = config.api_port;
-    if (const char *key = std::getenv("ZEROMOE_API_KEY")) options.api_key = key;
+    if (!config.api_key.empty()) options.api_key = config.api_key;
+    else if (const char *key = std::getenv("ZEROMOE_API_KEY")) options.api_key = key;
     NativeBackend backend(engine, ram_mgr, tokenizer, prefetcher, config, kind);
     try {
         Server server(backend, model, options);

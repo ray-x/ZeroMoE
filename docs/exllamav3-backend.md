@@ -131,7 +131,7 @@ After rebuilding ZeroMoE, normal inference can use the same config entrypoint:
 
 ```bash
 ./build_ggmlcuda/zeromoe \
-    --config configs/testing/qwen4exp_exllamav3_26_22.toml --prompt "Hello" --ngen 8
+    --config configs/testing/qwen4exp_exllamav3_26_22.toml --prompt "Hello" --predict 8
 ```
 
 For a fixed-length, greedy benchmark without early EOS stopping:
@@ -214,7 +214,7 @@ Verify the pack, then run the first profile on an otherwise idle host:
 ```bash
 ./build_ggmlcuda/exl3_tool verify /mnt/usb-ssd/Qwen3.8_flash/exl3_2bpw
 ./build_ggmlcuda/zeromoe --config configs/testing/qwen4exp_exllamav3_2bpw_0_44_4.toml \
-    --ngen 128
+    --predict 128
 ```
 
 The fixed-length 0/44/4 benchmark has now loaded and generated 128 tokens:
@@ -489,8 +489,9 @@ safe slot reuse. Route readback keeps the routed FFN callback itself outside
 CUDA graph capture. The adapter captures static GGML spans before and after
 that callback; it checks the graph's
 node signature before replay so changed graphs do not reuse stale segments.
-Set `ZEROMOE_EXL3_GGML_ROUTE_TIMING=1` to log per-layer route-readback count,
-bytes, cumulative host wait, and average synchronization time at teardown.
+Per-layer route-readback counts, bytes, and host wait timing follow the common
+DEBUG logging threshold in engine runs (`--verbosity 5`). The standalone
+cache-graph microbenchmark does not enable this instrumentation implicitly.
 The external path now computes the gate and up rotated matmuls in one CUDA
 kernel, staging both trellises and their input transforms together. This
 reduces the per-route sequence from five launches to four; SwiGLU/output
@@ -660,7 +661,7 @@ nonzero output buffer and checks that the second result does not accumulate the
 first call's output.
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 ZEROMOE_EXL3_GGML_ROUTE_TIMING=1 \
+CUDA_VISIBLE_DEVICES=1 \
   ./build_ggmlcuda/exl3_ggml_cuda_cache_graph_bench \
   /data/sdb/models/qwen3.8-flash-next/exl3_3bpw 2 0 1 --external 10
 ```

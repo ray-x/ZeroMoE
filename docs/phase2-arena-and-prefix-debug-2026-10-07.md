@@ -126,8 +126,9 @@ coherence loss.
 
 The existing coarse P2 timer grouped storage waiting, payload upload,
 conditional dispatch, and the tail replay under `suffix_submit_sync`; on the
-staged path `route_decision` also remained zero. With
-`ZEROMOE_QWEN4EXP_GRAPH_PHASE_TIMING=1`, the source now emits a
+staged path `route_decision` also remained zero. At the time, the source emitted a phase ledger under
+`ZEROMOE_QWEN4EXP_GRAPH_PHASE_TIMING=1`; that one-off setting has since been removed. Current per-layer timing follows
+`--verbosity 5`. The historical source emitted a
 `GGML-QWEN-FULL-DECODE-P2-STAGED-PHASES` ledger for each completed token. It
 separates storage request wall time and service queue/service measurements,
 payload preparation and H2D, both split-child scheduler replays, event-wait

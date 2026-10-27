@@ -109,7 +109,6 @@ void moe::GgmlMoeTransferManager::reset_transfer_state(int device) noexcept {
   stage_slot_capacity_ = 0;
   backend_weight_event_next_ = 0;
   weight_buffer_index_ = 0;
-  backend_stream_copies_ = false;
   weight_buffer_count_ = 1;
   raw_d2d_pending_ = false;
   batch_d2d_unpack_ = false;
@@ -583,22 +582,7 @@ bool GgmlMoeRunner::push_chunk(int buf, int first_expert, int count,
     if (direct_count + (size_t)compact_count >
         (size_t)plan_.chunk_experts)
       return false;
-    if (debug_check_device_output()) {
-      int slot31_compact = -1;
-      int slot63_compact = -1;
-      for (int compact = 0; compact < compact_count; ++compact) {
-        if (slot_map[(size_t)compact] == 31) {
-          slot31_compact = compact;
-        }
-        if (slot_map[(size_t)compact] == 63) {
-          slot63_compact = compact;
-        }
-      }
-      LOG_INFO("[GGML-MOE-DEBUG] compact transfer buf=%d first=%d count=%d "
-               "staged=%d slot31_compact=%d slot63_compact=%d\n",
-               buf, first_expert, count, compact_count, slot31_compact,
-               slot63_compact);
-    }
+
     size_t staged_bytes = 0;
     if (compact_count > 0) {
       const size_t bytes = weight_expert_stride_ * (size_t)compact_count;
@@ -611,8 +595,7 @@ bool GgmlMoeRunner::push_chunk(int buf, int first_expert, int count,
           (cudaStream_t)copy_stream_);
       if (!end_h2d_timing(buf, h2d_timing_slot)) return false;
     }
-    if (e == cudaSuccess && batch_d2d_unpack_ &&
-        !debug_check_device_output()) {
+    if (e == cudaSuccess && batch_d2d_unpack_) {
       auto &combined_map = packed_h2d_slot_map_[buf];
       combined_map.insert(combined_map.end(), slot_map.begin(), slot_map.end());
     }
@@ -636,71 +619,7 @@ bool GgmlMoeRunner::push_chunk(int buf, int first_expert, int count,
             (cudaStream_t)copy_stream_);
       }
     }
-    if (e == cudaSuccess && compact_count > 0 &&
-        debug_check_device_output() &&
-        !batch_d2d_unpack_) {
-        // Diagnostic only: compare the edge rows immediately after the
-        // device-local unpack, before MUL_MAT_ID consumes them.
-        e = cudaStreamSynchronize((cudaStream_t)copy_stream_);
-        if (e == cudaSuccess) {
-          const size_t gate_row = ggml_row_size(
-              (ggml_type)plan_.gate_type, plan_.d_model);
-          const size_t up_row = ggml_row_size(
-              (ggml_type)plan_.up_type, plan_.d_model);
-          const size_t down_row = ggml_row_size(
-              (ggml_type)plan_.down_type, plan_.d_ff);
-          std::vector<uint8_t> device_row;
-          auto verify_row = [&](const char *name, const uint8_t *host,
-                                const uint8_t *device, size_t row_bytes,
-                                int slot, int compact) {
-            if (row_bytes == 0) return;
-            device_row.resize(row_bytes);
-            const cudaError_t ce = cudaMemcpy(
-                device_row.data(), device, row_bytes,
-                cudaMemcpyDeviceToHost);
-            const bool same = ce == cudaSuccess &&
-                              std::memcmp(host, device_row.data(), row_bytes) ==
-                                  0;
-            if (!same) {
-              LOG_INFO("[GGML-MOE-DEBUG] unpack mismatch chunk_buf=%d "
-                       "compact=%d slot=%d plane=%s bytes=%zu copy=%s\n",
-                       buf, compact, slot, name, row_bytes,
-                       ce == cudaSuccess ? "ok" : cudaGetErrorString(ce));
-            }
-          };
-          for (int compact = 0; compact < compact_count; ++compact) {
-            const int slot = slot_map[(size_t)compact];
-            const uint8_t *src_record =
-                h_stage_[buf] + (size_t)compact * weight_expert_stride_;
-            verify_row("gate-first", src_record,
-                       w_gate_base_ + gate_exp_bytes_ * (size_t)slot,
-                       gate_row, slot, compact);
-            verify_row("gate-last",
-                       src_record + gate_exp_bytes_ - gate_row,
-                       w_gate_base_ + gate_exp_bytes_ * (size_t)slot +
-                           gate_exp_bytes_ - gate_row,
-                       gate_row, slot, compact);
-            verify_row("up-first", src_record + gate_exp_bytes_,
-                       w_up_base_ + up_exp_bytes_ * (size_t)slot, up_row, slot,
-                       compact);
-            verify_row("up-last",
-                       src_record + gate_exp_bytes_ + up_exp_bytes_ - up_row,
-                       w_up_base_ + up_exp_bytes_ * (size_t)slot +
-                           up_exp_bytes_ - up_row,
-                       up_row, slot, compact);
-            verify_row("down-first", src_record + gate_exp_bytes_ +
-                           up_exp_bytes_,
-                       w_down_base_ + down_exp_bytes_ * (size_t)slot,
-                       down_row, slot, compact);
-            verify_row("down-last",
-                       src_record + gate_exp_bytes_ + up_exp_bytes_ +
-                           down_exp_bytes_ - down_row,
-                       w_down_base_ + down_exp_bytes_ * (size_t)slot +
-                           down_exp_bytes_ - down_row,
-                       down_row, slot, compact);
-          }
-        }
-      }
+
     // The route-map upload is small but is still a real H2D operation; keep
     // it in the source-specific accounting instead of silently dropping it.
     if (e == cudaSuccess)
@@ -801,7 +720,7 @@ bool GgmlMoeRunner::copy_expert_h2d(int buf, int expert_index,
                           down_exp_bytes_, cudaMemcpyHostToDevice, st);
   } else {
     if (!packed_base_) return false;
-    if (batch_d2d_unpack_ && !debug_check_device_output()) {
+    if (batch_d2d_unpack_) {
       // Direct RAM sources are already persistently pinned. Give each one a
       // distinct packed record and defer the layout conversion until
       // push_chunk(), where all direct-H2D and staged-H2D records can share
@@ -933,7 +852,7 @@ bool GgmlMoeRunner::copy_expert_d2d(int buf, int expert_index,
   // scatter-unpack for the whole chunk to mark_copy_d2d_done(); otherwise a
   // cache hit costs one unpack kernel launch even though the copies are
   // already naturally ordered.
-  if (batch_d2d_unpack_ && !debug_check_device_output()) {
+  if (batch_d2d_unpack_) {
     const size_t compact = d2d_slot_map_[buf].size();
     if (compact >= (size_t)plan_.chunk_experts) return false;
     cudaError_t e = cudaMemcpyAsync(
@@ -966,52 +885,7 @@ bool GgmlMoeRunner::copy_expert_d2d(int buf, int expert_index,
     return false;
   }
   pending_d2d_bytes_[buf] += weight_raw_expert_stride_;
-  if (debug_check_device_output()) {
-    e = cudaStreamSynchronize(st);
-    if (e != cudaSuccess) return false;
-    const size_t gate_row =
-        ggml_row_size((ggml_type)plan_.gate_type, plan_.d_model);
-    const size_t up_row =
-        ggml_row_size((ggml_type)plan_.up_type, plan_.d_model);
-    const size_t down_row =
-        ggml_row_size((ggml_type)plan_.down_type, plan_.d_ff);
-    std::vector<uint8_t> source_row;
-    std::vector<uint8_t> device_row;
-    auto verify_d2d_row = [&](const char *name, const uint8_t *host,
-                              const uint8_t *device, size_t row_bytes) {
-      source_row.resize(row_bytes);
-      device_row.resize(row_bytes);
-      const cudaError_t src_e = cudaMemcpy(source_row.data(), host, row_bytes,
-                                           cudaMemcpyDeviceToHost);
-      const cudaError_t dst_e = cudaMemcpy(device_row.data(), device, row_bytes,
-                                           cudaMemcpyDeviceToHost);
-      if (src_e != cudaSuccess || dst_e != cudaSuccess ||
-          std::memcmp(source_row.data(), device_row.data(), row_bytes) != 0) {
-        LOG_INFO("[GGML-MOE-DEBUG] D2D unpack mismatch slot=%d plane=%s "
-                 "bytes=%zu copy=%s\n",
-                 expert_index, name, row_bytes,
-                 src_e != cudaSuccess
-                     ? cudaGetErrorString(src_e)
-                     : (dst_e == cudaSuccess ? "ok" : cudaGetErrorString(dst_e)));
-      }
-    };
-    const uint8_t *src_record = src;
-    verify_d2d_row("gate-last", src_record + gate_exp_bytes_ - gate_row,
-                   w_gate_base_ + gate_exp_bytes_ * (size_t)expert_index +
-                       gate_exp_bytes_ - gate_row,
-                   gate_row);
-    verify_d2d_row("up-last", src_record + gate_exp_bytes_ + up_exp_bytes_ -
-                                      up_row,
-                   w_up_base_ + up_exp_bytes_ * (size_t)expert_index +
-                       up_exp_bytes_ - up_row,
-                   up_row);
-    verify_d2d_row("down-last",
-                   src_record + gate_exp_bytes_ + up_exp_bytes_ +
-                       down_exp_bytes_ - down_row,
-                   w_down_base_ + down_exp_bytes_ * (size_t)expert_index +
-                       down_exp_bytes_ - down_row,
-                   down_row);
-  }
+
   raw_d2d_pending_ = true;
   return true;
 }
@@ -1021,7 +895,7 @@ void GgmlMoeRunner::sync_copies() {
   // would restore the old per-layer barrier. Completion events are drained
   // by collect_h2d() after the graph has been submitted.
   if (backend_stream_copies_) {
-    if (raw_d2d_pending_ && copy_stream_ && !use_async_moe_graph_reuse()) {
+    if (raw_d2d_pending_ && copy_stream_) {
       cudaSetDevice(device_);
       cudaStreamSynchronize((cudaStream_t)copy_stream_);
     }
@@ -1045,7 +919,7 @@ void GgmlMoeRunner::collect_h2d(double &seconds, size_t &bytes) {
 }
 
 void GgmlMoeRunner::collect_transfer_stats(GgmlMoeTransferStats &stats) {
-  if (backend_stream_copies_ && !use_async_moe_graph_reuse()) {
+  if (backend_stream_copies_) {
     // Preserve the conservative backend-stream mode when queued graph reuse
     // is disabled.  The asynchronous mode leaves these events pending across
     // layers; finish_h2d() performs the single request-level drain.

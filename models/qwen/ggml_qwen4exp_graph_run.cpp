@@ -12,60 +12,6 @@
 using namespace qwen4exp_graph;
 
 
-// ---- temporary measurement: cost of background expert-promotion copies ----
-// ZEROMOE_PROMO_PROBE_N=N: after every decode token copy N experts' worth of
-// real arena bytes (gate+up+down planes of arbitrary experts) host->device on a
-// side stream, and wait for the previous token's copies before issuing more.
-// Measures PCIe/RAM interference with decode; no model state is touched.
-static void promo_copy_probe(StreamingEngine &engine, int pos_base) {
-  static const int N = [] { const char *v = std::getenv("ZEROMOE_PROMO_PROBE_N"); return v ? std::atoi(v) : 0; }();
-  if (N <= 0) return;
-  static void *dev = nullptr;
-  static cudaStream_t st = nullptr;
-  static cudaEvent_t ev = nullptr;
-  static bool pending = false;
-  static uint64_t calls = 0, late = 0, bytes_total = 0;
-  static size_t per_expert = 0;
-  if (!dev) {
-    const auto &a0 = engine.graph_ram_arenas[0];
-    per_expert = a0.gate_bytes + a0.up_bytes + a0.down_bytes;
-    if (cudaMalloc(&dev, per_expert * static_cast<size_t>(N)) != cudaSuccess ||
-        cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking) != cudaSuccess ||
-        cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
-      LOG_ERROR("[PROMO-PROBE] setup failed\n");
-      return;
-    }
-    LOG_INFO("[PROMO-PROBE] N=%d per_expert=%zu bytes (%.2f MB per token)\n", N, per_expert,
-             N * per_expert / 1.0e6);
-  }
-  if (pending) {
-    if (cudaEventQuery(ev) != cudaSuccess) ++late;
-    cudaEventSynchronize(ev);
-    pending = false;
-  }
-  const int layers = static_cast<int>(engine.graph_ram_arenas.size());
-  for (int i = 0; i < N; ++i) {
-    const int layer = (pos_base * 7 + i * 5) % layers;
-    const auto &a = engine.graph_ram_arenas[layer];
-    if (!a.base) continue;
-    const int e = (pos_base * 131 + i * 37) % std::max(1, a.n_experts);
-    char *d = static_cast<char *>(dev) + static_cast<size_t>(i) * per_expert;
-    cudaMemcpyAsync(d, a.base + a.gate_offset + static_cast<size_t>(e) * a.gate_stride, a.gate_bytes,
-                    cudaMemcpyHostToDevice, st);
-    cudaMemcpyAsync(d + a.gate_bytes, a.base + a.up_offset + static_cast<size_t>(e) * a.up_stride, a.up_bytes,
-                    cudaMemcpyHostToDevice, st);
-    cudaMemcpyAsync(d + a.gate_bytes + a.up_bytes,
-                    a.base + a.down_offset + static_cast<size_t>(e) * a.down_stride, a.down_bytes,
-                    cudaMemcpyHostToDevice, st);
-    bytes_total += per_expert;
-  }
-  cudaEventRecord(ev, st);
-  pending = true;
-  if (++calls % 100 == 0)
-    LOG_INFO("[PROMO-PROBE] tokens=%llu late_waits=%llu copied=%.1f MB\n",
-             (unsigned long long)calls, (unsigned long long)late, bytes_total / 1.0e6);
-}
-
 bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
                                     float *hidden_states, int pos_base,
                                     const int *token_ids, float *logits,
@@ -134,14 +80,12 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
     entry.second->completed = false;
   }
   const auto start = std::chrono::steady_clock::now();
-  const auto replay_start = std::chrono::steady_clock::now();
   {
     ZE_NVTX("dec.submit");
     if (ggml_backend_sched_graph_compute_async(g.sched, g.graph) !=
         GGML_STATUS_SUCCESS)
       return false;
   }
-  const auto replay_submit_end = std::chrono::steady_clock::now();
   if (g.stage_enabled && g.stage_compute_end_event) {
     cudaStream_t graph_stream =
         zeromoe_ggml_backend_cuda_get_stream(g.cuda_raw);
@@ -157,7 +101,6 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
   if (g.engine && g.engine->exl3_gpu_executor)
     (void)g.engine->exl3_gpu_executor->stats();
   qwen_probe_dump(g);
-  const auto replay_sync_end = std::chrono::steady_clock::now();
   for (const auto &entry : g.early_ready) {
     if (entry.second->stage_source)
       entry.second->stage_source->token_complete(entry.second->calls);
@@ -246,14 +189,10 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
                wt.completed ? wt.run_ms_total / wt.completed : 0.0);
     }
   }
-  double host_node_d2h_ms = 0.0;
-  double host_node_h2d_ms = 0.0;
   double host_node_callback_span_ms = 0.0;
-  double host_node_cpu_ms = 0.0;
   double host_node_callback_total_ms = 0.0;
   double host_node_callback_guard_wait_ms = 0.0;
   double host_node_callback_body_ms = 0.0;
-  bool host_node_all_ok = true;
   if (!g.host_node_contexts.empty()) {
     float d2h_ms = 0.0f;
     float h2d_ms = 0.0f;
@@ -338,10 +277,6 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
              host_node_callback_guard_wait_ms, host_node_callback_body_ms,
              scheduler_gate_wait_ms,
              ordinary_cpu_wait_ms, cpu_split_enter_wait_ms, all_ok ? 1 : 0);
-    host_node_d2h_ms = d2h_ms;
-    host_node_h2d_ms = h2d_ms;
-    host_node_cpu_ms = cpu_ms;
-    host_node_all_ok = all_ok;
     if (!all_ok)
       return false;
   }
@@ -349,7 +284,7 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
   // and recorded at enqueue time (qwen4exp_cuda_gpu_stage_node_enqueue) but
   // never queried anywhere; add that here, mirroring the host-node ledger
   // immediately above, so a real per-op breakdown exists instead of only
-  // the callback body's own wall-clock (ZEROMOE_QWEN4EXP_GPU_STAGE_TIMING).
+  // the callback body's own wall-clock (available at DEBUG verbosity).
   if (!g.gpu_stage_contexts.empty()) {
     float d2h_ms = 0.0f;
     float h2d_ms = 0.0f;
@@ -390,7 +325,7 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
           stage_ctx->last_callback_ms.load(std::memory_order_acquire);
       all_ok = all_ok && stage_ctx->last_ok.load(std::memory_order_acquire);
     }
-    LOG_INFO("[QWEN4EXP-GPU-STAGE-TIME] pos=%d layers=%zu D2H=%.3fms "
+    LOG_DEBUG("[QWEN4EXP-GPU-STAGE-TIME] pos=%d layers=%zu D2H=%.3fms "
              "callback_span=%.3fms callback_body=%.3fms H2D=%.3fms "
              "total=%.3fms ok=%d\n",
              pos_base, g.gpu_stage_contexts.size(), d2h_ms, callback_span_ms,
@@ -477,45 +412,20 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
       hist.erase(hist.begin(), hist.end() - keep);
     engine.qwen4exp_ple_next_pos = pos_base + 1;
   }
-  promo_copy_probe(engine, pos_base);
   qwen4exp_promotion_step(g, 1);
   engine.qwen4exp_full_graph_output_ready = true;
   engine.qwen4exp_full_graph_logits_ready = logits != nullptr;
   const double ms = std::chrono::duration<double, std::milli>(
                          std::chrono::steady_clock::now() - start)
                          .count();
-  // Avoid a synchronous INFO log for every generated token during normal
-  // inference. The detailed replay ledger below remains available when its
-  // profiling switch is enabled; layer profiling also retains this total.
-  if (env_graph_replay_timing_enabled() || env_layer_timing_enabled()) {
-    LOG_INFO("[GGML-QWEN-FULL-DECODE-TIME] pos=%d total=%.3f ms\n", pos_base,
+  // Avoid a synchronous log for every generated token during normal
+  // inference; DEBUG layer timing retains this total.
+  if (env_layer_timing_enabled()) {
+    LOG_DEBUG("[GGML-QWEN-FULL-DECODE-TIME] pos=%d total=%.3f ms\n", pos_base,
              ms);
   }
-  if (env_graph_replay_timing_enabled()) {
-    double ordinary_cpu_compute_ms = 0.0;
-    for (const double layer_ms : g.layer_timing_cpu_ms)
-      ordinary_cpu_compute_ms += layer_ms;
-    const double ordinary_cpu_gap_ms = g.layer_timing_gap_ms_total;
-    const double replay_submit_ms = std::chrono::duration<double, std::milli>(
-        replay_submit_end - replay_start).count();
-    const double replay_sync_ms = std::chrono::duration<double, std::milli>(
-        replay_sync_end - replay_submit_end).count();
-    const double replay_total_ms = std::chrono::duration<double, std::milli>(
-        replay_sync_end - replay_start).count();
-    LOG_INFO(
-        "[QWEN4EXP-GRAPH-REPLAY-LEDGER] pos=%d splits=%d host_nodes=%zu "
-        "replay_submit=%.3fms replay_sync=%.3fms replay_total=%.3fms "
-        "host_node_d2h=%.3fms host_node_cpu=%.3fms host_node_h2d=%.3fms "
-        "host_node_ok=%d ordinary_cpu_compute=%.3fms "
-        "ordinary_cpu_between_node_gap=%.3fms ordinary_cpu_ledger=%.3fms\n",
-        pos_base, ggml_backend_sched_get_n_splits(g.sched),
-        g.host_node_contexts.size(), replay_submit_ms, replay_sync_ms,
-        replay_total_ms, host_node_d2h_ms, host_node_cpu_ms,
-        host_node_h2d_ms, host_node_all_ok ? 1 : 0, ordinary_cpu_compute_ms,
-        ordinary_cpu_gap_ms, ordinary_cpu_compute_ms + ordinary_cpu_gap_ms);
-  }
-  // Per-layer/per-op CPU timing (env: ZEROMOE_QWEN4EXP_GRAPH_LAYER_TIMING=1)
-  // -- emitted every 10 tokens (not every token) to avoid log spam; see
+  // Per-layer/per-op CPU timing follows DEBUG verbosity and is emitted every
+  // 10 tokens (not every token) to avoid log spam; see
   // memory: full-graph-per-layer-timing-instrumentation-plan.md for why
   // this exists and what it answers that nsys/DEBUG counters cannot.
   if (g.layer_timing_enabled &&
@@ -531,14 +441,14 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
                     std::to_string(static_cast<int>(lms * 100) / 100.0);
       }
     }
-    LOG_INFO("[GGML-QWEN-FULL-LAYER-TIMING] pos=%d cpu_total=%.3fms "
+    LOG_DEBUG("[GGML-QWEN-FULL-LAYER-TIMING] pos=%d cpu_total=%.3fms "
              "gap_total=%.3fms (n=%ld gaps, dispatch/barrier/scheduling "
              "overhead BETWEEN CPU nodes, invisible to any op-bracket "
              "timing)%s\n",
              pos_base, total_cpu_ms, g.layer_timing_gap_ms_total,
              g.layer_timing_gap_count, per_layer.c_str());
     for (const auto &[stem, oms] : g.layer_timing_op_ms) {
-      LOG_INFO("[GGML-QWEN-FULL-LAYER-TIMING]   op=%s cpu=%.3fms\n",
+      LOG_DEBUG("[GGML-QWEN-FULL-LAYER-TIMING]   op=%s cpu=%.3fms\n",
                stem.c_str(), oms);
     }
   }
@@ -812,7 +722,7 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
     // contaminated it yet), so this is the one directly comparable,
     // uncontaminated data point between the two paths. Diff this line
     // against a legacy run's TRACE-ROUTER output (log_level=VERBOSE,
-    // trace_filter=TRACE-ROUTER) for the same prompt/layer to test
+    // verbosity-level TRACE-ROUTER output for the same prompt/layer to test
     // [[qwen4exp-legacy-vs-fullgraph-routing-divergence]]'s BF16-router-
     // precision hypothesis.
     if (S > 0) {

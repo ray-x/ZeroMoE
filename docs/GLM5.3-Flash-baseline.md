@@ -44,10 +44,9 @@ Per token the scheduler runs 34 CPU splits and 35 GPU splits. The GPU is idle ab
 
 ```
 cmake -S . -B build_b11401 -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=75 \
-  -DGGML_CUDA=ON -DGGML_CUDA_GRAPHS=ON \
-  -DZEROMOE_ENABLE_CUDA_GRAPHS=ON -DGGML_NATIVE=ON -DGGML_OPENMP=ON -DZEROMOE_GGML_OPENMP=ON \
+  -DGGML_CUDA=ON -DGGML_NATIVE=ON -DGGML_OPENMP=ON \
   -DGGML_CUDA_FA_QUANTS="q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16" \
-  -DZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES=OFF -DZEROMOE_ENABLE_AVX512_VNNI=OFF \
+  -DZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES=OFF -DGGML_AVX512_VNNI=OFF \
   -DZEROMOE_GGML_ROOT=/home/ray/Projects/llama.cpp-moestream-b11401/ggml
 cmake --build build_b11401 --target zeromoe -j12
 ```
@@ -77,7 +76,7 @@ Keys that define this baseline:
 | `pin_file` / `prefill_pin_file` | `.zeromoe_usage_glm53flash` / `.zeromoe_usage_prefill_glm53flash` | routing counts, last written 2026-09-08 |
 | `host_ram_gb` | 106 | do not reduce; tied to a 2026-09-09 crash (also keep `mem_guard_stop_mb = 10240`) |
 | `ram_preload_all_experts` | true | ~80 GB of experts resident in RAM |
-| `mtp_enabled` | false | the reusable full graph is disabled when MTP is on |
+| `spec_type` | `none` | The reusable full graph is disabled when `draft-mtp` is selected |
 | `context_size` | 4096 | |
 
 Environment variables:
@@ -90,7 +89,8 @@ Environment variables:
 | `ZEROMOE_GLM5NEXT_CPU_LM_HEAD` | unset | set to 1 to put the LM head back on the CPU (about -48 ms/token) |
 | `ZEROMOE_GLM5NEXT_GPU1_LAYERS` | unset | e.g. `11-17` uploads those layers' experts to the 5060 Ti (not part of this baseline) |
 | `GGML_SCHED_PROF` | optional `1` | neurall-fork scheduler profiler; logs a per-graph CPU/GPU/copy breakdown |
-| `ZEROMOE_GLM5NEXT_GRAPH_LAYER_TIMING` | optional `1` | per-layer attention/FFN timing every 100 tokens (adds sync overhead) |
+Per-layer timing and other DEBUG diagnostics follow the common `--verbosity 5`
+setting; this adds synchronization overhead and is not used for the baseline run.
 
 ## 6. How to run
 
@@ -101,7 +101,7 @@ cd /home/ray/Projects/ZeroMoE
 nvidia-smi; pgrep -af zeromoe     # GPU co-existence guard: nothing else on the GPU
 export ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512 ZEROMOE_GLM5NEXT_CPU_THREADS=6
 echo "Write an extremely long and detailed 4000-word essay about the history, mathematics and engineering of mixture of experts models. Do not stop early." \
-  | ./build_b11401/zeromoe --config configs/bench/glm53flash_AJ_IQ2XXS_wholelayer8_cpu.toml --ngen 1500 \
+  | ./build_b11401/zeromoe --config configs/bench/glm53flash_AJ_IQ2XXS_wholelayer8_cpu.toml --predict 1500 \
   > logs/glm53flash_aj_run.log 2>&1
 ```
 

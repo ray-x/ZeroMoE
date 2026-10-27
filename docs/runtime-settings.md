@@ -29,7 +29,7 @@ single backend split (`splits=1`, `transitions=0` in the `[GGML-QWEN-FULL]` log)
 * Enabling it makes the CUDA schedule default to `blocking` (see below).
 * A CUDA *conditional* node cannot contain host nodes (instantiate fails with `invalid argument`), so host-node mode cannot
   be combined with `ZEROMOE_QWEN4EXP_MASTER_GRAPH` conditional bodies. See howto section 10.
-* `ZEROMOE_QWEN4EXP_GRAPH_REPLAY_TIMING=1` crashes the Phase 2 + host-node path; use `ZEROMOE_TOKEN_LOOP_DIAG=1` for timing.
+* Detailed Qwen graph and replay timing follows `--verbosity 5`. DEBUG timing can add synchronization overhead; the Phase 2 + host-node path has had profiling-only failures, so use it for diagnosis rather than performance measurement.
 
 **Performance.** Not a throughput feature today. Plain scheduler-split decode: **28.0 tok/s**. All 26 CPU layers as host
 nodes: **22.6 tok/s** (81%) with the blocking schedule, 18.2 tok/s with the old spinning schedule. Use it when you need a

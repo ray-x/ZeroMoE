@@ -15,7 +15,7 @@ reported zero demand misses, loads and read time.
 
 Order was ordinary graph / early-ready lane / early-ready lane / ordinary graph.
 Every run generated the same 150 tokens with greedy sampling. Timing used
-`ZEROMOE_TOKEN_LOOP_DIAG=1`; steady medians below exclude steps 0-19.
+`--verbosity 5` (the recorded runs used the now-retired `ZEROMOE_TOKEN_LOOP_DIAG=1`); steady medians below exclude steps 0-19.
 
 | Run | Early-ready | Request output tok/s | Steady median ms/token | Steady median tok/s |
 |---|---|---:|---:|---:|
@@ -73,7 +73,7 @@ Explain the difference between CPU and GPU architecture in terms of parallelism,
 
 Run on an otherwise idle machine with `CUDA_VISIBLE_DEVICES=0`,
 `ZEROMOE_GLM5NEXT_FULL_GRAPH=1`, `ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512`,
-`ZEROMOE_GLM5NEXT_CPU_THREADS=6`, `ZEROMOE_TOKEN_LOOP_DIAG=1`, and
+`ZEROMOE_GLM5NEXT_CPU_THREADS=6`, `--verbosity 5` (then `ZEROMOE_TOKEN_LOOP_DIAG=1`), and
 `ZEROMOE_BENCH_IGNORE_STOP=1`. Set `ZEROMOE_GLM5NEXT_EARLY_READY=0` or `1`
 for the controlled comparison; unset it to validate the fixed default. Use
 `scripts/run_capped.sh --limit-gb 100 -- <binary> --config <profile> --temp 0

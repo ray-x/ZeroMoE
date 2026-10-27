@@ -1,6 +1,6 @@
 // src/cpu_qwen_moe.cpp — CPU-only forward pass for Qwen3.6 MoE.
 #include "cpu_qwen_moe.hpp"
-#include "graph_config.hpp"
+#include "logger.hpp"
 
 #include <cmath>
 #include <cstdlib>
@@ -12,15 +12,13 @@
 // Helpers
 // ---------------------------------------------------------------------------
 
-// Opt-in per-layer hidden-state tracing (set ZEROMOE_DEBUG_LAYERS=1) to
-// localize where a numerical/permutation bug first shows up, without
-// touching normal-run performance or log volume. Reports the RMS and first
+// Per-layer hidden-state traces are available at the standard VERBOSE
+// logging level. Reports the RMS and first
 // few values of the LAST sequence position only -- during prefill that's
 // the position the LM head actually reads, and during decode S is always 1
 // anyway, so this is the one row worth watching every call.
 static bool debug_layers_enabled() {
-  static bool enabled = zeromoe::graphcfg::env("ZEROMOE_DEBUG_LAYERS") != nullptr;
-  return enabled;
+  return Logger::instance().would_log(LogLevel::VERBOSE);
 }
 
 // `abs_pos` is the token's ABSOLUTE position in the sequence (pos_base +
@@ -42,9 +40,10 @@ static void debug_print_norm_at(const char *tag, int layer_idx,
   for (int i = 0; i < D; ++i)
     ss += static_cast<double>(row[i]) * row[i];
   double rms = std::sqrt(ss / D);
-  std::cerr << "[CPU-QWEN-DEBUG] " << tag << "@" << abs_pos
-            << " layer=" << layer_idx << " rms=" << rms << " first3=["
-            << row[0] << "," << row[1] << "," << row[2] << "]\n";
+  LOG_STREAM_VERBOSE() << "[CPU-QWEN-DEBUG] " << tag << "@" << abs_pos
+                       << " layer=" << layer_idx << " rms=" << rms
+                       << " first3=[" << row[0] << "," << row[1] << ","
+                       << row[2] << "]\n";
 }
 
 // Prints the FIRST token (local pos 0) in addition to the LAST (local pos

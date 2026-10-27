@@ -31,7 +31,7 @@ layer indices where the ratio first crosses 2× / 5× / 10× / 30×.
 
 | file | purpose |
 |---|---|
-| `run_zeromoe.sh` | Run ZeroMoE on a prompt at `--log-level VERBOSE`, trace to a log |
+| `run_zeromoe.sh` | Run ZeroMoE on a prompt at `--verbosity 4`, trace to a log |
 | `run_colibri.sh`   | Run colibri (CPU) on the same prompt; copies `/tmp/colibri_trace.log` out |
 | `diff_trace.py`    | Parse + diff the two logs, print the per-layer ratio table |
 
@@ -109,8 +109,8 @@ at the bottom) and the threshold-crossing table.
      bypass ZeroMoE's template, so both engines embed the identical tokens.
 
 3. **`diff_trace.py` takes the first (prefill) occurrence** of each (layer,
-   stage), so the one decode step from `--ngen 1` is ignored. If you change
-   `--ngen`, the script still works as long as prefill ran.
+   stage), so the one decode step from `--predict 1` is ignored. If you change
+   `--predict`, the script still works as long as prefill ran.
 
 ## If the bug is confirmed
 

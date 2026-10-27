@@ -100,7 +100,7 @@ def main():
             wait_idle(args.wait_idle)
             print(f'Capturing {topic}', flush=True)
             with (directory / 'capture.stdout').open('w') as output:
-                subprocess.run([str(engine), '--config', str(config), '--ngen', str(args.ngen)],
+                subprocess.run([str(engine), '--config', str(config), '--predict', str(args.ngen)],
                     input=prompt + '\n:q\n', text=True, cwd=ROOT, env=run_env,
                     stdout=output, stderr=subprocess.STDOUT, check=True)
             scores = analyze(directory / 'capture.routes.jsonl',

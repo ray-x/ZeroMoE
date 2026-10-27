@@ -25,6 +25,50 @@ The separate `zeromoe_cpu` executable has a smaller CLI and uses `CPUConfig`,
 including `omp_max_threads`. It rejects `graph_*` keys rather than pretending
 to apply CUDA graph tuning. Use a CPU configuration, not a CUDA model recipe.
 
+## llama.cpp-compatible option names
+
+The common CLI settings use the names from the pinned llama.cpp CLI/server
+reference (source commit `8baabd53b77d`; `tools/cli/README.md`,
+`tools/server/README.md`, `docs/speculative.md`, and `docs/multi-gpu.md)):
+names and control meaning are aligned; model-recipe defaults remain
+ZeroMoE/model-specific.
+
+| Intent | llama.cpp | ZeroMoE |
+| --- | --- | --- |
+| Model, prompt | `--model`, `--prompt` | same |
+| Context, output length | `-c/--ctx-size`, `-n/--predict` | same |
+| CPU threads | `-t/--threads` | same; caps ZeroMoE's process-wide OpenMP team |
+| Temperature, nucleus sampling | `--temp`, `--top-p` | same |
+| System prompt | `--system-prompt` | same |
+| Single main GPU | `--main-gpu` | same for single-device recipes |
+| Log file and verbosity | `--log-file`, `--verbosity` | same |
+| Server alias and key | `--alias`, `--api-key` | same; the key environment variable remains `ZEROMOE_API_KEY` |
+| Speculative MTP | `--spec-type`, `--spec-draft-model`, `--spec-draft-n-max` | same names; ZeroMoE currently supports `none` and `draft-mtp` |
+
+For multi-GPU ZeroMoE runs, use the recipe's `[[gpus]]` tables. Those tables
+also assign dense/MoE roles and per-device cache budgets; they do not have a
+one-to-one equivalent to llama.cpp's `--device`, `--split-mode`, and
+`--tensor-split`. ZeroMoE's MTP `mtp_graph` key selects its graph-native
+implementation and remains ZeroMoE-specific.
+
+## ZeroMoE-specific settings retained for review
+
+These controls have no exact llama.cpp counterpart but configure core
+ZeroMoE capabilities. They remain documented for review rather than being
+treated as ordinary tuning switches:
+
+| Capability | Canonical controls | Why it is distinct |
+| --- | --- | --- |
+| Expert residency and offload | `graph_device_expert_layers`, `moe_cache_gb`, `graph_offload_*` | Separate DDR source, pinned DMA arena, VRAM expert cache, and graph placement |
+| Usage and pin profiles | `pin_file`, `prefill_pin_file`, `graph_offload_usage_file`, `graph_usage_record_file` | Create/consume route-frequency profiles to choose resident experts |
+| Per-device MoE topology | `[[gpus]]` roles, cache sizes, reservations, and active-layer pools | Assigns trunk, hotset, and expert-cache responsibilities per GPU |
+| Expert-storage I/O | `direct_io`, `io_uring`, `drop_pages` | Selects ZeroMoE's expert-slab I/O path; no direct llama.cpp CLI equivalent |
+| Host resource safety | `host_ram_gb`, memory guard and pinned-memory budgets | Bounds ZeroMoE's host expert tier and startup admission |
+| Phase reuse | `graph_phase_cache_mib`, `graph_phase_cache_reserve_mib` | Optional decode-hot expert allocation with explicit phase lifetime |
+
+Unlisted experiment flags should move into developer-only tools or be removed
+after their result is finalized. They should not grow the normal run interface.
+
 ## Advanced graph tuning and precedence
 
 The graph resolver uses:
@@ -90,6 +134,10 @@ effective. Historical environment parsing is preserved, including its
 inconsistent boolean and malformed-number behavior; TOML and CLI use the
 stricter canonical parser.
 
+MiMo2 and Ling-prefixed graph-setting aliases have been removed; their maintained
+launchers use canonical settings and `--graph-*` flags. Remaining Qwen and
+GLM aliases are transitional.
+
 Graph settings are bound before initialization and then immutable. Changing
 environment variables or rewriting the config while the process runs is not a
 supported way to retune a graph.
@@ -110,7 +158,7 @@ cmake --build --preset cuda --parallel 4
 Both presets select Release and ggml; CUDA additionally builds ggml's CUDA
 backend. They do not change inference tuning. Hardware-specific build choices
 still matter: for example, an x86 CPU without AVX-512 VNNI needs
-`-DZEROMOE_ENABLE_AVX512_VNNI=OFF` when configuring. See
+`-DGGML_AVX512_VNNI=OFF` when configuring. See
 [the build instructions](../README.md#build-and-installation-pipeline).
 Manual CMake and existing Make targets remain supported.
 

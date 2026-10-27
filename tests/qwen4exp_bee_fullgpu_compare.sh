@@ -41,8 +41,8 @@ runtime=(CUDA_VISIBLE_DEVICES=0 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=48
 wait_for_gpu
 printf '%s\n' 'What is 2 plus 2? Explain briefly.' |
     env "${runtime[@]}" ZEROMOE_GENERATED_TOKEN_FILE="$output_dir/decode.tokens" \
-        "$engine" --config "$config" --raw-prompt --ctx 151 --ngen 129 \
-        --log-path "$output_dir/capture.log" > "$output_dir/capture.stdout" 2>&1
+        "$engine" --config "$config" --raw-prompt --ctx-size 151 --predict 129 \
+        --log-file "$output_dir/capture.log" > "$output_dir/capture.stdout" 2>&1
 wait_for_gpu
 env CUDA_VISIBLE_DEVICES=0 LD_LIBRARY_PATH="$bee_libraries" \
     BEE_LLAMA_BENCH_TOKEN_FILE="$prompt_tokens" \
@@ -58,8 +58,8 @@ wait_for_gpu
 printf '%s\n' "${prompts[@]}" |
     env "${runtime[@]}" ZEROMOE_TEACHER_FORCE_TOKEN_FILE="$output_dir/decode.tokens" \
         ZEROMOE_TEACHER_FORCE_SKIP_SAMPLING=1 \
-        "$engine" --config "$config" --raw-prompt --ctx 151 --ngen 129 \
-        --log-path "$output_dir/zeromoe.log" > "$output_dir/zeromoe.stdout" 2>&1
+        "$engine" --config "$config" --raw-prompt --ctx-size 151 --predict 129 \
+        --log-file "$output_dir/zeromoe.log" > "$output_dir/zeromoe.stdout" 2>&1
 
 python3 - "$output_dir" <<'PY'
 from pathlib import Path

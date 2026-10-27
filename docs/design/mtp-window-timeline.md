@@ -33,7 +33,7 @@ Analyzer: `tools/nsys_window_breakdown.py <export.sqlite>`. The raw trace is in
 
 `--cuda-graph-trace=node` makes every `cudaGraphLaunch` cost 174-630 us (median 246) because nsys tracks each
 node; plain decode and the window have a similar node count (about 5,000 compute nodes; see
-`ZEROMOE_GRAPH_OP_HISTOGRAM`). The unprofiled window is 41.9 ms against 55.7 ms under nsys, a difference of
+`--verbosity 5` now emits the graph-op histogram. The unprofiled window is 41.9 ms against 55.7 ms under nsys, a difference of
 13.8 ms that matches the 14.6 ms attributed to "other CUDA calls". Without the artifact the window is about
 GPU kernels 19.7 + copies 3.7 + sync waits 1.9 + host-only 17 ms. Launch overhead is therefore a small lever;
 the 17 ms of host-only time (cold-expert compute and scheduling, GPU idle) is the largest non-GPU part. With the

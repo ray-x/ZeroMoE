@@ -176,84 +176,12 @@ bool type_is_valid(uint32_t type) {
   return type < static_cast<uint32_t>(GGML_TYPE_COUNT);
 }
 
-// Optional decode-only timing for the persistent Qwen CPU graph.  The normal
-// production path does not pay for extra clocks or atomics.  Set
-// ZEROMOE_QWEN_CPU_GRAPH_TIMING_REPORT_CALLS to the expected number of
-// decode graph calls (for example 3840 for 48 CPU layers x 80 tokens) to get
-// one aggregate split at the end of that window.  This is deliberately kept
-// in the Qwen runner instead of the generic PerfCounters so other model
-// families and the ordinary CPU fallback remain untouched.
-struct QwenCpuGraphTiming {
-  bool enabled = false;
-  uint64_t report_calls = 0;
-  std::atomic<uint64_t> calls{0};
-  std::atomic<double> input_s{0.0};
-  std::atomic<double> metadata_s{0.0};
-  std::atomic<double> compute_s{0.0};
-  std::atomic<double> output_s{0.0};
-  std::atomic<double> total_s{0.0};
-  std::atomic<bool> reported{false};
-};
-
-QwenCpuGraphTiming &qwen_cpu_graph_timing() {
-  static QwenCpuGraphTiming state;
-  static std::once_flag once;
-  std::call_once(once, [] {
-    const char *env =
-        zeromoe::graphcfg::env("ZEROMOE_QWEN_CPU_GRAPH_TIMING_REPORT_CALLS");
-    if (!env || !env[0])
-      return;
-    char *end = nullptr;
-    const unsigned long long parsed = std::strtoull(env, &end, 10);
-    if (end != env && *end == '\0' && parsed > 0) {
-      // The state object is function-static and already constructed before
-      // call_once invokes this initializer.
-      state.enabled = true;
-      state.report_calls = static_cast<uint64_t>(parsed);
-    }
-  });
-  return state;
-}
-
-void qwen_cpu_graph_timing_add(std::atomic<double> &target, double seconds) {
-  double old = target.load(std::memory_order_relaxed);
-  while (!target.compare_exchange_weak(old, old + seconds,
-                                       std::memory_order_relaxed,
-                                       std::memory_order_relaxed)) {
-  }
-}
-
-void qwen_cpu_graph_timing_report(QwenCpuGraphTiming &state,
-                                  uint64_t calls) {
-  if (!state.enabled || calls != state.report_calls ||
-      state.reported.exchange(true, std::memory_order_relaxed))
-    return;
-  const double input = state.input_s.load(std::memory_order_relaxed);
-  const double metadata = state.metadata_s.load(std::memory_order_relaxed);
-  const double compute = state.compute_s.load(std::memory_order_relaxed);
-  const double output = state.output_s.load(std::memory_order_relaxed);
-  const double total = state.total_s.load(std::memory_order_relaxed);
-  LOG_STREAM_INFO()
-      << "[CPU-MOE-GRAPH-TIMING] calls=" << calls
-      << " input_copy=" << input << "s (" << input * 1000.0 / calls
-      << "ms/call) metadata=" << metadata << "s ("
-      << metadata * 1000.0 / calls << "ms/call) compute=" << compute << "s ("
-      << compute * 1000.0 / calls << "ms/call) output_copy=" << output
-      << "s (" << output * 1000.0 / calls << "ms/call) total=" << total
-      << "s (" << total * 1000.0 / calls << "ms/call)\n";
-}
-
 // The production Qwen graph-RAM arena is interleaved per expert as
 // [gate|up|down].  Some focused tests and legacy callers provide three
 // independent strided planes instead; those must keep the separate gate/up
 // graph because their up pointer is not adjacent to the gate plane.
 bool can_merge_gate_up(const GgmlQwenCpuExpertRef &ref,
                        const void *gate_plane, const void *up_plane) {
-  static const bool disabled = [] {
-    return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN_CPU_DISABLE_MERGED_GATE_UP");
-  }();
-  if (disabled)
-    return false;
   return ref.gate_type == ref.up_type && ref.gate_bytes == ref.up_bytes &&
          gate_plane && up_plane &&
          static_cast<const uint8_t *>(up_plane) ==
@@ -269,7 +197,7 @@ bool qwen_cpu_direct_ephemeral_env_enabled() {
 }
 
 bool qwen_cpu_direct_timing_enabled() {
-  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN_CPU_DIRECT_TIMING");
+  return Logger::instance().would_log(LogLevel::DEBUG);
 }
 
 bool qwen_cpu_direct_fused_enabled() {
@@ -322,7 +250,7 @@ bool qwen_cpu_direct_prefetch_enabled() {
 }
 
 bool qwen_cpu_direct_diag_enabled() {
-  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN_CPU_DIRECT_DIAG");
+  return Logger::instance().would_log(LogLevel::DEBUG);
 }
 
 enum : int {
@@ -1748,7 +1676,7 @@ void GgmlQwenCpuMoeRunner::direct_worker_loop(int worker_index) {
           const auto ms = [](int64_t ns) {
             return static_cast<double>(ns) / 1000000.0;
           };
-          LOG_INFO("[QWEN-CPU-DIRECT-TIMING] input_q8k=%.3f "
+          LOG_DEBUG("[QWEN-CPU-DIRECT-TIMING] input_q8k=%.3f "
                    "gate_up_swiglu_q8_0=%.3f down=%.3f reduce_store=%.3f "
                    "total=%.3f d_model=%d d_ff=%d topk=%d\n",
                    ms(direct_timing_input_ns_.load()),
@@ -2407,32 +2335,15 @@ bool GgmlQwenCpuMoeRunner::run_strided(
   }
   static_cast<ggml_tensor *>(down_)->data = const_cast<void *>(down_plane);
 
-  QwenCpuGraphTiming &timing = qwen_cpu_graph_timing();
-  const auto total_start = std::chrono::steady_clock::now();
-  const auto input_start = total_start;
   std::memcpy(static_cast<ggml_tensor *>(x_)->data, input,
               static_cast<size_t>(d_model_) * sizeof(float));
-  if (timing.enabled)
-    qwen_cpu_graph_timing_add(
-        timing.input_s,
-        std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                      input_start)
-            .count());
 
-  const auto metadata_start = std::chrono::steady_clock::now();
   auto *ids = static_cast<int32_t *>(static_cast<ggml_tensor *>(ids_)->data);
   for (int k = 0; k < topk_; ++k)
     ids[k] = static_cast<int32_t>(expert_ids[k]);
   std::memcpy(static_cast<ggml_tensor *>(weights_)->data, router_weights,
               static_cast<size_t>(topk_) * sizeof(float));
 
-  if (timing.enabled)
-    qwen_cpu_graph_timing_add(
-        timing.metadata_s,
-        std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                      metadata_start)
-            .count());
-  const auto compute_start = std::chrono::steady_clock::now();
   if (!compute_graph())
     return false;
   dump_qwen_cpu_diag_tensor("down_input_swiglu",
@@ -2441,30 +2352,8 @@ bool GgmlQwenCpuMoeRunner::run_strided(
                             static_cast<const ggml_tensor *>(down_output_));
   dump_qwen_cpu_diag_tensor("cpu_output_pre_h2d",
                             static_cast<const ggml_tensor *>(output_));
-  if (timing.enabled)
-    qwen_cpu_graph_timing_add(
-        timing.compute_s,
-        std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                      compute_start)
-            .count());
-  const auto output_start = std::chrono::steady_clock::now();
   std::memcpy(output, static_cast<ggml_tensor *>(output_)->data,
               static_cast<size_t>(d_model_) * sizeof(float));
-  if (timing.enabled) {
-    qwen_cpu_graph_timing_add(
-        timing.output_s,
-        std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                      output_start)
-            .count());
-    qwen_cpu_graph_timing_add(
-        timing.total_s,
-        std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                      total_start)
-            .count());
-    const uint64_t calls =
-        timing.calls.fetch_add(1, std::memory_order_relaxed) + 1;
-    qwen_cpu_graph_timing_report(timing, calls);
-  }
   return true;
 }
 
@@ -2520,9 +2409,8 @@ bool GgmlQwenCpuMoeRunner::run_strided_planes(
   if (!ensure_graph(layer, n_experts, d_model, d_ff, topk, true,
                     gate_plane, up_plane, down_plane, gate_stride, false,
                     false, up_stride, down_stride)) {
-    const char *sched_debug = zeromoe::graphcfg::env("ZEROMOE_QWEN_DECODE_SCHED_DEBUG");
-    if (sched_debug && sched_debug[0] == '1')
-      LOG_WARN("[QWEN-CPU-PLANES] ensure_graph failed types=%u/%u/%u "
+    if (Logger::instance().would_log(LogLevel::DEBUG))
+      LOG_DEBUG("[QWEN-CPU-PLANES] ensure_graph failed types=%u/%u/%u "
                "bytes=%zu/%zu/%zu strides=%zu/%zu/%zu n=%d D=%d FF=%d K=%d\n",
                layer.gate_type, layer.up_type, layer.down_type,
                layer.gate_bytes, layer.up_bytes, layer.down_bytes,
@@ -2535,58 +2423,18 @@ bool GgmlQwenCpuMoeRunner::run_strided_planes(
   static_cast<ggml_tensor *>(up_)->data = const_cast<void *>(up_plane);
   static_cast<ggml_tensor *>(down_)->data = const_cast<void *>(down_plane);
 
-  QwenCpuGraphTiming &timing = qwen_cpu_graph_timing();
-  const auto total_start = std::chrono::steady_clock::now();
-  const auto input_start = total_start;
   std::memcpy(static_cast<ggml_tensor *>(x_)->data, input,
               static_cast<size_t>(d_model_) * sizeof(float));
-  if (timing.enabled)
-    qwen_cpu_graph_timing_add(
-        timing.input_s,
-        std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                      input_start)
-            .count());
 
-  const auto metadata_start = std::chrono::steady_clock::now();
   auto *ids = static_cast<int32_t *>(static_cast<ggml_tensor *>(ids_)->data);
   for (int k = 0; k < topk_; ++k)
     ids[k] = static_cast<int32_t>(expert_ids[k]);
   std::memcpy(static_cast<ggml_tensor *>(weights_)->data, router_weights,
               static_cast<size_t>(topk_) * sizeof(float));
-  if (timing.enabled)
-    qwen_cpu_graph_timing_add(
-        timing.metadata_s,
-        std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                      metadata_start)
-            .count());
-
-  const auto compute_start = std::chrono::steady_clock::now();
   if (!compute_graph())
     return false;
-  if (timing.enabled)
-    qwen_cpu_graph_timing_add(
-        timing.compute_s,
-        std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                      compute_start)
-            .count());
-  const auto output_start = std::chrono::steady_clock::now();
   std::memcpy(output, static_cast<ggml_tensor *>(output_)->data,
               static_cast<size_t>(d_model_) * sizeof(float));
-  if (timing.enabled) {
-    qwen_cpu_graph_timing_add(
-        timing.output_s,
-        std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                      output_start)
-            .count());
-    qwen_cpu_graph_timing_add(
-        timing.total_s,
-        std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                      total_start)
-            .count());
-    const uint64_t calls =
-        timing.calls.fetch_add(1, std::memory_order_relaxed) + 1;
-    qwen_cpu_graph_timing_report(timing, calls);
-  }
   return true;
 }
 

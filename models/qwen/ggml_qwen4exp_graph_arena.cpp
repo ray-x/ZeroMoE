@@ -22,13 +22,8 @@ namespace qwen4exp_graph {
 // 26 CPU layers that request is approximately the full 26-layer expert
 // footprint (~88 GiB), instead of a small activation workspace.
 void bind_host_expert_scheduler_backend(FullGraph &g, ggml_tensor *t) {
-  static int zeromoe_bind_diag = -1;
-  if (zeromoe_bind_diag < 0) {
-    const char *e = zeromoe::graphcfg::env("ZEROMOE_BIND_HOST_DIAG");
-    zeromoe_bind_diag = (e && e[0] == '1') ? 1 : 0;
-  }
-  if (zeromoe_bind_diag) {
-    LOG_WARN(
+  if (Logger::instance().would_log(LogLevel::DEBUG)) {
+    LOG_DEBUG(
         "[ZEROMOE-BIND-DIAG] name=%s sched=%p cpu=%p t=%p t->buffer=%p "
         "is_host=%d\n",
         t ? ggml_get_name(t) : "(null)", (void *)g.sched, (void *)g.cpu,
@@ -37,8 +32,8 @@ void bind_host_expert_scheduler_backend(FullGraph &g, ggml_tensor *t) {
   }
   if (!g.sched || !g.cpu || !t || !t->buffer ||
       !ggml_backend_buffer_is_host(t->buffer)) {
-    if (zeromoe_bind_diag)
-      LOG_WARN("[ZEROMOE-BIND-DIAG] SKIPPED pin for name=%s\n",
+    if (Logger::instance().would_log(LogLevel::DEBUG))
+      LOG_DEBUG("[ZEROMOE-BIND-DIAG] SKIPPED pin for name=%s\n",
                t ? ggml_get_name(t) : "(null)");
     return;
   }

@@ -40,7 +40,7 @@ no separate offload store is created.
 ```bash
 ZEROMOE_DISABLE_ROUTER_BF16=1 CUDA_VISIBLE_DEVICES=0,1 \
   scripts/run_capped.sh --limit-gb 100 -- build_mimo/zeromoe \
-  --config configs/mimo26-flash.toml --ngen 16
+  --config configs/mimo26-flash.toml --predict 16
 ```
 
 Enter a prompt through stdin/the REPL, then `:q` to exit. In this engine's

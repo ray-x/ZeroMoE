@@ -217,14 +217,14 @@ bool configure_vram_reference_experts(FullGraph &g) {
       aliased_bytes += stride;
     }
 
-    if (zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_DEBUG_PARTIAL") && layer < 8) {
+    if (Logger::instance().would_log(LogLevel::DEBUG) && layer < 8) {
       size_t n_pool = 0, n_ready = 0, n_ptr = 0, n_size = 0, n_gpu = 0;
       for (const ExpertLocation &l2 : g.topology->expert_vram_cache) {
         if (l2.pool_layer != layer) continue;
         ++n_pool; n_ready += l2.upload_ready; n_ptr += l2.device_ptr != nullptr;
         n_size += l2.size == stride; n_gpu += l2.gpu_id == g.device;
       }
-      LOG_WARN("[ALIAS-DEBUG] layer=%d compact=%d stride=%zu slot_count=%zu "
+      LOG_DEBUG("[ALIAS-DEBUG] layer=%d compact=%d stride=%zu slot_count=%zu "
                "base=%d pool=%zu ready=%zu ptr=%zu size_ok=%zu gpu_ok=%zu hot=%zu\n",
                layer, (int)g.topology->expert_compact_layout, stride, slot_count,
                p.vram_layer_base != nullptr, n_pool, n_ready, n_ptr, n_size, n_gpu,
@@ -764,12 +764,12 @@ void assign_gpu1_hot(FullGraph &g, double gib) {
                                 [&](int e) { return !is_cold[(size_t)l][(size_t)e]; }),
                  p.cold.end());
   }
-  if (zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_OFFLOAD_DEBUG")) {
+  if (Logger::instance().would_log(LogLevel::DEBUG)) {
     for (int l : {3, 4}) {
       std::string a, b;
       for (int e : g.partial_experts[(size_t)l].hot1) a += std::to_string(e) + ",";
       for (int e : g.partial_experts[(size_t)l].hot) b += std::to_string(e) + ",";
-      LOG_INFO("[HOT1-DEBUG] layer %d hot1=%s\n[HOT1-DEBUG] layer %d hot=%s cold=%zu\n", l, a.c_str(), l, b.c_str(),
+      LOG_DEBUG("[HOT1-DEBUG] layer %d hot1=%s\n[HOT1-DEBUG] layer %d hot=%s cold=%zu\n", l, a.c_str(), l, b.c_str(),
                g.partial_experts[(size_t)l].cold.size());
     }
   }

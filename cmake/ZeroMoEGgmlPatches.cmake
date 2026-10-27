@@ -12,7 +12,6 @@
 #   patches/ggml-host-node-beellama  ZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES; best effort.
 #                                    These use beellama-only scheduler profiling
 #                                    helpers and do not apply to plain upstream.
-#   patches/debug                    ZEROMOE_GGML_DEBUG_PATCHES (default OFF); best effort
 # patches/experimental and patches/obsolete are never applied.
 
 function(_zeromoe_ggml_apply_dir dir required)
@@ -73,6 +72,8 @@ function(zeromoe_apply_ggml_patches ggml_root)
     # earlier one), so the applied state is recorded: a stamp holding the hash of every patch file that
     # was applied. A tree with the same stamp is left alone; a changed series on a patched tree is an error.
     set(_stamp_files "")
+    # Keep the retired debug patch bytes in the stamp so existing default-OFF
+    # build trees remain valid after the user-facing option was removed.
     foreach(_dir IN ITEMS ggml ggml-host-node ggml-host-node-beellama debug)
         file(GLOB _p "${CMAKE_CURRENT_SOURCE_DIR}/patches/${_dir}/*.patch")
         list(SORT _p)
@@ -83,7 +84,7 @@ function(zeromoe_apply_ggml_patches ggml_root)
         file(SHA256 "${_f}" _h)
         string(APPEND _stamp "${_h}\n")
     endforeach()
-    string(APPEND _stamp "host_node=${ZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES} debug=${ZEROMOE_GGML_DEBUG_PATCHES}\n")
+    string(APPEND _stamp "host_node=${ZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES} debug=OFF\n")
     set(_stamp_file "${ggml_root}/.zeromoe_patches_applied")
     if(EXISTS "${_stamp_file}")
         file(READ "${_stamp_file}" _have)
@@ -99,9 +100,6 @@ function(zeromoe_apply_ggml_patches ggml_root)
     if(ZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES)
         _zeromoe_ggml_apply_dir(ggml-host-node TRUE)
         _zeromoe_ggml_apply_dir(ggml-host-node-beellama FALSE)
-    endif()
-    if(ZEROMOE_GGML_DEBUG_PATCHES)
-        _zeromoe_ggml_apply_dir(debug FALSE)
     endif()
     file(WRITE "${_stamp_file}" "${_stamp}")
 endfunction()

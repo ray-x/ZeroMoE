@@ -31,7 +31,7 @@ case "$MODE" in
     printf 'Tell a story.\n:q\n' | env CUDA_VISIBLE_DEVICES=0 \
       ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
       ZEROMOE_BENCH_SILENT=1 ZEROMOE_BENCH_IGNORE_STOP=1 \
-      timeout 900 "$BIN" --config "$TMP/cfg.toml" > "$LOG.log" 2>&1 || rc=$?
+      timeout 900 "$BIN" --verbosity 5 --config "$TMP/cfg.toml" > "$LOG.log" 2>&1 || rc=$?
     grep -E "PREFILL-DONE\] 16|REQUEST-DECODE-WALL" "$LOG.engine.log" | cut -c1-170 || true
     # Emit teardown evidence so the gate can recognize a benign teardown crash (§3.7) rather
     # than treat any nonzero exit as benign.
@@ -50,8 +50,8 @@ case "$MODE" in
     SP=$!
     echo "Explain briefly the key concepts of neural networks and gradient descent in plain English." | env CUDA_VISIBLE_DEVICES=0 \
       ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
-      ZEROMOE_TOKEN_LOOP_DIAG=1 ZEROMOE_BENCH_IGNORE_STOP=1 \
-      "$BIN" --config "$TMP/cfg.toml" --ngen "$NGEN" > "$LOG.log" 2>&1 || true
+      ZEROMOE_BENCH_IGNORE_STOP=1 \
+      "$BIN" --verbosity 5 --config "$TMP/cfg.toml" --predict "$NGEN" > "$LOG.log" 2>&1 || true
     kill $SP 2>/dev/null || true
     python3 - "$LOG" <<'EOF'
 import re, statistics as st, sys

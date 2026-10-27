@@ -104,7 +104,6 @@ moe_ggml_shared_expert = true
 moe_ggml_planar_copies = true
 moe_ggml_device     = 0
 moe_ggml_gpu_router = true
-ggml_async_graph_reuse = true
 
 hc_ggml             = true
 gdn_proj_ggml       = true

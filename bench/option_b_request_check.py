@@ -52,7 +52,7 @@ def main():
                            ZEROMOE_QWEN_EARLY_READY_STAGE_VERIFY='1')
         print(f'Running {arm}: three natural-stop requests', flush=True)
         with (out / f'{arm}.stdout').open('w') as output:
-            subprocess.run([str(engine), '--config', str(config), '--ngen', str(args.ngen)],
+            subprocess.run([str(engine), '--config', str(config), '--predict', str(args.ngen)],
                 input=(out / 'requests.txt').read_text(), text=True, cwd=ROOT, env=runtime,
                 stdout=output, stderr=subprocess.STDOUT, check=True)
         contents = log.read_text()

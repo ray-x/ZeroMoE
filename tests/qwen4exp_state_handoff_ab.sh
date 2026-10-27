@@ -40,8 +40,8 @@ for phase in prefill decode; do
                 ZEROMOE_DECODE_LOGITS_DUMP="$logits_dump" \
                 ZEROMOE_PREFILL_FINAL_HIDDEN_DUMP="$hidden_dump" \
                 "$binary" --config "$config" --raw-prompt \
-                    --ctx "$context" --ngen "$generated" \
-                    --log-path "$prefix.log" > "$prefix.stdout" 2>&1
+                    --ctx-size "$context" --predict "$generated" \
+                    --log-file "$prefix.log" > "$prefix.stdout" 2>&1
         echo "Completed $phase state_handoff=$mode: $prefix.log"
     done
 done

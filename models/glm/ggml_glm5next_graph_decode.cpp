@@ -379,136 +379,6 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
       (g_phase_cache && g_graph->placement_generation != g_phase_cache->generation()))
     return false;
   FullGraph &g = *g_graph;
-  struct NanProbe {
-    int reported = 0;
-    int seen = 0;
-  };
-  static NanProbe probe;
-  const bool nan_probe_on =
-      zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_DEBUG_NAN_NODES") != nullptr &&
-      probe.reported == 0;
-  if (nan_probe_on) {
-    probe.seen = 0;
-    ggml_backend_sched_set_eval_callback(
-        g.sched,
-        [](ggml_tensor *t, bool ask, void *ud) -> bool {
-          auto *p = static_cast<NanProbe *>(ud);
-          if (ask)
-            return p->reported < 6 && (t->type == GGML_TYPE_F32 ||
-                                       t->type == GGML_TYPE_F16);
-          const int idx = p->seen++;
-          if (p->reported >= 6)
-            return true;
-          const size_t n = ggml_nelements(t);
-          std::vector<uint8_t> raw(ggml_nbytes(t));
-          ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
-          size_t bad = 0;
-          if (t->type == GGML_TYPE_F32) {
-            for (size_t i = 0; i < n; ++i)
-              if (!std::isfinite(reinterpret_cast<const float *>(raw.data())[i]))
-                ++bad;
-          } else {
-            for (size_t i = 0; i < n; ++i)
-              if (!std::isfinite(ggml_fp16_to_fp32(
-                      reinterpret_cast<const ggml_fp16_t *>(raw.data())[i])))
-                ++bad;
-          }
-          if (bad) {
-            ++p->reported;
-            if (t->op == GGML_OP_MUL_MAT_ID && t->src[2] &&
-                t->src[2]->type == GGML_TYPE_I32 && t->type == GGML_TYPE_F32) {
-              const size_t nid = ggml_nelements(t->src[2]);
-              std::vector<int32_t> ids(nid);
-              ggml_backend_tensor_get(t->src[2], ids.data(), 0,
-                                      nid * sizeof(int32_t));
-              std::string line;
-              const size_t row_len = (size_t)t->ne[0];
-              for (size_t r = 0; r < (size_t)t->ne[1] && r < nid; ++r) {
-                size_t rb = 0;
-                for (size_t i = 0; i < row_len; ++i)
-                  if (!std::isfinite(reinterpret_cast<const float *>(
-                          raw.data())[r * row_len + i]))
-                    ++rb;
-                line += " [row" + std::to_string(r) + " id=" +
-                        std::to_string(ids[r]) + " bad=" + std::to_string(rb) +
-                        "]";
-              }
-              LOG_WARN("[NAN-NODE-IDS] w_ne2=%lld w_type=%s%s\n",
-                       (long long)t->src[0]->ne[2],
-                       ggml_type_name(t->src[0]->type), line.c_str());
-              const ggml_tensor *w = t->src[0];
-              const size_t blk_bytes = ggml_type_size(w->type);
-              const size_t blk_elems = (size_t)ggml_blck_size(w->type);
-              const size_t slot_blocks =
-                  (size_t)w->ne[0] * (size_t)w->ne[1] / blk_elems;
-              for (size_t r = 0; r < 8 && r < nid; ++r) {
-                if (ids[r] < 0 || ids[r] >= w->ne[2])
-                  continue;
-                std::vector<uint8_t> wb(slot_blocks * blk_bytes);
-                ggml_backend_tensor_get(w, wb.data(),
-                                        (size_t)ids[r] * w->nb[2], wb.size());
-                size_t bad_d = 0;
-                for (size_t b = 0; b < slot_blocks; ++b) {
-                  const ggml_fp16_t d = *reinterpret_cast<const ggml_fp16_t *>(
-                      wb.data() + b * blk_bytes);
-                  if (!std::isfinite(ggml_fp16_to_fp32(d)))
-                    ++bad_d;
-                }
-                LOG_WARN("[NAN-NODE-W] row=%zu slot=%d blocks=%zu bad_d=%zu "
-                         "nb2=%zu buft=%s\n",
-                         r, ids[r], slot_blocks, bad_d, (size_t)w->nb[2],
-                         w->buffer ? ggml_backend_buffer_name(w->buffer) : "-");
-                if (r == 0 && t->src[1] && t->src[1]->type == GGML_TYPE_F32 &&
-                    ggml_is_contiguous(t->src[1]) &&
-                    t->src[1]->ne[0] == w->ne[0]) {
-                  const auto *tr = ggml_get_type_traits(w->type);
-                  std::vector<float> x((size_t)w->ne[0]);
-                  ggml_backend_tensor_get(t->src[1], x.data(), 0,
-                                          x.size() * sizeof(float));
-                  double xmax = 0;
-                  size_t xbad = 0;
-                  for (float v : x) {
-                    if (!std::isfinite(v)) ++xbad;
-                    else xmax = std::max(xmax, (double)std::fabs(v));
-                  }
-                  std::vector<float> wrow((size_t)w->ne[0]);
-                  const size_t row_bytes = ggml_row_size(w->type, w->ne[0]);
-                  int shown = 0, ref_finite_of_bad = 0, bad_rows = 0;
-                  for (size_t j = 0; j < (size_t)t->ne[0]; ++j) {
-                    const float got =
-                        reinterpret_cast<const float *>(raw.data())[j];
-                    if (std::isfinite(got)) continue;
-                    ++bad_rows;
-                    tr->to_float(wb.data() + j * row_bytes, wrow.data(),
-                                 w->ne[0]);
-                    double ref = 0;
-                    for (size_t i = 0; i < x.size(); ++i)
-                      ref += (double)wrow[i] * x[i];
-                    if (std::isfinite(ref)) ++ref_finite_of_bad;
-                    if (shown < 3) {
-                      ++shown;
-                      LOG_WARN("[NAN-NODE-REF] out_idx=%zu got=%g cpu_ref=%g\n",
-                               j, got, ref);
-                    }
-                  }
-                  LOG_WARN("[NAN-NODE-REF] src1 nonfinite=%zu absmax=%g "
-                           "bad_rows=%d cpu_ref_finite=%d\n",
-                           xbad, xmax, bad_rows, ref_finite_of_bad);
-                }
-              }
-            }
-            LOG_WARN("[NAN-NODE] #%d op=%s name=%s bad=%zu/%zu ne=%lld,%lld,%lld,%lld "
-                     "src0=%s src1=%s\n",
-                     idx, ggml_op_name(t->op), t->name, bad, n,
-                     (long long)t->ne[0], (long long)t->ne[1],
-                     (long long)t->ne[2], (long long)t->ne[3],
-                     t->src[0] ? t->src[0]->name : "-",
-                     t->src[1] ? t->src[1]->name : "-");
-          }
-          return true;
-        },
-        &probe);
-  }
   if (g.dynamic_expert_cache && !publish_dynamic_uploads(g)) {
     if (!sync_glm5next_decode_state_to_host(g))
       LOG_ERROR("[GGML-GLM5NEXT-FULL-DECODE] cache-map handoff failed\n");
@@ -617,9 +487,8 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
     ggml_backend_sched_t sched = nullptr;
   };
   static OpProf op;
-  static const bool op_prof_env =
-      zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_OP_PROFILE") != nullptr;
-  const bool op_prof_on = op_prof_env && !layer_timing_on && !nan_probe_on &&
+  const bool op_prof_on = Logger::instance().would_log(LogLevel::DEBUG) &&
+                          !layer_timing_on && !nan_probe_on &&
                           op.tokens < 30;
   if (op_prof_on) {
     ggml_backend_sched_set_eval_callback(
@@ -716,7 +585,7 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
         return a.second.first > b.second.first;
       });
       for (size_t i = 0; i < v.size() && i < 25; ++i)
-        LOG_WARN("[GLM5NEXT-OP-PROFILE] %-28s total/token=%.2fms nodes/token=%.1f avg=%.1fus\n",
+        LOG_DEBUG("[GLM5NEXT-OP-PROFILE] %-28s total/token=%.2fms nodes/token=%.1f avg=%.1fus\n",
                  v[i].first.c_str(), v[i].second.first / 30,
                  v[i].second.second / 30.0,
                  1000.0 * v[i].second.first / v[i].second.second);
@@ -740,7 +609,7 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
                       lt.ffn_ms[(size_t)l] / lt.tokens);
         line += b;
       }
-      LOG_WARN("[GLM5NEXT-LAYER-TIMING] tokens=%d mean per token: attn=%.1fms "
+      LOG_DEBUG("[GLM5NEXT-LAYER-TIMING] tokens=%d mean per token: attn=%.1fms "
                "ffn=%.1fms (marked-node sync inflates absolute time)\n"
                "[GLM5NEXT-LAYER-TIMING] attn/ffn ms per layer:%s\n",
                lt.tokens, ta / lt.tokens, tf / lt.tokens, line.c_str());
@@ -775,7 +644,7 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
   }
   ggml_backend_tensor_get(g.output, hidden_states, 0,
                           (size_t)g.D * sizeof(float));
-  if (zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_DEBUG_DECODE_OUT")) {
+  if (Logger::instance().would_log(LogLevel::DEBUG)) {
     size_t bad = 0;
     double sum = 0.0, mx = 0.0;
     for (int i = 0; i < g.D; ++i) {
@@ -783,7 +652,7 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
       if (!std::isfinite(v)) { ++bad; continue; }
       sum += v; mx = std::max(mx, (double)std::fabs(v));
     }
-    LOG_WARN("[GLM5NEXT-DECODE-OUT] pos=%d nonfinite=%zu/%d mean=%g absmax=%g "
+    LOG_DEBUG("[GLM5NEXT-DECODE-OUT] pos=%d nonfinite=%zu/%d mean=%g absmax=%g "
              "h[0..3]=%g %g %g %g\n",
              pos_base, bad, g.D, sum / g.D, mx, hidden_states[0],
              hidden_states[1], hidden_states[2], hidden_states[3]);

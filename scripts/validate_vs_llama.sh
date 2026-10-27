@@ -33,7 +33,7 @@ echo "llama.cpp prompt ids: $(grep -a 'prompt ids' "$OUT.llama.log" | head -1)"
 # 3. ZeroMoE: --raw-prompt so no chat template is applied; temp 0; the same row dump.
 printf '%s\n' "$PROMPT" | env CUDA_VISIBLE_DEVICES="${DEVS:-0,1}" ${MS_ENV:-} \
   ZEROMOE_DECODE_LOGITS_DUMP="$PWD/$OUT.ms.bin" \
-  scripts/run_capped.sh -- "$BIN" --config "$CONFIG" --ngen "$STEPS" --temp 0 --raw-prompt > "$OUT.ms.log" 2>&1 || true
+  scripts/run_capped.sh -- "$BIN" --config "$CONFIG" --predict "$STEPS" --temp 0 --raw-prompt > "$OUT.ms.log" 2>&1 || true
 
 # 4. Compare row by row.
 python3 tools/compare_logits.py "$OUT.ms.bin" "$OUT.llama.bin" | tee "$OUT.compare.txt"

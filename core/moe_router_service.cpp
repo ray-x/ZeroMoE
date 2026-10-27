@@ -411,33 +411,6 @@ bool moe_pipeline_detail::qwen4exp_decode_ggml_path(
   return engine.qwen4exp_decode_ggml_moe &&
          engine.family_ops.family == ModelFamily::Qwen4Exp;
 }
-// Diagnostic/A-B only: route CPU-affinity Qwen decode layers with the local
-// AVX-512 F32 matmul instead of the ordinary dense_proj GPU GEMV.  The
-// production route remains unchanged unless this explicit Qwen-only switch is
-// set.  Other model families, GPU-affinity Qwen layers, and prefill never take
-// this branch.
-static bool qwen4exp_decode_cpu_router_enabled() {
-  static const bool enabled = [] {
-    const char *e = zeromoe::graphcfg::env("ZEROMOE_QWEN_DECODE_CPU_ROUTER");
-    return e && e[0] == '1';
-  }();
-  return enabled;
-}
-
-// Diagnostic/A-B only: use the already device-resident Qwen HC mixed row as
-// the input to the ordinary CUDA router GEMV.  This is deliberately separate
-// from qwen4exp_decode_gpu_router: it does not build a second GGML routing
-// graph or change top-k/cache bookkeeping; it only removes the host->device
-// activation upload from dense_proj().  Keep it opt-in until the router's
-// device/host numerical result and real decode timing are confirmed.
-static bool qwen4exp_decode_device_router_gemv_enabled() {
-  static const bool enabled = [] {
-    const char *e = zeromoe::graphcfg::env("ZEROMOE_QWEN_DECODE_DEVICE_ROUTER_GEMV");
-    return e && e[0] == '1';
-  }();
-  return enabled;
-}
-
 // Full-graph decode topology is deliberately Qwen-only and
 // config-gated while it is being validated.  It is safe only for a layer
 // backed by the immutable fixed-stride DDR arena: a scheduler graph cannot
@@ -1300,65 +1273,11 @@ bool MoeRouterService::route(MoePipelineContext &context) {
     }
 
     if (!gpu_router_handled) {
-      bool cpu_router_done = false;
-      const bool qwen_device_router_gemv =
-          qwen4exp_decode_device_router_gemv_enabled() && S == 1 &&
-          engine.family_ops.family == ModelFamily::Qwen4Exp &&
-          engine.family_ops.uses_hyper_connections &&
-          is_cpu_affinity_layer(layer_idx) && engine.gpu &&
-          engine.qwen4exp_device_hc_ffn_input &&
-          (router_it->second.device_ptr ||
-           router_it->second.gpu_fast_ptr);
-      if (qwen_device_router_gemv) {
-        const void *device_normed =
-            GgmlHcRunner::instance().device_data(
-                engine.qwen4exp_device_hc_ffn_input);
-        if (device_normed) {
-          const auto &router_weight = router_it->second;
-          const void *router_device_weight =
-              router_weight.gpu_fast_ptr
-                  ? static_cast<const void *>(router_weight.gpu_fast_ptr)
-                  : static_cast<const void *>(router_weight.device_ptr);
-          const GGUFType router_type =
-              router_weight.gpu_fast_ptr ? GGUFType::BF16
-                                         : router_weight.meta.type;
-          cpu_router_done = engine.gpu->dense_matmul_device_host(
-              router_type, router_device_weight,
-              static_cast<const float *>(device_normed),
-              scratch.router_logits.data(), S, D, n_experts);
-          static std::atomic<bool> logged_device_router_gemv{false};
-          if (cpu_router_done &&
-              !logged_device_router_gemv.exchange(true,
-                                                  std::memory_order_relaxed)) {
-            LOG_INFO("[MOE-ROUTE] Qwen decode router uses device HC input "
-                     "(CUDA GEMV; host top-k/CPU expert path retained)\n");
-          }
-        }
-      }
-      const bool qwen_cpu_router =
-          S == 1 && qwen4exp_decode_cpu_router_enabled() &&
-          engine.family_ops.family == ModelFamily::Qwen4Exp &&
-          engine.family_ops.uses_hyper_connections &&
-          is_cpu_affinity_layer(layer_idx) && router_it->second.host_ptr;
-      if (qwen_cpu_router) {
-        cpu_router_done = cpu_quant_matmul(
-            router_it->second.meta.type, router_it->second.host_ptr,
-            scratch.normed.data(), scratch.router_logits.data(), S, D,
-            n_experts);
-        static std::atomic<bool> logged_cpu_router{false};
-        if (cpu_router_done &&
-            !logged_cpu_router.exchange(true, std::memory_order_relaxed)) {
-          LOG_INFO("[MOE-ROUTE] Qwen CPU-affinity decode router A/B active "
-                   "(local CPU matmul; production GPU GEMV unchanged)\n");
-        }
-      }
-      if (!cpu_router_done) {
-        dense_proj(
-            engine,
-            "blk." + std::to_string(layer_idx) + ".ffn_gate_inp.weight",
-            scratch.normed.data(), scratch.router_logits.data(), S, D,
-            n_experts);
-      }
+      dense_proj(
+          engine,
+          "blk." + std::to_string(layer_idx) + ".ffn_gate_inp.weight",
+          scratch.normed.data(), scratch.router_logits.data(), S, D,
+          n_experts);
 
       // Gating activation: turns raw logits into probs in-place. These are
       // the UNBIASED values later gathered as expert weights.

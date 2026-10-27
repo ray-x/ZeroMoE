@@ -69,7 +69,6 @@
 
 // Enable stream-ordered reuse of the persistent MoE graph workspace. This is
 // separate from the copy-stream experiment and is disabled by default.
-void set_ggml_moe_async_graph_reuse(bool enabled);
 
 // Shared ggml CUDA backend, created on first use and reused by EVERY ggml
 // sub-graph runner in this project (MoE FFN, hyper-connections, ...). One
@@ -505,13 +504,6 @@ class GgmlMoeRunner : private moe::GgmlMoeTransferManager {
   static void collect_all_h2d(double &seconds, size_t &bytes);
   static void collect_all_transfer_stats(GgmlMoeTransferStats &stats);
 
-  // Queue a device-side dependency before Qwen's persistent HC mixed-input
-  // tensor is reused by the next pre-mix graph.  The direct HC->MoE input
-  // path intentionally aliases that tensor instead of copying it, so the
-  // previous MoE graph must have finished reading it first.  This is an
-  // asynchronous backend event wait, not a host synchronize.
-  static void queue_input_reuse_dependency();
-
   // Size/validate storage for one layer's compact expert set. Returns false if
   // the plan is unsupported (bad shape, unsupported quant type, allocation
   // failure) -- the caller must then run its own path for this layer.
@@ -710,7 +702,6 @@ class GgmlMoeRunner : private moe::GgmlMoeTransferManager {
   // GGML CUDA stream and are ordered directly before the MoE graph. While it
   // is enabled, the caller uses pinned staging sources so RAM-tier blocks do
   // not need to remain held after the CPU staging memcpy.
-  bool backend_stream_copies() const { return backend_stream_copies_; }
 
   ~GgmlMoeRunner();
 
@@ -844,22 +835,6 @@ class GgmlMoeRunner : private moe::GgmlMoeTransferManager {
   std::vector<std::vector<int32_t>> chunk_token_keepalive_;
   std::vector<std::vector<int32_t>> chunk_id_keepalive_;
   std::vector<std::vector<float>> chunk_weight_keepalive_;
-
-  // IDs and router weights are supplied by per-layer local vectors in the
-  // execution path. In asynchronous graph mode those vectors can disappear
-  // before the backend's H2D stream consumes them. Keep a persistent pinned
-  // host ring so the route tables can use ggml_backend_tensor_set_async()
-  // instead of the synchronous setter (which showed up as one blocking
-  // cudaMemcpy pair per MoE layer during decode). A request has at most 48
-  // layers here; the extra slots cover a request boundary before the backend
-  // is drained. The ring is drained only on wrap or capacity growth.
-  static constexpr int NROUTE_STAGE = 64;
-  int32_t *route_ids_pinned_ = nullptr;
-  float *route_weights_pinned_ = nullptr;
-  size_t route_stage_capacity_ = 0;
-  int route_stage_index_ = 0;
-
-  bool ensure_route_stage(size_t route_count);
 
   // --- current plan ---
   GgmlMoeLayerPlan plan_{};

@@ -390,12 +390,12 @@ def main():
     parser = argparse.ArgumentParser(description="Run the unmodified ExLlamaV3 model/cache/generator backend")
     parser.add_argument("--config", required=True)
     parser.add_argument("--prompt")
-    parser.add_argument("--ngen", type=int)
-    parser.add_argument("--ctx", type=int)
+    parser.add_argument("-n", "--predict", type=int)
+    parser.add_argument("-c", "--ctx-size", type=int)
     parser.add_argument("--threads", type=int)
     parser.add_argument("--cuda-schedule", choices=("auto", "spin", "yield", "blocking"))
     parser.add_argument("--mtp", action="store_true", help="Enable the checkpoint's Qwen3.8 MTP draft head")
-    parser.add_argument("--temperature", type=float)
+    parser.add_argument("--temp", type=float)
     parser.add_argument("--top-p", type=float)
     parser.add_argument("--raw-prompt", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=None)
@@ -408,12 +408,12 @@ def main():
         if arguments.warmup_tokens < 0:
             raise ValueError("warmup-tokens cannot be negative")
         overrides = {key: value for key, value in {
-            "context_size": arguments.ctx, "omp_max_threads": arguments.threads,
+            "context_size": arguments.ctx_size, "omp_max_threads": arguments.threads,
             "exllamav3_cuda_schedule": arguments.cuda_schedule,
-            "temperature": arguments.temperature, "top_p": arguments.top_p,
+            "temperature": arguments.temp, "top_p": arguments.top_p,
             "raw_prompt": arguments.raw_prompt, "enable_thinking": arguments.thinking,
         }.items() if value is not None}
-        settings = read_settings(arguments.config, arguments.prompt, arguments.ngen, overrides,
+        settings = read_settings(arguments.config, arguments.prompt, arguments.predict, overrides,
                                  use_mtp=arguments.mtp)
         with model_view(settings) as view:
             if arguments.check:

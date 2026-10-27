@@ -67,17 +67,9 @@ bool env_device_expert_trailing() {
       .tun.device_expert_trailing.value != 0;
 }
 
-// See FullGraph::layer_timing_enabled's own comment.
+// Detailed graph timing follows the common DEBUG verbosity threshold.
 bool env_layer_timing_enabled() {
-  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_GRAPH_LAYER_TIMING");
-}
-
-// Decode phase ledger for the Phase-2/master-graph A/B.  This is deliberately
-// separate from the per-CPU-node callback timing above: it brackets the
-// scheduler submission, route decision/readback, suffix submission, output
-// readback, and (for the master path) the actual device graph span.
-bool env_phase_timing_enabled() {
-  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_GRAPH_PHASE_TIMING");
+  return Logger::instance().would_log(LogLevel::DEBUG);
 }
 
 // Phase 4 host-node integration is deliberately a separate opt-in from the
@@ -97,23 +89,7 @@ bool env_qwen4exp_host_node_enabled() {
 // qwen4exp-phase2-gpu-branch-slower-than-cpu.md's own "not yet diagnosed"
 // note and the live investigation this answers.
 bool env_layer_timing_verbose() {
-  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_GRAPH_LAYER_TIMING_VERBOSE");
-}
-
-// Opt-in ledger for the CUDA graph replay boundary and ordinary GGML CPU
-// backend work.  Keep this disabled by default because it adds steady_clock
-// reads to the replay path.
-bool env_graph_replay_timing_enabled() {
-  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_GRAPH_REPLAY_TIMING");
-}
-
-// The merged gate/up representation is intentionally runtime-switchable while
-// its CUDA and CPU kernel cost is being compared with the established
-// three-projection graph.  It is opt-in until the doubled-row MUL_MAT_ID path
-// matches the separate projection path; setting this to 1 enables it without
-// changing placement or routing.
-bool env_merged_gate_up_enabled() {
-  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_GRAPH_MERGED_GATE_UP");
+  return Logger::instance().would_log(LogLevel::DEBUG);
 }
 
 // Host-node transport diagnostic. The layer is selected explicitly so the

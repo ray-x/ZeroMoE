@@ -95,8 +95,9 @@ def main():
     ok = True
     for k in a.lengths:
         cfg = with_keys(base, updates + [
-            "mtp_enabled = true", "mtp_graph = true", f"mtp_draft_tokens = {k}",
-            f'mtp_model_path = "{a.mtp_model}"'], drops)
+            'spec_type = "draft-mtp"', "mtp_graph = true",
+            f"spec_draft_n_max = {k}",
+            f'spec_draft_model = "{a.mtp_model}"'], drops)
         rc, text, stats = run(a.binary, cfg, f"k{k}", workdir, env, a.prompt, a.timeout)
         if rc != 0 or not text or not stats:
             print(f"FAIL k={k}: rc={rc}, output={'yes' if text else 'no'}, "

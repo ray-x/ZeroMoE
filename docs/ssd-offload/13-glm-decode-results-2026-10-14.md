@@ -151,7 +151,7 @@ The 5060 Ti's own kernels are ~3 ms/token, so most of the gain is the 3090 trunk
 
 ### Prefill workspace breakdown and fix
 
-`ZEROMOE_GLM5NEXT_WS_DUMP=1` prints the intermediate live-set peak at graph build. At S=128 the peak was 754 MiB, of
+At the time, `ZEROMOE_GLM5NEXT_WS_DUMP=1` printed the intermediate live-set peak at graph build; it now follows DEBUG verbosity (`--verbosity 5`). At S=128 the peak was 754 MiB, of
 which ~420 MiB were the 34 KDA layers' conv-input concats (`[S+3, 24576]` f32, 12.3 MiB each): the exported conv-history
 and state copies were expanded into the graph only at its end, which kept each layer's conv input and scan output live for
 the whole graph. Expanding them right after the layer (`ggml_build_forward_expand`, `ZEROMOE_GLM5NEXT_EARLY_STATE_EXPORT=0`
