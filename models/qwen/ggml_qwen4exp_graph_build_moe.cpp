@@ -672,6 +672,14 @@ bool exl3_ggml_bridge_requested(const FullGraph &g, int layer,
   return true;
 }
 
+// The early-ready CPU lane for multi-token decode windows is opt-in
+// (ZEROMOE_QWEN4EXP_WINDOW_LANE=1): with it on, the text of a window run diverged from plain
+// decoding on the test prompt (investigation open), and it saved only ~2 ms per window.
+static bool window_lane_enabled() {
+  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_WINDOW_LANE");
+  return v && v[0] == '1';
+}
+
 ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                        int layer, ggml_tensor *router,
                        ggml_tensor *selection_bias, ggml_tensor *gate_exps,
@@ -945,7 +953,8 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       const bool early_requested =
           ((early_env && early_env[0] == '1' && layer == 13) ||
            (!all_early_env || all_early_env[0] != '0')) &&
-          g.decode_mode && g.S == 1;
+          g.decode_mode && g.S >= 1 &&
+          (g.S == 1 || window_lane_enabled());
       const bool partial_requested =
           g.decode_mode && g.S == 1 && env_partial_graph_enabled(layer);
       if (partial_requested && early_requested) {
@@ -962,7 +971,7 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         GGML_ASSERT(!g.layer_timing_enabled && g.early_ready.count(layer) == 0);
         early = std::make_unique<EarlyReadyLane>();
         GGML_ASSERT(early->prepare(g.cpu, g.device, g.D, c.topk,
-                    gate_exps, up_exps, down_exps, tab.remap_cpu, tab.mask_cpu));
+                    gate_exps, up_exps, down_exps, tab.remap_cpu, tab.mask_cpu, g.S));
         if (early->resident_tables) {
           GGML_ASSERT(early->prepare_gpu_tables(g.cuda, ctx,
                       tab.remap_gpu, tab.remap_cpu, tab.mask_gpu, tab.mask_cpu));
@@ -971,7 +980,7 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
           for (auto *table : early->gpu_tables)
             ggml_backend_sched_set_tensor_backend(g.sched, table, g.cuda);
         }
-        const char *stage = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_STAGE_LAYER");
+        const char *stage = g.S == 1 ? zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_STAGE_LAYER") : nullptr;
         if (stage && g.split_gpu_expert_ids.count(layer - 1) &&
             (std::strcmp(stage, "all") == 0 || std::atoi(stage) == layer)) {
           if (!g.early_stage_shapes)
@@ -1056,11 +1065,11 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         ggml_backend_sched_set_tensor_backend(g.sched, dst, g.cuda);
         ggml_backend_sched_set_tensor_backend(g.sched, fork, g.cuda);
         early->gpu_input = fork;
-        input3 = ggml_reshape_3d(ctx, fork, g.D, 1, 1);
+        input3 = ggml_reshape_3d(ctx, fork, g.D, 1, g.S);
         ggml_build_forward_expand(g.graph, fork);
-        const char *predict = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_PREDICT");
+        const char *predict = g.S == 1 ? zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_PREDICT") : nullptr;
         const char *target = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_PREDICT_LAYER");
-        const char *stage = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_STAGE_LAYER");
+        const char *stage = g.S == 1 ? zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_STAGE_LAYER") : nullptr;
         const bool stage_next = stage &&
             (std::strcmp(stage, "all") == 0 || std::atoi(stage) == layer + 1);
         const bool predict_this_layer = !target || std::atoi(target) == layer + 1;

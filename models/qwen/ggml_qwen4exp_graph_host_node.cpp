@@ -4,6 +4,7 @@
 // Split out of the former single-file ggml_qwen4exp_graph.cpp; shared
 // declarations live in ggml_qwen4exp_graph_internal.hpp.
 
+#include <cstdio>
 #include "ggml_qwen4exp_graph_internal.hpp"
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
@@ -218,6 +219,10 @@ void CUDART_CB qwen4exp_cuda_usage_track_callback(void *user_data) {
   const auto start = std::chrono::steady_clock::now();
   const bool hit_log = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_ROUTE_HIT_LOG") != nullptr;
   std::string hit_line;
+  static FILE *ids_dump = [] {
+    const char *path = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_ROUTE_IDS_DUMP");
+    return path && path[0] ? std::fopen(path, "w") : nullptr;
+  }();
   for (int l = 0; l < ctx->n_layers; ++l) {
     int hits = 0;
     const bool has_mask =
@@ -230,8 +235,21 @@ void CUDART_CB qwen4exp_cuda_usage_track_callback(void *user_data) {
       if (has_mask && ctx->hot_mask[l][expert])
         ++hits;
     }
+    if (ids_dump) {
+      std::fprintf(ids_dump, "%llu %d", static_cast<unsigned long long>(ctx->token_count), l);
+      for (int k = 0; k < ctx->topk; ++k) {
+        const int32_t expert = ctx->host_ids[static_cast<size_t>(l) * ctx->topk + k];
+        const bool hot = has_mask && expert >= 0 && expert < ctx->n_experts && ctx->hot_mask[l][expert];
+        std::fprintf(ids_dump, " %d:%d", expert, hot ? 1 : 0);
+      }
+      std::fputc('\n', ids_dump);
+    }
     if (hit_log)
       hit_line += (has_mask ? std::to_string(hits) : std::string("-")) + ",";
+  }
+  if (ids_dump) {
+    std::fflush(ids_dump);
+    if (!hit_log) ++ctx->token_count;
   }
   if (hit_log)
     LOG_INFO("[ROUTE-HIT] tok=%llu hits=%s\n",
