@@ -1,6 +1,16 @@
 // tests/test_components.cpp — Unit tests for ZeroMoE components
 // Build: g++ -std=c++23 -O2 -I../include -o test_components test_components.cpp
 // (Does NOT require CUDA for the CPU-path tests)
+//
+// The default Makefile build type is Release, which defines NDEBUG and turns
+// every assert into a no-op. That is wrong for a test binary: several checks
+// (and two side effects, symlink()/unlink(), written inside assert) would be
+// skipped or would never happen, so a Release test run aborts in
+// exl3_ngram_reader and silently "passes" the numeric checks. Keep assertions
+// live regardless of the build type.
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include "direct_io.hpp" // the REAL O_DIRECT alignment-window arithmetic (no CUDA deps)
 #include "gguf_loader.hpp" // DeepSeek-V4 compression metadata validation helper
 #include "gguf_tokenizer.hpp"
