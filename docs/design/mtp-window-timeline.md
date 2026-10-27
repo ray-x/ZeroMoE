@@ -113,3 +113,25 @@ multiply and add roundings).
   gain is real but small, about +1 to +3 tok/s; first-pass numbers are dominated by cold page cache and are not used.
 * **Measurement note:** an earlier private ggml build was configured without GGML_CUDA_GRAPHS/GGML_AVX512 and ran 4-5
   tok/s slower; build the private copy with `scripts/build_ggml.sh` flags.
+
+## Levers explored after the hyper-connection fusion (2026-10-28)
+
+Window under nsys, palindrome, fused: 48.6 ms = GPU kernels 18.6 + copies 3.7 + sync 1.6 + other CUDA calls 10.3
+(nsys-inflated) + host-only 14.3 (CPU cold experts + scheduler). 3,611 kernels per window (4,623 before the fusion).
+
+1. **More fusion.** Remaining small kernels total about 3 ms of the 18.6 ms (`k_bin_bcast` 905 x 1.6 us, `rms_norm`
+   208, `unary` 270). Decode-window graph nodes now: ADD 570 (+192 fused hc), CONT 478, MUL 395, CONCAT 192, GET_ROWS 144.
+   The window-only part is the per-token GDN handling (CONT + CONCAT, about 7 nodes per GDN layer that one preallocated
+   CPY target would cut to 4). Realistic saving 300-600 nodes, about 1 ms: +1 to +2 tok/s. Not built.
+2. **CPU/GPU overlap.** The cold CPU node is built after the hot-expert nodes, so the scheduler runs hot experts,
+   then the CPU step, then the rest, serially (0% overlap measured). Per layer the overlappable GPU work (hot MoE kernels
+   3.2 ms + part of the shared expert per window, about 110 us per layer) is smaller than the CPU step (about 155 us),
+   an upper bound of about 5 ms per window; the CPU step has to move into a callback inside the CUDA stream
+   (early-ready lane / host-node), whose copies and callback cost took most of the gain when measured before (about
+   2 ms). Estimate +2 to +4 tok/s, a multi-day change that alters the output text. Not built.
+3. **Draft count per prompt.** K=4 vs 3 (tok/s): palindrome +1.0, math +1.4, leet +1.4, review -4, btree -5. A per-prompt
+   oracle gains about +0.6 on average and would need two window graphs resident (VRAM is full). Not worth building.
+
+Exactness check on a correct build (CUDA graphs on, AVX-512 on): BF16 weights on the vector kernel for batch <= 8
+(`ZM_BF16_MMVF_MAXB=8`, experiment in the private ggml) cost 3 tok/s (68.2 -> 65.8 mean of 3 alternating pairs,
+acceptance 81.0% -> 79.8%), not the 14% measured earlier on a library built without CUDA graphs.
