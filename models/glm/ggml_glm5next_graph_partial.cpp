@@ -5,6 +5,7 @@
 // declarations live in ggml_glm5next_graph_impl.hpp.
 
 #include <future>
+#include "graph_config.hpp"
 #include "ggml_glm5next_graph_impl.hpp"
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
@@ -1264,14 +1265,14 @@ void route_tap_flush(RouteTap &t) {
 // an upload costs about one CPU compute, so it only pays for experts that come back.
 float dynamic_heat_threshold() {
   static const float v = [] {
-    const char *e = std::getenv("ZEROMOE_GLM5NEXT_DYNAMIC_HEAT");
+    const char *e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_DYNAMIC_HEAT");
     return e && e[0] ? (float)std::atof(e) : 0.0f;
   }();
   return v;
 }
 float dynamic_heat_halflife() {
   static const float v = [] {
-    const char *e = std::getenv("ZEROMOE_GLM5NEXT_DYNAMIC_HEAT_HALFLIFE");
+    const char *e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_DYNAMIC_HEAT_HALFLIFE");
     const float h = e && e[0] ? (float)std::atof(e) : 30.0f;
     return h > 0.5f ? h : 30.0f;
   }();

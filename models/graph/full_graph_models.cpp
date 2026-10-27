@@ -60,7 +60,7 @@ class Qwen4ExpGraphModel final : public FullGraphModelBase<Qwen4ExpGraphModel> {
   // whole prompt (0). Batches continue each other (recurrent state, dense KV rows and the PLE window are carried through
   // the engine), and the memory pre-check lowers a batch that does not fit to the one that does (suggested batch).
   int max_prefill_tokens(const StreamingEngine &e) const override {
-    if (const char *v = std::getenv("ZEROMOE_QWEN4EXP_PREFILL_CHUNK"); v && v[0])
+    if (const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PREFILL_CHUNK"); v && v[0])
       return std::atoi(v);
     return e.prefill_batch_tokens > 0 ? e.prefill_batch_tokens : 0;
   }
@@ -424,7 +424,7 @@ class Glm5NextGraphModel final : public FullGraphModelBase<Glm5NextGraphModel> {
       // The batched sparse hot/cold MUL_MAT_ID split reaches a CUDA MMQ
       // route-compaction limitation for inactive branch slots, so graph
       // prefill stays opt-in until that is fixed upstream.
-      const char *prefill = std::getenv("ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL");
+      const char *prefill = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL");
       return prefill && prefill[0] == '1';
     }
     return phase == ModelGraphPhase::Decode;
@@ -444,7 +444,7 @@ class Glm5NextGraphModel final : public FullGraphModelBase<Glm5NextGraphModel> {
   // (up to the sparse top-k of 2048 tokens of context). Whatever is configured is reduced by the prepare check to what
   // fits in free VRAM / host RAM, so an oversized value cannot request memory the box does not have.
   int max_prefill_tokens(const StreamingEngine &e) const override {
-    if (const char *v = std::getenv("ZEROMOE_GLM5NEXT_PREFILL_CHUNK"); v && v[0])
+    if (const char *v = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PREFILL_CHUNK"); v && v[0])
       return std::atoi(v);
     return e.prefill_batch_tokens > 0 ? e.prefill_batch_tokens : 2048;
   }
@@ -496,7 +496,7 @@ class GlmDsaGraphModel final : public FullGraphModelBase<GlmDsaGraphModel> {
   bool enabled(const StreamingEngine &engine, ModelGraphPhase phase) const override {
     if (engine.mtp_enabled)
       return false;
-    const char *v = std::getenv(phase == ModelGraphPhase::Prefill ? "ZEROMOE_GLM_DSA_FULL_GRAPH_PREFILL"
+    const char *v = zeromoe::graphcfg::env(phase == ModelGraphPhase::Prefill ? "ZEROMOE_GLM_DSA_FULL_GRAPH_PREFILL"
                                                                   : "ZEROMOE_GLM_DSA_FULL_GRAPH");
     return v && v[0] == '1';
   }
@@ -504,12 +504,12 @@ class GlmDsaGraphModel final : public FullGraphModelBase<GlmDsaGraphModel> {
   void shutdown() const override { glm5next_full_graph_shutdown(); }
   int device_expert_layers() const override { return glm5next_full_graph_device_expert_layers(); }
   bool supports_cpu_lane() const override {
-    const char *v = std::getenv("ZEROMOE_GLM_DSA_CPU_LANE");
+    const char *v = zeromoe::graphcfg::env("ZEROMOE_GLM_DSA_CPU_LANE");
     return v && v[0] == '1';
   }
 
   int max_prefill_tokens(const StreamingEngine &e) const override {
-    if (const char *v = std::getenv("ZEROMOE_GLM5NEXT_PREFILL_CHUNK"); v && v[0])
+    if (const char *v = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PREFILL_CHUNK"); v && v[0])
       return std::atoi(v);
     return e.prefill_batch_tokens > 0 ? e.prefill_batch_tokens : 2048;
   }
@@ -646,7 +646,7 @@ class DeepseekV41GraphModel final
   }
   int max_prefill_tokens(const StreamingEngine &) const override {
     static const int chunk = [] {
-      const char *v = std::getenv("ZEROMOE_DEEPSEEK_V41_PREFILL_CHUNK");
+      const char *v = zeromoe::graphcfg::env("ZEROMOE_DEEPSEEK_V41_PREFILL_CHUNK");
       // Native cache-backed attention supports the whole prompt. A 128-token
       // cap sent the rest of long prompts through serial decode.
       return v && v[0] ? std::max(0, std::atoi(v)) : 0;

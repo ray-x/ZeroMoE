@@ -1,5 +1,7 @@
 #pragma once
 
+#include "graph_config.hpp"
+
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -7,19 +9,19 @@
 
 namespace dsv41_trace {
 inline const char *directory() {
-  static const char *value = std::getenv("ZEROMOE_DEEPSEEK_V41_TRACE_DIR");
+  static const char *value = zeromoe::graphcfg::env("ZEROMOE_DEEPSEEK_V41_TRACE_DIR");
   return value && value[0] ? value : nullptr;
 }
 inline int selected_layer() {
   static const int value = [] {
-    const char *s = std::getenv("ZEROMOE_DEEPSEEK_V41_TRACE_LAYER");
+    const char *s = zeromoe::graphcfg::env("ZEROMOE_DEEPSEEK_V41_TRACE_LAYER");
     return s && s[0] ? std::atoi(s) : -1;
   }();
   return value;
 }
 inline int selected_pos() {
   static const int value = [] {
-    const char *s = std::getenv("ZEROMOE_DEEPSEEK_V41_TRACE_POS");
+    const char *s = zeromoe::graphcfg::env("ZEROMOE_DEEPSEEK_V41_TRACE_POS");
     return s && s[0] ? std::atoi(s) : -1;
   }();
   return value;

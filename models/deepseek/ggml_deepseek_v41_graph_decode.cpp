@@ -3,6 +3,7 @@
 // Host graph nodes call the existing cache-aware MoE dispatcher, which binds
 // live DDR/VRAM slots and holds them through compute. Both GGUF layouts work.
 #include "ggml_deepseek_v41_graph.hpp"
+#include "graph_config.hpp"
 #include "dsv41_attention.hpp"
 #include "glm5next_graph_internal.hpp"
 #include "cache_backed_moe.hpp"
@@ -70,7 +71,7 @@ LayerScratch *runtime_scratch = nullptr;
 bool v41_grouped_outproj_gpu_enabled() {
   static const bool enabled = [] {
     const char *value =
-        std::getenv("ZEROMOE_DEEPSEEK_V41_OUTPROJ_GPU");
+        zeromoe::graphcfg::env("ZEROMOE_DEEPSEEK_V41_OUTPROJ_GPU");
     return !value || value[0] != '0';
   }();
   return enabled;

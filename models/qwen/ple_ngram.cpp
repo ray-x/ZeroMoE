@@ -27,6 +27,7 @@
 // a real Qwen3.8-Flash-Next GGUF with a known prompt before trusting output.
 
 #include "engine.hpp"
+#include "graph_config.hpp"
 #include "dense_dispatch.hpp"
 #include "kquant_dequant.hpp"
 #include "ple_hash.hpp" // the REAL n-gram hash (pure, unit-tested)
@@ -54,7 +55,7 @@ namespace {
 
 bool ple_timing_enabled() {
   static const bool enabled = [] {
-    const char *v = std::getenv("ZEROMOE_QWEN4EXP_TIMING");
+    const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_TIMING");
     return v && v[0] == '1';
   }();
   return enabled;
@@ -65,17 +66,17 @@ bool ple_timing_enabled() {
 // the normal PLE path has no dependency on diagnostic plumbing.  The files
 // are only written when the existing prefill boundary dump is enabled.
 bool ple_diag_selected(int layer, int pos) {
-  static const char *base = std::getenv("ZEROMOE_PREFILL_BOUNDARY_DUMP");
+  static const char *base = zeromoe::graphcfg::env("ZEROMOE_PREFILL_BOUNDARY_DUMP");
   static const int selected_layer = [] {
-    const char *v = std::getenv("ZEROMOE_PREFILL_BOUNDARY_LAYER");
+    const char *v = zeromoe::graphcfg::env("ZEROMOE_PREFILL_BOUNDARY_LAYER");
     return v && *v ? std::atoi(v) : 0;
   }();
   static const int first_pos = [] {
-    const char *v = std::getenv("ZEROMOE_PREFILL_BOUNDARY_FIRST_POS");
+    const char *v = zeromoe::graphcfg::env("ZEROMOE_PREFILL_BOUNDARY_FIRST_POS");
     return v && *v ? std::atoi(v) : 0;
   }();
   static const int last_pos = [] {
-    const char *v = std::getenv("ZEROMOE_PREFILL_BOUNDARY_LAST_POS");
+    const char *v = zeromoe::graphcfg::env("ZEROMOE_PREFILL_BOUNDARY_LAST_POS");
     return v && *v ? std::atoi(v) : -1;
   }();
   return base && *base && (selected_layer < 0 || selected_layer == layer) &&
@@ -86,7 +87,7 @@ void ple_diag_dump(const char *label, int layer, int pos, const float *data,
                    size_t count) {
   if (!data || count == 0 || !ple_diag_selected(layer, pos))
     return;
-  const char *base = std::getenv("ZEROMOE_PREFILL_BOUNDARY_DUMP");
+  const char *base = zeromoe::graphcfg::env("ZEROMOE_PREFILL_BOUNDARY_DUMP");
   std::string path = std::string(base) + ".l" +
                      (layer < 10 ? "0" : "") + std::to_string(layer) +
                      ".p" + std::to_string(pos) + "." + label + ".f32";
@@ -121,7 +122,7 @@ std::atomic<uint64_t> g_ple_row_cache_misses{0};
 
 bool ple_row_cache_enabled() {
   static const bool enabled = [] {
-    const char *v = std::getenv("ZEROMOE_QWEN4EXP_PLE_ROW_CACHE");
+    const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PLE_ROW_CACHE");
     return !v || v[0] != '0';
   }();
   return enabled;

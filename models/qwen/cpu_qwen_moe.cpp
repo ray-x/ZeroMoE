@@ -1,5 +1,6 @@
 // src/cpu_qwen_moe.cpp — CPU-only forward pass for Qwen3.6 MoE.
 #include "cpu_qwen_moe.hpp"
+#include "graph_config.hpp"
 
 #include <cmath>
 #include <cstdlib>
@@ -18,7 +19,7 @@
 // the position the LM head actually reads, and during decode S is always 1
 // anyway, so this is the one row worth watching every call.
 static bool debug_layers_enabled() {
-  static bool enabled = std::getenv("ZEROMOE_DEBUG_LAYERS") != nullptr;
+  static bool enabled = zeromoe::graphcfg::env("ZEROMOE_DEBUG_LAYERS") != nullptr;
   return enabled;
 }
 
