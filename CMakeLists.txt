@@ -36,12 +36,16 @@ target_include_directories(mtp_speculation_test PRIVATE
 # Build options
 # ---------------------------------------------------------------------------
 option(ZEROMOE_CPU_ONLY "Disable CUDA and build CPU-only components" OFF)
-option(ZEROMOE_USE_GGML_CUDA
-       "Build/link ggml-cuda for the experimental MUL_MAT_ID prefill backend"
-       OFF)
-# ggml's own default for this is OFF outside llama.cpp (its option() comment
-# literally says "llama.cpp only") -- a plain ZEROMOE_USE_GGML_CUDA=ON build
-# silently never defines GGML_CUDA_USE_GRAPHS, so ggml-cuda's CUDA graph
+# ZEROMOE_USE_GGML_CUDA is not a user option. Every CUDA build links ggml-cuda
+# and defines the macro (see the CPU-only/Apple block below); it exists only as
+# the compile capability that guards CUDA-only translation units. A CUDA build
+# without it cannot even link: full_graph_models.cpp references
+# qwen4exp_full_graph_bootstrap(), whose definition lives in the guarded half of
+# ggml_qwen4exp_graph.cpp.
+#
+# ggml's own default for GGML_CUDA_GRAPHS is OFF outside llama.cpp (its
+# option() comment literally says "llama.cpp only") -- a CUDA build would
+# silently never define GGML_CUDA_USE_GRAPHS, so ggml-cuda's CUDA graph
 # capture/replay path (ggml_backend_cuda_graph_compute in ggml-cuda.cu) is
 # compiled out entirely: every decode-graph node gets its own individual
 # cudaLaunchKernel instead of one batched cudaGraphLaunch per captured split.
@@ -50,8 +54,8 @@ option(ZEROMOE_USE_GGML_CUDA
 # to ~8 tok/s (graphs silently absent) on identical hardware/model/config --
 # this was mistaken for a correctness or scheduling regression for an entire
 # investigation before the missing compile define was found. Default ON here
-# so any ZEROMOE_USE_GGML_CUDA build gets it without the caller having to
-# know this ggml-specific gotcha; still overridable with -DGGML_CUDA_GRAPHS=OFF.
+# so every CUDA build gets it without the caller having to know this
+# ggml-specific gotcha; still overridable with -DGGML_CUDA_GRAPHS=OFF.
 option(ZEROMOE_ENABLE_CUDA_GRAPHS
        "Enable ggml CUDA graph capture/replay (GGML_CUDA_GRAPHS) for full-graph decode/prefill"
        ON)
@@ -100,6 +104,17 @@ endif()
 if(APPLE)
     set(ZEROMOE_CPU_ONLY ON CACHE BOOL "macOS has no CUDA SDK; force CPU-only build" FORCE)
     message(STATUS "ZeroMoE: Apple platform detected — forcing ZEROMOE_CPU_ONLY=ON")
+endif()
+
+# ggml-cuda is part of every CUDA build. There is no supported "CUDA without
+# the ggml CUDA backend" configuration: the full-graph entry point lives in the
+# guarded half of ggml_qwen4exp_graph.cpp, so such a build fails to link.
+# CPU-only builds (including macOS) leave the macro undefined and compile the
+# CPU/NEON path instead.
+if(ZEROMOE_CPU_ONLY)
+    set(ZEROMOE_USE_GGML_CUDA OFF)
+else()
+    set(ZEROMOE_USE_GGML_CUDA ON)
 endif()
 
 # ZeroMoE always links ggml for reference dequantizers. The default fetches a
@@ -184,9 +199,9 @@ if(ZEROMOE_LLAMA_CPP_ROOT AND NOT ZEROMOE_GGML_ROOT)
     message(WARNING "ZEROMOE_LLAMA_CPP_ROOT is deprecated; use ZEROMOE_GGML_ROOT")
 endif()
 
-# Disable everything we do not need for a CPU decode assistant, except the
-# explicit experimental CUDA backend option. GGML_CUDA must be set BEFORE
-# the subproject is configured.
+# Disable everything we do not need for a CPU decode assistant. GGML_CUDA
+# follows the derived ZEROMOE_USE_GGML_CUDA and must be set BEFORE the
+# subproject is configured.
 set(GGML_CUDA        ${ZEROMOE_USE_GGML_CUDA} CACHE BOOL "" FORCE)
 set(GGML_CUDA_GRAPHS ${ZEROMOE_ENABLE_CUDA_GRAPHS} CACHE BOOL "" FORCE)
 # Loud, impossible-to-miss configure-time confirmation of the exact
@@ -197,7 +212,7 @@ set(GGML_CUDA_GRAPHS ${ZEROMOE_ENABLE_CUDA_GRAPHS} CACHE BOOL "" FORCE)
 # turned off without an explicit, informed override.
 if(ZEROMOE_USE_GGML_CUDA AND NOT ZEROMOE_ENABLE_CUDA_GRAPHS)
     message(WARNING
-        "ZEROMOE_USE_GGML_CUDA=ON but ZEROMOE_ENABLE_CUDA_GRAPHS=OFF: "
+        "CUDA build with ZEROMOE_ENABLE_CUDA_GRAPHS=OFF: "
         "full-graph decode will silently run WITHOUT CUDA graph capture/"
         "replay (every node becomes an individual cudaLaunchKernel). "
         "This previously cost ~20 tok/s -> ~8 tok/s and was mistaken for "

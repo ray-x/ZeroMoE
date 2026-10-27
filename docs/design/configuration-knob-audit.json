@@ -2592,8 +2592,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "CMakeLists.txt execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-27: the default OFF build did not link (full_graph_models.cpp references qwen4exp_full_graph_bootstrap, which only exists under the macro). Deleted the option; the macro is derived from ZEROMOE_CPU_ONLY and GGML_CUDA follows it, so a CUDA build always includes ggml-cuda.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0027"
     },
@@ -5355,7 +5355,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "backends/core/kernels/models execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
+      "review_decision": "KEPT 2026-10-27 as an internal capability, not a user option: the macro is now derived from ZEROMOE_CPU_ONLY (ON for CUDA builds, OFF for CPU-only/macOS) and guards CUDA-only translation units.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0035"

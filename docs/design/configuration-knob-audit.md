@@ -220,6 +220,28 @@ Verification for this batch:
   `ZEROMOE_BUILD_SERVER` or `ZEROMOE_USE_LLAMA_CPP` condition, definition or
   flag.
 
+### 2026-10-27 — CUDA builds always link ggml-cuda
+
+`ZEROMOE_USE_GGML_CUDA` defaulted to `OFF`, but `OFF` was not a working
+configuration. `models/graph/full_graph_models.cpp` calls
+`qwen4exp_full_graph_bootstrap()`, and that definition only exists inside the
+guarded half of `models/qwen/ggml_qwen4exp_graph.cpp`; the `#else` stub list
+never provided it. A CUDA configure that left the option off failed at link
+time, which the inventory missed because it only inspected preprocessor
+conditions. macOS already forces `ZEROMOE_CPU_ONLY=ON`, so "CUDA build" and
+"ggml-cuda" are the same set.
+
+| Control | Surface | Evidence | Change |
+| --- | --- | --- | --- |
+| `ZEROMOE_USE_GGML_CUDA` (K0027) | CMake option | Default `OFF` failed to link: `full_graph_models.cpp:(.text+0x544): undefined reference to qwen4exp_full_graph_bootstrap(StreamingEngine&)`. The stub branch omits the function at `b78dd9b` too, so no supported build ever used it. | Deleted the option. The macro is now derived from `ZEROMOE_CPU_ONLY` (ON for every CUDA build, OFF for CPU-only/macOS) and `GGML_CUDA` follows it, so the two names can no longer disagree. |
+
+Stale `-DZEROMOE_USE_GGML_CUDA=ON` arguments were removed from
+`CMakePresets.json` (the `cuda` preset), `scripts/build_with_ggml.sh`,
+`bench/build_native.sh`, the README build recipe, `docs/env-vars.md`, the
+API-server and measurement notes, and the two revert how-tos. The macro itself
+stays as the internal capability that keeps CUDA-only translation units out of
+CPU-only builds; it is no longer a configure-time input.
+
 ### 2026-10-27 — remaining compile-time macros (current tree)
 
 `tools/config_inventory.py --json` scans `core/`, `memory/`, `models/`,
@@ -230,28 +252,64 @@ pass.
 
 | Macro | Defined by | Guard sites | Role | Disposition |
 | --- | --- | ---: | --- | --- |
-| `ZEROMOE_USE_GGML_CUDA` | `CMakeLists.txt:36`; compile definition on the engine and tests | 84 | Enables the ggml CUDA backend and the CUDA full-graph code paths. | Keep the capability; collapse into the CUDA preset. |
+| `ZEROMOE_USE_GGML_CUDA` | Derived in `CMakeLists.txt` from `ZEROMOE_CPU_ONLY`; compile definition on the engine and tests | 84 | Enables the ggml CUDA backend and the CUDA full-graph code paths. | Internal capability only; no configure-time option, so a CUDA build cannot omit it. |
 | `ZEROMOE_EXL3_CUDA` | `CMakeLists.txt:540` | 18 | Compiles the EXL3 CUDA decode path. | Keep the capability; collapse into the CUDA preset. |
 | `ZEROMOE_EXL3_UPSTREAM` | `CMakeLists.txt:424` (source-file property) | 4 | Chooses upstream ExLlamaV3 EXL3 kernels instead of the legacy kernels; only defined when `ZEROMOE_EXLLAMAV3_SRC` supplies a checkout. | Internalize once one kernel path is pinned; currently a developer A/B. |
-| `ZEROMOE_METAL` | `CMakeLists.txt:67`; compile definition at `1184` | 2 | Enables Apple Metal dispatch in the NEON kernel path. | Keep as a platform capability. |
+| `ZEROMOE_METAL` | `CMakeLists.txt:74`; compile definition at `1238` | 2 | Enables Apple Metal dispatch in the NEON kernel path. | Keep as a platform capability; see the macOS section below. |
 
 `ZEROMOE_ARM_NEON`, `ZEROMOE_HAVE_CUFILE`, `ZEROMOE_USE_GGML` and
 `ZEROMOE_BUILD_SERVER` are recorded as removed in the log above and no longer
 appear in the inventory.
 
-ggml and the API server are no longer configurable: they are always linked and
-built, so no configure-time input can request a build the tree does not
-support. Removing the two options also removed their cache entries, which is
-why the build-cache list below is shorter than in earlier snapshots.
+### Metal on macOS (unchanged in this pass)
+
+macOS is forced to `ZEROMOE_CPU_ONLY=ON` (`CMakeLists.txt:105`), so none of
+the CUDA or ggml-cuda code — including every `ZEROMOE_USE_GGML_CUDA` branch —
+is built there. Metal is the only GPU path on macOS, and it is optional:
+
+- `ZEROMOE_METAL` (default `OFF`, `CMakeLists.txt:74`) adds
+  `backends/cpu/kernels_metal.mm` to `kernels_cpu` only after Apple Silicon is
+  detected from `CMAKE_SYSTEM_PROCESSOR=arm64`, defines `ZEROMOE_METAL=1`
+  publicly (`CMakeLists.txt:1238`), and links `Metal` +
+  `MetalPerformanceShaders` (plus `Foundation` for the final executables).
+- The only caller is the F32 `matmul` in `backends/cpu/kernels_cpu_neon.cpp`
+  (`:20` and `:132`). Quantized GEMV/GEMM kernels never dispatch to Metal. The
+  MPS call is used when `S*I*O >= 256K` FLOPs and falls back to NEON whenever
+  the device is unavailable or any MPS step fails.
+- Each call uploads `x`, `W` and the result through new
+  `MTLResourceStorageModeShared` buffers, so the weights are copied to the
+  device per call. That amortises over prefill-sized `S` but is likely slower
+  than NEON for `S=1` decode; no Apple hardware was available to measure it.
+- ggml's own Metal backend follows the same flag, but is only enabled when
+  full Xcode provides `metal`/`metallib` (`CMakeLists.txt:247`). The CPU-only
+  engine never creates a ggml backend or scheduler — it uses ggml only for
+  reference dequantization — so `GGML_METAL` builds a library no ZeroMoE code
+  selects. It is not a second execution path.
+- Coverage: `test_components` includes a 64x256x256 F32 matmul above the
+  threshold, so a CMake build with `-DZEROMOE_METAL=ON` exercises MPS numerics.
+  `tests/run_components.sh` compiles `kernels_metal.mm` but never defines
+  `ZEROMOE_METAL`, so its "exercises Metal if enabled" test actually runs the
+  NEON path.
+- `tests/test_components.cpp` now undefines `NDEBUG` before its includes. The
+  default `Release` build compiled every `assert` out, which skipped the
+  numeric checks and also aborted the suite in `exl3_ngram_reader` (its
+  `symlink()`/`unlink()` calls live inside `assert`). With assertions enabled
+  all 46 component tests pass in a Linux CPU-only build.
+
+ggml, the API server and ggml-cuda are no longer configurable: they are always
+linked and built when the target platform supports them, so no configure-time
+input can request a build the tree does not support. Removing those options
+also removed their cache entries, which is why the build-cache list below is
+shorter than in earlier snapshots.
 
 Build-time inputs that are not source guards remain, but they configure the
 build rather than branch engine code:
 
-- **9 CMake options**: `ZEROMOE_CPU_ONLY`, `ZEROMOE_USE_GGML_CUDA`,
-  `ZEROMOE_ENABLE_CUDA_GRAPHS`, `ZEROMOE_ENABLE_AVX512_VNNI`,
-  `ZEROMOE_GGML_OPENMP`, `ZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES`,
-  `ZEROMOE_GGML_DEBUG_PATCHES`, `ZEROMOE_METAL` and `ZEROMOE_SERVER_TESTS`
-  (`server/CMakeLists.txt:31`).
+- **8 CMake options**: `ZEROMOE_CPU_ONLY`, `ZEROMOE_ENABLE_CUDA_GRAPHS`,
+  `ZEROMOE_ENABLE_AVX512_VNNI`, `ZEROMOE_GGML_OPENMP`,
+  `ZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES`, `ZEROMOE_GGML_DEBUG_PATCHES`,
+  `ZEROMOE_METAL` and `ZEROMOE_WRITE_BUILD_PROVENANCE`, plus
+  `ZEROMOE_SERVER_TESTS` (`server/CMakeLists.txt:31`).
 - **5 build-cache inputs**: `ZEROMOE_CPU_ONLY`, `ZEROMOE_EXLLAMAV3_SRC`,
   `ZEROMOE_GGML_COMMIT`, `ZEROMOE_GGML_PREBUILT_DIR` and `ZEROMOE_GGML_ROOT`.
 - **Deprecated alias**: `ZEROMOE_LLAMA_CPP_ROOT` is still parsed and remapped to

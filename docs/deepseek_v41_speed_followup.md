@@ -169,7 +169,6 @@ focused targets with:
 
 ```bash
 cmake -S . -B <build-dir> \
-  -DZEROMOE_USE_GGML_CUDA=ON \
   -DZEROMOE_ENABLE_CUDA_GRAPHS=ON \
   -DZEROMOE_GGML_ROOT=/home/ray/Projects/llama.cpp-moestream-b11401/ggml \
   -DZEROMOE_GGML_PREBUILT_DIR=/home/ray/Projects/ZeroMoE/build_b11401/ggml-build \

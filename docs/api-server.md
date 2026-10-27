@@ -19,8 +19,7 @@ option to omit it from the binary.
 Linux/CUDA:
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-  -DZEROMOE_USE_GGML_CUDA=ON
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target zeromoe server_tests -j"$(nproc)"
 ```
 

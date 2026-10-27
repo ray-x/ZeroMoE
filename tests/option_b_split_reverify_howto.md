@@ -29,13 +29,14 @@ cp tests/moe_usage_survey/zeromoe_usage_survey_prefill /tmp/reverify_wt/tests/mo
 
 ## 2. Build
 
-The CUDA-graph decode path needs `ZEROMOE_USE_GGML_CUDA=ON` (ggml itself is
-always linked). Without it `Test 34` (GLM5NEXT KDA dense projection fusion)
-will report "Skipped (GGML CUDA backend not compiled)" as the tell:
+Every CUDA build links ggml-cuda, so the CUDA-graph decode path is present
+whenever the host is not CPU-only. If `Test 34` (GLM5NEXT KDA dense projection
+fusion) reports "Skipped (GGML CUDA backend not compiled)", the build was
+configured with `ZEROMOE_CPU_ONLY=ON`:
 
 ```bash
 cmake -S /tmp/reverify_wt -B /tmp/reverify_wt/build_ggmlcuda \
-  -DCMAKE_BUILD_TYPE=Release -DZEROMOE_USE_GGML_CUDA=ON \
+  -DCMAKE_BUILD_TYPE=Release \
   -DZEROMOE_GGML_ROOT=/home/ray/Projects/beellama.cpp/ggml
 make -j$(nproc) -C /tmp/reverify_wt/build_ggmlcuda
 ```
