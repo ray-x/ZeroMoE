@@ -1,8 +1,9 @@
 // src/kernels_metal.mm — Apple Metal Performance Shaders dispatch.
 //
-// Compiled as Objective-C++ only when ZEROMOE_METAL=ON on Apple Silicon.
-// Uses ARC (-fobjc-arc).  All entry points are synchronous and return false
-// on failure so the caller can fall back to NEON.
+// Compiled as Objective-C++ only when ZEROMOE_METAL=ON on Apple Silicon
+// (the default there). Uses ARC (-fobjc-arc).  All entry points are synchronous
+// and return false on failure so the caller can fall back to NEON.  Only
+// prefill-sized F32 matmuls (S>=32) are dispatched; decode stays on NEON.
 
 #include "kernels_metal.hpp"
 
@@ -26,6 +27,12 @@ static std::mutex g_mutex;
 // Retry init once per process.  We do not want to keep probing if the device
 // is unavailable.
 static std::atomic<bool> g_init_attempted{false};
+
+// matmul_f32() uploads the whole weight matrix on every call, which only pays
+// off once the row count is prefill-sized.  Decode (S=1) and small
+// speculative batches stay on NEON; the threshold is a heuristic, not a
+// measured crossover.
+static constexpr int kMinPrefillRows = 32;
 
 bool init() {
   @autoreleasepool {
@@ -58,6 +65,11 @@ bool matmul_f32(float *y, const float *x, const float *W, int S, int I, int O) {
   if (!available())
     return false;
   if (S <= 0 || I <= 0 || O <= 0)
+    return false;
+
+  // Decode and small speculative batches: the per-call weight upload dominates,
+  // so NEON is faster than MPS here (see kMinPrefillRows).
+  if (S < kMinPrefillRows)
     return false;
 
   // Tiny matmuls are dominated by GPU dispatch overhead; the NEON path is

@@ -71,7 +71,15 @@ option(ZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES
 option(ZEROMOE_GGML_DEBUG_PATCHES
        "Also apply the debug/profiling ggml patches in patches/debug (not part of the main series)"
        OFF)
-option(ZEROMOE_METAL "Enable Apple Metal GPU backend (requires ggml)" OFF)
+# Metal/MPS is the only GPU path on macOS, so default it on for Apple Silicon.
+# Everywhere else the option is inert (and warns if forced ON below).
+set(_ZEROMOE_METAL_DEFAULT OFF)
+if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
+    set(_ZEROMOE_METAL_DEFAULT ON)
+endif()
+option(ZEROMOE_METAL
+       "Enable Apple Metal/MPS dispatch for prefill-sized F32 matmul (Apple Silicon)"
+       ${_ZEROMOE_METAL_DEFAULT})
 
 # Resolve the architecture list before add_subdirectory(ggml): ggml-cuda
 # creates its CUDA targets during that call, so detecting architectures later
@@ -128,6 +136,12 @@ if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
     message(STATUS "ZeroMoE: Apple Silicon (arm64) detected")
 else()
     set(ZEROMOE_APPLE_SILICON OFF)
+endif()
+
+if(ZEROMOE_METAL AND NOT ZEROMOE_APPLE_SILICON)
+    message(WARNING
+        "ZEROMOE_METAL=ON is only supported on Apple Silicon (arm64); "
+        "the option is ignored on this platform")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -243,25 +257,12 @@ endif()
 message(STATUS
     "ZeroMoE: AVX-512 VNNI=${ZEROMOE_ENABLE_AVX512_VNNI} (ZeroMoE and ggml CPU kernels)")
 
-if(ZEROMOE_METAL AND APPLE)
-    # ggml's Metal backend requires the offline shader compiler (metal,
-    # metallib), which Apple only ships inside the full Xcode.app.  Our
-    # own MPS dispatch uses the runtime Metal Performance Shaders API and
-    # does NOT need those tools.  If the compiler is missing, keep our MPS
-    # path alive but turn off ggml Metal to avoid a configure/build failure.
-    find_program(_ZEROMOE_METALC metal)
-    find_program(_ZEROMOE_METALLIB metallib)
-    if(_ZEROMOE_METALC AND _ZEROMOE_METALLIB)
-        set(GGML_METAL ON CACHE BOOL "" FORCE)
-        message(STATUS "ZeroMoE: ggml Metal backend enabled (metal/metallib found)")
-    else()
-        set(GGML_METAL OFF CACHE BOOL "" FORCE)
-        message(STATUS "ZeroMoE: ggml Metal backend disabled (full Xcode not installed); "
-                        "custom MPS dispatch still enabled")
-    endif()
-else()
-    set(GGML_METAL OFF CACHE BOOL "" FORCE)
-endif()
+# ZeroMoE's macOS engine never creates a ggml backend or scheduler; it uses
+# ggml only for reference dequantization, so ggml's Metal backend would be
+# built and linked but never selected. The only Metal path is ZEROMOE_METAL's
+# MPS matmul in kernels_cpu. ggml defaults GGML_METAL=ON on APPLE, so force it
+# off explicitly (this also avoids the full-Xcode shader-compiler dependency).
+set(GGML_METAL OFF CACHE BOOL "" FORCE)
 
 # Revision of a ggml tree that ZeroMoE itself places in the build directory.
 # A user-supplied ZEROMOE_GGML_ROOT is left empty so the provenance stamp reads
@@ -1204,7 +1205,9 @@ else()
         message(STATUS "ZeroMoE: using ARM NEON CPU kernel backend")
         if(ZEROMOE_METAL)
             list(APPEND ZEROMOE_CPU_KERNEL_SRCS backends/cpu/kernels_metal.mm)
-            message(STATUS "ZeroMoE: Metal/MPS dispatch enabled (falls back to NEON)")
+            message(STATUS
+                "ZeroMoE: Metal/MPS dispatch enabled for prefill-sized F32 matmul "
+                "(S>=32; falls back to NEON)")
         endif()
     else()
         list(APPEND ZEROMOE_CPU_KERNEL_SRCS backends/cpu/kernels_cpu.cpp)

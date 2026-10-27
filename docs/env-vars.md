@@ -28,6 +28,7 @@ Settings are read when the process starts, and graph settings are cached per mod
 | Option | Default | Effect |
 | --- | --- | --- |
 | `ZEROMOE_CPU_ONLY` | OFF | Build without CUDA. Forced ON on macOS. |
+| `ZEROMOE_METAL` | ON on Apple Silicon | Dispatch prefill-sized F32 matmuls (`S>=32`) to Metal/MPS in the CPU backend. Ignored elsewhere. Decode stays on NEON. |
 | `ZEROMOE_ENABLE_CUDA_GRAPHS` | ON | Enable ggml CUDA graph capture and replay. Every CUDA build links ggml-cuda. |
 | `ZEROMOE_ENABLE_AVX512_VNNI` | ON | Compile with AVX-512 VNNI. Set OFF on a CPU without VNNI, or the binary fails with an illegal instruction. |
 | `ZEROMOE_GGML_COMMIT` | `8baabd53b…` | llama.cpp commit whose `ggml/` directory is built. Changing it changes the numerics; re-validate. |

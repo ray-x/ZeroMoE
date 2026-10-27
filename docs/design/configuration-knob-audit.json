@@ -906,8 +906,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "ggml Apple Metal backend build exclusion/selection. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED AS AN INPUT 2026-10-27: GGML_METAL is forced OFF unconditionally. ZeroMoE's CPU-only engine never creates a ggml backend or scheduler, so ggml-metal was built and linked but never selected. ZEROMOE_METAL's MPS matmul is the only Metal path; forcing this off also drops the full-Xcode shader-compiler requirement.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0006"
     },
@@ -2388,7 +2388,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "CMakeLists.txt execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "KEPT 2026-10-27 with a new default: ON for Apple Silicon, where it is the only GPU path, and OFF elsewhere (a forced ON warns and is ignored). MPS dispatch is limited to prefill-sized F32 matmul (S>=32 and >=256K FLOPs); decode stays on NEON because each call uploads the weight matrix. ggml Metal is forced OFF: no CPU-only path selects a ggml backend.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0024"
@@ -3408,7 +3408,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "backends execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "KEPT 2026-10-27: the macro guards the MPS call sites in kernels_cpu_neon.cpp and is defined publicly by kernels_cpu only on Apple Silicon. The CMake option now defaults ON for Apple Silicon.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0033"

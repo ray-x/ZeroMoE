@@ -255,42 +255,46 @@ pass.
 | `ZEROMOE_USE_GGML_CUDA` | Derived in `CMakeLists.txt` from `ZEROMOE_CPU_ONLY`; compile definition on the engine and tests | 84 | Enables the ggml CUDA backend and the CUDA full-graph code paths. | Internal capability only; no configure-time option, so a CUDA build cannot omit it. |
 | `ZEROMOE_EXL3_CUDA` | `CMakeLists.txt:540` | 18 | Compiles the EXL3 CUDA decode path. | Keep the capability; collapse into the CUDA preset. |
 | `ZEROMOE_EXL3_UPSTREAM` | `CMakeLists.txt:424` (source-file property) | 4 | Chooses upstream ExLlamaV3 EXL3 kernels instead of the legacy kernels; only defined when `ZEROMOE_EXLLAMAV3_SRC` supplies a checkout. | Internalize once one kernel path is pinned; currently a developer A/B. |
-| `ZEROMOE_METAL` | `CMakeLists.txt:74`; compile definition at `1238` | 2 | Enables Apple Metal dispatch in the NEON kernel path. | Keep as a platform capability; see the macOS section below. |
+| `ZEROMOE_METAL` | `CMakeLists.txt:80`; compile definition at `1241` | 2 | Default ON for Apple Silicon. Dispatches prefill-sized F32 matmul (`S>=32`) to Metal/MPS in the NEON backend. | Keep as a platform capability; decode stays on NEON. |
 
 `ZEROMOE_ARM_NEON`, `ZEROMOE_HAVE_CUFILE`, `ZEROMOE_USE_GGML` and
 `ZEROMOE_BUILD_SERVER` are recorded as removed in the log above and no longer
 appear in the inventory.
 
-### Metal on macOS (unchanged in this pass)
+### Metal on macOS (default on for Apple Silicon)
 
-macOS is forced to `ZEROMOE_CPU_ONLY=ON` (`CMakeLists.txt:105`), so none of
-the CUDA or ggml-cuda code — including every `ZEROMOE_USE_GGML_CUDA` branch —
-is built there. Metal is the only GPU path on macOS, and it is optional:
+macOS is forced to `ZEROMOE_CPU_ONLY=ON`, so none of the CUDA or ggml-cuda
+code — including every `ZEROMOE_USE_GGML_CUDA` branch — is built there. Metal
+is the only GPU path on macOS:
 
-- `ZEROMOE_METAL` (default `OFF`, `CMakeLists.txt:74`) adds
-  `backends/cpu/kernels_metal.mm` to `kernels_cpu` only after Apple Silicon is
-  detected from `CMAKE_SYSTEM_PROCESSOR=arm64`, defines `ZEROMOE_METAL=1`
-  publicly (`CMakeLists.txt:1238`), and links `Metal` +
-  `MetalPerformanceShaders` (plus `Foundation` for the final executables).
+- `ZEROMOE_METAL` defaults **ON** on Apple Silicon (`CMakeLists.txt` derives
+  the default from `APPLE AND CMAKE_SYSTEM_PROCESSOR=arm64`) and warns when
+  forced ON on any other platform. It adds
+  `backends/cpu/kernels_metal.mm` to `kernels_cpu`, defines `ZEROMOE_METAL=1`
+  publicly, and links `Metal` + `MetalPerformanceShaders` (plus `Foundation`
+  for the final executables).
 - The only caller is the F32 `matmul` in `backends/cpu/kernels_cpu_neon.cpp`
-  (`:20` and `:132`). Quantized GEMV/GEMM kernels never dispatch to Metal. The
-  MPS call is used when `S*I*O >= 256K` FLOPs and falls back to NEON whenever
-  the device is unavailable or any MPS step fails.
+  (`:20` and `:132`). Quantized GEMV/GEMM kernels never dispatch to Metal.
+  Dispatch requires at least 32 rows and `S*I*O >= 256K` FLOPs. The row gate
+  keeps decode (`S=1`) and small speculative batches on NEON, because each MPS
+  call re-uploads the whole weight matrix. Both thresholds are heuristics, not
+  a measured crossover; no Apple hardware was available to measure one.
 - Each call uploads `x`, `W` and the result through new
   `MTLResourceStorageModeShared` buffers, so the weights are copied to the
-  device per call. That amortises over prefill-sized `S` but is likely slower
-  than NEON for `S=1` decode; no Apple hardware was available to measure it.
-- ggml's own Metal backend follows the same flag, but is only enabled when
-  full Xcode provides `metal`/`metallib` (`CMakeLists.txt:247`). The CPU-only
-  engine never creates a ggml backend or scheduler — it uses ggml only for
-  reference dequantization — so `GGML_METAL` builds a library no ZeroMoE code
-  selects. It is not a second execution path.
-- Coverage: `test_components` includes a 64x256x256 F32 matmul above the
-  threshold, so a CMake build with `-DZEROMOE_METAL=ON` exercises MPS numerics.
-  `tests/run_components.sh` compiles `kernels_metal.mm` but never defines
-  `ZEROMOE_METAL`, so its "exercises Metal if enabled" test actually runs the
-  NEON path.
-- `tests/test_components.cpp` now undefines `NDEBUG` before its includes. The
+  device per call. That amortises over prefill-sized `S` but would be slower
+  than NEON for `S=1` decode, which is why the row gate exists.
+- ggml's own Metal backend is forced OFF (`GGML_METAL`; K0006, superseding the
+  snapshot's "keep capability" recommendation). The CPU-only engine never
+  creates a ggml backend or scheduler — it uses ggml only for reference
+  dequantization — so `GGML_METAL` would build and link a library no ZeroMoE
+  code selects, and would add a full-Xcode shader-compiler requirement. It is
+  not a second execution path.
+- Coverage: `test_components` includes a 64x256x256 F32 matmul, above both
+  thresholds, so a CMake build on Apple Silicon exercises MPS numerics.
+  `tests/run_components.sh` now defines `ZEROMOE_METAL=1` on arm64 so the
+  standalone subset runner matches the CMake default instead of silently
+  testing NEON.
+- `tests/test_components.cpp` undefines `NDEBUG` before its includes. The
   default `Release` build compiled every `assert` out, which skipped the
   numeric checks and also aborted the suite in `exl3_ngram_reader` (its
   `symlink()`/`unlink()` calls live inside `assert`). With assertions enabled

@@ -2278,9 +2278,9 @@ void test_cpu_matmul_f32() {
 void test_cpu_matmul_f32_large() {
   std::cout << "[TEST] CPU f32 matmul (large, exercises Metal if enabled)..."
             << std::flush;
-  // Size above the 256 KFLOP Metal threshold so a Metal-enabled build
-  // actually exercises the MPS path.  On non-Metal builds this just runs
-  // the NEON/scalar fallback.
+  // Above both Metal dispatch thresholds (32 rows and 256 KFLOPs), so a
+  // Metal-enabled build actually exercises the MPS path.  On non-Metal
+  // builds this just runs the NEON/scalar fallback.
   const int S = 64, I = 256, O = 256;
   std::vector<float> x(static_cast<size_t>(S) * I);
   std::vector<float> W(static_cast<size_t>(O) * I);

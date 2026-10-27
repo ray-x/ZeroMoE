@@ -122,6 +122,10 @@ cmake -S . -B build
 cmake --build build -j$(sysctl -n hw.ncpu)
 ```
 
+`ZEROMOE_METAL` defaults ON on Apple Silicon: prefill-sized F32 matmuls
+(`S >= 32`) are dispatched to Metal/MPS, while decode and small batches stay
+on NEON.  Configure with `-DZEROMOE_METAL=OFF` for a NEON-only build.
+
 #### ggml-cuda / full-graph decode build
 
 Every CUDA build links ggml's CUDA backend, so the ggml-backed full-graph prefill/decode path (`ZEROMOE_QWEN4EXP_FULL_GRAPH*` env vars at runtime) is always available:

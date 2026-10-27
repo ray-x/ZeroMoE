@@ -34,13 +34,15 @@ ARCH=$(uname -m)
 EXTRA_SRCS=""
 EXTRA_LDFLAGS=""
 ARCH_FLAGS=""
+METAL_FLAGS=""
 INC_FLAGS=""
 if [ "$ARCH" = "arm64" ] && [ "$(uname -s)" = "Darwin" ]; then
     KERNEL_SRC="backends/cpu/kernels_cpu_neon.cpp"
-    # kernels_cpu_neon.cpp calls into zeromoe_metal:: under #ifdef __APPLE__
-    # (backends/cpu/kernels_metal.mm, an Objective-C++ TU using MPSMatrixMultiplication)
-    # -- link it in and pull the frameworks it needs, or every test binary on
-    # Apple Silicon fails at link time with undefined zeromoe_metal symbols.
+    # CMake defaults ZEROMOE_METAL=ON on Apple Silicon. Mirror that here so
+    # the large-matmul test exercises MPS; the framework links below are then
+    # required. Without the define kernels_cpu_neon.cpp stays NEON-only and
+    # the Metal objects would be unused.
+    METAL_FLAGS="-DZEROMOE_METAL=1"
     EXTRA_SRCS="backends/cpu/kernels_metal.mm"
     EXTRA_LDFLAGS="-framework Metal -framework MetalPerformanceShaders -framework Foundation"
 else
@@ -101,8 +103,8 @@ if "$CXX" -std=c++23 -fopenmp -c -x c++ /dev/null -o /dev/null 2>/dev/null; then
 fi
 
 mkdir -p "$(dirname "$BIN")"
-echo "[run_components] $CXX -std=c++23 -O2 -Iinclude $INC_FLAGS $ARCH_FLAGS $OMP_FLAGS $SRC $SUPPORT_SRCS $KERNEL_SRC $EXTRA_SRCS $EXTRA_LDFLAGS -> $BIN"
-"$CXX" -std=c++23 -O2 -Iinclude $INC_FLAGS $ARCH_FLAGS $OMP_FLAGS -o "$BIN" "$SRC" $SUPPORT_SRCS "$KERNEL_SRC" $EXTRA_SRCS $EXTRA_LDFLAGS
+echo "[run_components] $CXX -std=c++23 -O2 -Iinclude $INC_FLAGS $ARCH_FLAGS $METAL_FLAGS $OMP_FLAGS $SRC $SUPPORT_SRCS $KERNEL_SRC $EXTRA_SRCS $EXTRA_LDFLAGS -> $BIN"
+"$CXX" -std=c++23 -O2 -Iinclude $INC_FLAGS $ARCH_FLAGS $METAL_FLAGS $OMP_FLAGS -o "$BIN" "$SRC" $SUPPORT_SRCS "$KERNEL_SRC" $EXTRA_SRCS $EXTRA_LDFLAGS
 
 ROUTE_TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/zeromoe-route-test.XXXXXX")"
 trap 'rm -rf "$ROUTE_TEST_DIR"' EXIT

@@ -30,6 +30,9 @@ bool available();
 
 // Synchronous F32 matmul using MPSMatrixMultiplication:
 //   y[S,O] = x[S,I] * W^T, where W is [O,I] row-major.
+// Only prefill-sized calls are dispatched (S >= 32 and at least 256K FLOPs);
+// smaller calls return false immediately and run on NEON, because the MPS
+// path uploads the weight matrix on every call.
 // Returns false on failure (caller should fall back to NEON/CPU).
 bool matmul_f32(float *y, const float *x, const float *W, int S, int I, int O);
 
