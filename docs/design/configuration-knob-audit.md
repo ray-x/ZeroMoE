@@ -160,6 +160,77 @@ Verification for this pass:
 - `grep -rn 'MMID_NO_NEGATIVE_SKIP\|MMID_NO_BATCHED_NEGATIVE_SKIP'` finds only
   the dated validation note and the audit records that mark them removed.
 
+### 2026-10-27 — environment reads routed through graphcfg (no names removed)
+
+This pass removed direct `std::getenv` calls, not configuration names. Every
+production `ZEROMOE_*` read in `memory/`, `backends/`, `core/` and `models/`
+now goes through `graphcfg::env()` or a typed reader, so `log_effective()` can
+report which knobs a run actually consulted. The two CUDA kernel files
+(`backends/exl3/exl3_upstream_ops.cu` and
+`kernels/quant/kquant_matmul.cu`) use the same reader. `graphcfg::atol_or()`
+was added for the legacy `atol` call site in the memory guard.
+
+The following raw reads are deliberate and are not migration gaps:
+
+| Location | Variable | Reason |
+| --- | --- | --- |
+| `core/main.cpp`, `core/engine_runner_api.cpp`, `backends/cpu/cpu_main.cpp` | `ZEROMOE_API_KEY` | Secret; must not enter the logged settings surface. |
+| `backends/exl3/exl3_decode.cpp` | `OMP_WAIT_POLICY`, `GOMP_SPINCOUNT` | Owned by the OpenMP runtime, not by ZeroMoE. |
+| `core/qwen4exp_graph_mtp.cpp`, `core/mtp_*` / `models/**/mtp_*` | MTP knobs | Active MTP work; deliberately out of scope. |
+| `patches/ggml*` | GGML-patch knobs | Bundled ggml C sources; they must not depend on a ZeroMoE header. |
+| `bench/` (16 call sites) | Benchmark knobs | Developer harnesses, not production paths. `config_inventory.py` does not scan them. |
+
+Verification for this pass:
+
+- `zeromoe_cpu` builds; `ctest -R '^graph_settings'` passes 2/2.
+- Host syntax checks pass for every touched `core/`, `models/` and backend TU;
+  the two CUDA files compile with `nvcc -std=c++17 -arch=sm_80`.
+- `test_moe_partial_route` passes in `capable` and `stock` modes.
+- `python3 tools/config_inventory.py --check` passes.
+
+### 2026-10-27 — remaining compile-time macros
+
+`tools/config_inventory.py --json` scans `core/`, `memory/`, `models/`,
+`backends/` and `kernels/` for `ZEROMOE_*`/`GGML_*` names in preprocessor
+conditions. The current tree has **six `ZEROMOE_*` source guards**. All are
+build capabilities rather than per-request knobs, and none was removed in this
+pass.
+
+| Macro | Defined by | Guard sites | Role | Disposition |
+| --- | --- | ---: | --- | --- |
+| `ZEROMOE_USE_GGML` | `CMakeLists.txt:37`; compile definition on `kernels_cpu` (PUBLIC) and the engine/tests/benches | 33 | Selects the bundled ggml quantized CPU kernels. Mandatory for a full engine build (`CMakeLists.txt:119`), optional only for CPU-only fallback builds. | Keep the capability; collapse the normal choice into the CPU/CUDA presets. |
+| `ZEROMOE_USE_GGML_CUDA` | `CMakeLists.txt:38`; compile definition on the engine and tests | 84 | Enables the ggml CUDA backend and the CUDA full-graph code paths. | Keep the capability; collapse into the CUDA preset. |
+| `ZEROMOE_EXL3_CUDA` | `CMakeLists.txt:561` | 18 | Compiles the EXL3 CUDA decode path. | Keep the capability; collapse into the CUDA preset. |
+| `ZEROMOE_EXL3_UPSTREAM` | `CMakeLists.txt:444` (source-file property) | 4 | Chooses upstream ExLlamaV3 EXL3 kernels instead of the legacy kernels; only defined when `ZEROMOE_EXLLAMAV3_SRC` supplies a checkout. | Internalize once one kernel path is pinned; currently a developer A/B. |
+| `ZEROMOE_BUILD_SERVER` | `CMakeLists.txt:36`; compile definitions at `1285`/`1290` | 7 | Includes the optional native OpenAI/Anthropic server. | Keep the capability; collapse into a server preset. |
+| `ZEROMOE_METAL` | `CMakeLists.txt:70`; compile definition at `1221` | 2 | Enables Apple Metal dispatch in the NEON kernel path. | Keep as a platform capability. |
+
+`ZEROMOE_ARM_NEON` and `ZEROMOE_HAVE_CUFILE` were removed earlier and no
+longer appear in the inventory.
+
+Build-time inputs that are not source guards remain, but they configure the
+build rather than branch engine code:
+
+- **12 CMake options**: `ZEROMOE_CPU_ONLY`, `ZEROMOE_BUILD_SERVER`,
+  `ZEROMOE_USE_GGML`, `ZEROMOE_USE_GGML_CUDA`, `ZEROMOE_ENABLE_CUDA_GRAPHS`,
+  `ZEROMOE_ENABLE_AVX512_VNNI`, `ZEROMOE_GGML_OPENMP`,
+  `ZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES`, `ZEROMOE_GGML_DEBUG_PATCHES`,
+  `ZEROMOE_USE_LLAMA_CPP`, `ZEROMOE_METAL` and `ZEROMOE_SERVER_TESTS`
+  (`server/CMakeLists.txt:31`).
+- **6 build-cache inputs**: `ZEROMOE_CPU_ONLY`, `ZEROMOE_USE_GGML`,
+  `ZEROMOE_EXLLAMAV3_SRC`, `ZEROMOE_GGML_COMMIT`,
+  `ZEROMOE_GGML_PREBUILT_DIR` and `ZEROMOE_GGML_ROOT`.
+- **Deprecated aliases**: `ZEROMOE_USE_LLAMA_CPP` and
+  `ZEROMOE_LLAMA_CPP_ROOT` are still parsed and remapped; they are
+  compatibility inputs, not dead names.
+- **9 forwarded `GGML_*` options**: `GGML_AVX512`, `GGML_AVX512_VNNI`,
+  `GGML_CUDA`, `GGML_CUDA_GRAPHS`, `GGML_HIPBLAS`, `GGML_METAL`,
+  `GGML_OPENMP`, `GGML_SYCL` and `GGML_VULKAN` (K0001-K0009). These belong to
+  the ggml dependency and are not ZeroMoE source guards.
+
+The JSON still carries the pre-merge recommendations for K0017-K0035; this
+section records the current source inventory, not a new removal decision.
+
 ### Findings deliberately left in place
 
 These look dead but changing them would either alter a supported feature or
@@ -231,7 +302,7 @@ Build-cache rows include `CACHE ... FORCE` assignments that are already internal
 
 These totals are deliberately broader than the earlier settings-only scan: they include other worktrees, non-ZEROMOE environment reads, extra table-presence checks and separate tooling names.
 Do not add these totals and call them independent user decisions. Tool references/forwarded arguments and capability macros are not necessarily configurable engine controls.
-The table is the pre-merge snapshot; the [removal log](#removal-log) lists the rows already deleted, so the current-tree inventory is smaller (399 environment names after `ZEROMOE_GGML_ASYNC_GRAPH_REUSE`, and no `build_legacy_input` row after `ZEROMOE_LLAMA_CPP_TAG`).
+The table is the pre-merge snapshot; the [removal log](#removal-log) lists the rows already deleted. A fresh source inventory on 2026-10-27 over `core/`, `memory/`, `models/`, `backends/` and `kernels/` reports **363 environment names**, **6 source macro guards**, **11 root CMake options** (plus `ZEROMOE_SERVER_TESTS` in `server/CMakeLists.txt`) and **6 build-cache entries**, with no `build_legacy_input` row. The environment count covers native source only, not `tools/`, `tests/` or `bench/`.
 
 ## Manually checked exceptions
 
@@ -318,6 +389,8 @@ The reference column gives a primary path/line. Use the JSON for exact worktree 
 | K0028 `ZEROMOE_USE_LLAMA_CPP` | api, mtp, original, settings | Configure/build time, not per-request. Exact predicates are in linked evidence. | COMBINE into build preset/internal build policy; retain developer A/B only if active | llama.cpp-backed optional integration build boundary. Preserve behavior in replacement; full impact/owner in JSON. | HIGH | `CMakeLists.txt:35` |
 
 ### capability_macro
+
+Current status (2026-10-27): K0032 is removed; the six remaining source guards are re-inventoried in the 2026-10-27 macro section above.
 
 | ID / control | Worktrees | When used | Proposed action / owner | Affected if removed | Risk | Evidence |
 |---|---|---|---|---|---|---|
