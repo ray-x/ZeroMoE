@@ -32,15 +32,8 @@ constexpr int kGpuColdBatchThreshold = 4;
 // and expert_ffn_gpu_issue fences only its own compute stream on the slot's
 // upload_event, so the decode thread can resolve/load the next expert while
 // this expert's H2D is still draining. A/B on usage-survey prompt 061 showed
-// 3/3 wins and byte-identical output (4.31 vs 4.24 output tok/s, +1.7%).
-// ZEROMOE_ACTIVE_DEMAND_ASYNC=0 restores the old fully-synchronous path.
-bool active_demand_async_enabled() {
-  static const bool enabled = []() {
-    const char *value = std::getenv("ZEROMOE_ACTIVE_DEMAND_ASYNC");
-    return !value || std::atoi(value) != 0;
-  }();
-  return enabled;
-}
+// 3/3 wins and byte-identical output (4.31 vs 4.24 output tok/s, +1.7%);
+// the synchronous A/B control was retired 2026-10-27.
 } // namespace
 
 const ExpertLocation *expert_ffn_resolve_gpu_loc(
@@ -106,7 +99,7 @@ const ExpertLocation *expert_ffn_resolve_gpu_loc(
       // slot's event. This keeps the decode thread free to resolve/load the
       // next expert while the DMA drains. Fall back to the existing
       // synchronous upload if the async slot/stream is unavailable.
-      if (active_demand_async_enabled() && S == 1) {
+      if (S == 1) {
         location = context->topo->upload_expert_active_async(
             context->layer_idx, context->expert_id, context->slab_buffer,
             context->slab_capacity, /*speculative=*/false, /*target_gpu_id=*/-1,
@@ -127,8 +120,7 @@ const ExpertLocation *expert_ffn_resolve_gpu_loc(
         LOG_DEBUG("[MOE-VRAM]  ACTIVE-LAYER layer=%d expert=%d -> temporary "
                   "%s upload (no LRU eviction)\n",
                   context->layer_idx, context->expert_id,
-                  (active_demand_async_enabled() && S == 1 &&
-                   location->demand_async_pending)
+                  (S == 1 && location->demand_async_pending)
                       ? "async-demand"
                       : "sync");
       } else {

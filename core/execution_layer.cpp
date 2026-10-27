@@ -1653,27 +1653,6 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       scratch.moe_device_runner = nullptr;
       scratch.moe_shared_device_output = false;
       scratch.moe_device_output_ready = false;
-      // TEMP DIAGNOSTIC: the last layer's FFN post-combine is the one HC
-      // residual update no later layer's own hc_pre_mix ever re-validates
-      // (every other layer's corruption would show up as that layer's own
-      // "post qwen4exp hc_pre_mix, ggml" check the very next iteration) --
-      // it's only ever checked once, at hc_collapse_output, after the whole
-      // 48-layer pass. Read it back right here instead, so a NaN at collapse
-      // can be attributed to this exact point instead of "somewhere in 48
-      // layers".
-      if (l == c.n_layers - 1 && std::getenv("ZEROMOE_LAST_LAYER_HC_TRACE")) {
-        std::vector<float> probe((size_t)S * D * c.hc_mult);
-        if (GgmlHcRunner::instance().download_streams(probe.data(), S)) {
-          size_t nan_count = 0;
-          for (float v : probe)
-            if (!std::isfinite(v)) ++nan_count;
-          LOG_ERROR("[LAST-LAYER-HC-TRACE] layer=%d after FFN post_combine: "
-                    "%zu/%zu non-finite\n",
-                    l, nan_count, probe.size());
-        } else {
-          LOG_ERROR("[LAST-LAYER-HC-TRACE] layer=%d download_streams failed\n", l);
-        }
-      }
     }
     if (!moe_device_consumed) {
       // Missing timer found investigating a large gap between [REQUEST]'s

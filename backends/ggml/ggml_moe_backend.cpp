@@ -188,23 +188,20 @@ bool copy_router_tensor_to_host(int device, const ggml_tensor *tensor,
 
 bool backend_stream_copy_override = false;
 
-// H2D-queued-on-shared-GGML-stream mode (ZEROMOE_GGML_BACKEND_
-// STREAM_COPY=1 or the override flag above). TRIED earlier this session:
-// gave no measurable improvement over the plain copy_stream_ path (61.70 vs
-// 62.72 tok/s baseline) -- left OFF by default. RE-VERIFIED 2026-09-10
-// against the current, materially faster post-fix baseline (RAM/VRAM tier
-// independence fix + vram_preload_prefix_layers + the GgmlQwenSharedRunner
-// device_x fix): same 574-token real-text prompt, prefill= from the
-// shutdown report's Rates line -- ON: 86.01 tok/s, vs the same-config OFF
-// baseline's 79.84/86.37/85.66 tok/s (mean 83.96) -- squarely inside the
-// OFF spread, not a separate cluster. Conclusion unchanged: still no real
-// effect, confirmed against the current baseline too.
+// H2D-queued-on-shared-GGML-stream mode (the ggml_async_graph_reuse override
+// above). TRIED earlier this session: gave no measurable improvement over the
+// plain copy_stream_ path (61.70 vs 62.72 tok/s baseline) -- left OFF by
+// default. RE-VERIFIED 2026-09-10 against the current, materially faster
+// post-fix baseline (RAM/VRAM tier independence fix + vram_preload_prefix_layers
+// + the GgmlQwenSharedRunner device_x fix): same 574-token real-text prompt,
+// prefill= from the shutdown report's Rates line -- ON: 86.01 tok/s, vs the
+// same-config OFF baseline's 79.84/86.37/85.66 tok/s (mean 83.96) -- squarely
+// inside the OFF spread, not a separate cluster. Conclusion unchanged: still no
+// real effect, confirmed against the current baseline too. The independent
+// ZEROMOE_GGML_BACKEND_STREAM_COPY environment alias was retired 2026-10-27;
+// the mode is reachable only through the config-driven override.
 bool use_backend_stream_copies() {
-  static const bool env_enabled = [] {
-    const char *env = std::getenv("ZEROMOE_GGML_BACKEND_STREAM_COPY");
-    return env && env[0] == '1';
-  }();
-  return env_enabled || backend_stream_copy_override;
+  return backend_stream_copy_override;
 }
 
 // The HC runner and the router share the same CUDA backend.  In the normal
@@ -346,8 +343,8 @@ void set_ggml_moe_async_graph_reuse(bool enabled) {
   // double-buffered and copied through the backend's ordered copy path. The
   // legacy raw-copy mode has one compact weight buffer and must synchronize
   // before every layer reuses it, which silently defeats this configuration.
-  // Keep the environment variable as an explicit opt-in for callers that
-  // want backend-stream copies without enabling graph reuse.
+  // The backend-stream-copy experiment has no independent environment alias;
+  // this config-driven override is its only remaining switch.
   moe::detail::backend_stream_copy_override = enabled;
 }
 

@@ -1430,39 +1430,6 @@ bool GgmlHcRunner::post_combine_device_fused(
     cudaStreamWaitEvent(
         0, (cudaEvent_t)((ggml_backend_event_t)post_done_event_)->context, 0);
   cudaStreamWaitEvent(0, (cudaEvent_t)producer->context, 0);
-  // TEMP DIAGNOSTIC: is sub_out already NaN at its last element (d=D-1) for
-  // every token BEFORE this kernel ever touches it? Distinguishes "upstream
-  // FFN producer never wrote D-1" from "this kernel corrupts D-1 itself".
-  if (std::getenv("ZEROMOE_HC_POST_FUSED_SRC_TRACE")) {
-    cudaStreamSynchronize(0);
-    std::vector<float> probe((size_t)S * d_model_);
-    const cudaError_t e = cudaMemcpy(probe.data(), src->data,
-                                     probe.size() * sizeof(float),
-                                     cudaMemcpyDeviceToHost);
-    if (e == cudaSuccess) {
-      size_t nan_count = 0;
-      std::vector<int> nan_tokens;
-      for (int s = 0; s < S; ++s) {
-        if (!std::isfinite(probe[(size_t)s * d_model_ + d_model_ - 1])) {
-          ++nan_count;
-          if (nan_tokens.size() < 5) nan_tokens.push_back(s);
-        }
-      }
-      LOG_ERROR("[HC-POST-FUSED-SRC-TRACE] S=%d D=%d last-dim non-finite in "
-                "%zu/%d tokens (first tokens: %s)\n",
-                S, d_model_, nan_count, S,
-                [&] {
-                  std::string s;
-                  for (int t : nan_tokens) s += std::to_string(t) + " ";
-                  return s;
-                }()
-                    .c_str());
-    } else {
-      LOG_ERROR("[HC-POST-FUSED-SRC-TRACE] cudaMemcpy failed: %s\n",
-                cudaGetErrorString(e));
-      cudaGetLastError();
-    }
-  }
   launch_qwen4exp_hc_q8_post(
       static_cast<float *>(streams->data),
       static_cast<const float *>(src->data),
@@ -1513,33 +1480,6 @@ bool GgmlHcRunner::post_combine_impl(int layer, int sub_block, int S,
   if (S > s_cap_ || inject_valid_S_ != S) return false;
   cudaSetDevice(device_);
   if (!ensure_post_graph(S)) return false;
-
-  // TEMP DIAGNOSTIC: is device_sub_block_out already NaN at its last element
-  // (d=D-1) for every token, before this function does anything with it?
-  if (device_sub_block_out && layer == 11 && sub_block == 1 &&
-      std::getenv("ZEROMOE_HC_POST_SRC_TRACE")) {
-    cudaStreamSynchronize(0);
-    ggml_backend_synchronize((ggml_backend_t)backend_);
-    std::vector<float> probe((size_t)S * d_model_);
-    const cudaError_t e = cudaMemcpy(probe.data(), device_sub_block_out,
-                                     probe.size() * sizeof(float),
-                                     cudaMemcpyDeviceToHost);
-    if (e == cudaSuccess) {
-      size_t nan_count = 0;
-      for (int s = 0; s < S; ++s)
-        if (!std::isfinite(probe[(size_t)s * d_model_ + d_model_ - 1]))
-          ++nan_count;
-      LOG_ERROR("[HC-POST-SRC-TRACE] layer=%d sub=%d S=%d D=%d last-dim "
-                "non-finite in %zu/%d tokens; overall nan_total=%zu\n",
-                layer, sub_block, S, d_model_, nan_count, S,
-                (size_t)std::count_if(probe.begin(), probe.end(),
-                                      [](float v) { return !std::isfinite(v); }));
-    } else {
-      LOG_ERROR("[HC-POST-SRC-TRACE] cudaMemcpy failed: %s\n",
-                cudaGetErrorString(e));
-      cudaGetLastError();
-    }
-  }
 
   // The graph and its [D,S] input are persistent for the whole request shape.
   // In particular, do not call ggml_gallocr_alloc_graph() here: doing so at

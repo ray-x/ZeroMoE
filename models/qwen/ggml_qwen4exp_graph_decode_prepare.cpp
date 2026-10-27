@@ -405,25 +405,6 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     ggml_threadpool_params cpu_tp_params =
         ggml_threadpool_params_default(g->cpu_threads);
     pin_host_node_threads(cpu_tp_params, g->cpu_threads);
-    // 2026-09-15: tested ggml's own threadpool .poll (default 50 -- NOT
-    // controlled by OMP_WAIT_POLICY/GOMP_SPINCOUNT, which only affect
-    // libgomp's separate pool) as a candidate for the mixed CPU/GPU decode
-    // regression via a temporary env override swept across 0/50/400/1000.
-    // Ruled out via THROUGHPUT: all four values landed within noise of each
-    // other (11.76-12.37 tok/s at device_expert_layers=20).
-    // TEMPORARY re-test (2026-09-15, same day): now that the ELEVENTH ROUND
-    // per-op gap instrumentation exists (ZEROMOE_QWEN4EXP_GRAPH_LAYER_
-    // TIMING=1), re-checking whether .poll moves the GAP time specifically
-    // (a real but small effect could have been lost in the earlier
-    // throughput-only measurement's noise). Remove this override again if
-    // inconclusive, per the original decision record's own discipline.
-    if (const char *poll_env =
-            zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_CPU_POLL_RETEST")) {
-      char *end = nullptr;
-      const long v = std::strtol(poll_env, &end, 10);
-      if (end != poll_env && v >= 0 && v <= 100)
-        cpu_tp_params.poll = static_cast<uint32_t>(v);
-    }
     // ggml pins the creating thread to the pool's first CPU; keep the main
     // thread's own affinity unchanged (only the callback team should be pinned).
     cpu_set_t main_affinity;
