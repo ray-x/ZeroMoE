@@ -65,3 +65,19 @@ gave 59.8 / 58.0 / 58.5 tok/s on palindrome and 57.5 / 55.6 / 57.4 on math, insi
 Levers this leaves on the CPU side: fewer cold evaluations (promotion; the hot-set size is capped near 13,000 by
 the draft and window memory: K=13,500 and 14,000 fail draft admission), and fewer barriers per layer by fusing the
 cold branch's ops (gate/up/down matmuls, SwiGLU, activation quantization).
+
+## Two remaining ideas, evaluated and not built
+
+**Fall back to plain decoding when acceptance is low (story prompt).** Matrix, promotion on, 256 tokens: plain
+44.8 tok/s, MTP 42.9 wall / 45.5 steady, acceptance 50%, 2.51 tokens per cycle. A steady cycle is 55.2 ms against
+~22.3 ms per plain token, so the break-even is 2.47 tokens per cycle: on story MTP is exactly at break-even in
+steady state, and the 0.96x is the ~244 ms draft setup (6%). A switch to plain could gain at most the setup, which
+has already been paid by the time acceptance is known, and the decode graph is a singleton built for the window
+size, so going back to one token per step means a graph rebuild of seconds. Adaptive window length has the same
+problem (cost model: best fixed draft count beats 3 by at most ~6% on story, 0-3% elsewhere). Net: not worth it.
+
+**Draft-ahead on the idle GPU.** The next cycle's first draft step needs the token the window is about to
+produce (the bonus token), so it can only start early on a guess: the draft's own continuation, right about as
+often as the draft accepts (~80% on easy prompts) and only when the whole window was accepted (~50% of cycles for
+3 drafts). Expected saving ~0.4 x 7 ms = ~3 ms of a 56 ms cycle (<=5%), minus GPU contention with the window and
+a draft-KV rollback path. Not worth the complexity.
