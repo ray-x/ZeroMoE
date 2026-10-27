@@ -122,6 +122,35 @@ manifests: `~/Projects/ZeroMoE-results/promotion-study/matrix-6751f3c/{static,pr
   runs pick up the +-4 tok/s noise. 60-62 tok/s is the honest figure for a 256-token reply on easy prompts.
 * Strata, measured by the user on this machine: ~68-70 tok/s (31 and 512 token decodes).
 
+## Cross-request promotion (studied, not built)
+
+The decode graph, and with it the promotion policy, is rebuilt for every request, so each request starts again from
+the static hot set (two requests in one process: 47.1 then 47.5 tok/s, no carry-over). Offline from the recorded
+traces (first 256 tokens, same policy and constants), the share of routed experts that run on the CPU:
+
+| prompt | cold start | start from the set learned on the same topic | start from another topic | experts to restore |
+|---|---|---|---|---|
+| palindrome | 4.4% | 1.2% | 4.7% | 1,911 (2.6 GB) |
+| code review | 3.1% | 0.8% | 7.1% | 1,393 (1.9 GB) |
+| math | 7.0% | 1.0% | 7.3% | 3,221 (4.4 GB) |
+| btree | 3.6% | 0.8% | 5.8% | 1,699 (2.3 GB) |
+| leetcode | 6.7% | 1.8% | 18.2% | 2,614 (3.6 GB) |
+| story | 6.6% | 0.6% | 7.4% | 2,648 (3.7 GB) |
+
+* Same topic: 3,900-7,300 fewer cold evaluations per 256 tokens, roughly 0.4-0.7 s at about 0.1 ms each.
+* The set has to be copied back before the first token (2-4 GB, about 0.2-0.4 s at 10 GB/s, not hidden behind
+  decode), so the net gain is a few percent, and only when the topic repeats.
+* A different topic is worse than a cold start (leetcode 6.7% -> 18.2%): the carried-over set evicts the static
+  experts the new prompt needs.
+* Decision: not built. The warm-up is already hidden behind decode; persistence would trade it for an exposed copy.
+
+Multi-request check (plain decode, two identical prompts in one process, promotion on vs off, 200 tokens):
+K=13,000 and K=11,000 give identical text for both requests; K=12,500 matches until character 785 of ~810 and then
+differs, as static mode already does between its own first and second request (809 vs 812 characters). I found no
+sign that a later request rebinds promoted bytes. The binding code still treats the arena as immutable and keys
+reuse on the source pointers, so this is a tested behaviour, not a guarantee; a request that does not release the
+arena at prefill would be the case to watch.
+
 ## Output check under promotion (teacher-forced, `tools/check_adaptive_placement_accuracy.py`)
 
 Static hot set (K=13,000) generates 256 tokens per prompt; the same tokens are forced through the same binary with
