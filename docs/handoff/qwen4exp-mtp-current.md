@@ -5,9 +5,10 @@ binary or citing a result.
 
 ## Master status (2026-10-27)
 
-`master` is at `19100ff`. Five changes landed after the `b78dd9b` binary that
-produced the matched raw-story numbers below, and none is a runtime change on
-the CUDA engine:
+`master` is at `a8a1c7d`. Six changes landed after the `b78dd9b` binary that
+produced the matched raw-story numbers below. The first five are not runtime
+changes on the CUDA engine; the sixth changes the default graph/preload
+surface:
 
 - `5781401` removes the always-on `ZEROMOE_USE_GGML` and
   `ZEROMOE_BUILD_SERVER` build macros. The guards were true in every supported
@@ -26,12 +27,18 @@ the CUDA engine:
   prefill-sized F32 matmul (`S>=32`), so macOS decode stays on NEON.
   `GGML_METAL` is forced OFF; the CPU-only engine never selects a ggml
   backend. This only affects macOS.
+- `a8a1c7d` removes the Qwen/GLM-DSA/Ling/DeepSeek-V4.1 full-graph env gates
+  and the Qwen decode gate. Full graph is now the default; only the Qwen TOML
+  keys, GLM-DSA MTP, Ling's native selector and the V4.1 decode comparison
+  remain explicit fallbacks. Qwen whole-layer preload defaults to 2 (`0` is
+  still the global-pool sentinel) and trailing placement defaults to false.
+  See `docs/handoff/env-surface-full-graph-2026-10-27.md`.
 
 `build/zeromoe` is still stamped from `b78dd9b` and fails
 `python3 tools/build_provenance.py check --binary build/zeromoe --repo .`
 against current master. Do not quote new rates from it; rebuild first. The
 validation build in `build_verify_master/` is current (CPU_ONLY=OFF, arch 86,
-no `ZEROMOE_USE_GGML_CUDA` input); its manifest reports `source=19100ff
+no `ZEROMOE_USE_GGML_CUDA` input); its manifest reports `source=a8a1c7d
 dirty=True` because `models/base/family_ops.cpp` remains uncommitted in its
 owning session.
 
