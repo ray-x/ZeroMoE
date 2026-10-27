@@ -33,8 +33,11 @@ struct PromotionConfig {
   int cap = 6;                 // promotions planned per step
   int burst_extra = 20;        // extra promotions per step while bursting
   int burst_steps = 40;        // steps at the start of a request that burst
-  uint64_t freq_weight = 64;   // eviction score = last_used + freq_weight * hits
-  uint32_t decay_every = 4096; // halve all hit counts after this many hits
+  // eviction score = last_used + freq_weight * hits. With real evictions the old constants (64, halve
+  // every 4096 hits = every ~9 tokens) made the score pure recency; 4096 with no practical decay keeps
+  // frequently used experts through topic changes (+3 points of CPU evals removed, 4 random orders).
+  uint64_t freq_weight = 4096;
+  uint32_t decay_every = 16'000'000;  // halve all hit counts after this many hits (~never in a session)
 };
 
 struct PromotionAction {

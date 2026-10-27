@@ -38,6 +38,31 @@ count per layer and counts the routed experts that would still run on the CPU.
   The layer-ordered cap lets early layers consume the budget; rotating the start layer (or one
   promotion per layer per token) closes the gap to A.
 
+## Eviction score under real evictions (MTP-style steps)
+
+The first sweeps never forced a real eviction (each layer has hundreds of never-used slots), so every
+score looked identical. `tools/expert_promotion_eviction_sim.py` removes the slack: the resident set
+holds only experts that some prompt uses, a step is 3 tokens (MTP commits ~3 tokens), budget 6 promotions
+per token plus the start-of-reply burst. Four random orders of ten prompts (repeating topics), CPU expert
+evaluations removed against the static set:
+
+| eviction score | mean over 4 orders |
+|---|---|
+| pure LRU | 61.3% |
+| ZeroMoE tiered-cache constants (`last_used + 64*hits`, halve every 4,096 hits) | 61.3% |
+| `last_used + 4096*hits`, no practical decay | **64.1%** |
+| `last_used + 16384*hits`, no practical decay | 63.6% |
+| `last_used + 65536*hits` | 57.0% (frequency too sticky) |
+| true LRFU, half-life 250k accesses (~520 tokens) | 64.3% |
+
+With the old constants the blend is pure recency: its hit counts halve every 4,096 hits, i.e. every
+~9 tokens at ~480 routed experts per token. A frequency weight of about 4,096 (one hit is worth ~8.5
+tokens of recency) with no practical decay matches true LRFU, so our own score stays and only the
+constants change (`PromotionConfig`). Step size matters little (1 token 64%, 3 tokens 63%, 8 tokens 61%).
+
+Recorded traces, prompts and the simulators live in `~/Projects/ZeroMoE-results/promotion-study/`;
+the six prompts are also in `bench/prompts/mtp_suite/`.
+
 ## Decision
 
 The gap between A and B is within a point of miss rate, so build **B**: promote a missed expert

@@ -1,0 +1,1 @@
+Review the following Python code and list every bug and possible improvement: def merge(a, b): result = []; i = j = 0; while i < len(a) and j < len(b): if a[i] < b[j]: result.append(a[i]); i += 1 else: result.append(b[j]); j += 1; return result. Also explain how you would test it.
