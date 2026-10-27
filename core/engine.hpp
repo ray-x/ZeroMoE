@@ -530,6 +530,8 @@ public:
     // beats a per-layer host-node tap. Off by default: real per-token
     // overhead, only worth paying during a usage survey.
     bool qwen4exp_track_router_usage = false;
+    // 0 = static hot set, 1 = observe (count misses only), 2 = promote (see EngineConfig).
+    int qwen4exp_expert_promotion = 0;
 
     bool qwen4exp_option_b_layer_enabled(int layer) const {
       if (!qwen4exp_option_b_committed)

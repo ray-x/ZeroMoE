@@ -163,6 +163,14 @@ struct EarlyReadyLane {
     return prepare(backend, dev, dim, topk, w, remap, mask);
   }
 
+  // The host route tables (cpu_remap/cpu_mask, shared with the owner) changed between graph runs
+  // (expert promotion): re-read the cached copies. Never call while the lane's graph is running.
+  void refresh_routes() {
+    original_remap.assign(cpu_remap, cpu_remap + n_experts);
+    original_mask.assign(cpu_mask, cpu_mask + n_experts);
+    for (int e = 0; e < n_experts; ++e) cold_mask[e] = cpu_mask[e] != 0.0f;
+  }
+
   // Called on the CPU lane right before its graph runs with the routed experts
   // this lane owns (mask != 0, deduplicated, in route order). Return false to
   // fail the token. Used by the SSD-offload path to make them resident.

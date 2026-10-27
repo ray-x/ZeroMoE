@@ -935,6 +935,11 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         g, ctx, c.n_experts, *split_gpu_ids,
         /*safe_dummy_fill=*/g.S != 1 && !g.decode_mode);
     if (tab.remap_gpu && tab.remap_cpu && tab.mask_gpu && tab.mask_cpu) {
+      if (g.decode_mode) {
+        auto &pl = g.promo_layers[layer];
+        pl.remap_gpu = tab.remap_gpu; pl.remap_cpu = tab.remap_cpu;
+        pl.mask_gpu = tab.mask_gpu;   pl.mask_cpu = tab.mask_cpu;
+      }
       const char *early_env = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_LAYER13");
       const char *all_early_env = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT");
       const bool early_requested =

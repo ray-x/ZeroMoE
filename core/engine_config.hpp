@@ -491,6 +491,11 @@ struct EngineConfig {
   // usage survey, never for production decode.
   bool qwen4exp_track_router_usage = false;
 
+  // Adaptive promotion of missed experts into the static per-layer VRAM set (docs/design/expert-promotion.md).
+  // "off" (default): static set. "observe": count misses, never swap (frozen set, for A/B and validation).
+  // "on": swap. Environment override: ZEROMOE_QWEN4EXP_EXPERT_PROMOTION=off|observe|on.
+  std::string qwen4exp_expert_promotion = "off";
+
   // prompt_cache: reuse the previous request's end-of-prompt state when the
   // new prompt EXTENDS it (or repeats it), so only the new suffix is
   // prefilled. Restricted to families whose carried recurrent/conv/PLE state
@@ -2987,6 +2992,8 @@ inline bool EngineConfig::load(const std::string &path) {
       doc.root.get_int_array("qwen4exp_gpu_stage_layers");
   qwen4exp_track_router_usage = doc.root.get_bool(
       "qwen4exp_track_router_usage", qwen4exp_track_router_usage);
+  qwen4exp_expert_promotion = doc.root.get_str(
+      "qwen4exp_expert_promotion", qwen4exp_expert_promotion);
   qwen4exp_cpu_offload_ring_slots = (int)doc.root.get_int(
       "qwen4exp_cpu_offload_ring_slots", qwen4exp_cpu_offload_ring_slots);
   if (qwen4exp_cpu_offload_ring_slots < 1)

@@ -471,6 +471,7 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
     engine.qwen4exp_ple_next_pos = pos_base + 1;
   }
   promo_copy_probe(engine, pos_base);
+  qwen4exp_promotion_step(g, 1);
   engine.qwen4exp_full_graph_output_ready = true;
   engine.qwen4exp_full_graph_logits_ready = logits != nullptr;
   const double ms = std::chrono::duration<double, std::milli>(

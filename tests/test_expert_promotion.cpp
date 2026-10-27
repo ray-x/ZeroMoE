@@ -61,7 +61,7 @@ int main() {
         for (int l = 0; l < L; ++l)
           for (int k = 0; k < 10; ++k) p.note_routed(l, int(rng() % E));
       const auto actions = p.plan();
-      const int budget = cfg.cap + (step < cfg.burst_steps ? cfg.burst_extra : 0);
+      const int budget = cfg.cap + (step < cfg.burst_tokens ? cfg.burst_extra : 0);
       budget_ok = budget_ok && int(actions.size()) <= budget;
       for (const auto &a : actions) {
         ok = ok && !p.resident(a.layer, a.expert_in) && p.slot_pending(a.layer, a.slot);
@@ -121,7 +121,7 @@ int main() {
   // 4) Burst: more promotions in the first steps of a request than later; begin_request re-arms it.
   {
     PromotionConfig cfg;
-    cfg.min_misses = 1; cfg.cap = 2; cfg.burst_extra = 10; cfg.burst_steps = 3;
+    cfg.min_misses = 1; cfg.cap = 2; cfg.burst_extra = 10; cfg.burst_tokens = 3;
     ExpertPromotionPolicy p(cfg, E, initial_slots());
     auto count_step = [&]() {
       for (int l = 0; l < L; ++l)

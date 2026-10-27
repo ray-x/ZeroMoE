@@ -140,6 +140,7 @@ bool qwen4exp_full_graph_window_commit(StreamingEngine &engine, int m) {
     engine.qwen4exp_ple_next_pos = g.window_pos + m;
   }
   g.window_pos = -1;
+  qwen4exp_promotion_step(g, m);
   return true;
 }
 

@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include "expert_promotion.hpp"
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -856,6 +857,26 @@ std::vector<std::tuple<int, ggml_tensor *>> layer_input_taps;
   ggml_tensor *window_ple_padded = nullptr;
   std::vector<int> window_tokens;
   int window_pos = -1;
+
+  // ---- adaptive expert promotion (engine.qwen4exp_expert_promotion; see ggml_qwen4exp_graph_promote.cpp) ----
+  // Per layer: where each hot-expert plane lives on the device and where its bytes come from, plus the four
+  // route tables (host tensors; the early-ready lane keeps device copies that are refreshed too).
+  struct PromoPlane {
+    ggml_tensor *dst = nullptr;     // device tensor [.., .., K_l]; slot s starts at s * bytes
+    const uint8_t *src = nullptr;   // expert e starts at src + e * stride (pinned host arena)
+    size_t stride = 0, bytes = 0;
+  };
+  struct PromoLayer {
+    PromoPlane plane[3];            // gate, up, down
+    ggml_tensor *remap_gpu = nullptr, *remap_cpu = nullptr, *mask_gpu = nullptr, *mask_cpu = nullptr;
+  };
+  std::map<int, PromoLayer> promo_layers;
+  std::unique_ptr<zeromoe::graph::ExpertPromotionPolicy> promo;
+  std::vector<zeromoe::graph::PromotionAction> promo_pending;   // copies in flight
+  cudaStream_t promo_stream = nullptr;
+  cudaEvent_t promo_event = nullptr;
+  std::vector<int32_t> promo_ids_host;
+  uint64_t promo_steps = 0, promo_late = 0;
   std::vector<ggml_tensor *> gdn_state_updates;
   std::vector<ggml_tensor *> gdn_hist_updates;
   std::vector<int> gdn_layers;
@@ -1042,6 +1063,11 @@ std::vector<std::tuple<int, ggml_tensor *>> layer_input_taps;
   window_ple_padded = nullptr;
   window_tokens.clear();
   window_pos = -1;
+  promo.reset();
+  promo_layers.clear();
+  promo_pending.clear();
+  if (promo_event) { cudaEventDestroy(promo_event); promo_event = nullptr; }
+  if (promo_stream) { cudaStreamDestroy(promo_stream); promo_stream = nullptr; }
     gdn_state_updates.clear();
     gdn_hist_updates.clear();
     gdn_layers.clear();
@@ -1097,6 +1123,8 @@ struct ExpertSplitTables {
 
 
 } // namespace qwen4exp_graph
+
+void qwen4exp_promotion_step(qwen4exp_graph::FullGraph &g, int tokens);
 
 #endif // ZEROMOE_USE_GGML_CUDA
 

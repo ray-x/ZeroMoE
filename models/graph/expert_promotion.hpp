@@ -30,9 +30,9 @@ namespace zeromoe::graph {
 struct PromotionConfig {
   bool enabled = true;
   int min_misses = 2;          // misses before an expert is a candidate
-  int cap = 6;                 // promotions planned per step
+  int cap = 6;                 // promotions per committed token
   int burst_extra = 20;        // extra promotions per step while bursting
-  int burst_steps = 40;        // steps at the start of a request that burst
+  int burst_tokens = 40;       // tokens at the start of a request that burst
   // eviction score = last_used + freq_weight * hits. With real evictions the old constants (64, halve
   // every 4096 hits = every ~9 tokens) made the score pure recency; 4096 with no practical decay keeps
   // frequently used experts through topic changes (+3 points of CPU evals removed, 4 random orders).
@@ -75,7 +75,7 @@ class ExpertPromotionPolicy {
 
   // A new request starts: restart the burst and age the miss evidence.
   void begin_request() {
-    step_ = 0;
+    step_ = 0;  // tokens committed in this request
     for (auto &row : misses_)
       for (auto &m : row) m >>= 1;
   }
@@ -97,12 +97,13 @@ class ExpertPromotionPolicy {
     }
   }
 
-  // End of a step: choose promotions. Victims stop being resident now.
-  std::vector<PromotionAction> plan() {
+  // End of a step that committed `tokens` tokens (1 for plain decode, ~3 for an MTP window): choose
+  // promotions. Victims stop being resident now.
+  std::vector<PromotionAction> plan(int tokens = 1) {
     std::vector<PromotionAction> out;
     if (!cfg_.enabled) return out;
-    const int budget = cfg_.cap + (step_ < uint64_t(cfg_.burst_steps) ? cfg_.burst_extra : 0);
-    ++step_;
+    const int budget = cfg_.cap * tokens + (step_ < uint64_t(cfg_.burst_tokens) ? cfg_.burst_extra : 0);
+    step_ += uint64_t(tokens);
     struct Cand { uint16_t misses; int layer, expert; };
     std::vector<Cand> pool;
     for (size_t l = 0; l < slots_.size(); ++l)
