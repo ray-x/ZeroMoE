@@ -1,22 +1,21 @@
 #pragma once
 
-// Opt-in Qwen4Exp full graph.  The implementation is deliberately kept
-// behind this small bridge so the existing per-layer path remains available
-// as a correctness fallback while the full graph is validated on hardware.
+// Qwen4Exp full graph.  The implementation is deliberately kept behind this
+// small bridge so the per-layer path remains available as an explicit
+// correctness fallback, but both graph phases are on by default.
 
 #include <cstddef>
 
 struct StreamingEngine;
 
-// Enabled only when ZEROMOE_QWEN4EXP_FULL_GRAPH=1 is present.  The mode is
-// The prefill graph is enabled by ZEROMOE_QWEN4EXP_FULL_GRAPH=1.  Decode
-// additionally requires ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1, keeping the
-// established layered decode path as the default and as the fallback.
+// Full-graph prefill and decode are enabled by default.  A TOML profile may
+// explicitly set qwen4exp_full_graph/qwen4exp_full_graph_decode to false for
+// a documented fallback or diagnostic; there are no environment overrides.
 bool qwen4exp_full_graph_enabled();
 bool qwen4exp_full_graph_decode_enabled();
 
-// Configure full-graph enablement from the TOML profile. Environment
-// variables remain supported and take precedence in the query functions.
+// Configure full-graph enablement from the TOML profile.  The defaults are
+// true/true; the call is kept so config parsing has one explicit handoff.
 void qwen4exp_full_graph_configure(bool enabled, bool decode_enabled,
                                    bool prefill_state_handoff = false);
 bool qwen4exp_full_graph_sync_state_to_host(StreamingEngine &engine);

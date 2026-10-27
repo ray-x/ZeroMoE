@@ -42,17 +42,16 @@ Settings are read when the process starts, and graph settings are cached per mod
 
 ## Qwen 3.8 Flash full graph
 
-The shipped Qwen recipe no longer requires these variables. Full-graph prefill/decode
-default to enabled; placement uses `graph_device_expert_layers` and
-`graph_device_expert_trailing`. The table retains the historical launch values for
-existing scripts.
+The shipped Qwen recipe no longer requires full-graph launch flags. Prefill and
+decode default to the graph; placement uses `graph_device_expert_layers` and
+`graph_device_expert_trailing`. The legacy preload aliases remain.
 
 | Variable | Set to | Effect |
 | --- | --- | --- |
-| `ZEROMOE_QWEN4EXP_FULL_GRAPH` | `1` | Run prefill through the full ggml graph. |
-| `ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE` | `1` | Run decode through the full graph. |
-| `ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS` | `0` | Whole layers preloaded to VRAM, as an integer. Zero, empty or malformed means none; values above 48 are capped at 48. The hybrid recipe uses `qwen4exp_option_b_global_top_k` instead. |
-| `ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING` | `1` | Choose the preloaded layers from the end of the network. |
+| ~~`ZEROMOE_QWEN4EXP_FULL_GRAPH`~~ | removed | Full-graph prefill is always enabled. A TOML `qwen4exp_full_graph = false` is the only explicit fallback. |
+| ~~`ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE`~~ | removed | Full-graph decode is always enabled together with prefill. A TOML `qwen4exp_full_graph_decode = false` is the only explicit fallback. |
+| `ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS` | `2` | Whole layers preloaded to VRAM. `0` explicitly disables the whole-layer block (the global-pool recipe uses this); an enabled block must be at least `2` layers, and values above 48 are capped at 48. Legacy alias for `graph_device_expert_layers`. |
+| `ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING` | `0` | Place the whole GPU-resident block at the end of the network (llama.cpp `-ncmoe` style) instead of the start. Only has an effect when `GRAPH_PRELOAD_LAYERS` is nonzero. Legacy alias for `graph_device_expert_trailing`. |
 | `ZEROMOE_QWEN4EXP_PREFILL_OP_OFFLOAD` | `1` (default) | Run host-resident experts on the GPU during prefill, by copying the batch's experts across. `0` keeps them on the CPU. |
 | `ZEROMOE_QWEN_CPU_THREADS` | all OpenMP threads | Positive integer. Caps (never raises) the threads used for Qwen CPU expert work. |
 | `ZEROMOE_QWEN4EXP_HOST_NODE` | off | Use the host-node CPU/GPU schedule (`flag_on`). Measured in [runtime-settings.md](runtime-settings.md). |
@@ -93,7 +92,7 @@ These are model-specific. The model's own document (`docs/models/<model>.md`) is
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `ZEROMOE_GLM_DSA_FULL_GRAPH`, `ZEROMOE_LING_FULL_GRAPH`, `ZEROMOE_DEEPSEEK_V41_FULL_GRAPH` | off | Enable the full graph for that family (`flag_on`, so only a leading `1` enables). GLM DSA uses `ZEROMOE_GLM_DSA_FULL_GRAPH_PREFILL` for the batched prefill graph and `ZEROMOE_DEEPSEEK_V41_FULL_GRAPH_DECODE` to split DeepSeek decode from prefill. |
+| ~~`ZEROMOE_GLM_DSA_FULL_GRAPH`~~, ~~`ZEROMOE_LING_FULL_GRAPH`~~, ~~`ZEROMOE_DEEPSEEK_V41_FULL_GRAPH`~~ | removed | Full graph is the default for these families and cannot be disabled through the environment. `ZEROMOE_LING_NATIVE_GRAPH` still selects Ling's native cache-backed graph; `ZEROMOE_DEEPSEEK_V41_FULL_GRAPH_DECODE=0` remains an explicit native-decode comparison. |
 | `ZEROMOE_GLM_DSA_CPU_LANE` | off | Advertise the GLM DSA CPU lane: cold experts may run on a private CPU lane concurrently with the layer's GPU work (the early-ready/gpu-assist capability). Only a leading `1` enables it; without it, a mixed VRAM+DDR placement logs a `PLACEMENT-WARN`. |
 | `ZEROMOE_GLM5NEXT_CPU_THREADS` | `6` | ggml CPU threads for GLM-5 Next. Prefill prefers `ZEROMOE_GLM5NEXT_PREFILL_CPU_THREADS` when that is set. |
 | `ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB` | `2048` | Free-VRAM floor the graph allocator must leave before it builds GLM-5 Next graphs, in MiB. `0` removes the floor; it also gates pilot staging. |

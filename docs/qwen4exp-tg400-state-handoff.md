@@ -94,10 +94,8 @@ to repeat the test exactly. Runtime switches used for the measured runs:
 
 ```text
 CUDA_VISIBLE_DEVICES=0
-ZEROMOE_QWEN4EXP_FULL_GRAPH=1
-ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1
+# Full-graph prefill/decode are now engine defaults (no switch).
 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40
-ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1
 ZEROMOE_PROMPT_TOKEN_INPUT_FILE=/tmp/tg400_qwen_prompt_tokens.txt
 ZEROMOE_TEACHER_FORCE_TOKEN_FILE=<quantization-specific 400-token file>
 ZEROMOE_TEACHER_FORCE_SKIP_SAMPLING=1
@@ -116,10 +114,7 @@ The ZeroMoE measured-run shape is:
 ```bash
 { printf 'TG400 timing run\n:q\n'; } | env \
   CUDA_VISIBLE_DEVICES=0 \
-  ZEROMOE_QWEN4EXP_FULL_GRAPH=1 \
-  ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1 \
   ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40 \
-  ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
   ZEROMOE_PROMPT_TOKEN_INPUT_FILE=/tmp/tg400_qwen_prompt_tokens.txt \
   ZEROMOE_TEACHER_FORCE_TOKEN_FILE=/tmp/zeromoe_q2_0_tg400_decode_tokens_20261002.txt \
   ZEROMOE_TEACHER_FORCE_SKIP_SAMPLING=1 \
@@ -228,10 +223,11 @@ decode setup and its recurrent-state seed above.
   prompt the last token overflows the KV capacity, drops to the legacy path (~1.4 s) and the run
   reads ~24 tok/s, a fake ~11% gap. Check `[PREFILL-DONE] 16 tokens`.
 - Required switches beyond the doc's list: `ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40`,
-  `ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1`, `ZEROMOE_QWEN4EXP_FULL_GRAPH=1`,
-  `ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1`, plus `..._BORROW_PREFILL_ARENAS=1` and
-  `..._GRAPH_BOOTSTRAP=1` for the 54 ms setup (borrow alone fails the 1 GiB VRAM floor and falls
-  back to a degenerate layered decode; neither flag works on per-expert split configs).
+  plus `..._BORROW_PREFILL_ARENAS=1` and `..._GRAPH_BOOTSTRAP=1` for the 54 ms setup
+  (borrow alone fails the 1 GiB VRAM floor and falls back to a degenerate layered
+  decode; neither flag works on per-expert split configs). Full-graph
+  prefill/decode are now defaults; the old `ZEROMOE_QWEN4EXP_FULL_GRAPH*` names
+  were removed.
 - Measured: ZeroMoE 26.17 / 26.44 / 26.89 tok/s over 400 tokens (setup included) vs Bee
   `llama-bench -p 0 -n 400 -r 3` 26.96-27.06 (build 43fed6726, same 26-layer CPU mask).
   Per token: graph run ~36.3 ms + ~0.5 ms sampling. GPU kernels ~12.9 ms (about 3,900 kernels),

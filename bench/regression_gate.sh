@@ -380,7 +380,7 @@ run_dsv41() {
   local log="$LOG_DIR/dsv41.$STAMP.log" eng="$LOG_DIR/dsv41.$STAMP.engine.log" rc=0
   echo "--- dsv41: DNS prompt, 64 tokens (dual GPU) ---"
   echo "Explain what DNS is and how a domain name gets resolved to an IP address." \
-    | env CUDA_VISIBLE_DEVICES=0,1 ZEROMOE_DEEPSEEK_V41_FULL_GRAPH=1 \
+    | env CUDA_VISIBLE_DEVICES=0,1 \
         scripts/run_capped.sh -- "$BIN" \
         --config configs/bench/deepseek_v41_100gib_ddr_17gib_vram_dual_gpu.toml \
         --log-path "$eng" \

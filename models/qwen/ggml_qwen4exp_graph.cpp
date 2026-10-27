@@ -71,9 +71,9 @@ std::unique_ptr<FullGraph> g_graph_decode_arena_owner;
 
 
 
-bool g_config_full_graph = false;
+bool g_config_full_graph = true;
 
-bool g_config_full_graph_decode = false;
+bool g_config_full_graph_decode = true;
 
 bool g_config_prefill_state_handoff = false;
 
@@ -106,18 +106,18 @@ ggml_backend_t full_graph_cuda_scheduler_backend(FullGraph &g) {
 
 } // namespace qwen4exp_graph
 
-bool qwen4exp_full_graph_enabled() { return env_enabled(); }
+bool qwen4exp_full_graph_enabled() { return g_config_full_graph; }
 
 int qwen4exp_full_graph_device_expert_layers() {
-  return env_enabled() ? env_device_expert_layers() : 0;
+  return g_config_full_graph ? env_device_expert_layers() : 0;
 }
 
 bool qwen4exp_full_graph_device_expert_trailing() {
-  return env_enabled() && env_device_expert_trailing();
+  return g_config_full_graph && env_device_expert_trailing();
 }
 
 bool qwen4exp_full_graph_decode_enabled() {
-  return env_enabled() && env_decode_enabled();
+  return g_config_full_graph && g_config_full_graph_decode;
 }
 
 void qwen4exp_full_graph_configure(bool enabled, bool decode_enabled,

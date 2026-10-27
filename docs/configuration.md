@@ -40,8 +40,8 @@ For example, Qwen's old launch-time placement flags become:
 
 ```toml
 # Root settings, before [[gpus]]
-graph_device_expert_layers = 0
-graph_device_expert_trailing = true
+graph_device_expert_layers = 2      # 0 = no whole-layer block (global-pool recipe)
+graph_device_expert_trailing = false
 # Optional: cap Qwen CPU expert workers; 0 keeps available-thread selection.
 # graph_cpu_threads_decode = 10
 ```
@@ -49,8 +49,11 @@ graph_device_expert_trailing = true
 Qwen full-graph prefill/decode already default to enabled. The shipped
 `configs/qwen38-flash.toml` no longer requires its four historical launch
 flags. It retains its existing measured backend, hotset and memory settings.
-Whole-layer placement and partial hotset budgets remain separate concepts;
-trailing placement has no whole-layer effect while the layer count is zero.
+Whole-layer placement and partial hotset budgets remain separate concepts.
+`graph_device_expert_layers` is 2 by default; `0` is the explicit sentinel for
+"no whole-layer block" (the global-pool recipe), and an enabled block must be
+at least 2 layers. `graph_device_expert_trailing` defaults to false (leading
+block) and only affects placement when the layer count is nonzero.
 
 Canonical keys use real TOML types: `true`/`false` for booleans, integers for
 counts, numeric fractions in `[0,1]`, and strings for paths or `"auto"`.

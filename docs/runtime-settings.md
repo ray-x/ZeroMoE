@@ -12,7 +12,7 @@ interleaved repetitions. Methodology and raw results: `tests/option_b_split_reve
 | Values | `1` enables. Unset or anything else = off (only the first character `1` counts). |
 | Default | off |
 | Scope | Qwen4Exp full-graph **decode** only (`S == 1`). Prefill is unaffected. |
-| Needs | `ZEROMOE_QWEN4EXP_FULL_GRAPH=1` and `ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1`; TOML `qwen4exp_cpu_offload = true` and `qwen4exp_cpu_offload_layers = [...]`; complete preloaded DDR expert arenas for those layers (`ram_preload_all_experts = true`). |
+| Needs | Qwen4Exp full-graph decode (the default); TOML `qwen4exp_cpu_offload = true` and `qwen4exp_cpu_offload_layers = [...]`; complete preloaded DDR expert arenas for those layers (`ram_preload_all_experts = true`). |
 
 **What it does.** Each layer listed in `qwen4exp_cpu_offload_layers` has its routed-MoE FFN replaced by a `GGML_OP_CPY`
 marker. While the CUDA graph is captured, the marker expands to *device-to-host copy -> `cudaLaunchHostFunc` callback ->

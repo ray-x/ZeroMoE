@@ -479,8 +479,8 @@ class Glm5NextGraphModel final : public FullGraphModelBase<Glm5NextGraphModel> {
 };
 
 // GLM-5.x "glm-dsa" (absorbed MLA with RoPE, plain residual, routed MoE).  Shares the glm5next graph implementation; the
-// DSA indexer is not part of it (dense attention, as the layered path).  Opt-in: ZEROMOE_GLM_DSA_FULL_GRAPH=1 enables the
-// decode graph, ZEROMOE_GLM_DSA_FULL_GRAPH_PREFILL=1 the batched prefill graph.
+// DSA indexer is not part of it (dense attention, as the layered path).  Full-graph prefill and decode are the defaults;
+// MTP is the only supported opt-out because its speculative loop is not integrated with this graph.
 class GlmDsaGraphModel final : public FullGraphModelBase<GlmDsaGraphModel> {
  public:
   GraphRuntimeTuning runtime_tuning(const StreamingEngine &) const override { return {}; }
@@ -493,12 +493,10 @@ class GlmDsaGraphModel final : public FullGraphModelBase<GlmDsaGraphModel> {
   void bind_vram_cache(GpuTopology *t) const override { glm5next_full_graph_set_vram_cache(t); }
   const char *name() const override { return "glm_dsa"; }
 
-  bool enabled(const StreamingEngine &engine, ModelGraphPhase phase) const override {
-    if (engine.mtp_enabled)
-      return false;
-    const char *v = zeromoe::graphcfg::env(phase == ModelGraphPhase::Prefill ? "ZEROMOE_GLM_DSA_FULL_GRAPH_PREFILL"
-                                                                  : "ZEROMOE_GLM_DSA_FULL_GRAPH");
-    return v && v[0] == '1';
+  bool enabled(const StreamingEngine &engine, ModelGraphPhase) const override {
+    // Prefill and decode both default to the graph.  MTP keeps the layered
+    // path because this adapter does not implement speculative graph decode.
+    return !engine.mtp_enabled;
   }
   bool bootstrap(StreamingEngine &engine) const override { return glm5next_full_graph_bootstrap(engine); }
   void shutdown() const override { glm5next_full_graph_shutdown(); }

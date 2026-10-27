@@ -62,7 +62,7 @@ qwen4exp_option_b_global_top_k = 14000
 qwen4exp_option_b_global_floor_per_layer = 1
 
 graph_device_expert_layers = 0
-graph_device_expert_trailing = true
+graph_device_expert_trailing = false
 qwen4exp_cpu_gpu_overlap = true
 qwen4exp_cpu_gpu_overlap_max_layers = 0
 

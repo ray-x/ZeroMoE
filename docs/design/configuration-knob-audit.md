@@ -27,6 +27,31 @@ that made the deletion behavior-neutral. One exception was requested
 explicitly: retiring the dead cuFile feature also removes the `cuda_cufile`
 TOML key (and its CLI help mention) because that key was its only consumer.
 
+### 2026-10-27 — full-graph gates and Qwen preload defaults
+
+| Control | Surface | Evidence | Change |
+| --- | --- | --- | --- |
+| `ZEROMOE_QWEN4EXP_FULL_GRAPH`, `ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE` (K0372, K0373) | environment | `env_enabled()`/`env_decode_enabled()` were the only readers. The engine config already defaults both TOML keys to true, so removing the env reads preserves every default run. | Deleted both readers and their declarations; `g_config_full_graph`/`g_config_full_graph_decode` default true and are set only by `qwen4exp_full_graph_configure()`. TOML `qwen4exp_full_graph=false` remains the explicit fallback/diagnostic. |
+| `ZEROMOE_GLM_DSA_FULL_GRAPH`, `_PREFILL` (K0294, K0295) | environment | `GlmDsaGraphModel::enabled()` read these per phase. Nothing else consumed them; MTP already returned false before the env check. | `enabled()` now returns `!engine.mtp_enabled` for both phases. MTP remains the documented opt-out. |
+| `ZEROMOE_LING_FULL_GRAPH` (K0302) | environment | `ling_full_graph_enabled()` and the native-graph conjunction were the only readers. Native/hybrid selection is a separate implementation choice. | `ling_full_graph_enabled()` returns true under CUDA; `bailingmoe3_native_graph_enabled()` now reads only `ZEROMOE_LING_NATIVE_GRAPH`. |
+| `ZEROMOE_DEEPSEEK_V41_FULL_GRAPH` (K0112) | environment | `v41_env_enabled()` guarded prefill prepare/run and the top-level enabled query. The decode query fell back to this name when its own override was unset. | `v41_full_graph_enabled()` returns true. The decode fallback now defaults to true; `ZEROMOE_DEEPSEEK_V41_FULL_GRAPH_DECODE=0` remains an explicit native-decode comparison. |
+| `ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS` (K0386) | environment | Legacy alias for `graph_device_expert_layers`. Default 0 made the whole-layer block absent unless a script set it. | Default 2. `0` remains the explicit no-whole-layer/global-pool sentinel. An enabled block must have at least 2 layers: env `1` is raised to 2 with a warning, TOML `1` is rejected. |
+| `ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING` (K0388) | environment | Legacy alias for `graph_device_expert_trailing`. The code default was already false; documentation incorrectly said 1. | Default false (leading block). The flag remains an explicit placement selector matching llama.cpp `-ncmoe` when true, and has no effect when the layer count is 0. |
+
+Verification for this batch:
+
+- `graph_settings_test` passes against the updated defaults snapshot
+  (`device_expert_layers=2`), including rejection of TOML `1` and preservation
+  of the explicit `0` sentinel.
+- A CUDA `zeromoe` build links; `build_provenance.py check` reports the current
+  source commit and a clean manifest.
+- CPU-only configure is unchanged (the Qwen/Ling/DeepSeek graph stubs still
+  return false, because the graph needs the CUDA backend).
+- Remaining references to the removed names in dated benchmark records
+  (`bench/results/`, `docs/perf-record-*`, `configs/bench/perf-baselines.md`)
+  are historical provenance, not live configuration; active scripts and
+  current guides were updated.
+
 ### 2026-10-27 — safe dead-knob batch
 
 | Control | Surface | Evidence | Change |

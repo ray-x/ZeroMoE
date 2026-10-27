@@ -72,8 +72,9 @@ throughput. Usage statistics stay frozen during comparisons.
 
 The output projection is enabled by default. Set
 `ZEROMOE_DEEPSEEK_V41_OUTPROJ_GPU=0` to compare its native fallback.
-`ZEROMOE_DEEPSEEK_V41_FULL_GRAPH_DECODE=0` selects native decode while
-`ZEROMOE_DEEPSEEK_V41_FULL_GRAPH=1` keeps graph prefill enabled.
+Full-graph prefill and decode are the defaults.  The only remaining split is
+the explicit `ZEROMOE_DEEPSEEK_V41_FULL_GRAPH_DECODE=0` native-decode
+comparison; graph prefill stays enabled.
 
 ## Memory contract
 
@@ -114,7 +115,7 @@ For the configured build used during this investigation:
 
 ```sh
 cmake --build /tmp/zeromoe-v41-build --target zeromoe -j4
-CUDA_VISIBLE_DEVICES=0,1 ZEROMOE_DEEPSEEK_V41_FULL_GRAPH=1 \
+CUDA_VISIBLE_DEVICES=0,1 \
   /tmp/zeromoe-v41-build/zeromoe \
   --config configs/bench/deepseek_v41_100gib_ddr_17gib_vram_dual_gpu.toml
 ```

@@ -3,7 +3,7 @@
 
   bench/perf_report.py run --name qwen38-flash --config configs/qwen38-flash.toml \\
       --model /path/to/model --binary build/zeromoe \\
-      --env ZEROMOE_QWEN4EXP_FULL_GRAPH=1 --set omp_max_threads=10 --note ram="DDR4-2666 4ch"
+      --set omp_max_threads=10 --note ram="DDR4-2666 4ch"
   bench/perf_report.py render bench/results/*.json
 
 The measurements come from the engine itself: this script starts `zeromoe --bench` (core/bench_mode.hpp), which loads

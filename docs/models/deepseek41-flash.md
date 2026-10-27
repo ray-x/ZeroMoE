@@ -10,7 +10,7 @@
 
 ```bash
 echo "Explain what DNS is and how a domain name gets resolved to an IP address." \
-  | CUDA_VISIBLE_DEVICES=0,1 ZEROMOE_DEEPSEEK_V41_FULL_GRAPH=1 \
+  | CUDA_VISIBLE_DEVICES=0,1 \
     scripts/run_capped.sh -- ./build_master/zeromoe \
     --config configs/bench/deepseek_v41_100gib_ddr_17gib_vram_dual_gpu.toml --temp 0 --ngen 64 --force-start
 ```

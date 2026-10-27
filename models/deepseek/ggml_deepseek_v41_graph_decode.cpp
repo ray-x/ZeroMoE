@@ -817,9 +817,11 @@ bool build(DecodeGraph &g) {
 } // namespace
 
 bool deepseek_v41_full_graph_decode_enabled() {
+  // Decode is on by default.  The explicit ..._DECODE=0 opt-out is kept so a
+  // run can compare native decode while graph prefill stays enabled.
   if (zeromoe::graphcfg::env("ZEROMOE_DEEPSEEK_V41_FULL_GRAPH_DECODE"))
     return zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_FULL_GRAPH_DECODE");
-  return zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_FULL_GRAPH");
+  return true;
 }
 
 void deepseek_v41_bind_graph_runtime(StreamingEngine &e, RAMSafetyManager &r,

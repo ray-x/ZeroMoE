@@ -717,13 +717,12 @@ struct EngineConfig {
   // model top-k are useful for stressing concurrent H2D staging.
   int qwen4exp_option_b_stage_count = 1;
 
-  // Configurable full-graph switches.  Environment variables remain valid
-  // overrides for existing A/B scripts; these fields make the master-based
-  // Option B profile self-contained.
   // Qwen4Exp execution policy: full-graph prefill/decode are the defaults.
-  // A config may explicitly disable them only for a documented exemption or
-  // a diagnostic; the runtime must not silently select layered decode after
-  // a requested full graph fails to build or execute.
+  // These TOML fields are the only opt-out: a config may explicitly disable
+  // them for a documented exemption or a diagnostic.  There are no
+  // environment overrides; an unset key keeps the graph.  The runtime must
+  // not silently select layered decode after a requested full graph fails to
+  // build or execute.
   bool qwen4exp_full_graph = true;
   bool qwen4exp_full_graph_decode = true;
   bool qwen4exp_prefill_state_handoff = false;

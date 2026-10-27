@@ -9,7 +9,7 @@ struct LayerScratch;
 // layer; attention and MoE reuse the engine's native cache-aware dispatch.
 bool bailingmoe3_native_graph_enabled();
 // Hybrid path: GLM5Next's GGML/CUDA attention graph with native cache-backed
-// Ling MoE callbacks. Requires both native graph flags plus the hybrid opt-in.
+// Ling MoE callbacks. Requires ZEROMOE_LING_NATIVE_GRAPH plus the hybrid opt-in.
 bool bailingmoe3_hybrid_cuda_graph_enabled();
 void bailingmoe3_native_graph_bind_runtime(StreamingEngine &engine,
                                            RAMSafetyManager &ram,

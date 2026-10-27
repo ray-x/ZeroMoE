@@ -208,8 +208,11 @@ ggml_tensor *v41_weight(FullGraph &g, ggml_context *ctx,
   return t;
 }
 
-bool v41_env_enabled() {
-  return zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_FULL_GRAPH");
+bool v41_full_graph_enabled() {
+  // The graph is the default execution path for DeepSeek-V4.1.  The separate
+  // ZEROMOE_DEEPSEEK_V41_FULL_GRAPH_DECODE=0 opt-out is handled by the decode
+  // adapter; prefill always uses the graph.
+  return true;
 }
 
 int v41_device_expert_layers() {
@@ -1622,7 +1625,7 @@ ggml_tensor *v41_build_cache_moe(FullGraph &g, ggml_tensor *cur, int layer,
 
 using namespace glm5next_graph;
 
-bool deepseek_v41_full_graph_enabled() { return v41_env_enabled(); }
+bool deepseek_v41_full_graph_enabled() { return v41_full_graph_enabled(); }
 
 int deepseek_v41_full_graph_device_expert_layers() {
   // The cache owns all expert storage; reserve no graph preload arena.
@@ -1636,7 +1639,7 @@ void deepseek_v41_full_graph_shutdown() {
 
 bool deepseek_v41_full_graph_prepare(StreamingEngine &engine, int S,
                                      int pos_base, const int *token_ids) {
-  if (!v41_env_enabled() || S <= 1 || pos_base != 0 || !token_ids ||
+  if (!v41_full_graph_enabled() || S <= 1 || pos_base != 0 || !token_ids ||
       engine.family_ops.family != ModelFamily::DeepSeek_V41)
     return false;
   const auto &c = engine.model_file.architecture_config;
@@ -1726,7 +1729,7 @@ bool deepseek_v41_full_graph_prepare(StreamingEngine &engine, int S,
 
 bool deepseek_v41_full_graph_run(StreamingEngine &engine, float *hidden_states,
                                  int S, int pos_base, const int *) {
-  if (!v41_env_enabled() || !hidden_states || S <= 1 || pos_base != 0 ||
+  if (!v41_full_graph_enabled() || !hidden_states || S <= 1 || pos_base != 0 ||
       !g_dsv41_graph || !g_dsv41_graph->ready ||
       g_dsv41_graph->engine != &engine || g_dsv41_graph->S != S)
     return false;

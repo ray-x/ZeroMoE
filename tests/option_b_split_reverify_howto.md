@@ -59,11 +59,12 @@ tests unexpectedly report `Skipped (GGML CUDA backend not compiled)`.
 
 ## 4. Config file
 
-`device_expert_layers` (the trailing full-GPU-resident layer-block size —
-the `X` in `X/split/plainCPU` naming) has **no TOML key**; it is env-var
-only (`ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS` /
-`ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1`). Everything else about the
-split lives in the TOML. See `configs/testing/qwen4exp_option_b_rightsize_split44_x0.toml`
+`device_expert_layers` (the whole-GPU-resident layer-block size — the `X`
+in `X/split/plainCPU` naming) is the TOML key
+`graph_device_expert_layers`; the legacy
+`ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS` / `..._PRELOAD_TRAILING` aliases still
+work. Everything else about the split lives in the TOML. See
+`configs/testing/qwen4exp_option_b_rightsize_split44_x0.toml`
 in the main repo for a complete worked example; the load-bearing keys are:
 
 ```toml
@@ -91,8 +92,7 @@ paths resolve from).
 ```bash
 cd /tmp/reverify_wt
 echo "Explain what a binary search tree is and give a short example in Python." | \
-ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1 \
-ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
+ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0 \
 ZEROMOE_BENCH_IGNORE_STOP=1 CUDA_VISIBLE_DEVICES=0 ZEROMOE_CUDA_SCHEDULE=auto \
 ./build_ggmlcuda/zeromoe --config path/to/config.toml --ngen 40
 ```

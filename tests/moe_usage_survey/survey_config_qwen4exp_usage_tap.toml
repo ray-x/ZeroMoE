@@ -5,7 +5,7 @@
 # full-graph's throughput (smoke-tested: ~0.012ms callback overhead/token,
 # steady-state decode unchanged at ~34-36ms/token).
 #
-# Launch with (adds ZEROMOE_QWEN4EXP_FULL_GRAPH=1 vs the older
+# Launch with (full-graph prefill/decode are defaults; the older
 # gpu_stage_test.toml recipe -- decode's full graph requires prefill to have
 # ALSO run through full graph first, to seed GDN/KV/PLE state; this also
 # turns out to give route_freq_prefill real data for free, via the existing
@@ -13,7 +13,6 @@
 # moe_router_service.cpp path even when full-graph prefill is on):
 #   ZEROMOE_SURVEY_BINARY=build_ggmlcuda/zeromoe
 #   CUDA_VISIBLE_DEVICES=0 ZEROMOE_CUDA_SCHEDULE=auto
-#   ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1
 #   ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=22
 #   ZEROMOE_BENCH_IGNORE_STOP=1
 

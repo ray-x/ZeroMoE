@@ -100,8 +100,6 @@ def main():
     for key in ('OMP_WAIT_POLICY', 'GOMP_SPINCOUNT', 'OMP_PROC_BIND', 'OMP_PLACES'):
         env.pop(key, None)
     env.update(CUDA_VISIBLE_DEVICES='0', GGML_CUDA_BF16_MMVF_CUBLAS='0',
-               ZEROMOE_QWEN4EXP_FULL_GRAPH='1',
-               ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE='1',
                ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS='0',
                ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING='1',
                ZEROMOE_QWEN_CPU_THREADS=str(args.threads),

@@ -29,7 +29,6 @@ case "$MODE" in
     # "Tell a story." is 4 tokens; with the chat template the prompt is 16 tokens ([PREFILL-DONE] must say 16)
     rc=0
     printf 'Tell a story.\n:q\n' | env CUDA_VISIBLE_DEVICES=0 \
-      ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1 \
       ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
       ZEROMOE_BENCH_SILENT=1 ZEROMOE_BENCH_IGNORE_STOP=1 \
       timeout 900 "$BIN" --config "$TMP/cfg.toml" > "$LOG.log" 2>&1 || rc=$?
@@ -50,7 +49,6 @@ case "$MODE" in
     nvidia-smi --id=0 --query-gpu=timestamp,memory.used,memory.total --format=csv,noheader,nounits -lms 250 > "$LOG.csv" &
     SP=$!
     echo "Explain briefly the key concepts of neural networks and gradient descent in plain English." | env CUDA_VISIBLE_DEVICES=0 \
-      ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1 \
       ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
       ZEROMOE_TOKEN_LOOP_DIAG=1 ZEROMOE_BENCH_IGNORE_STOP=1 \
       "$BIN" --config "$TMP/cfg.toml" --ngen "$NGEN" > "$LOG.log" 2>&1 || true

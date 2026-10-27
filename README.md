@@ -128,7 +128,7 @@ on NEON.  Configure with `-DZEROMOE_METAL=OFF` for a NEON-only build.
 
 #### ggml-cuda / full-graph decode build
 
-Every CUDA build links ggml's CUDA backend, so the ggml-backed full-graph prefill/decode path (`ZEROMOE_QWEN4EXP_FULL_GRAPH*` env vars at runtime) is always available:
+Every CUDA build links ggml's CUDA backend, so the ggml-backed full-graph prefill/decode path is always available and is the default; no runtime switch is required:
 
 ```bash
 cmake -S . -B build

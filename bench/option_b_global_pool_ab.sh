@@ -38,8 +38,8 @@ run() { # name rep
     if ! pgrep -x zeromoe >/dev/null && [[ -z "$competing" ]]; then break; fi
     sleep 3
   done
-  echo "$PROMPT" | env CUDA_VISIBLE_DEVICES=$GPU ZEROMOE_QWEN4EXP_FULL_GRAPH=1 \
-    ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0 \
+  echo "$PROMPT" | env CUDA_VISIBLE_DEVICES=$GPU \
+    ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0 \
     ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 ZEROMOE_TOKEN_LOOP_DIAG=1 ZEROMOE_BENCH_IGNORE_STOP=1 \
     ../moestream-build-upstream-master/moestream --config "$cfg" --ngen "$NGEN" > "logs/$tag.stdout" 2>&1
   grep TOKEN-LOOP-DIAG "logs/$tag.engine.log" 2>/dev/null |

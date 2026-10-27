@@ -162,7 +162,7 @@ template <class T> struct Field {
 inline const std::vector<Field<long>> &long_fields() {
   using F = Family;
   static const std::vector<Field<long>> t = {
-      {"device_expert_layers", ZEROMOE_SETTINGS_REF(tun.device_expert_layers), 0, Parse::IntStrict,
+      {"device_expert_layers", ZEROMOE_SETTINGS_REF(tun.device_expert_layers), 2, Parse::IntStrict,
        claims_for(F::Qwen),
        {only_family(F::Qwen, "ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS")}, false},
       {"device_expert_trailing", ZEROMOE_SETTINGS_REF(tun.device_expert_trailing), 0, Parse::FlagOn,
@@ -297,7 +297,9 @@ inline bool auto_flag(const std::string &name, Parse p) {
 }
 
 inline bool valid_integer(const std::string &name, long n) {
-  if (name == "device_expert_layers") return n >= 0 && n <= 48;
+  // 0 is the explicit "no whole-layer block" sentinel (global-pool recipe);
+  // an enabled block needs at least 2 complete layers.
+  if (name == "device_expert_layers") return n == 0 || (n >= 2 && n <= 48);
   if (name == "offload_first_layer") return n >= -1 && n <= 1000000;
   if (name == "prefill_min_batch") return n > 0 && n <= 1000000;
   if (name == "offload_pinned_pct") return n >= 0 && n <= 100;
@@ -324,8 +326,8 @@ inline const char *family_name(Family fam) {
 
 inline const char *meaning(const std::string &name) {
   static const std::map<std::string, const char *> descriptions{
-      {"device_expert_layers", "Qwen whole expert layers resident on GPU (0..48); separate from the partial hotset budget."},
-      {"device_expert_trailing", "Place whole GPU-resident expert layers at the end rather than start of the model."},
+      {"device_expert_layers", "Qwen whole expert layers resident on GPU (0, or 2..48); 0 keeps the global-pool placement. Separate from the partial hotset budget."},
+      {"device_expert_trailing", "Place the whole GPU-resident expert block at the end (llama.cpp -ncmoe style) rather than the start; only used when device_expert_layers is nonzero."},
       {"phase_cache_mib", "Optional decode-hot VRAM extension, in MiB; 0 disables it. Additional to the main expert cache."},
       {"phase_cache_reserve_mib", "Free VRAM retained for decode workspace when sizing the phase cache, in MiB."},
       {"cpu_threads_decode", "CPU expert worker count; Qwen uses this as a cap (0 = available threads), MiMo as its team size."},

@@ -2,7 +2,7 @@
 # Derived from the dual-GPU profile; usage frozen OFF and redirected to survey
 # files so the live pin files are not overwritten.
 # DeepSeek-V4.1-Flash dual-GPU full graph profile (context 4096, temperature 0).
-# Enable with ZEROMOE_DEEPSEEK_V41_FULL_GRAPH=1; see docs/deepseek_v41_decode.md.
+# Full graph is the default; see docs/deepseek_v41_decode.md.
 # 3090: 17 GiB main expert cache, 48 active slots, one shared native dense pool.
 # 5060 Ti: 13.5 GiB main expert cache and 16 active slots.
 # DDR: 8360 slots are an upper capacity target; physical-memory admission

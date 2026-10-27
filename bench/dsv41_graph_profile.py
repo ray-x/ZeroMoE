@@ -95,7 +95,6 @@ def main() -> None:
     env = dict(os.environ,
                CUDA_VISIBLE_DEVICES="0,1", NVIDIA_TF32_OVERRIDE="0",
                LD_LIBRARY_PATH=str(args.backend.resolve()),
-               ZEROMOE_DEEPSEEK_V41_FULL_GRAPH="1",
                ZEROMOE_DEEPSEEK_V41_GPU_PREFILL="0" if args.native_reference else "1",
                ZEROMOE_DEEPSEEK_V41_CACHE_MOE_GRAPH="0" if args.native_reference else "1",
                ZEROMOE_DEEPSEEK_V41_NATIVE_F32_GRAPH="0" if args.native_reference else "1")

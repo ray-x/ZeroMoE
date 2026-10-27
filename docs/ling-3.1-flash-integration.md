@@ -20,7 +20,7 @@ router filters to the four selected expert groups before top eight selection.
 The tokenizer recognizes the `bailingmoe2` pre-tokenizer's single-digit split,
 and the interactive prompt path renders Bailing V3's system, human, and
 assistant tags. `Ling31FlashGraphModel` enables the 72-layer GGML graph for
-both prefill and decode when `ZEROMOE_LING_FULL_GRAPH=1`. It reuses the
+both prefill and decode by default. It reuses the
 GLM5Next graph lifecycle and router graph operations with Ling's own KDA,
 RoPE-split MLA, and attention-gate equations. The offload aliases configure
 layers 4–71 to read routed experts from the four GGUF shards, with an 8 GiB

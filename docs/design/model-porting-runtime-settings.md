@@ -99,13 +99,11 @@ For a graph-only model, a zero device-layer request is a likely performance prob
 
 For CPU thread settings, budget all concurrent pools together: `omp_max_threads`, expert-fetch workers, prefetch workers, and any model-specific graph lane. `OMP_NUM_THREADS` influences OpenMP defaults when the config leaves `omp_max_threads` unset; some graph families have their own resolved CPU-thread setting. Avoid setting each pool to all cores independently, which can oversubscribe the host and slow both CPU work and input/output.
 
-Keep the complete launch command with each baseline. For example, a Qwen4Exp graph run uses explicit prefill/decode feature gates and a TOML profile:
+Keep the complete launch command with each baseline. For example, a Qwen4Exp graph run uses the default prefill/decode graph and a TOML profile:
 
 ```sh
 CUDA_VISIBLE_DEVICES=0 \
-ZEROMOE_QWEN4EXP_FULL_GRAPH=1 \
-ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1 \
 ./build/zeromoe --config configs/testing/qwen4exp_3090_only_decode_batched.toml --ngen 8
 ```
 
-That command illustrates feature-gate handling, not a portable placement or memory recipe. Choose the profile and placement values for the target hardware, then verify the resolved values and actual arena in the logs.
+That command illustrates the default graph path, not a portable placement or memory recipe. Choose the profile and placement values for the target hardware, then verify the resolved values and actual arena in the logs.

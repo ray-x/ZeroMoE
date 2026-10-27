@@ -32,13 +32,6 @@ bool prefill_device_state_inputs_enabled(const StreamingEngine &engine) {
          engine.qwen4exp_gpu_stage_layers.empty();
 }
 
-bool env_enabled() {
-  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_FULL_GRAPH");
-  if (v && v[0])
-    return v[0] == '1';
-  return g_config_full_graph;
-}
-
 bool env_decode_borrow_prefill_arenas() {
   const char *v =
       zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_DECODE_RECREATE_GRAPH_ARENA");
@@ -47,11 +40,27 @@ bool env_decode_borrow_prefill_arenas() {
 
 int env_device_expert_layers() {
   const auto &s = zeromoe::graphsettings::settings_for(zeromoe::graphsettings::Family::Qwen);
-  return static_cast<int>(std::clamp(s.tun.device_expert_layers.value, 0L, 48L));
+  long n = std::clamp(s.tun.device_expert_layers.value, 0L, 48L);
+  // 0 is the explicit "no whole-layer block" sentinel (the global-pool recipe
+  // uses it).  Any enabled block needs at least two complete layers: one layer
+  // cannot amortize the per-layer device arena and made the 5060 Ti decline the
+  // dense-arena path (docs/handoff-2026-10-03-option-b-global-pool.md).
+  if (n == 1) {
+    static bool warned = false;
+    if (!warned) {
+      LOG_WARN("[GRAPH-SETTINGS] device_expert_layers=1 raised to 2; "
+               "use 0 to disable the whole-layer block\n");
+      warned = true;
+    }
+    n = 2;
+  }
+  return static_cast<int>(n);
 }
 
-// Matches llama.cpp's `-ncmoe N` convention (GPU-resident block at the END
-// of the model) instead of ZeroMoE's historical leading-N convention.
+// Placement side of device_expert_layers.  false (default) keeps ZeroMoE's
+// historical leading-N block; true matches llama.cpp's `-ncmoe N` convention
+// and puts the same number of complete layers at the END of the network.
+// It has no effect when device_expert_layers is 0.
 // See FullGraph::device_expert_trailing's own comment.
 bool env_device_expert_trailing() {
   return zeromoe::graphsettings::settings_for(zeromoe::graphsettings::Family::Qwen)
@@ -217,13 +226,6 @@ std::chrono::milliseconds env_storage_wait_timeout() {
 
 bool env_adaptive_completion_policy_enabled() {
   return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_ADAPTIVE_POLICY");
-}
-
-bool env_decode_enabled() {
-  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE");
-  if (v && v[0])
-    return v[0] == '1';
-  return g_config_full_graph_decode;
 }
 
 int env_decode_kv_capacity(int max_t, int required) {

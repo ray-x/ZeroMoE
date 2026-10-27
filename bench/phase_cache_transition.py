@@ -72,7 +72,7 @@ def prepare(model, model_path, directory, isolate_assist=False, gpu0_cache_gb=No
         text = (ROOT / "configs/bench/ling/reference-audit/config.toml").read_text()
         profile = ROOT / "bench/ling/reference-audit/usage-hi-there-robust4.pin"
         text = re.sub(r"^pinned_vram_capacity = .*", "pinned_vram_capacity = 3700", text, flags=re.M)
-        env.update(ZEROMOE_LING_FULL_GRAPH="1", ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL="1",
+        env.update(ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL="1",
                    ZEROMOE_FULL_GRAPH_USAGE_FILE=str(profile), ZEROMOE_GLM5NEXT_DYNAMIC_CACHE="0",
                    ZEROMOE_GLM5NEXT_GPU_ASSIST="3", ZEROMOE_GLM5NEXT_ASSIST2_SLOTS="1",
                    ZEROMOE_GLM5NEXT_CPU_THREADS="10", ZEROMOE_GLM5NEXT_EARLY_READY="1",

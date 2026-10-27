@@ -290,7 +290,9 @@ bool gpu_assist_layer_ok(const FullGraph &g, int layer) {
 } // namespace glm5next_graph
 
 bool ling_full_graph_enabled() {
-  return zeromoe::graphcfg::flag_on("ZEROMOE_LING_FULL_GRAPH");
+  // Ling's full graph is the default.  ZEROMOE_LING_NATIVE_GRAPH still selects
+  // the cache-backed implementation over the shared GLM5Next graph.
+  return true;
 }
 
 #endif // ZEROMOE_USE_GGML_CUDA

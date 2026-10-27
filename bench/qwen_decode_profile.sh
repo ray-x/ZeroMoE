@@ -11,7 +11,6 @@ while [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]; do 
 sed "s#^log_path *=.*#log_path = \"$out/$tag.engine.log\"#" "$toml_src" > "$out/$tag.toml"
 printf 'Explain briefly the key concepts of neural networks and gradient descent in plain English.\n:q\n' | \
   env CUDA_VISIBLE_DEVICES=0 GGML_CUDA_BF16_MMVF_CUBLAS=0 \
-  ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1 \
   ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
   ZEROMOE_QWEN_CPU_THREADS=10 ZEROMOE_BENCH_IGNORE_STOP=1 ZEROMOE_TOKEN_LOOP_DIAG=1 \
   ZEROMOE_PROMPT_TOKEN_INPUT_FILE="$prompt_ids" ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT=1 \

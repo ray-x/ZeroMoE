@@ -2,8 +2,9 @@
 
 ## Implementation
 
-Ling 3.1 Flash (`bailingmoe3`) has an opt-in full-graph path through
-`ZEROMOE_LING_FULL_GRAPH=1 ZEROMOE_LING_NATIVE_GRAPH=1`. It builds one
+Ling 3.1 Flash (`bailingmoe3`) runs the full graph by default; the
+cache-backed implementation is selected with `ZEROMOE_LING_NATIVE_GRAPH=1`
+(the old `ZEROMOE_LING_FULL_GRAPH` gate was removed). It builds one
 CPU callback node per layer and delegates attention, dense FFN, and MoE work
 to the existing `FamilyOps`, `dense_ffn_gguf`, and `moe_forward_gguf` paths.
 The graph owns no expert storage. RAM and VRAM expert ownership stays with
@@ -157,9 +158,9 @@ source changed.
 The 32-token A/B used the same raw two-token `Hi there` prompt that generated
 the fixed usage profile, `/tmp/ling-3.1-flash-usage-fullgraph.pin` (5,879
 records). The profile was left unchanged. Context was 64, generation was
-greedy, and the opt-in flags were
-`ZEROMOE_LING_FULL_GRAPH=1`, `ZEROMOE_LING_NATIVE_GRAPH=1`, and
-`ZEROMOE_LING_HYBRID_CUDA_GRAPH=1`.
+greedy, and the opt-in selectors were `ZEROMOE_LING_NATIVE_GRAPH=1` and
+`ZEROMOE_LING_HYBRID_CUDA_GRAPH=1` (the family-wide full-graph gate no longer
+exists).
 
 The test used `host_ram_gb=90`, `MemoryMax=100G`, and `MemorySwapMax=0`.
 Startup admitted 116.9 GB available against the engine's 111.5 GB requirement.

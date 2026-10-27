@@ -35,7 +35,7 @@ while pgrep -x zeromoe >/dev/null || [[ -n "$(nvidia-smi --id="$GPU" --query-com
 nvidia-smi --id="$GPU" --query-gpu=timestamp,memory.used,memory.total --format=csv,noheader,nounits -lms 250 > "logs/$TAG.csv" &
 SP=$!
 printf '%s\n%s\n%s\n%s\n%s\n:q\n' "$SHORT" "$LONG" "$SHORT" "$LONG" "$SHORT" | env \
-  CUDA_VISIBLE_DEVICES=$GPU ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1 \
+  CUDA_VISIBLE_DEVICES=$GPU \
   ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 ZEROMOE_TOKEN_LOOP_DIAG=1 \
   ../moestream-build-upstream-master/moestream --config "$TMP/cfg.toml" --ngen "$NGEN" > "logs/$TAG.stdout" 2>&1 || true
 kill $SP 2>/dev/null || true

@@ -77,8 +77,6 @@ def main():
         env.pop(key, None)
     env.update({
         "CUDA_VISIBLE_DEVICES": "0",
-        "ZEROMOE_QWEN4EXP_FULL_GRAPH": "1",
-        "ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE": "1",
         "ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS": "0",
         "ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING": "1",
         "ZEROMOE_QWEN_CPU_THREADS": str(args.threads),

@@ -39,9 +39,8 @@ def run(binary, cfg_text, name, workdir, env_extra, prompt, timeout):
     out = os.path.join(workdir, name + ".out")
     with open(cfg, "w") as f:
         f.write(re.sub(r'(?m)^log_path.*', f'log_path = "{log}"', cfg_text))
-    env = dict(os.environ, ZEROMOE_QWEN4EXP_FULL_GRAPH="1",
-               ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE="1",
-               ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING="1", **env_extra)
+    env = dict(os.environ, ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING="1",
+               **env_extra)
     with open(out, "w") as o:
         rc = subprocess.run([binary, "--config", cfg], input=prompt, text=True,
                             stdout=o, stderr=subprocess.STDOUT, env=env,

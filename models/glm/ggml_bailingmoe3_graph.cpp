@@ -183,8 +183,9 @@ std::unique_ptr<LingNativeGraph> build_graph(StreamingEngine &engine, int S,
 
 bool bailingmoe3_native_graph_enabled() {
 #if defined(ZEROMOE_USE_GGML_CUDA)
-  return zeromoe::graphcfg::flag_on("ZEROMOE_LING_FULL_GRAPH") &&
-         zeromoe::graphcfg::flag_on("ZEROMOE_LING_NATIVE_GRAPH");
+  // The family-wide full graph is always on; this flag only chooses the
+  // cache-backed native implementation over the shared GLM5Next graph.
+  return zeromoe::graphcfg::flag_on("ZEROMOE_LING_NATIVE_GRAPH");
 #else
   return false;
 #endif

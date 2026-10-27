@@ -36,7 +36,7 @@ int main(int argc, char **argv) {
       }
     });
     CHECK(reference.find("mimo2=512") != std::string::npos);
-    CHECK(reference.find("qwen4exp=0") != std::string::npos);
+    CHECK(reference.find("qwen4exp=2") != std::string::npos);
     std::string error;
     resolve_settings(Family::MiMo2, env_of({}), &error, {{"cpu_threads_decode", "0"}});
     CHECK(!error.empty());
@@ -107,8 +107,14 @@ int main(int argc, char **argv) {
     CHECK(validate_config(config, {Family::MiMo2}, error));
     auto q = resolve_settings(Family::Qwen, env_of({}));
     CHECK(q.tun.cpu_threads_decode.value == 0);
-    CHECK(q.tun.device_expert_layers.value == 0 && q.tun.device_expert_trailing.value == 0);
+    CHECK(q.tun.device_expert_layers.value == 2 && q.tun.device_expert_trailing.value == 0);
     CHECK(settings_findings(q).empty());
+    // 0 is the explicit no-whole-layer sentinel; one enabled layer is not.
+    auto no_block = resolve_settings(Family::Qwen, env_of({}), nullptr,
+                                     {{"device_expert_layers", "0"}});
+    CHECK(no_block.tun.device_expert_layers.value == 0);
+    error.clear();
+    CHECK(!validate_config({{"device_expert_layers", "1"}}, {Family::Qwen}, error));
     q = resolve_settings(Family::Qwen, env_of({}), nullptr,
                          {{"device_expert_layers", "8"}, {"device_expert_trailing", "true"}});
     CHECK(q.tun.device_expert_layers.value == 8 && q.tun.device_expert_trailing.value == 1);
@@ -118,7 +124,8 @@ int main(int argc, char **argv) {
     CHECK(q.tun.device_expert_trailing.value == old.tun.device_expert_trailing.value);
     for (const auto &contents : {
         "graph_cpu_threads_decode = 12x", "graph_cpu_threads_decode = true",
-        "graph_device_expert_layers = 49", "graph_device_expert_trailing = 1",
+        "graph_device_expert_layers = 49", "graph_device_expert_layers = 1",
+        "graph_device_expert_trailing = 1",
         "graph_offload_pin = \"false\"", "graph_prefill_op_offload = 1",
         "graph_typo = 1", "graph_offload_pin_dma = 1",
         "graph_offload_pin_dma = \"true\"", "[[gpus]]\ngraph_cpu_threads_decode = 4"}) {
@@ -136,7 +143,7 @@ int main(int argc, char **argv) {
       CHECK(validate_config(values, {Family::Other, Family::Qwen}, error));
       auto settings = resolve_settings(Family::Qwen, env_of({}), nullptr, values);
       CHECK(settings.tun.device_expert_layers.value == 0);
-      CHECK(settings.tun.device_expert_trailing.value == 1);
+      CHECK(settings.tun.device_expert_trailing.value == 0);
     }
     ConfigValues values;
     error.clear();

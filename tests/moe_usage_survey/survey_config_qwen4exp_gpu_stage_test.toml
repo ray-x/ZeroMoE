@@ -7,7 +7,6 @@
 # Launch with (matches the verified recipe exactly):
 #   ZEROMOE_SURVEY_BINARY=build_ggmlcuda/zeromoe
 #   CUDA_VISIBLE_DEVICES=0 ZEROMOE_CUDA_SCHEDULE=auto
-#   ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1
 #   ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=22
 #   ZEROMOE_BENCH_IGNORE_STOP=1 (forces exactly --ngen tokens/response --
 #   verified coherent continuation on this fixed build, not the degenerate

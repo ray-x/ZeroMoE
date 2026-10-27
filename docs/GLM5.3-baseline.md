@@ -28,7 +28,7 @@ Environment recipe (set by `bench/glm53/run_ab.sh` + `run_dsa_graph2gpu.sh`):
 
 | Variable | Value | Role |
 |---|---|---|
-| `ZEROMOE_GLM_DSA_FULL_GRAPH`, `_PREFILL` | 1 | full ggml graph for decode and prefill (strict: a failed graph fails the request) |
+| ~~`ZEROMOE_GLM_DSA_FULL_GRAPH`, `_PREFILL`~~ | removed | full ggml graph for decode and prefill is the default (strict: a failed graph fails the request) |
 | `ZEROMOE_GLM_DSA_CPU_LANE` | 1 | CPU lane runs the cold experts while the GPU runs the rest |
 | `ZEROMOE_GLM5NEXT_GPU1_HOT_GIB` | 22 | VRAM hot-expert set (23 GiB does not fit; Trial 37) |
 | `OFFLOAD_DDR_GIB` | 64 (74 for long prompts) | DDR expert pool |

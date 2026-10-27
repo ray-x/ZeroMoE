@@ -12554,8 +12554,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "DeepSeek: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-27: v41_full_graph_enabled() returns true; DeepSeek-V4.1 prefill always uses the graph. The separate ZEROMOE_DEEPSEEK_V41_FULL_GRAPH_DECODE=0 native-decode comparison remains and now defaults to enabled.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0112"
     },
@@ -30546,8 +30546,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "GLM: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-27: GlmDsaGraphModel::enabled() no longer reads an environment variable; the graph is the default for both phases. MTP remains the only opt-out because the adapter has no speculative graph decode.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0294"
     },
@@ -30620,8 +30620,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "GLM: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-27: GLM-DSA batched prefill now defaults to the graph together with decode; the separate _PREFILL gate was deleted.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0295"
     },
@@ -31173,8 +31173,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Ling: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-27: ling_full_graph_enabled() returns true; the family-wide full graph is always on. ZEROMOE_LING_NATIVE_GRAPH still selects the cache-backed native graph over the shared GLM5Next graph, and the hybrid flag still selects the hybrid implementation.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0302"
     },
@@ -40330,8 +40330,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-27: Qwen4Exp full-graph prefill is always enabled. The env reader env_enabled() was deleted; g_config_full_graph defaults true and is set only from the TOML qwen4exp_full_graph key, which remains an explicit fallback/diagnostic opt-out.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0372"
     },
@@ -40580,8 +40580,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-27: Qwen4Exp full-graph decode is always enabled with prefill. The env reader env_decode_enabled() was deleted; g_config_full_graph_decode defaults true and is set only from TOML qwen4exp_full_graph_decode, which remains an explicit fallback.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0373"
     },
@@ -43134,7 +43134,7 @@
       ],
       "affected_if_removed": "Qwen: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner.cpp, core/engine_runner_cache.cpp, models/glm/ggml_glm5next_graph.cpp, models/glm/ggml_glm5next_graph_arena.cpp (+11 other files).",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
+      "review_decision": "KEPT 2026-10-27 as a legacy alias for graph_device_expert_layers: the default is now 2; 0 is the explicit no-whole-layer/global-pool sentinel; an enabled block must be at least 2 layers (env value 1 is raised to 2 with a warning, TOML 1 is rejected).",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0386"
@@ -43869,7 +43869,7 @@
       ],
       "affected_if_removed": "Qwen/Ling: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner.cpp, core/engine_runner_cache.cpp, models/graph/full_graph_models.cpp, models/graph/graph_settings.hpp (+5 other files).",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
+      "review_decision": "KEPT 2026-10-27 as a legacy alias for graph_device_expert_trailing: default false (leading block). It matches llama.cpp's -ncmoe trailing convention when set, and has no effect when device_expert_layers is 0.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0388"
