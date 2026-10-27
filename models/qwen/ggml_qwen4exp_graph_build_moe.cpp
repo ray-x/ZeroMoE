@@ -1067,7 +1067,7 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         early->gpu_input = fork;
         input3 = ggml_reshape_3d(ctx, fork, g.D, 1, g.S);
         ggml_build_forward_expand(g.graph, fork);
-        const char *predict = g.S == 1 ? zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_PREDICT") : nullptr;
+        const char *predict = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_PREDICT");  // also for windows (lane on)
         const char *target = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_PREDICT_LAYER");
         const char *stage = g.S == 1 ? zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_STAGE_LAYER") : nullptr;
         const bool stage_next = stage &&

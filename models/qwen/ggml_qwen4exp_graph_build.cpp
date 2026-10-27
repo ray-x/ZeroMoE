@@ -28,7 +28,8 @@ static ggml_tensor *build_qwen35moe_graph_layer(FullGraph &g,
   const std::string p = "blk." + std::to_string(layer) + ".";
   auto probe = [&](const char *label, ggml_tensor *value) {
     if (!value || !g.graph ||
-        !zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP"))
+        !zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP") ||
+        zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_ROUTER_ONLY"))
       return;
     const std::string name = "qwen35_" + std::string(label) + "_" +
                              std::to_string(layer);

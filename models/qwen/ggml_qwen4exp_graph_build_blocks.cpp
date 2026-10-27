@@ -69,7 +69,8 @@ ggml_tensor *build_gdn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   ggml_tensor *qkv = ggml_mul_mat(ctx, w_qkv, cur);
   auto diag = [&](const char *label, ggml_tensor *value) {
     if (!value || !g.graph ||
-        !zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP"))
+        !zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP") ||
+        zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_ROUTER_ONLY"))
       return;
     const std::string name = "qwen35_" + std::string(label) + "_" +
                              std::to_string(layer);

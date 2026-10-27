@@ -50,3 +50,43 @@ Palindrome, 463 tokens, 5.9% of routed evaluations cold. Scored on the cold eval
 * Effect on output: a prediction only chooses what to stage or precompute, never the routing, so its only
   effect on text is the CPU-versus-GPU rounding path, the same class as promotion. Measuring that needs the
   teacher-forced gate (side session); it has not been run for promotion or prediction.
+
+## 4. Same predictor in an MTP window (apples to apples)
+
+Router lookahead inside a verify window (lane on, `ZEROMOE_QWEN4EXP_WINDOW_LANE=1`, palindrome, 18,941 samples):
+recall@10 64.8%, cold recall 45.7%, cold precision 26.0% - the same as plain decode (64.9% / 44.1% / 24.3%).
+The lower numbers in section 2 are the history predictors, which see less than the router lookahead (no
+activations of the token being processed).
+
+## 5. Can accuracy be improved?
+
+**Ridge correction** (`bench/qwen_ridge_export.py`, learned `(x - mu) R + c` added to the pilot scores). Fitted on
+router activation dumps of six prompts (`~/Projects/ZeroMoE-results/promotion-study/ridge/`; 300 decode tokens
+each, router taps only via `ZEROMOE_QWEN4EXP_PROBE_ROUTER_ONLY=1`):
+* held-out top-3 hit rate, mean over layers: 90.7% -> 92.8% (story held out); 84.9% -> 89.5% (leetcode held
+  out, fit on five prompts). Gains concentrate in a few layers (1, 5, 9, 12, 25, 42, 47: +5 to +16 points).
+* In the engine on the never-seen story prompt (fit on five other prompts), cold-expert prediction got
+  **worse**: cold recall 61.5% -> 57.4%, cold precision 38.3% -> 28.2%. The fit optimizes top-3 hits, not cold
+  top-10 recall, so it is not the right objective for staging. Not recommended as exported.
+
+**Predictor variants** (`tools/expert_predictor_variants.py`; offline from the dumps, static hot set, six
+prompts; recall = share of cold evaluations predicted):
+
+| predictor | cold recall | precision | experts / token / layer |
+|---|---|---|---|
+| baseline: pilot top-10, cold part | 64.2% | 53.1% | 2.79 |
+| top-1 / 2 / 3 / 4 / 6 cold by pilot | 21 / 36 / 48 / 57 / 70% | 49 / 42 / 37 / 33 / 27% | 1-6 |
+| pilot prob >= 0.05 / 0.02 | 1.1 / 10.7% | 77.6 / 88.8% | 0.03 / 0.28 |
+| history: cold missed >=2x in last 32 tokens | 65.3% | 13.6% | 11.1 |
+| top-3 cold by pilot UNION history | 80.2% | 14.2% | 13.1 |
+| top-6 cold by pilot UNION history | 87.0% | 13.1% | 15.4 |
+
+* Restricting to the top-m cold experts is worse per expert than filtering the overall top-10 (48% recall at 3
+  experts vs 64% at 2.79). Confident predictions are accurate but rare (the router softmax over 512 experts is
+  flat: almost nothing reaches 0.1). Combining the pilot with recent-miss history reaches 80-87% recall, but with
+  13-15 experts per layer and token, about 600-700 per token.
+* Staging by copy is out of reach: even the baseline set would copy ~134 experts per token (~185 MB), against
+  the ~12 promotions (~17 MB) per token that decode tolerates. What a predictor could still serve is starting
+  the CPU work on the likely cold experts early, while the GPU runs attention: the baseline would move 64% of
+  the cold compute to idle CPU time at the price of about 1.3 wasted expert evaluations per layer and token.
+  That has not been built or measured.

@@ -148,27 +148,28 @@ void qwen4exp_promotion_step(FullGraph &g, int tokens) {
           std::fprintf(trace, " %d:%d", ids[k], ids[k] >= 0 && ids[k] < c.n_experts && policy.resident(l, ids[k]) ? 1 : 0);
         std::fputc('\n', trace);
       }
-      // next-layer prediction (early-ready lane, single-token decode only): predicted vs actual for layer l+1
-      if (g.S == 1) {
+      // next-layer prediction (early-ready lane): layer l's lane predicted layer l+1's routing for each of its tokens
+      {
         const auto lane = g.early_ready.find(l);
         if (lane != g.early_ready.end() && lane->second->prediction && l + 1 < g.n_layers &&
             lane->second->prediction_layer == l + 1 && policy.slots(l + 1) > 0) {
-          int32_t pred[64] = {};
           const int k = std::min<int>(c.topk, 64);
-          if (ggml_nbytes(lane->second->prediction) >= static_cast<size_t>(k) * sizeof(int32_t)) {
-            ggml_backend_tensor_get(lane->second->prediction, pred, 0, static_cast<size_t>(k) * sizeof(int32_t));
-            const int32_t *actual = &g.promo_ids_host[static_cast<size_t>(l + 1) * c.topk];
+          std::vector<int32_t> pred(static_cast<size_t>(k) * g.S);
+          if (ggml_nbytes(lane->second->prediction) >= pred.size() * sizeof(int32_t)) {
+            ggml_backend_tensor_get(lane->second->prediction, pred.data(), 0, pred.size() * sizeof(int32_t));
+            const int32_t *mine = &pred[static_cast<size_t>(t) * k];
+            const int32_t *actual = &g.promo_ids_host[static_cast<size_t>(t) * row + static_cast<size_t>(l + 1) * c.topk];
             ++g_pred.layers_tokens;
             for (int i = 0; i < k; ++i) {
-              const bool in_pred = std::find(pred, pred + k, actual[i]) != pred + k;
+              const bool in_pred = std::find(mine, mine + k, actual[i]) != mine + k;
               const bool cold = actual[i] >= 0 && actual[i] < c.n_experts && !policy.resident(l + 1, actual[i]);
               ++g_pred.actual; g_pred.hit += in_pred;
               if (cold) { ++g_pred.actual_cold; g_pred.cold_hit += in_pred; }
             }
             for (int i = 0; i < k; ++i) {
-              if (pred[i] < 0 || pred[i] >= c.n_experts || policy.resident(l + 1, pred[i])) continue;
+              if (mine[i] < 0 || mine[i] >= c.n_experts || policy.resident(l + 1, mine[i])) continue;
               ++g_pred.predicted_cold;
-              g_pred.predicted_cold_used += std::find(actual, actual + c.topk, pred[i]) != actual + c.topk;
+              g_pred.predicted_cold_used += std::find(actual, actual + c.topk, mine[i]) != actual + c.topk;
             }
           }
         }
