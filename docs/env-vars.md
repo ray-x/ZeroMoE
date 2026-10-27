@@ -48,8 +48,8 @@ decode default to the graph; placement uses `graph_device_expert_layers` and
 
 | Variable | Set to | Effect |
 | --- | --- | --- |
-| ~~`ZEROMOE_QWEN4EXP_FULL_GRAPH`~~ | removed | Full-graph prefill is always enabled. A TOML `qwen4exp_full_graph = false` is the only explicit fallback. |
-| ~~`ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE`~~ | removed | Full-graph decode is always enabled together with prefill. A TOML `qwen4exp_full_graph_decode = false` is the only explicit fallback. |
+| ~~`ZEROMOE_QWEN4EXP_FULL_GRAPH`~~ | removed | Full-graph prefill is the default. TOML `qwen4exp_full_graph = false` is the only opt-out; set the decode key false too for a fully layered fallback. |
+| ~~`ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE`~~ | removed | Full-graph decode is the default. TOML `qwen4exp_full_graph_decode = false` keeps graph prefill and selects layered decode. |
 | `ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS` | `2` | Whole layers preloaded to VRAM. `0` explicitly disables the whole-layer block (the global-pool recipe uses this); an enabled block must be at least `2` layers, and values above 48 are capped at 48. Legacy alias for `graph_device_expert_layers`. |
 | `ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING` | `0` | Place the whole GPU-resident block at the end of the network (llama.cpp `-ncmoe` style) instead of the start. Only has an effect when `GRAPH_PRELOAD_LAYERS` is nonzero. Legacy alias for `graph_device_expert_trailing`. |
 | `ZEROMOE_QWEN4EXP_PREFILL_OP_OFFLOAD` | `1` (default) | Run host-resident experts on the GPU during prefill, by copying the batch's experts across. `0` keeps them on the CPU. |

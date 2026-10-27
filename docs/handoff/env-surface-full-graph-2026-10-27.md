@@ -17,7 +17,7 @@
 
 | Family | Prefill graph | Decode graph | Explicit fallback / selector |
 | --- | --- | --- | --- |
-| Qwen4Exp | on by default | on by default | TOML `qwen4exp_full_graph=false` and/or `qwen4exp_full_graph_decode=false`; both remain documented diagnostic/fallback paths. |
+| Qwen4Exp | on by default | on by default | TOML is the only opt-out. `qwen4exp_full_graph_decode=false` alone keeps graph prefill and selects layered decode; to select layered prefill as well, set both keys false (prefill false with decode still true is rejected as an inconsistent request). |
 | GLM-DSA | on by default | on by default | `engine.mtp_enabled` keeps the layered path; the adapter has no speculative graph decode. |
 | Ling 3.1 Flash | on by default | on by default | `ZEROMOE_LING_NATIVE_GRAPH` selects the cache-backed native graph; without it the shared GLM5Next graph is used. `ZEROMOE_LING_HYBRID_CUDA_GRAPH` still selects the hybrid implementation. |
 | DeepSeek-V4.1 | on | on by default | `ZEROMOE_DEEPSEEK_V41_FULL_GRAPH_DECODE=0` selects native decode while graph prefill stays on. `engine.mtp_enabled` also opts out. |
