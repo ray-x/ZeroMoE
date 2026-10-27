@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <atomic>
 #include "expert_promotion.hpp"
+#include "cold_ffn_fused.hpp"
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -492,6 +493,8 @@ struct FullGraph : zeromoe::graph::GraphCore {
   std::unique_ptr<std::ofstream> early_route_trace;
   std::unique_ptr<Qwen4ExpStageShapeClassPool> early_stage_shapes;
   std::vector<std::unique_ptr<Qwen4ExpStagePool>> early_stage_pools;
+  // Scratch of the fused cold-expert ops (one per layer); the graph nodes hold raw pointers into these.
+  std::vector<std::shared_ptr<qwen4exp_cold::Context>> cold_fused;
   // Per-layer CPU timing instrumentation (env: ZEROMOE_QWEN4EXP_GRAPH_
   // LAYER_TIMING=1). Uses ggml_backend_sched_set_eval_callback, which fires
   // synchronously around each CPU-backend node's real compute (ggml-cpu has
@@ -916,6 +919,7 @@ std::vector<std::tuple<int, ggml_tensor *>> layer_input_taps;
     }
     if (early_stage_shapes) early_stage_shapes->shutdown();
     early_stage_pools.clear();
+    cold_fused.clear();
     early_stage_shapes.reset();
     early_ready.clear();
     early_route_trace.reset();

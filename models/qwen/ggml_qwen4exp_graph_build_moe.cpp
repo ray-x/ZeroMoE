@@ -675,6 +675,12 @@ bool exl3_ggml_bridge_requested(const FullGraph &g, int layer,
 // The early-ready CPU lane for multi-token decode windows is opt-in
 // (ZEROMOE_QWEN4EXP_WINDOW_LANE=1): with it on, the text of a window run diverged from plain
 // decoding on the test prompt (investigation open), and it saved only ~2 ms per window.
+// ZEROMOE_QWEN4EXP_COLD_FUSED=1 replaces the cold branch's ggml node chain by one fused CPU node.
+static bool cold_fused_enabled() {
+  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_COLD_FUSED");
+  return v && v[0] == '1';
+}
+
 static bool window_lane_enabled() {
   const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_WINDOW_LANE");
   return v && v[0] == '1';
@@ -1138,14 +1144,32 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         // Submit hot work before the independent private CPU marker.
         ggml_build_forward_expand(g.graph, hot_weighted);
       } else {
-        moe_routed::ExpertWeights cold_w;
-        cold_w.gate = gate_exps;
-        cold_w.up = up_exps;
-        cold_w.down = down_exps;
-        const moe_routed::FfnNodes cold_ffn =
-            moe_routed::expert_ffn(ctx, cold_w, input3, ids_cpu);
-        ggml_tensor *experts_cpu = cold_ffn.down;
-        cold_weighted = ggml_mul(ctx, experts_cpu, weights_cpu);
+        // Opt-in fused cold branch (ZEROMOE_QWEN4EXP_COLD_FUSED=1): one CPU node for the whole branch.
+        // Resident-expert routes and the recorded masks are read from the same host tables as below.
+        ggml_tensor *fused = nullptr;
+        if (cold_fused_enabled() && g.decode_mode && !g.stage_route_ids &&
+            qwen4exp_cold::supported(gate_exps, up_exps, down_exps, c.topk, g.S)) {
+          std::shared_ptr<qwen4exp_cold::Context> owner;
+          fused = qwen4exp_cold::build(
+              ctx, owner, input3, ggml_cont(ctx, ids),
+              ggml_cont(ctx, weights), tab.remap_cpu, tab.mask_cpu, gate_exps, up_exps,
+              down_exps, g.cpu_threads);
+          if (fused) {
+            g.cold_fused.push_back(std::move(owner));
+            ggml_backend_sched_set_tensor_backend(g.sched, fused, g.cpu);
+            cold_weighted = fused;
+          }
+        }
+        if (!fused) {
+          moe_routed::ExpertWeights cold_w;
+          cold_w.gate = gate_exps;
+          cold_w.up = up_exps;
+          cold_w.down = down_exps;
+          const moe_routed::FfnNodes cold_ffn =
+              moe_routed::expert_ffn(ctx, cold_w, input3, ids_cpu);
+          ggml_tensor *experts_cpu = cold_ffn.down;
+          cold_weighted = ggml_mul(ctx, experts_cpu, weights_cpu);
+        }
       }
       experts = ggml_add(ctx, hot_weighted, cold_weighted);
     }
