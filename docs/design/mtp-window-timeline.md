@@ -44,3 +44,24 @@ early-ready lane on in windows the picture barely changes (window 52.5 ms under 
 Only a third of the window is GPU compute. The rest is per-layer overhead: launching ~4,600 small kernels
 through 49 graph launches, and the serialized CPU split for the cold experts. Faster GPU kernels would not move
 this; fewer launches/splits and fewer cold experts would.
+
+## Host-side CPU profile (perf, palindrome, MTP + promotion, 3090, 10 OpenMP threads)
+
+`perf record -F 1999` over the decode phase (about 7.3 s, 138k samples, `mtp_prom_run.sh` setup; sampling delayed
+until just before decode). By thread:
+
+| thread | share of its samples |
+|---|---|
+| 9 OpenMP workers (each ~91% of the decode window) | 67% libgomp barrier/spin wait, 33% ggml kernels (essentially all `ggml_vec_dot_q2_0_q8_0`) |
+| main thread | 53% CUDA driver (graph launches, sync polling), 25% ggml kernels, 19% other, 3% spin |
+
+Reading: the Q2_0 cold-expert compute is real work, about 30% of wall time on every worker, which matches the
+~11-12 ms per window the hot-set sweeps attributed to cold experts. The rest of the CPU time is waiting: workers
+spin at a barrier for every small op of the cold branch (about 2-3 cold experts per layer and window) while the
+main thread drives the GPU. The Q2_0 dot already has a ZeroMoE AVX-512 VNNI path (1-row and 4-row variants,
+runtime-dispatched on `avx512vnni`); a faster dot is not the lever. Thread count is not either (6 / 8 / 10 threads
+gave 59.8 / 58.0 / 58.5 tok/s on palindrome and 57.5 / 55.6 / 57.4 on math, inside the noise).
+
+Levers this leaves on the CPU side: fewer cold evaluations (promotion; the hot-set size is capped near 13,000 by
+the draft and window memory: K=13,500 and 14,000 fail draft admission), and fewer barriers per layer by fusing the
+cold branch's ops (gate/up/down matmuls, SwiGLU, activation quantization).
