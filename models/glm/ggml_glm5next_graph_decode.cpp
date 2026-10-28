@@ -519,10 +519,6 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
     op.sched = g.sched;
     op.last = std::chrono::steady_clock::now();
   }
-  if (FILE *rt = route_trace_file()) {
-    std::fprintf(rt, "P %d\n", pos_base);
-    std::fflush(rt);
-  }
   for (auto &entry : g.early_ready) {
     entry.second->residency_ready = false;
     entry.second->completed = false;
@@ -645,10 +641,8 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
   const auto ms = [](auto a, auto b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
   };
-  LOG_INFO("[GGML-GLM5NEXT-FULL-DECODE-TIME] pos=%d sync=%.3f ms "
-           "cache_update=%.3f ms output_get=%.3f ms total=%.3f ms\n",
-           pos_base, ms(start, synced), ms(cache_update_start, cache_update_done),
-           ms(cache_update_done, done), ms(start, done));
+  LOG_INFO("[GGML-GLM5NEXT-FULL-DECODE-TIME] pos=%d total=%.3f ms\n",
+           pos_base, ms(start, done));
   return true;
 }
 
