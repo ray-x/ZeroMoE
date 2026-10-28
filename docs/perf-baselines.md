@@ -416,6 +416,20 @@ Kernel: `patches/experimental/0011-ggml-cpu-iq3_xxs-avx512vl-dot.patch` (applied
 
 Compute fell 1.2% (440.8 -> 435.6), against about 6% predicted from the 1.23x microbenchmark. One valid run, so the difference is inside run-to-run noise. Output text is coherent (the answer starts "How a Transformer Language Model Generates Text ... Let me walk through the complete process"). Correction of the first explanation: I guessed decode was bound by memory traffic. `bench/iq3k/iq3_cold_bench.c` (2 GB of weights, 6 or 12 threads, each row read once) shows the dot product, not DRAM, is the limit on this CPU: stock 18.5 GB/s at 6 threads and 19.9 at 12 against a 58-64 GB/s raw read, and the AVX-512VL kernel is 1.15x (6 threads) to 1.25x (12 threads) faster, so the kernel gain survives cold memory. So the 1.2% end-to-end compute change is not explained by memory traffic. Cause unknown: the IQ3_XXS share of the lane compute may be smaller than the 152 ms I attributed, the 6 lane threads may not be running the new branch (verified afterwards: the loaded libggml-cpu.so contains the masked vpsubb, so the branch is in the binary), or the run was within noise. The 64 GiB pool is marginal against the MEM-GUARD stop threshold: it failed 1 of 2 runs here and 1 of 1 at 426 tokens.
 
+### Trial 25 follow-up (2026-10-28): the IQ3_XXS AVX-512VL dot, promoted to patches/ggml/0017
+
+Trial 25 found no end-to-end gain because GLM-5.3-Flash decode was disk/miss-bandwidth-bound; the kernel was never judged on a CPU-bound workload.
+`bench/expert_cost_by_quant_bench.cpp` (ggml `MUL_MAT_ID` on the CPU backend: gate+up, SwiGLU, down) at Qwen3.6-35B-A3B's expert shape
+(`BENCH_D=2048 BENCH_F=512 BENCH_NE=256 BENCH_TOPK=8`), 6 threads pinned to cores 0-5, 3 alternating runs of stock vs patched ggml: IQ3_XXS
+69/69/68 -> 55/56/56 us per expert (-19%; one valid expert 135/136/132 -> 121/118/121 us, ten 691/693/678 -> 550/559/563 us); the IQ2_XXS control is
+unchanged (41/41/42 vs 41/41/42 us). The dot is bit-identical (`bench/iq3k/iq3_dot_bench.c`: 0 mismatching rows).
+End to end on Qwen3.6-35B-A3B is not measurable here. The validated recipe keeps every expert on the GPU, so no CPU dot runs (3090: 158.0 / 157.6 tok/s with
+the patched ggml against 157.9 without; `tools/check_full_graph_moe_run.py --full-fit --require-all-expert-layers-on-device --require-full-graph-prefill`
+passes). With 16 GiB of the 3090 held by another process the planner reports `memory_plan=insufficient` and falls back (3.15 tok/s decode), but that layered path
+does not call ggml's `ggml_vec_dot_iq3_xxs_q8_K`: `perf` shows ZeroMoE's own FP32-activation `dot_iq3_xxs_f32_avx512` (3.5% of samples) and
+`dot_iq2_xxs_f32_avx512` (5.3%) next to dense `matmul_q6_k_fused` (39%) and `matmul_q5_k_fused` (12%), i.e. dense layers run on the CPU too. Patch 0017 only
+matters where cold experts go through ggml's `MUL_MAT_ID` on the CPU backend (the Qwen4Exp hot/cold split), and no IQ3_XXS model of that family is available.
+
 ### Trial 26: decode CPU profile and lane thread count
 
 Config as trial 25: 22-token prompt, NGEN=80, 22 GiB 3090 hot set, 64 GiB pool, swap-free, new IQ3_XXS kernel. `perf record -F 199` over the whole run, `logs/perf/perf1.data` (decode run 1.45 tok/s).

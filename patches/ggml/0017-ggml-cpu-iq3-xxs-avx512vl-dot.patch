@@ -1,5 +1,12 @@
---- a/ggml/src/ggml-cpu/arch/x86/quants.c
-+++ b/ggml/src/ggml-cpu/arch/x86/quants.c
+ggml-cpu: AVX-512BW/VL IQ3_XXS x Q8_K dot with block-expanded signs
+
+The 8 sign words and 8 scales of a block are expanded once (four 7-bit sign indices per word become one byte each,
+bit 7 is the parity of the other seven) and applied with a masked subtract, replacing the keven_signs lookups and
+_mm256_sign_epi8, as in the IQ2_XXS kernel (0009). Same integer arithmetic as the AVX2 path: bit-identical results
+(bench/iq3k/iq3_dot_bench.c: 0 mismatching rows over 4096 x 4096), 1.26-1.33x faster on one core.
+
+--- a/src/ggml-cpu/arch/x86/quants.c
++++ b/src/ggml-cpu/arch/x86/quants.c
 @@ -3521,7 +3521,65 @@
  
      const int nb = n / QK_K;
