@@ -27,7 +27,6 @@ struct GpuConfig {
   double vram_gb = 0.0;      // Usable VRAM budget (0 = auto-detect)
   double dense_gb = 0.0;     // GB reserved for dense layers
   double kv_cache_gb = 0.0;  // GB reserved for KV cache
-  int kv_bits = 4;           // KV cache quantization (4 or 32)
   double moe_cache_gb = 0.0; // GB reserved for expert LRU cache
   // > 0: size the cache to FILL the VRAM that dense weights, KV and graph workspace do not claim, ignoring
   // moe_cache_gb (so a copied or stale config cannot waste memory). Dual-role GPU: cache = free VRAM after the
@@ -142,22 +141,6 @@ struct EngineConfig {
   // (should collapse toward ~0 when this is on) and overall Prefill
   // wall-clock before trusting it. See CLAUDE.md.
   bool prefill_warm_via_prefetcher = false;
-
-  // Only meaningful when prefill_warm_via_prefetcher is also true --
-  // separately gates the cross-layer opportunistic RAM->VRAM promotion
-  // follow-up (LayerScratch::pending_prefill_promotions,
-  // execution_layer.cpp) from the hint-pushing itself.
-  //
-  // REAL A/B, CONCLUSIVE, DEFAULT OFF (2026-08-12): four runs ON all
-  // landed at prefill=0.56 tok/s; OFF landed at 0.60, matching the
-  // pre-feature baseline. Root cause confirmed: this pass and Phase 2's
-  // own hint-pushing loop compete for the same free-VRAM-slot budget --
-  // running eager promotion first starves later layers of hints
-  // entirely (n_prefill_hint_pushed nearly halved, 420 vs ~930 ON vs
-  // OFF), losing the RAM-prefetch overlap the whole feature exists to
-  // provide. See engine.hpp's mirror of this field for the full
-  // writeup, and CLAUDE.md.
-  bool prefill_opportunistic_promote = false;
 
   // Decode-time analogue of prefill's own upload_expert_active_async +
   // sync_active_layer_batch pre-warm (see execution_layer.cpp's Phase-3
@@ -341,13 +324,6 @@ struct EngineConfig {
   // families and provide a clean A/B.
   bool glm5next_dense_prefill_fusion = false;
 
-  // qwen4exp_attn_gpu / qwen4exp_gdn_gpu: DEPRECATED NO-OPS. The layered
-  // dense-attention and chunkwise-GDN CUDA paths were removed (Qwen4Exp runs
-  // as a ggml full graph; kernels are in obsolete/cuda). The keys are still
-  // parsed so existing configs load; the values are ignored.
-  bool qwen4exp_attn_gpu = false;
-  bool qwen4exp_gdn_gpu = false;
-
   // qwen4exp_gdn_conv_gpu: GDN's causal short conv + SiLU on the GPU
   // (cuda/gdn_conv1d.cu), replacing attn_causal_conv1d_silu's CPU AVX-512
   // path. MEASURED 2026-09-05: conv was 0.43-0.46s of a ~5.0s p=512 prefill
@@ -399,9 +375,7 @@ struct EngineConfig {
 
   // Qwen4Exp-only decode path: use the grouped GGML/CUDA MUL_MAT_ID routed
   // FFN for S==1, collapsing the per-token/per-expert cache and dispatch
-  // loop into one graph submission per MoE layer. Separate from the older
-  // CPU-oriented moe_decode_batched experiment, which is not appropriate
-  // for Qwen IQ1_M. Default off for every model/config.
+  // loop into one graph submission per MoE layer. Default off for all models.
   bool qwen4exp_decode_ggml_moe = false;
   // Qwen4Exp-only full-graph decode topology experiment. A complete
   // preloaded DDR arena may use one scheduler graph containing the CUDA
@@ -419,9 +393,6 @@ struct EngineConfig {
   // retain the existing direct-slab path unless the diagnostic environment
   // override is used.
   bool qwen4exp_decode_batch_stage = false;
-  // Qwen-only exact-Q8 HC decode kernels. Off by default and ignored by all
-  // other model families.
-  bool qwen4exp_decode_custom_hc_q8 = false;
   // Qwen-only HC [D,S] result readback for CPU-routed layers. When enabled,
   // the producer event is waited on by a reusable nonblocking CUDA copy
   // stream and the D2H copy lands in pinned staging memory before the CPU
@@ -432,7 +403,6 @@ struct EngineConfig {
   // than the AVX-512 host router for decode on the RTX 3090. Keep this opt-in
   // so enabling the GPU router for prefill does not force the slower decode
   // boundary. The Qwen prediction pilot has its own GPU-router path.
-  bool qwen4exp_decode_gpu_router = false;
   // Qwen4Exp-only grouped CPU fallback for explicitly selected
   // cpu_affinity_layers. Other model families never consult this switch.
   bool qwen4exp_cpu_ggml_moe = false;
@@ -468,11 +438,6 @@ struct EngineConfig {
   // experiment can be enabled without changing the baseline configuration.
   bool qwen4exp_cpu_offload = false;
   std::vector<int> qwen4exp_cpu_offload_layers;
-  // Force the first N routed slots cold for a deterministic A/B while keeping
-  // the router's IDs and weights unchanged.  A fixed expert ID can be forced
-  // instead with qwen4exp_cpu_offload_force_expert.
-  int qwen4exp_cpu_offload_force_cold_count = 0;
-  int qwen4exp_cpu_offload_force_expert = -1;
   // Milestone B: queue the CPU result through a pinned host/device ring and
   // fence the shared CUDA stream on the copy event.  Milestone A remains the
   // default until the event protocol has been A/B validated.
@@ -768,59 +733,6 @@ struct EngineConfig {
   // PCIe cost per-token far better than a lone S=1 GEMV does).
   int cpu_offload_max_experts = 0;
 
-  // Prefill-only (S>1), additive/purely-a-widening-of-the-existing-call
-  // config: when moe_forward_gguf's Phase 3 loop resolves token s's own
-  // genuine cache misses via RAMSafetyManager::get_experts_batch, it ALSO
-  // opportunistically folds in the next prefill_dispatch_lookahead_tokens
-  // tokens' own not-yet-resident picks into that SAME combined io_uring-
-  // batched call -- purely to warm the RAM tier ahead of when THEIR OWN
-  // token's turn comes up later in the loop, never dispatched by token s
-  // itself. Motivated by a real, measured finding: with prefill_warm_via_
-  // prefetcher already on, Phase 2's own whole-layer hint push still left
-  // phase_b (blocking, prefetcher-missed disk reads) at ~35% of a long
-  // (237-token) prefill's wall time, because Phase 2 pushes ALL of a
-  // layer's hints ONCE, right before Phase 3 starts consuming them
-  // immediately -- the very first tokens in a layer get almost no lead
-  // time by construction, regardless of prompt length. Widening EVERY
-  // token's own get_experts_batch call to also pull in upcoming tokens'
-  // needs gives those specific experts real additional wall-clock lead
-  // time (however many tokens' worth of dispatch happen before their own
-  // turn) without touching dispatch ORDER, dispatch_expert_k, or any
-  // per-token scratch shape at all -- a deliberately narrower, lower-risk
-  // alternative to actually reordering/deferring dispatch across tokens
-  // (which would require turning scratch.expert_ptrs/vram_loc_hint/
-  // vram_shadow_blocks/pending_gpu into per-chunk 2D state -- a real
-  // restructuring of the single most incident-prone loop in this
-  // codebase, not attempted here). 0 = off (exact prior behavior, each
-  // token's call scoped to only its own topk picks). Decode is
-  // unaffected by construction -- moe_forward_gguf's S==1 branch never
-  // reads this field, and S==1 means "the next N tokens" wouldn't be a
-  // real batch of independent tokens waiting to be routed anyway.
-  // VERIFIED ON REAL HARDWARE -- and a real, clean REGRESSION, not a win.
-  // Same 237-token prompt: 225.28s/1.05 tok/s (off) -> 260.23s/0.91 tok/s
-  // (8 tokens ahead). [PREFILL-LOOKAHEAD] showed 1.12M candidates scanned,
-  // only 37,555 (3.4%) genuinely new -- but fetching those pushed ~176GB
-  // MORE real disk traffic onto a drive already sitting near its ~4 GB/s
-  // bandwidth ceiling (confirmed independently the same session via a
-  // prefetch_worker_threads 6->8 A/B that also found no headroom there).
-  // disk= grew 74.78s->182.44s (309.5GB@4.14GB/s -> 485.2GB@2.66GB/s --
-  // the achieved RATE dropped too, plausibly from breaking up what would
-  // otherwise be larger/more sequential reads into more numerous, smaller,
-  // competing ones) and phase_b (blocking) got WORSE (77.35s->110.10s),
-  // not better. Root cause: on THIS hardware, disk bandwidth is a hard
-  // ceiling, not a scheduling/timing problem -- adding more speculative
-  // fetch demand onto an already-saturated resource competes with fetches
-  // that were already correctly timed, rather than getting free overlap.
-  // Same failure shape as this codebase's own repeated VRAM-promotion
-  // over-eagerness regressions (ram_vram_promote_top_k, the reverted
-  // prefill_opportunistic_promote), one tier down (disk instead of VRAM).
-  // Default OFF. Kept implemented (not deleted) -- correct, 0 errors,
-  // real instrumentation ([PREFILL-LOOKAHEAD]) -- matching this project's
-  // convention for a well-evidenced negative result. Would need a genuine
-  // bandwidth increase (faster/more drives) or a smaller working set
-  // (bigger cache budgets) before this mechanism could plausibly help;
-  // not something a config flip alone can fix.
-  int prefill_dispatch_lookahead_tokens = 0;
 
   // Prefill-only (S>1). Phase 2's cold-start warm-up (moe_forward_gguf)
   // pushes hint(s) for a layer's WHOLE real candidate set (every expert
@@ -924,12 +836,8 @@ struct EngineConfig {
   // call exactly (execution_layer.cpp), just applied to the much wider
   // candidate set pilot_widen_all_tokens computes instead of DEPTH-1's
   // fixed 8. Deliberately HINT-PUSH ONLY, no VRAM promotion wired --
-  // this codebase has repeated, real evidence (ram_vram_promote_top_k,
-  // the reverted prefill_opportunistic_promote, the ATTN-PILOT VRAM-
-  // promotion stacking regressions) that widening a SPECULATIVE VRAM-
-  // promotion population too far causes real cache churn/regression;
-  // widening the much cheaper, disk-tier-only DISK-prefetch population
-  // is the safer, more directly-motivated lever for this specific gap
+  // Real A/Bs rejected over-eager VRAM promotion; this option widens only
+  // the disk-prefetch candidate set, not the GPU promotion population.
   // ("layer 6 predicts 8 MoEs but uses 1,896 in total" -- the coverage
   // problem this field exists to close). A future session could
   // consider VRAM promotion for a NARROW, high-confidence slice of the
@@ -1413,41 +1321,6 @@ struct EngineConfig {
   // false or ram_pinned_budget_gb<=0.
   bool ram_pin_eager_preregister = false;
 
-  // Seed a Tier-3 RAM-preloaded slot's hit_count from its REAL historical
-  // count in the pin_file ranking (v[i].count in main.cpp), instead of the
-  // hardcoded 0 every RAM-tier slot starts at today. Directly targets a
-  // real, measured gap: RAMSafetyManager::eviction_score's frequency term
-  // (hit_count * FREQ_BONUS_TICKS) is the ONLY thing that keeps a hot
-  // expert from being evicted as easily as a cold one -- but hit_count only
-  // ever grows from RE-HITS WITHIN THIS SESSION, so a genuinely
-  // popular expert that just got preloaded from .zeromoe_usage looks
-  // identical to a marginal one until it happens to get touched twice
-  // during THIS request. A real 2026-09-04 run showed the RAM tier turning
-  // over almost exactly once per request (5925 evictions / 5702 slots)
-  // with 39.5% of what the prefetcher loaded never read before eviction --
-  // consistent with "no memory of real popularity" being a real cost, not
-  // just a hypothesis.
-  //
-  // Clamped to promote_hit_threshold-1, never the raw count, on purpose:
-  // seeding hit_count >= promote_hit_threshold would make the slot look
-  // ALREADY re-hit before it's ever touched this session, firing a
-  // reactive VRAM promotion (ram_manager.hpp's own hit_count>=
-  // promote_hit_threshold check) on the very first real access instead of
-  // the second -- a different, separately-tuned, historically
-  // regression-prone lever (see pinned_vram_capacity/ram_vram_promote_*'s
-  // own extensive over-promotion tuning history in CLAUDE.md) that this
-  // flag is not meant to touch. Clamping keeps the effect scoped to RAM
-  // retention only: a real re-hit is still what crosses the threshold,
-  // exactly as today, just starting from a "known warm" baseline instead
-  // of a blank one. Additive, not a hard pin -- still decays via
-  // decay_hit_counts like any other hit_count, still fully evictable if
-  // nothing re-hits it. Off by default: byte-identical to pre-2026-09-04
-  // behavior (seed=0) when false. UNVERIFIED ON REAL HARDWARE -- run an
-  // A/B (same prompt, same pin_file, freeze_usage_stats=true) toggling
-  // only this flag and compare the [CACHE-CHURN] Host RAM tier eviction
-  // count / Unified RAM waste % / cache hit rate / decode tok/s.
-  bool ram_preload_seed_hit_count = false;
-
   // Optional SECOND physical copy of the same model, on a DIFFERENT drive
   // (e.g. "/data/models/UD-IQ2_M_align" while model_path is on another
   // NVMe). Empty (default) = single-drive behavior, unchanged.
@@ -1873,23 +1746,6 @@ struct EngineConfig {
   // CPU path per-layer (not a hard failure) if the VRAM upload fails.
   bool dsv4_outproj_gpu = false;
 
-  // cpu_dot_ggml_avx2: switches the CPU-fallback dot product for
-  // IQ2_XXS/IQ3_XXS (GLM-5.2's actual routed-expert types) from the
-  // existing FMA path to a ported upstream llama.cpp/ggml AVX2 kernel --
-  // real isolated bench showed ~1.7-1.9x faster per-call, but IQ3_XXS
-  // carries a real, not-yet-resolved accuracy caveat (20-row worst-case
-  // 1.73% relative error). Default off -- see kquant_dequant.hpp's
-  // cpu_dot_ggml_avx2_flag() for the full writeup and CLAUDE.md's
-  // "CPU-offload feasibility" entries for the investigation this came
-  // from. Exists to A/B the real end-to-end decode effect, not yet a
-  // recommended production setting.
-  bool cpu_dot_ggml_avx2 = false;
-
-  // Qwen4Exp-only CPU expert fallback: use ggml's IQ1_M x Q8_K kernel
-  // (the same family used by llama.cpp) instead of row dequant + FP32 dot.
-  // Off by default so other model families and their existing CPU paths are
-  // unchanged; enable only after an end-to-end Qwen CPU-layer A/B.
-  bool cpu_dot_ggml_iq1m = false;
 
   // Group a prefill batch's tokens BY EXPERT before dispatch (one call per
   // expert over all its tokens) instead of one S=1 call per (token, expert).
@@ -1900,33 +1756,6 @@ struct EngineConfig {
   // generic switch can stay off in the GLM profile.
   bool moe_prefill_batched = false;
 
-  // Decode-time (S==1) counterpart to moe_prefill_batched -- see
-  // dense_dispatch.hpp's own accessor for the full writeup and the real
-  // measured numbers. Routes every topk expert of a decode token straight
-  // to the existing CPU dequant-matmul path (dispatch_expert_k's own
-  // CPU-fallback branch, execution_layer.cpp), skipping the VRAM-cache
-  // find_expert/hold_for_compute/GPU-pool-issue machinery entirely for a
-  // genuinely RAM-resident expert.
-  //
-  // MUST STAY FALSE FOR QWEN3.8-FLASH-NEXT (qwen4exp) -- VERIFIED ON REAL
-  // HARDWARE, 2026-09-10: a real, reproducible ~41% DECODE REGRESSION
-  // (5.03/4.97 tok/s baseline vs 2.93 tok/s with this on), not a wash and
-  // not a win. That model's routed experts (UD-IQ1_M quant) already have
-  // a fast, working GPU kernel (480GPU/0CPU dispatch at baseline), so
-  // forcing CPU dequant-then-matmul instead is strictly worse for it. See
-  // memory: moe-decode-batched-regression.md. Only a plausible win when
-  // GPU dispatch was never going to be used anyway (a quant type with NO
-  // GPU kernel at all, or an all-`cpu_affinity_layers` config) -- do not
-  // enable for qwen4exp UD-IQ1_M, and do not assume this generalizes to
-  // any other model/quant without re-measuring first.
-  //
-  // Real trade-off even where it might help, not free: this also
-  // permanently skips expert_ffn_resolve_gpu_loc's own decode-time
-  // cold-miss VRAM promotion for every expert while enabled. Never
-  // engages for a vram_shadow block (no host bytes without a synchronous
-  // reload) -- falls through to the existing per-expert path unchanged
-  // for those. Default off.
-  bool moe_decode_batched = false;
 
   // Optional legacy stream path: read prefill expert weights from a whole-
   // shard mmap through a pinned, double-buffered GPU chunk instead of the RAM
@@ -2306,7 +2135,6 @@ struct EngineConfig {
 
   // Derived: which GPU index serves each role (set by validate())
   int dense_gpu_idx = -1;
-  std::vector<int> moe_gpu_idxs;
 
   bool load(const std::string &path);
   bool validate();
@@ -2472,7 +2300,6 @@ inline Value parse_value(const std::string &raw) {
 inline Document parse(const std::string &content) {
   Document doc;
   Table *current = &doc.root;
-  bool in_gpu_array = false;
 
   std::istringstream stream(content);
   std::string line;
@@ -2483,7 +2310,6 @@ inline Document parse(const std::string &content) {
 
     // [[gpus]] — array of tables
     if (line == "[[gpus]]") {
-      in_gpu_array = true;
       doc.gpu_tables.emplace_back();
       current = &doc.gpu_tables.back();
       continue;
@@ -2491,8 +2317,7 @@ inline Document parse(const std::string &content) {
 
     // [section] — named table (not gpus)
     if (line.front() == '[' && line.back() == ']') {
-      in_gpu_array = false;
-      current = &doc.root; // flatten non-gpu sections into root
+        current = &doc.root; // flatten non-gpu sections into root
       continue;
     }
 
@@ -2674,14 +2499,6 @@ inline bool EngineConfig::load(const std::string &path) {
         cpu_offload_max_experts);
     cpu_offload_max_experts = std::max(0, std::min(8, cpu_offload_max_experts));
   }
-  prefill_dispatch_lookahead_tokens = doc.root.get_int(
-      "prefill_dispatch_lookahead_tokens", prefill_dispatch_lookahead_tokens);
-  if (prefill_dispatch_lookahead_tokens < 0) {
-    LOG_WARN("[CONFIG] prefill_dispatch_lookahead_tokens must be >= 0 (got %d) "
-             "-- clamping to 0\n",
-             prefill_dispatch_lookahead_tokens);
-    prefill_dispatch_lookahead_tokens = 0;
-  }
   prefill_hint_order_by_earliest_token =
       doc.root.get_bool("prefill_hint_order_by_earliest_token",
                         prefill_hint_order_by_earliest_token);
@@ -2778,8 +2595,6 @@ inline bool EngineConfig::load(const std::string &path) {
   direct_io = doc.root.get_bool("direct_io", direct_io);
   prefill_warm_via_prefetcher = doc.root.get_bool("prefill_warm_via_prefetcher",
                                                   prefill_warm_via_prefetcher);
-  prefill_opportunistic_promote = doc.root.get_bool(
-      "prefill_opportunistic_promote", prefill_opportunistic_promote);
   decode_async_prewarm =
       doc.root.get_bool("decode_async_prewarm", decode_async_prewarm);
   decode_async_prewarm_max_batch = doc.root.get_int(
@@ -2808,9 +2623,7 @@ inline bool EngineConfig::load(const std::string &path) {
       "glm5next_moe_prefill_gpu", glm5next_moe_prefill_gpu);
   glm5next_dense_prefill_fusion = doc.root.get_bool(
       "glm5next_dense_prefill_fusion", glm5next_dense_prefill_fusion);
-  qwen4exp_attn_gpu = doc.root.get_bool("qwen4exp_attn_gpu", qwen4exp_attn_gpu);
-  qwen4exp_gdn_gpu = doc.root.get_bool("qwen4exp_gdn_gpu", qwen4exp_gdn_gpu);
-  qwen4exp_gdn_conv_gpu = doc.root.get_bool("qwen4exp_gdn_conv_gpu", qwen4exp_gdn_conv_gpu);
+    qwen4exp_gdn_conv_gpu = doc.root.get_bool("qwen4exp_gdn_conv_gpu", qwen4exp_gdn_conv_gpu);
   qwen4exp_router_pilot =
       doc.root.get_bool("qwen4exp_router_pilot", qwen4exp_router_pilot);
   qwen4exp_router_pilot_k = (int)doc.root.get_int(
@@ -2859,12 +2672,8 @@ inline bool EngineConfig::load(const std::string &path) {
       "qwen4exp_decode_device_hc", qwen4exp_decode_device_hc);
   qwen4exp_decode_batch_stage = doc.root.get_bool(
       "qwen4exp_decode_batch_stage", qwen4exp_decode_batch_stage);
-  qwen4exp_decode_custom_hc_q8 = doc.root.get_bool(
-      "qwen4exp_decode_custom_hc_q8", qwen4exp_decode_custom_hc_q8);
   qwen4exp_hc_async_readback = doc.root.get_bool(
       "qwen4exp_hc_async_readback", qwen4exp_hc_async_readback);
-  qwen4exp_decode_gpu_router = doc.root.get_bool(
-      "qwen4exp_decode_gpu_router", qwen4exp_decode_gpu_router);
   qwen4exp_cpu_ggml_moe =
       doc.root.get_bool("qwen4exp_cpu_ggml_moe", qwen4exp_cpu_ggml_moe);
   qwen4exp_cpu_strided_grouped = doc.root.get_bool(
@@ -2888,20 +2697,6 @@ inline bool EngineConfig::load(const std::string &path) {
       doc.root.get_bool("qwen4exp_cpu_offload", qwen4exp_cpu_offload);
   qwen4exp_cpu_offload_layers =
       doc.root.get_int_array("qwen4exp_cpu_offload_layers");
-  qwen4exp_cpu_offload_force_cold_count = (int)doc.root.get_int(
-      "qwen4exp_cpu_offload_force_cold_count",
-      qwen4exp_cpu_offload_force_cold_count);
-  if (qwen4exp_cpu_offload_force_cold_count < 0) {
-    LOG_WARN("[CONFIG] qwen4exp_cpu_offload_force_cold_count=%d is invalid; "
-             "clamping to 0\n",
-             qwen4exp_cpu_offload_force_cold_count);
-    qwen4exp_cpu_offload_force_cold_count = 0;
-  }
-  if (qwen4exp_cpu_offload_force_cold_count > 16)
-    qwen4exp_cpu_offload_force_cold_count = 16;
-  qwen4exp_cpu_offload_force_expert = (int)doc.root.get_int(
-      "qwen4exp_cpu_offload_force_expert",
-      qwen4exp_cpu_offload_force_expert);
   qwen4exp_cpu_offload_event_fence = doc.root.get_bool(
       "qwen4exp_cpu_offload_event_fence", qwen4exp_cpu_offload_event_fence);
   qwen4exp_gpu_stage_enabled = doc.root.get_bool(
@@ -2999,8 +2794,6 @@ inline bool EngineConfig::load(const std::string &path) {
   ram_pinned_budget_gb_explicit = doc.root.has("ram_pinned_budget_gb");
   ram_pin_eager_preregister =
       doc.root.get_bool("ram_pin_eager_preregister", ram_pin_eager_preregister);
-  ram_preload_seed_hit_count = doc.root.get_bool(
-      "ram_preload_seed_hit_count", ram_preload_seed_hit_count);
   promote_hit_threshold =
       doc.root.get_int("promote_hit_threshold", promote_hit_threshold);
   pin_threshold = doc.root.get_int("pin_threshold", pin_threshold);
@@ -3027,10 +2820,7 @@ inline bool EngineConfig::load(const std::string &path) {
   vram_evict_demote_to_ram =
       doc.root.get_bool("vram_evict_demote_to_ram", vram_evict_demote_to_ram);
   dsv4_outproj_gpu = doc.root.get_bool("dsv4_outproj_gpu", dsv4_outproj_gpu);
-  cpu_dot_ggml_avx2 = doc.root.get_bool("cpu_dot_ggml_avx2", cpu_dot_ggml_avx2);
-  cpu_dot_ggml_iq1m = doc.root.get_bool("cpu_dot_ggml_iq1m", cpu_dot_ggml_iq1m);
   moe_prefill_batched = doc.root.get_bool("moe_prefill_batched", moe_prefill_batched);
-  moe_decode_batched = doc.root.get_bool("moe_decode_batched", moe_decode_batched);
   moe_prefill_stream = doc.root.get_bool("moe_prefill_stream", moe_prefill_stream);
   moe_prefill_stream_chunk = (int)doc.root.get_int("moe_prefill_stream_chunk", moe_prefill_stream_chunk);
   moe_ggml_mul_mat_id = doc.root.get_bool("moe_ggml_mul_mat_id", moe_ggml_mul_mat_id);
@@ -3165,7 +2955,6 @@ gdn_proj_ggml = doc.root.get_bool("gdn_proj_ggml", gdn_proj_ggml);
     gc.vram_gb = gt.get_double("vram_gb");
     gc.dense_gb = gt.get_double("dense_gb");
     gc.kv_cache_gb = gt.get_double("kv_cache_gb");
-    gc.kv_bits = gt.get_int("kv_bits", 4);
     gc.moe_cache_gb = gt.get_double("moe_cache_gb");
     gc.moe_cache_reserve_gb = gt.get_double("moe_cache_reserve_gb");
     gc.active_layer_weight = gt.get_int("active_layer_weight", 0);
@@ -3311,28 +3100,6 @@ inline bool EngineConfig::validate() {
 
   // Assign roles
   dense_gpu_idx = -1;
-  moe_gpu_idxs.clear();
-  for (size_t i = 0; i < gpus.size(); ++i) {
-    const std::string &r = gpus[i].role;
-    if (r == "dense" || r == "dense+moe") {
-      if (dense_gpu_idx < 0)
-        dense_gpu_idx = (int)i;
-    }
-    if (r == "moe" || r == "dense+moe") {
-      moe_gpu_idxs.push_back((int)i);
-    }
-  }
-
-  if (dense_gpu_idx < 0) {
-    std::cerr << "[CONFIG] No GPU with role 'dense' or 'dense+moe'. "
-              << "Assigning GPU 0 as dense+moe.\n";
-    gpus[0].role = "dense+moe";
-    dense_gpu_idx = 0;
-    if (std::find(moe_gpu_idxs.begin(), moe_gpu_idxs.end(), 0) ==
-        moe_gpu_idxs.end())
-      moe_gpu_idxs.push_back(0);
-  }
-
   if (dense_model_path.empty())
     dense_model_path = model_path;
   for (auto &gc : gpus) {
@@ -3496,13 +3263,6 @@ inline void EngineConfig::print() const {
                             ? "ON"
                             : "off (legacy synchronous)")
                     << "\n";
-  if (prefill_warm_via_prefetcher)
-    LOG_STREAM_INFO() << "[CONFIG] Prefill opportunistic VRAM promotion: "
-                      << (prefill_opportunistic_promote
-                              ? "ON"
-                              : "off (hints land in RAM only until Phase 3's "
-                                "own synchronous dispatch)")
-                      << "\n";
   LOG_STREAM_INFO()
       << "[CONFIG] Decode async pre-warm (batched active-layer H2D for "
          "decode-time misses): "
@@ -3649,14 +3409,6 @@ inline void EngineConfig::print() const {
         << " expert(s)/layer/token max -- see '[CPU-OFFLOAD]' shutdown report "
            "line\n";
   }
-  if (prefill_dispatch_lookahead_tokens > 0) {
-    LOG_STREAM_INFO() << "[CONFIG] Prefill dispatch lookahead (additive "
-                         "RAM-warm widening of each "
-                         "token's own get_experts_batch call, prefill-only): "
-                      << prefill_dispatch_lookahead_tokens
-                      << " token(s) ahead -- see '[PREFILL-LOOKAHEAD]' "
-                         "shutdown report line\n";
-  }
   if (prefill_hint_order_by_earliest_token) {
     LOG_STREAM_INFO() << "[CONFIG] Prefill Phase 2 hint push order: by "
                          "earliest-needing-token "
@@ -3739,20 +3491,6 @@ inline void EngineConfig::print() const {
                               "layer, ~5.8GB total)"
                             : "off")
                     << "\n";
-  LOG_STREAM_INFO()
-      << "[CONFIG] CPU-fallback dot (IQ2_XXS/IQ3_XXS): "
-      << (cpu_dot_ggml_avx2
-              ? "AVX2 ggml-port (EXPERIMENTAL -- ~1.7-1.9x faster per isolated "
-                "bench, "
-                "IQ3_XXS has an unresolved accuracy caveat, see CLAUDE.md)"
-              : "existing FMA path")
-      << "\n";
-  LOG_STREAM_INFO()
-      << "[CONFIG] CPU-fallback dot (Qwen IQ1_M): "
-      << (cpu_dot_ggml_iq1m
-              ? "ggml Q8_K path (current IQ1_M kernel is AVX2-width; no AVX-512/VNNI IQ1_M specialization)"
-              : "row dequant + FP32 path")
-      << "\n";
   LOG_STREAM_INFO()
       << "[CONFIG] Qwen CPU strided grouped projections: "
       << (qwen4exp_cpu_strided_grouped
@@ -3944,8 +3682,7 @@ inline void EngineConfig::print() const {
     if (g.dense_gb > 0)
       LOG_STREAM_INFO() << "[CONFIG]   Dense: " << g.dense_gb << " GB\n";
     if (g.kv_cache_gb > 0)
-      LOG_STREAM_INFO() << "[CONFIG]   KV Cache: " << g.kv_cache_gb << " GB ("
-                        << g.kv_bits << "-bit)\n";
+      LOG_STREAM_INFO() << "[CONFIG]   KV Cache budget: " << g.kv_cache_gb << " GB\n";
     if (g.moe_cache_gb > 0)
       LOG_STREAM_INFO() << "[CONFIG]   MoE Cache: " << g.moe_cache_gb
                         << " GB\n";
@@ -4071,21 +3808,6 @@ direct_io      = false
 # legacy behavior); A/B via t_prefill_warm_time / overall Prefill wall time
 # before trusting it.
 prefill_warm_via_prefetcher = false
-# prefill_opportunistic_promote: only meaningful when
-# prefill_warm_via_prefetcher=true above. When true, a hint that lands in
-# RAM before Phase 3 needs it gets opportunistically promoted to VRAM
-# right then (cross-layer follow-up, decode-thread), instead of waiting
-# for Phase 3's own synchronous dispatch to do it. REAL A/B, CONCLUSIVE,
-# DEFAULT OFF: four runs ON landed at prefill=0.56 tok/s; OFF landed at
-# 0.60 (matches the pre-feature baseline). Root cause: this pass competes
-# with Phase 2's own hint-pushing loop for the same free-VRAM-slot budget
-# -- eager promotion starves LATER layers of hints entirely (hint volume
-# nearly halved, 420 vs ~930), losing the RAM-prefetch overlap the whole
-# feature exists to provide. Not a promotion-accuracy problem (every
-# candidate is still a confirmed real pick, never a wrong bet) -- a
-# resource-contention one. See CLAUDE.md.
-prefill_opportunistic_promote = false
-
 # decode_async_prewarm: decode-time analogue of prefill's own
 # upload_expert_active_async batch pre-warm -- batches a token's own real
 # active-layer VRAM misses into small async-issue-then-sync groups (size
@@ -4709,7 +4431,6 @@ role         = "dense"          # "dense", "moe", or "dense+moe"
 vram_gb      = 16.0             # 0 = auto-detect
 dense_gb     = 7.5              # GB for dense layers (attn, norms, embed, lm_head)
 kv_cache_gb  = 4.5              # GB for KV cache
-kv_bits      = 4                # KV cache quantization: 4 or 32
 moe_cache_gb = 0                # no expert cache on this GPU
 
 # GPU 1: Expert Vault — MoE LRU cache

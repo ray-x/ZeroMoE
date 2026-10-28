@@ -91,24 +91,6 @@ bool env_layer_timing_verbose() {
   return Logger::instance().would_log(LogLevel::DEBUG);
 }
 
-// Host-node transport diagnostic. The layer is selected explicitly so the
-// same pre-H2D/post-H2D proof used for the historical Layer-0 IQ2 check can be
-// applied to Layer 13 without enabling diagnostics for every callback.
-int env_host_node_diag_layer() {
-  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_HOST_NODE_DIAG_LAYER");
-  if (!v || !v[0])
-    return -1;
-  char *end = nullptr;
-  const long layer = std::strtol(v, &end, 10);
-  if (end == v || *end != '\0' || layer < 0 || layer > 47)
-    return -1;
-  return static_cast<int>(layer);
-}
-
-bool env_host_node_transport_diag_enabled(int layer) {
-  return layer == env_host_node_diag_layer();
-}
-
 // Phase 1 "all-or-nothing" partial-layer GPU dispatch (see
 // engine.hpp's qwen4exp_partial_layer field group for the full contract).
 int env_partial_layer() {
@@ -224,9 +206,6 @@ int env_decode_kv_capacity(int max_t, int required) {
 // ZEROMOE_QWEN4EXP_HOST_NODE_PIN=0 disables it.
 void pin_host_node_threads(ggml_threadpool_params &p, int n_threads) {
   if (!env_qwen4exp_host_node_enabled())
-    return;
-  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_HOST_NODE_PIN");
-  if (v && v[0] == '0')
     return;
   cpu_set_t allowed;
   CPU_ZERO(&allowed);

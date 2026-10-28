@@ -134,22 +134,6 @@ void PerfCounters::dump_report_part4(double session_elapsed_s) const {
         }
     }
     {
-        uint64_t qc = n_qwen4exp_attn_gpu_calls.load();
-        uint64_t qf = n_qwen4exp_attn_gpu_fallback_cpu.load();
-        if (qc || qf) {
-            double up = t_qwen4exp_attn_gpu_up.load();
-            double cmp = t_qwen4exp_attn_gpu_cmp.load();
-            double dn = t_qwen4exp_attn_gpu_dn.load();
-            LOG_INFO("Qwen4Exp dense-attention GPU path (EngineConfig::qwen4exp_attn_gpu): "
-                     "%llu call(s), up=%.3fs cmp=%.3fs dn=%.3fs (%.3fms/call avg) / "
-                     "%llu CPU fallback(s) (a fallback means an alloc or cuBLAS call failed "
-                     "and that layer used the byte-identical CPU loop -- should be 0)\n",
-                     (unsigned long long)qc, up, cmp, dn,
-                     qc ? (up + cmp + dn) * 1000.0 / (double)qc : 0.0,
-                     (unsigned long long)qf);
-        }
-    }
-    {
         uint64_t ga = n_expert_gpu_activation.load();
         if (ga) LOG_INFO("Expert SwiGLU on GPU: %llu call(s), %.3fs "
                          "(replaces the gate/up download + CPU silu/mul + product upload)\n",
@@ -213,21 +197,6 @@ void PerfCounters::dump_report_part4(double session_elapsed_s) const {
                      "%llu split fallbacks\n",
                      (unsigned long long)gd, (unsigned long long)gh,
                      (unsigned long long)gdf, (unsigned long long)gs);
-    }
-    {
-        uint64_t gc = n_qwen4exp_gdn_gpu_calls.load();
-        uint64_t gf = n_qwen4exp_gdn_gpu_fallback_cpu.load();
-        if (gc || gf) {
-            double up = t_qwen4exp_gdn_gpu_up.load();
-            double cmp = t_qwen4exp_gdn_gpu_cmp.load();
-            double dn = t_qwen4exp_gdn_gpu_dn.load();
-            LOG_INFO("Qwen4Exp chunkwise GDN GPU path (EngineConfig::qwen4exp_gdn_gpu): "
-                     "%llu call(s), up=%.3fs cmp=%.3fs dn=%.3fs (%.3fms/call avg) / "
-                     "%llu CPU fallback(s)\n",
-                     (unsigned long long)gc, up, cmp, dn,
-                     gc ? (up + cmp + dn) * 1000.0 / (double)gc : 0.0,
-                     (unsigned long long)gf);
-        }
     }
     {
         uint64_t cc = n_gdn_conv1d_gpu_calls.load();

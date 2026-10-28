@@ -181,14 +181,13 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   // is dense, which equals the model's top-k selection only while the context fits in top_k.
   if (pos_base > 0) {
     const int kpool = c.glm5next_indexer_kpool, top_k = c.glm5next_indexer_top_k;
-    if (zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_PREFILL_NO_CONTINUATION", 0) != 0)
-      return false; // A/B reference: the rest of the prompt is stepped
     if (g_continuation.engine != &engine || g_continuation.total_tokens != pos_base)
       return false;
     if (kpool > 1 && pos_base % kpool != 0)
       return false;
-    // Context beyond top_k: the chunk's attention selects pools per query like the decode graph (sparse_prefill below);
-    // ZEROMOE_GLM5NEXT_PREFILL_DENSE_BEYOND_TOPK=1 keeps the dense attention instead (A/B only).
+    // Context beyond top_k uses the same per-query pooled selection as the
+    // decode graph (sparse_prefill below); dense prefill beyond top_k is not
+    // the model's exact attention semantics.
   }
   if (g_graph && g_graph->ready && g_graph->engine == &engine &&
       g_graph->S == S && g_graph->pos_base == pos_base && !g_graph->decode_mode &&
@@ -224,9 +223,7 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   g->prev_indexer_seeds = std::move(prev_seeds);
   {
     const int kpool = c.glm5next_indexer_kpool, top_k = c.glm5next_indexer_top_k;
-    static const bool dense_beyond = zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_PREFILL_DENSE_BEYOND_TOPK", 0) != 0;
-    static const bool force_sparse = zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_PREFILL_FORCE_SPARSE", 0) != 0; // test hook
-    if (top_k > 0 && (pos_base + S > top_k || force_sparse) && !dense_beyond) {
+    if (top_k > 0 && pos_base + S > top_k) {
       // The selection needs the pooled indexer keys of every earlier chunk (the seeds) and pool-aligned boundaries.
       if (kpool <= 1 || top_k % kpool != 0 || (pos_base > 0 && g->prev_indexer_seeds.empty()))
         return false;

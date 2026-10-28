@@ -77,7 +77,7 @@ Run on an otherwise idle machine with `CUDA_VISIBLE_DEVICES=0`,
 `ZEROMOE_BENCH_IGNORE_STOP=1`. Set `ZEROMOE_GLM5NEXT_EARLY_READY=0` or `1`
 for the controlled comparison; unset it to validate the fixed default. Use
 `scripts/run_capped.sh --limit-gb 100 -- <binary> --config <profile> --temp 0
---ngen 150 --force-start --log-path <unique-log>`.
+--ngen 150 --log-path <unique-log>`.
 
 The table above is the durable record; raw logs, token files and binary
 manifests from the investigation were kept only on the measurement host.

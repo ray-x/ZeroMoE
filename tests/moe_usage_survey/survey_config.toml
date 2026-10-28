@@ -35,16 +35,7 @@ freeze_usage_stats = false  # SURVEY: usage-file writes ENABLED for this batch (
 # smaller cost than the CPU compute it adds. Do not re-enable without a
 # structural change (e.g. only offloading GPU-unsupported quant types that
 # were headed to CPU anyway) -- see that entry before re-attempting.
-# cpu_dot_ggml_avx2: real A/B'd (2026-08-25) after wiring into production --
-# caught and fixed a real OMP-spawn-at-S=1 bug along the way (see kernels_
-# cpu.cpp's matmul_iq2/3_xxs_ggml_avx2), but even after that fix the real
-# decode-level impact was marginal (cpu= bucket -12.6% with cpu_offload_
-# max_experts=2, decode 0.81->0.82 tok/s, still well short of the 0.86
-# tok/s baseline) -- the isolated ~1.7-1.9x per-dot speedup doesn't survive
-# contact with the real per-call Q8_K activation-quantization cost at this
-# call pattern. Reverted to off. See CLAUDE.md for the full writeup.
 cpu_offload_max_experts = 0
-cpu_dot_ggml_avx2 = false
 # ATTN-PILOT real hint wiring (2026-08-25) -- real A/B (3 runs each): OFF
 # avg 0.84 tok/s decode (0.86/0.80/0.86), ON avg 0.86 (0.87/0.85/0.86) --
 # a small, consistent-direction signal (tighter band, never dipped as low
@@ -60,9 +51,6 @@ cpu_dot_ggml_avx2 = false
 # above. Attempt 4 (top_k=1, even more conservative) landed dead-center of
 # the baseline band, not above it -- see attn_pilot_vram_promote_top_k's
 # own comment for the full result. See CLAUDE.md for the full writeup.
-prefetch_attn_pilot = false  # 2026-08-29 RE-TESTED (hint-push only, RAM tier, no VRAM promotion): mean 0.947 vs baseline 0.966 across 3 runs each, but individual runs (0.901-0.977) overlap heavily with baseline's own spread (0.928-0.992) -- ambiguous, not a clear win or regression, same "not proven" status as before. RAM waste stayed healthy (3.7-8.9%), 0 errors. Left off -- see CLAUDE.md.
-prefetch_attn_pilot_k = 8
-# attn_pilot_vram_promote_top_k: two real attempts, both regressed, both
 # reverted -- see CLAUDE.md for the full writeup.
 # Attempt 1 (top_k=4, stacked on DEPTH-1's unchanged top_k=2 + DEPTH-2
 # k=4): decode 0.80 tok/s both runs (vs 0.84-0.87 baseline), cache hit
@@ -206,60 +194,12 @@ drop_pages     = true
 direct_io      = true
 io_uring       = true
 
-disk_batch_padding = false  # 2026-08-18: A/B test -- a real per-request [REQUEST] line
-# showed disk=11.76s (2.63 GB/s real-only / 3.67 GB/s incl. padding, 30.96 GB
-# real + 12.15 GB padding) with this =true: padding was 28% of phase_b's
-# bytes on the decode-blocking path, against the shutdown report's own
-# 51.1% payoff rate for padded reads (541/1059 later genuinely hit) --
-# testing whether phase_b/disk= genuinely improves with padding off, or
-# whether the lost future-hit rate offsets it. See CLAUDE.md's own
-# disk_batch_padding entry (still marked UNVERIFIED ON REAL HARDWARE) --
-# this is that verification. Restore to true if this A/B doesn't show a
-# clear win.
-disk_batch_padding_target = 8
-# Tested: engages fine mechanically (n_pad_evict_dup_used counter wired
-# correctly) but never actually reclaims anything under real GLM traffic --
-# root-caused to do_promote_ram_slot_to_vram's COPY branch never setting
-# also_in_vram=true at promotion time (a pre-existing gap, see CLAUDE.md),
-# so the population this feature draws from is nearly always empty in
-# practice. Turned off here (not just numerically inert but removed as a
-# variable entirely) while isolating the ZeroMoE_8.2 reference-vs-current
-# gap to a single-variable A/B -- re-enable only after the also_in_vram gap
-# is fixed and there's a real population for it to reclaim from.
-disk_batch_padding_evict_dup = false
 
 
 attn_score_threads = 8
-# Was `= true` (a boolean) -- silently ignored by the parser (which only
-# accepts an integer here) until a type-mismatch warning was added; this
-# config had actually been running DEPTH-1-only this whole time. Set to the
-# real default explicitly. Real A/B on this exact model found DEPTH-2
-# (prefetch_pilot_k_depth2=1) gave no measurable throughput benefit anyway
-# (see CLAUDE.md) -- left at 1, not raised to 2, pending a reason to revisit.
-# 2026-08-14: found live at depth=2/k_depth2=2 here, contradicting this
-# comment and never actually A/B'd at k_depth2=2 -- reverted to match the
-# comment's stated intent (depth-1 only) pending a fresh, deliberate test.
-# 2026-08-19: actually applying the revert this comment already decided on --
-# found still live at depth=2/k_depth2=2 despite the note above saying
-# "reverted", i.e. the config drifted from its own stated conclusion without
-# the value ever being changed (see memory: config-comment-drift-pattern).
-# CLAUDE.md's own DEPTH-2 entry is unambiguous: a real same-prompt A/B found
-# no throughput benefit from depth=2/k_depth2=1 (disk time UP 1.54s->1.82s,
-# Unified RAM waste roughly doubled 4.0%->7.9%, tok/s within noise both
-# ways) and k_depth2=2 was never validated at all. Reverting to the
-# validated default now.
-# 2026-08-25: re-enabled (depth=2, k_depth2=4) three times now as one tier
-# of a multi-tier pilot setup. Attempt 1 (DEPTH-2 top-4->RAM, ATTN-PILOT
-# top-4->VRAM, DEPTH-1 top-8->VRAM) regressed hard (cache hit 39-40%),
-# root-caused to DEPTH-1's own ram_vram_promote_top_k=8 and ATTN-PILOT's
-# attn_pilot_vram_promote_top_k, both reverted separately. Attempt 3 (this
-# value, DEPTH-1 held at its own settled top-2, ATTN-PILOT top-2) was NOT
-# a regression (decode 0.88/0.88/0.83, within/at the baseline band) but
-# not a clearly confirmed win either -- see attn_pilot_vram_promote_top_k's
-# own comment for the full result. DEPTH-2's own k_depth2=4 contribution
-# has never been isolated in any of these three tests (always combined
-# with the other tiers) -- reverted to 1 along with the rest each time.
-prefetch_pilot_depth = 1  # 1: layer + 1 only, 2: layer + 1 and 2
+# DEPTH-2 stays disabled at the code default (depth=1). Same-prompt tests
+# found no throughput gain and increased disk time/RAM waste; see the
+# configuration-knob audit for the measured results.
 # prefetch_pilot_k: raised 4->8 (2026-08-19), real same-prompt A/B on real
 # hardware. Root cause: the "Unified RAM claim" report line showed only
 # 2538/5546 decode misses (45.7%) were being served by a prefetch worker --
@@ -283,8 +223,6 @@ prefetch_pilot_depth = 1  # 1: layer + 1 only, 2: layer + 1 and 2
 # prewarm_max_batch were both tried and found not to help (genuinely
 # bytes-bound, not contention- or call-count-bound).
 prefetch_pilot_k = 8
-prefetch_pilot_k_depth2 = 1
-# unpacked_expert_format = false
 # Was 55.0 (86% of a 64GB machine) -- cut to 45.0 after a real run showed the
 # workstation freezing on larger prompts (fine on a trivial "hi" prompt,
 # frozen on a bigger one) while a smaller/simpler run stayed fine. Larger
@@ -610,22 +548,6 @@ prefill_pin_file = "/path/to/ZeroMoE/tests/moe_usage_survey/zeromoe_usage_survey
 # a clean single-variable test against the current 0.70 decode / ~0.55
 # prefill baseline).
 prefill_warm_via_prefetcher = true
-# 2026-08-12: SETTLED, false, two real attempts tried. Original placement:
-# 420 hints pushed (vs ~930 baseline), prefill 0.56. Reordered (follow-up
-# runs after the per-layer candidate loop instead of before): only a
-# PARTIAL recovery, 498 hints / prefill 0.58 -- still short of the clean
-# 0.60 baseline `prefill_warm_via_prefetcher` alone already delivers.
-# Root cause of why the reorder was incomplete: it only removes the
-# same-layer race (negligible -- a hint essentially never lands within its
-# own layer's processing anyway); the DOMINANT race is cross-layer --
-# layer N's follow-up still runs before layer N+1's own candidate loop
-# regardless of where it sits inside layer N's own call, since Phase 2
-# fires exactly once per layer, strictly sequential. A real fix would need
-# a genuinely separate, non-competing free-slot budget for opportunistic
-# promotion, not a call-order tweak -- not attempted, ROI unclear against
-# a lever (prefill_warm_via_prefetcher alone) that already delivers the
-# full win for free. See CLAUDE.md.
-prefill_opportunistic_promote = false
 # Capped (was 0/auto-fill-available-capacity): a real run showed auto-fill
 # pinning 1579/1642 VRAM slots (96%) at startup from a prior run's usage
 # history, starving both the reactive cache and the decode-time GPU
@@ -1020,7 +942,6 @@ move_on_promotion = false
 # (decode 0.88/0.88/0.83 across 3 runs), but within/at the established
 # baseline band, not clearly above it -- see attn_pilot_vram_promote_top_k's
 # own comment for the full numbers.
-ram_vram_promote_top_k = 0  # 0 because ram_vram_promote_dynamic_layer below
     # is now the live mode (mutually exclusive with top_k>0) -- this value
     # was the settled flat baseline before that; restore to 2 if reverting
     # ram_vram_promote_dynamic_layer to off.
@@ -1054,8 +975,6 @@ ram_vram_promote_top_k = 0  # 0 because ram_vram_promote_dynamic_layer below
 #   showed zero cost to leaving it on, but zero benefit either, so off by
 #   default per this project's own convention).
 ram_vram_promote_layer_gate = false
-ram_vram_promote_layer_gate_threshold = 0.65
-ram_vram_promote_layer_gate_min_samples = 30
 
 # 2026-08-26: direct graduation of the veto-only gate above into a smooth
 # per-layer WIDTH, per user feedback that the plain veto moved nothing
@@ -1354,7 +1273,6 @@ name         = "NVIDIA GeForce RTX 3090"
 role         = "moe"
 vram_gb      = 24.0
 kv_cache_gb  = 0.0
-kv_bits      = 4
 dense_gb     = 0.0
 # STALE COMMENT, corrected 2026-08-28: this used to claim "~4.7GB free" --
 # a real nvidia-smi check the same day found only ~1.97GB genuinely free
@@ -1394,7 +1312,6 @@ name         = "NVIDIA GeForce RTX 5060 Ti"
 role         = "dense+moe"
 vram_gb      = 16.0
 kv_cache_gb  = 3.0
-kv_bits      = 4
 # 2026-08-16: was 12.0, stale -- this model's real dense-tensor requirement
 # (native quant, gate_inp excluded since it's converted/budgeted
 # separately) is 12.9315 GB, confirmed both by the live engine's own new

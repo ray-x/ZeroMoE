@@ -8,8 +8,10 @@ Many experimental controls remain environment-only; this is a staged migration.
 
 This page lists the `ZEROMOE_*` settings a user is expected to see: the ones the README and the shipped configs
 refer to, the model-path fallback, and the model-specific and diagnostic knobs that the model guides name. Deep
-experiment knobs that no guide or public config mentions are not listed here; they live in the source
-(`grep -rn ZEROMOE_ core models memory backends`).
+experiment knobs that no guide or public config mentions are not listed
+here; the comprehensive source-linked inventory is in the
+[configuration-knob audit](design/configuration-knob-audit.md), with its
+companion JSON inventory.
 
 Legacy readers differ; do not treat environment values as TOML:
 
@@ -27,7 +29,7 @@ Settings are read when the process starts, and graph settings are cached per mod
 
 | Option | Default | Effect |
 | --- | --- | --- |
-| `ZEROMOE_CPU_ONLY` | OFF | Build without CUDA. Forced ON on macOS. |
+| `GGML_CUDA` | ON outside macOS; OFF on macOS | llama.cpp/GGML build option. Controls whether ZeroMoE builds the CUDA engine; the CPU preset sets it OFF. |
 | `ZEROMOE_METAL` | ON on Apple Silicon | Dispatch prefill-sized F32 matmuls (`S>=32`) to Metal/MPS in the CPU backend. Ignored elsewhere. Decode stays on NEON. |
 | `GGML_AVX512_VNNI` | ON on ZeroMoE x86 builds | llama.cpp/GGML option shared by ZeroMoE and ggml CPU kernels. Set OFF on CPUs without VNNI. |
 | `GGML_OPENMP` | ON | llama.cpp/GGML CPU backend OpenMP setting. OFF selects ggml's persistent threadpool. |
@@ -120,5 +122,4 @@ These are model-specific. The model's own document (`docs/models/<model>.md`) is
 | `ZEROMOE_QWEN4EXP_DIAG_DUMP_DIR` | With `--verbosity 5`, write layer-0 Qwen CPU graph tensor snapshots into this directory. |
 | `--verbosity 5` | Emits Qwen layer-0 CPU graph diagnostics (`[QWEN4EXP-LAYER0-DIAG]`); the separate dump-directory variable controls binary snapshots. |
 | `ZEROMOE_WUV_INT8` | Attention value-projection int8 path (`1` enables). Diagnostic; read in `core/attention_layer.cpp`. |
-| `ZEROMOE_GLM5NEXT_ROUTE_TRACE` | Write routed expert IDs to a trace file. Diagnostic. Per-layer timing follows `--verbosity 5`. |
 | `ZEROMOE_TEST_EXL3_CPU_ONLY`, `ZEROMOE_TEST_EXL3_ONLY` | Stop the native test harness early: after the CPU/EXL3 checks with `_CPU_ONLY`, after the CUDA kernel checks with `_ONLY` (the form `README.md` uses for the short CUDA check). |

@@ -8,7 +8,7 @@ a built binary.
 | `--config <file>` | Load engine config from a TOML file (preferred over legacy CLI flags). |
 | `--gen-config [output.toml]` | Write a minimal starter config (default `zeromoe_config.toml`) and exit. |
 | `--gen-config-full [output.toml]` | Write the annotated full config reference and exit. |
-| `--version`, `-V` | Print the version, source commit and engine flavor (CUDA or CPU-only), then exit. |
+| `--version` | Print the version, source commit and engine flavor (CUDA or CPU-only), then exit. |
 | `--model <path>` | Path to a GGUF model file or directory (legacy CLI mode, used without `--config`). |
 | `--ram <GB>` | Strict RAM budget in GB (default: auto-detect 88% of free system memory). |
 | `-c, --ctx-size <N>` | Maximum context size / token window (default: 4096). |

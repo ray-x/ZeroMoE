@@ -9,7 +9,7 @@
 //     compatibility shim while the codebase is being modernized.
 //
 // CMake controls which implementation file is compiled:
-//   - ZEROMOE_CPU_ONLY=ON forces the CPU-only path (auto-set on macOS).
+//   - GGML_CUDA=OFF selects the CPU-only engine (forced on macOS).
 //   - On arm64 Apple, kernels_cpu_neon.cpp is selected.
 //   - Otherwise kernels_cpu.cpp (AVX-512) is selected.
 
@@ -155,14 +155,6 @@ struct block_q8_K_local {
 extern "C" void quantize_row_q8_K_ref(const float *x, block_q8_K_local *y, int64_t k);
 float dot_iq2_xxs_avx2_prototype(const uint8_t *block, const block_q8_K_local *y, int64_t k);
 float dot_iq3_xxs_avx2_prototype(const uint8_t *block, const block_q8_K_local *y, int64_t k);
-// Production-callable OMP-parallel matmul wrappers around the two dot
-// functions above -- called from kquant_dequant.hpp's cpu_quant_matmul,
-// gated behind EngineConfig::cpu_dot_ggml_avx2 (dense_dispatch.hpp's
-// cpu_dot_ggml_avx2_enabled()). See their own header comments (kernels_cpu.cpp).
-void matmul_iq2_xxs_ggml_avx2(float *y, const float *x, const uint8_t *W_quantized,
-                              int S, int I, int O);
-void matmul_iq3_xxs_ggml_avx2(float *y, const float *x, const uint8_t *W_quantized,
-                              int S, int I, int O);
 // Qwen4Exp/UD-IQ1_M CPU fallback using ggml's production IQ1_M x Q8_K
 // quantized-activation path.  Kept as a separate opt-in symbol so GLM and
 // other model CPU paths remain unchanged.
@@ -179,15 +171,14 @@ bool matmul_iq1_m_avx512_q8k_grouped(
     int n_matrices, int S, int I, int O);
 // Grouped Qwen CPU route: one Q8_K activation quantization feeds several
 // compact expert matrices. `W_quantized[m]` points to one [O,I] matrix and
-// `y[m]` points to its [S,O] result. This removes the per-expert OpenMP
-// fork/join and activation quantization that made the old CPU fallback much
-// slower than llama.cpp's ggml MUL_MAT_ID path.
+// `y[m]` points to its [S,O] result. This removes per-expert OpenMP fork/join
+// and activation quantization from the Qwen CPU fallback.
 bool matmul_iq1_m_ggml_q8k_grouped(float *const *y, const float *x,
                                    const uint8_t *const *W_quantized,
                                    int n_matrices, int S, int I, int O);
-// Qwen decode gate+up pair with the same activation: quantize the input once
-// and execute both IQ1_M projections in one OpenMP region. This is restricted
-// to the Qwen CPU-affinity path; it does not alter generic model kernels.
+// Qwen decode gate+up pair with the same activation: quantize input once
+// and execute both IQ1_M projections in one OpenMP region. Restricted to
+// the Qwen CPU-affinity path; it does not alter generic model kernels.
 bool matmul_iq1_m_ggml_q8k_grouped_pair(
     float *const *gate_y, float *const *up_y, const float *x,
     const uint8_t *const *gate_weights, const uint8_t *const *up_weights,
@@ -197,16 +188,6 @@ bool matmul_iq1_m_ggml_q8k_grouped_pair(
 bool matmul_iq1_m_ggml_q8k_grouped_inputs(
     float *const *y, const float *const *x,
     const uint8_t *const *W_quantized, int n_matrices, int S, int I, int O);
-// Grouped Qwen CPU routes for the other quantized projections present in the
-// Qwen4Exp checkpoint.  IQ2/ IQ3 use the same Q8_K activation contract as the
-// existing AVX2 per-matrix wrappers; IQ4_NL uses ggml's Q8_0 dot kernel for
-// the down projection, whose activation differs after each expert's SwiGLU.
-bool matmul_iq2_xxs_ggml_avx2_grouped(
-    float *const *y, const float *x, const uint8_t *const *W_quantized,
-    int n_matrices, int S, int I, int O);
-bool matmul_iq3_xxs_ggml_avx2_grouped(
-    float *const *y, const float *x, const uint8_t *const *W_quantized,
-    int n_matrices, int S, int I, int O);
 // Qwen-only grouped wrappers around the production GGML CPU dot kernels.
 // Unlike the older AVX2 prototypes above, these use the same dispatched
 // ggml_vec_dot_iq*_q8_K implementation as llama.cpp's MUL_MAT_ID path.

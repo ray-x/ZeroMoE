@@ -415,7 +415,6 @@ def run_one(idx, category, slug, text):
             str(CONFIG),
             "--predict",
             str(NGEN),
-            "--collect-usage-stats",
         ]
         if ENGINE_LOG_PATH:
             command += ["--log-file", ENGINE_LOG_PATH]
@@ -483,7 +482,6 @@ def run_persistent(items):
         str(CONFIG),
         "--predict",
         str(NGEN),
-        "--collect-usage-stats",
     ]
     if ENGINE_LOG_PATH:
         command += ["--log-file", ENGINE_LOG_PATH]

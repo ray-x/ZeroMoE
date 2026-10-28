@@ -472,31 +472,7 @@ public:
     return ram_expert_index.count(swap_key(layer, expert_id)) > 0;
   }
 
-  // Like is_ram_resident, but also confirms the slot is FULLY POPULATED
-  // (!ram_loading) and returns it -- for a caller that wants to act on
-  // the data (e.g. prefill's opportunistic Phase-2 VRAM promotion,
-  // execution_layer.cpp's LayerScratch::pending_prefill_promotions),
-  // never merely note its presence. Must NEVER block: a still-Loading
-  // slot (claimed by a prefetch worker, read in flight) returns nullptr
-  // exactly like a genuinely-absent one -- the caller's job is to try
-  // again later, not wait here (that's what wait_for_ram_slot is for,
-  // and this function is deliberately not that). Reuses find_ram_slot's
-  // own trusted-index-hit/self-healing-on-stale-hit logic under the
-  // lock, so this is not const the way is_ram_resident is.
-  MoEExpertBlock *
-  find_ram_slot_if_ready(std::vector<MoEExpertBlock> &layer_slots, size_t cap,
-                         int layer, int expert_id) {
-    RAM_TIMED_LOCK(lock);
-    ssize_t idx = find_ram_slot(layer_slots, cap, layer, expert_id);
-    if (idx < 0)
-      return nullptr;
-    MoEExpertBlock &slot = layer_slots[(size_t)idx];
-    if (slot.ram_loading)
-      return nullptr; // still in flight -- try again next layer
-    return &slot;
-  }
-
-  // Same lookup as find_ram_slot_if_ready(), but retain the RAM-tier
+  // Find and retain the RAM-tier
   // temporary pin before releasing ram_mutex. This closes the lookup-to-pin
   // window for callers that queue an asynchronous DMA directly from the
   // returned slab_buffer: a prefetch worker may otherwise evict or regrow the
@@ -1617,7 +1593,6 @@ public:
       }
       slot.also_in_vram = false;
       slot.loaded_by_prefetch = false;
-      slot.loaded_by_lookahead = false;
       slot.consumed_by_vram_upload = false;
       slot.prefill_demand = 0;  // 2026-08-31: same reset lifecycle
       slot.from_padding = false;
@@ -1933,11 +1908,6 @@ public:
               1, std::memory_order_relaxed);
       }
     }
-    if (displaced != -1 && victim.loaded_by_lookahead &&
-        victim.hit_count == 0) {
-      perf().n_prefill_lookahead_loaded_evicted_unused.fetch_add(
-          1, std::memory_order_relaxed);
-    }
     // Erase the outgoing identity's index entry now -- this slot is
     // committed to being overwritten by `expert_id` from here on,
     // whether the D2H copy below ultimately succeeds or fails (see the
@@ -2077,7 +2047,6 @@ public:
       victim.expert_id = -1;
       victim.also_in_vram = false;
       victim.loaded_by_prefetch = false;
-      victim.loaded_by_lookahead = false;
       victim.consumed_by_vram_upload =
           false; // 2026-08-30: same reset lifecycle (engine.hpp)
       victim.prefill_demand = 0;  // 2026-08-31: same reset lifecycle
@@ -2093,7 +2062,6 @@ public:
         false; // it just left VRAM -- this RAM copy is the only one now
     victim.loaded_by_prefetch =
         false; // fresh identity, synchronously salvaged, not prefetch-loaded
-    victim.loaded_by_lookahead = false; // ditto
     victim.consumed_by_vram_upload =
         false; // 2026-08-30: same reset lifecycle (engine.hpp)
     victim.prefill_demand = 0;  // 2026-08-31: same reset lifecycle
@@ -2414,25 +2382,6 @@ public:
       }
 
       // -- Ready: an ordinary cache hit --
-      // EngineConfig::prefill_dispatch_lookahead_tokens instrumentation:
-      // captured BEFORE the increment below, since hit_count==0 only
-      // means "never hit before" up to this exact point -- this is the
-      // FIRST real reuse of a slot that was loaded purely by the
-      // lookahead widening (see MoEExpertBlock::loaded_by_lookahead's
-      // own comment), i.e. the future token this fetch was FOR actually
-      // reached it and found it resident (a genuine "prefetch worked"
-      // event), as opposed to the slot instead being evicted before
-      // anyone ever claimed it again (n_prefill_lookahead_loaded_
-      // evicted_unused, ram_manager.hpp's eviction-victim-selection
-      // sites). Together the two give a real used-vs-wasted split for
-      // this mechanism, mirroring loaded_by_prefetch/"Unified RAM
-      // waste"'s own existing design exactly, just for a different
-      // caller/mechanism that design's own who==PrefetchWorker gate
-      // doesn't cover.
-      if (slot.loaded_by_lookahead && slot.hit_count == 0) {
-        perf().n_prefill_lookahead_first_hit.fetch_add(
-            1, std::memory_order_relaxed);
-      }
       slot.last_used_clock = ++global_clock;
       if (slot.hit_count < UINT32_MAX)
         slot.hit_count++;
@@ -2566,10 +2515,6 @@ public:
                 1, std::memory_order_relaxed);
         }
       }
-      if (victim.loaded_by_lookahead && victim.hit_count == 0) {
-        perf().n_prefill_lookahead_loaded_evicted_unused.fetch_add(
-            1, std::memory_order_relaxed);
-      }
       ram_swap_stats[swap_key(layer, evicted_expert_id)].swap_out++;
       ram_expert_index.erase(swap_key(layer, evicted_expert_id));
     }
@@ -2606,7 +2551,6 @@ public:
     // own Phase A sets this true afterward, right after this Claimed
     // result comes back, for exactly the candidates its own is_lookahead
     // array marks -- see that call site's own comment.
-    victim.loaded_by_lookahead = false;
     victim.from_padding = false;
     victim.expert_id = expert_id;
     victim.ram_loading = true;
@@ -3100,7 +3044,6 @@ public:
     slot.hit_count = 0;
     slot.ram_loading = false;
     slot.loaded_by_prefetch = false;
-    slot.loaded_by_lookahead = false;
     slot.consumed_by_vram_upload =
         false; // 2026-08-30: same reset lifecycle (engine.hpp)
     slot.prefill_demand = 0;  // 2026-08-31: same reset lifecycle
@@ -3116,18 +3059,15 @@ public:
   // synchronous, already-completed load (engine.load_expert_slab has
   // already filled slab_buffer/gate_proj/up_proj/down_proj by the time this
   // is called), no Loading transition needed.
-  // seed_hit_count: EngineConfig::ram_preload_seed_hit_count's own value,
-  // already clamped to promote_hit_threshold-1 by the caller (main.cpp) --
-  // see that flag's comment for why the clamp matters. 0 (default,
-  // matches every pre-2026-09-04 call site) reproduces the original
-  // behavior exactly.
+  // The historical usage-file count selects which experts to preload;
+  // each new slot starts with no in-session re-hits.
   void preload_ram_slot(StreamingEngine &engine, int layer, int expert_id,
-                        size_t slot_idx, uint32_t seed_hit_count = 0) {
+                        size_t slot_idx) {
     RAM_TIMED_LOCK(lock);
     auto &layer_slots = engine.layers_experts[layer];
     MoEExpertBlock &slot = layer_slots[slot_idx];
     slot.last_used_clock = ++global_clock;
-    slot.hit_count = seed_hit_count;
+    slot.hit_count = 0;
     slot.ram_loading = false;
     ram_expert_index[swap_key(layer, expert_id)] = slot_idx;
   }
@@ -3326,22 +3266,9 @@ public:
   // can decide which ones are eligible to redirect to CPU compute instead
   // of a VRAM upload (a Hit/Loading entry was never a candidate for that
   // decision in the first place, it never touched disk this call).
-  // caller_k (nullable, parallel array to expert_ids, size `topk`):
-  // execution_layer.cpp's own ram_needed_k array, reused directly rather
-  // than asking the caller to build a second parallel array -- a value
-  // of -1 already means exactly "this entry is a prefill_dispatch_
-  // lookahead_tokens addition, not the calling token's own real need"
-  // (see that field's own comment, engine_config.hpp). When caller_k[k]
-  // < 0 and Phase A's claim_or_wait for expert_ids[k] returns Claimed (a
-  // genuine new fetch, not an existing Hit/Loading), the resulting slot
-  // is tagged MoEExpertBlock::loaded_by_lookahead=true so its later
-  // used-vs-evicted-unused outcome can be measured (see that field's own
-  // comment for the two counters this feeds). nullptr (every pre-existing
-  // caller) = exact prior behavior, no tagging.
   void get_experts_batch(StreamingEngine &engine, int layer,
                          const int *expert_ids, int topk, MoEExpertBlock **out,
-                         bool *out_was_real_fetch = nullptr,
-                         const int *caller_k = nullptr) {
+                         bool *out_was_real_fetch = nullptr) {
     // See get_expert's own comment on t_ram_get_expert -- same rationale,
     // this is get_expert's batched sibling and the higher-traffic of the
     // two on the real decode-time call path (called once per non-shadowed
@@ -3462,8 +3389,6 @@ public:
       ram_pin(*out[k]);
       if (out_was_real_fetch)
         out_was_real_fetch[k] = true;
-      if (caller_k && caller_k[k] < 0)
-        layer_slots[result.slot_idx].loaded_by_lookahead = true;
       claimed_this_batch.push_back(result.slot_idx);
       pending.push_back({result.slot_idx, expert_id, k, 0.0});
     }
@@ -3762,7 +3687,6 @@ public:
                 claimed_this_batch.push_back(slot_idx);
                 pv.also_in_vram = false;
                 pv.loaded_by_prefetch = false;
-                pv.loaded_by_lookahead = false;
                 pv.consumed_by_vram_upload =
                     false; // 2026-08-30: same reset lifecycle (engine.hpp)
                 pv.prefill_demand = 0;  // 2026-08-31: same reset lifecycle

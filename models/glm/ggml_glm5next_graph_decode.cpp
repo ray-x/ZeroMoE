@@ -611,26 +611,6 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
                lt.tokens, ta / lt.tokens, tf / lt.tokens, line.c_str());
     }
   }
-  if (!g.probe_x.empty()) {
-    // Training/diagnostic tap: the exact pilot input (pre-FFN hidden, f32 [D]) of every layer for this decode token.
-    const char *dir = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PROBE_DUMP");
-    std::vector<float> row((size_t)g.D);
-    for (const auto &lx : g.probe_x) {
-      if (!dir || lx.second->type != GGML_TYPE_F32 || (size_t)lx.second->ne[0] != (size_t)g.D)
-        continue;
-      ggml_backend_tensor_get(lx.second, row.data(), 0, (size_t)g.D * sizeof(float));
-      std::ofstream xo(std::string(dir) + "/L" + std::to_string(lx.first) + ".x.bin", std::ios::binary | std::ios::app);
-      xo.write(reinterpret_cast<const char *>(row.data()), (std::streamsize)((size_t)g.D * sizeof(float)));
-    }
-  }
-  const auto synced = std::chrono::steady_clock::now();
-  const double compute_ms = std::chrono::duration<double, std::milli>(
-                                synced - start)
-                                .count();
-  const auto cache_update_start = std::chrono::steady_clock::now();
-  if (route_stats_enabled())
-    update_partial_routes(g, pos_base, compute_ms);
-  const auto cache_update_done = std::chrono::steady_clock::now();
   if (!g.ready) {
     if (!sync_glm5next_decode_state_to_host(g))
       LOG_ERROR("[GGML-GLM5NEXT-FULL-DECODE] cache update state handoff "

@@ -1989,7 +1989,7 @@ static void qwen4exp_gdn_delta_rule(const float *Q, const float *K,
   // 64 matches llama.cpp's own CS for the non-KDA (GDN) branch.
   constexpr int kGdnChunk = 64;
 
-  // GPU chunkwise path (EngineConfig::qwen4exp_gdn_gpu). Same chunk size and
+  // GPU chunkwise path (`ZEROMOE_GDN_CHUNKED`). Same chunk size and
   // same closed form as the CPU chunk function below -- chunks stay
   // sequential (the state carries) but all H_v heads and hd columns run in
   // parallel, which the CPU form cannot do. Prefill only, matching

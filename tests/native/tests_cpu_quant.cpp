@@ -138,7 +138,8 @@ bool test_avx512_dequant_iq() {
 // ------------------------------------------------------------------
 // The decode path uses three different CPU contracts here:
 //   * IQ2_XXS/IQ3_XXS default to ZeroMoE's exact dequant+F32 dot path;
-//   * IQ1_M optionally uses ggml's production IQ1_M x Q8_K dot path;
+//   * IQ1_M uses exact dequant+F32 in generic CPU fallback; the GGML Q8_K
+//     kernel is tested separately for the grouped Qwen CPU path;
 //   * the Qwen grouped wrappers must produce the same result as their
 //     one-matrix form, regardless of whether the caller has one or many
 //     routed experts.

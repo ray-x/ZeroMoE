@@ -310,25 +310,6 @@ struct MoEExpertBlock {
     // different expert, so it can never describe the wrong expert.
     uint32_t prefill_demand = 0;
 
-    // True when this slot was claimed by EngineConfig::prefill_dispatch_
-    // lookahead_tokens (prefill-only, additive get_experts_batch widening --
-    // see that field's own comment, engine_config.hpp) rather than by the
-    // token whose real, immediate need triggered the call. Deliberately a
-    // SEPARATE flag from loaded_by_prefetch above, not a shared one: that
-    // flag is set purely from RamClaimCaller (who==PrefetchWorker), and
-    // lookahead widening always goes through RamClaimCaller::MainThread (it's
-    // called from the SAME get_experts_batch call as the triggering token's
-    // own real needs, just for a different, later token's picks) -- so
-    // reusing loaded_by_prefetch would have made lookahead-loaded slots
-    // invisible to the "Unified RAM waste" design's own who-based gate, and
-    // this project's own "was_it_used" question for this specific mechanism
-    // needs its own answer, not a borrowed one. See RAMSafetyManager::
-    // claim_or_wait's own n_prefill_lookahead_first_hit comment (the "used"
-    // signal) and the eviction-victim-selection sites' n_prefill_lookahead_
-    // loaded_evicted_unused comment (the "wasted" signal) for the two halves
-    // of this measurement. Reset to false whenever a slot is claimed for a
-    // different expert, same lifecycle as also_in_vram/loaded_by_prefetch.
-    bool loaded_by_lookahead = false;
 
     // True when this slot was claimed by Phase B's speculative disk-batch
     // padding (RAMSafetyManager::get_experts_batch, disk_batch_padding
@@ -486,9 +467,7 @@ public:
     // cold-DDR CPU seam is eligible for a decode layer.
     bool qwen4exp_cpu_offload = false;
     std::vector<int> qwen4exp_cpu_offload_layers;
-    int qwen4exp_cpu_offload_force_cold_count = 0;
-    int qwen4exp_cpu_offload_force_expert = -1;
-    bool qwen4exp_cpu_offload_event_fence = false;
+        bool qwen4exp_cpu_offload_event_fence = false;
     int qwen4exp_cpu_offload_ring_slots = 2;
 
     // GPU staging for host-resident decode layers -- see
@@ -857,33 +836,6 @@ public:
     size_t ram_pinned_budget_bytes = 0;
     std::atomic<size_t> ram_pinned_bytes_used{0};
 
-    // Set from EngineConfig::prefill_opportunistic_promote at startup
-    // (main.cpp). Only meaningful when prefill_warm_via_prefetcher is also
-    // true -- gates LayerScratch::pending_prefill_promotions' cross-layer
-    // follow-up (execution_layer.cpp) separately from the hint-pushing
-    // itself.
-    //
-    // REAL A/B, CONCLUSIVE, DEFAULT FLIPPED TO OFF (2026-08-12): four
-    // consecutive runs with this ON all landed at prefill=0.56 tok/s; one
-    // run with it OFF landed at 0.60, matching the pre-feature baseline
-    // (0.59) almost exactly. Root cause confirmed, not just correlated:
-    // hint volume (n_prefill_hint_pushed) nearly HALVED when this was ON
-    // (420 vs ~930) -- this pass and Phase 2's own per-layer hint-pushing
-    // loop compete for the SAME resource (vram_cache->has_free_slot()).
-    // Running the opportunistic follow-up FIRST in every Phase 2 call
-    // consumes free slots faster than Phase 2's own loop would have on its
-    // own, so `has_free_slot()` goes false sooner -- meaning LATER layers'
-    // own candidates stop getting hints pushed at all, losing the RAM-
-    // prefetch overlap prefill_warm_via_prefetcher exists to provide, and
-    // falling back to Phase 3's fully-synchronous path instead. The
-    // mechanism itself is safe (every candidate is a confirmed real router
-    // pick, never a wrong speculative bet) -- the bug is resource
-    // contention with the very feature it was meant to complement, not
-    // promotion accuracy. Left implemented (not deleted) rather than
-    // ripped out, per this project's own convention for a well-evidenced,
-    // cleanly-reasoned negative result -- see CLAUDE.md.
-    bool prefill_opportunistic_promote = false;
-
     // Set from EngineConfig::decode_async_prewarm/decode_async_prewarm_
     // max_batch at startup (main.cpp). Decode-time analogue of the prefill
     // pre-warm above -- see EngineConfig::decode_async_prewarm's own
@@ -921,12 +873,6 @@ public:
     // at the end of each request -- see RAMSafetyManager::decay_prefill_demand.
     bool prefill_retention_decay = true;
 
-    // Set from EngineConfig::prefill_dispatch_lookahead_tokens at startup
-    // (main.cpp). 0 = off (default is 8 in EngineConfig itself). See that
-    // field's own extensive comment (engine_config.hpp) for the mechanism
-    // and the real "phase_b dominates even with prefill_warm_via_prefetcher
-    // on" finding this responds to.
-    int prefill_dispatch_lookahead_tokens = 0;
 
     // Set from EngineConfig::prefill_hint_order_by_earliest_token at
     // startup (main.cpp). false = off (default, exact prior expert_freq-
@@ -1002,12 +948,10 @@ public:
     // Qwen-only S==1 RAM->VRAM batch staging. Other model families never
     // consult this switch; false preserves the direct pinned-slab path.
     bool qwen4exp_decode_batch_stage = false;
-    bool qwen4exp_decode_custom_hc_q8 = false;
     // Keep the GPU router for batched Qwen prefill, but opt into it for the
     // S==1 decode boundary only when it wins on the target hardware. The
     // Qwen router pilot remains independently GPU-backed for prediction.
-    bool qwen4exp_decode_gpu_router = false;
-    // Qwen4Exp-only CPU affinity fast path: group IQ1_M expert projections
+      // Qwen4Exp-only CPU affinity fast path: group IQ1_M expert projections
     // with the same ggml Q8_K dot kernel used by llama.cpp. It is consulted
     // only when cpu_affinity_layers selects a layer, so other models and the
     // normal GPU route are unchanged.

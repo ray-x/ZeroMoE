@@ -61,29 +61,21 @@ target_include_directories(mtp_speculation_test PRIVATE
 # ---------------------------------------------------------------------------
 # Build options
 # ---------------------------------------------------------------------------
-option(ZEROMOE_CPU_ONLY "Disable CUDA and build CPU-only components" OFF)
-# ZEROMOE_USE_GGML_CUDA is not a user option. Every CUDA build links ggml-cuda
-# and defines the macro (see the CPU-only/Apple block below); it exists only as
-# the compile capability that guards CUDA-only translation units. A CUDA build
-# without it cannot even link: full_graph_models.cpp references
-# qwen4exp_full_graph_bootstrap(), whose definition lives in the guarded half of
-# ggml_qwen4exp_graph.cpp.
+if(NOT DEFINED GGML_CUDA)
+    if(APPLE)
+        set(_ZEROMOE_GGML_CUDA_DEFAULT OFF)
+    else()
+        set(_ZEROMOE_GGML_CUDA_DEFAULT ON)
+    endif()
+    set(GGML_CUDA ${_ZEROMOE_GGML_CUDA_DEFAULT} CACHE BOOL "ggml: use CUDA")
+endif()
+if(APPLE AND GGML_CUDA)
+    set(GGML_CUDA OFF CACHE BOOL "ggml: use CUDA" FORCE)
+    message(STATUS "ZeroMoE: Apple platform uses the CPU/Metal engine; forcing GGML_CUDA=OFF")
+endif()
+# ZEROMOE_USE_GGML_CUDA is internal. CUDA builds link ggml-cuda and define
+# this capability macro to guard CUDA-only translation units.
 #
-# ggml's own default for GGML_CUDA_GRAPHS is OFF outside llama.cpp (its
-# option() comment literally says "llama.cpp only") -- a CUDA build would
-# silently never define GGML_CUDA_USE_GRAPHS, so ggml-cuda's CUDA graph
-# capture/replay path (ggml_backend_cuda_graph_compute in ggml-cuda.cu) is
-# compiled out entirely: every decode-graph node gets its own individual
-# cudaLaunchKernel instead of one batched cudaGraphLaunch per captured split.
-# Measured real-world cost of missing this on the full-graph Qwen4Exp decode
-# path: full-graph decode dropped from a verified ~20 tok/s (graphs enabled)
-# to ~8 tok/s (graphs silently absent) on identical hardware/model/config --
-# this was mistaken for a correctness or scheduling regression for an entire
-# investigation before the missing compile define was found. CUDA graph
-# capture is mandatory for ZeroMoE CUDA builds and is always enabled below.
-option(ZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES
-       "Apply GGML CUDA/CPUOffload host-node integration patches"
-       ON)
 # Metal/MPS is the only GPU path on macOS, so default it on for Apple Silicon.
 # Everywhere else the option is inert (and warns if forced ON below).
 set(_ZEROMOE_METAL_DEFAULT OFF)
@@ -97,7 +89,7 @@ option(ZEROMOE_METAL
 # Resolve the architecture list before add_subdirectory(ggml): ggml-cuda
 # creates its CUDA targets during that call, so detecting architectures later
 # would affect ZeroMoE's kernels but leave ggml-cuda with a different target.
-if(NOT ZEROMOE_CPU_ONLY AND
+if(GGML_CUDA AND
    (NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR
     CMAKE_CUDA_ARCHITECTURES STREQUAL "" OR
     CMAKE_CUDA_ARCHITECTURES STREQUAL "native"))
@@ -120,23 +112,10 @@ if(NOT ZEROMOE_CPU_ONLY AND
     endif()
 endif()
 
-# On macOS the CPU-only binary is the only usable engine, and real MoE models
-# are almost always quantized.
-if(APPLE)
-    set(ZEROMOE_CPU_ONLY ON CACHE BOOL "macOS has no CUDA SDK; force CPU-only build" FORCE)
-    message(STATUS "ZeroMoE: Apple platform detected — forcing ZEROMOE_CPU_ONLY=ON")
-endif()
-
-# ggml-cuda is part of every CUDA build. There is no supported "CUDA without
-# the ggml CUDA backend" configuration: the full-graph entry point lives in the
-# guarded half of ggml_qwen4exp_graph.cpp, so such a build fails to link.
-# CPU-only builds (including macOS) leave the macro undefined and compile the
-# CPU/NEON path instead.
-if(ZEROMOE_CPU_ONLY)
-    set(ZEROMOE_USE_GGML_CUDA OFF)
-else()
-    set(ZEROMOE_USE_GGML_CUDA ON)
-endif()
+# CUDA builds require ggml-cuda because the full-graph entry point is compiled
+# in its CUDA-only translation unit; CPU-only builds leave the capability macro
+# undefined and use the CPU/NEON path instead.
+set(ZEROMOE_USE_GGML_CUDA ${GGML_CUDA})
 
 # ZeroMoE always links ggml for reference dequantizers. The default fetches a
 # stable llama.cpp release and builds it in-tree; point ZEROMOE_GGML_ROOT or
@@ -195,9 +174,6 @@ endif()
 # inspected (Windows, a cross-compile, an unreadable /proc). UNKNOWN keeps the
 # historical behaviour of trusting the requested flags.
 # ---------------------------------------------------------------------------
-option(ZEROMOE_CHECK_HOST_CPU
-    "Fail configuration when the host x86 CPU lacks the AVX-512 baseline ZeroMoE requires" ON)
-
 set(ZEROMOE_HOST_X86 OFF)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
     set(ZEROMOE_HOST_X86 ON)
@@ -265,21 +241,22 @@ if(ZEROMOE_HOST_X86 AND NOT ZEROMOE_APPLE_SILICON AND NOT CMAKE_CROSSCOMPILING)
     endif()
 endif()
 
+# A non-native AVX-512 VNNI build explicitly targets a deployment CPU,
+# as used by setup.sh --release-binary. Derive this from upstream GGML settings
+# instead of exposing a ZeroMoE-only safety bypass.
+set(_ZEROMOE_AVX512_DEPLOYMENT_TARGET OFF)
+if(DEFINED GGML_NATIVE AND NOT GGML_NATIVE AND
+   DEFINED GGML_AVX512_VNNI AND GGML_AVX512_VNNI)
+    set(_ZEROMOE_AVX512_DEPLOYMENT_TARGET ON)
+endif()
 if(ZEROMOE_HOST_AVX512 STREQUAL "OFF")
-    string(CONCAT _zeromoe_cpu_remedy
-        "ZeroMoE's CPU kernels and the component tests are compiled for the "
-        "Skylake-X AVX-512 baseline and execute those instructions "
-        "unconditionally, so this build would crash with SIGILL on this "
-        "machine.\n"
-        "Build on a host that has AVX-512 F/CD/BW/DQ/VL (Intel Skylake-X or "
-        "Sunny Cove server cores, AMD Zen 4 or newer), or configure with "
-        "-DZEROMOE_CHECK_HOST_CPU=OFF to deliberately build a binary for a "
-        "different machine.")
-    if(ZEROMOE_CHECK_HOST_CPU)
-        message(FATAL_ERROR "ZeroMoE: host CPU lacks ${_zeromoe_missing_cpu_features}.\n${_zeromoe_cpu_remedy}")
+    if(_ZEROMOE_AVX512_DEPLOYMENT_TARGET)
+        message(STATUS "ZeroMoE: build host lacks ${_zeromoe_missing_cpu_features}; "
+                       "non-native GGML_AVX512_VNNI=ON build targets a deployment CPU")
     else()
-        message(WARNING "ZeroMoE: host CPU lacks ${_zeromoe_missing_cpu_features}, "
-                        "continuing because ZEROMOE_CHECK_HOST_CPU=OFF.\n${_zeromoe_cpu_remedy}")
+        message(FATAL_ERROR "ZeroMoE: host CPU lacks ${_zeromoe_missing_cpu_features}. "
+            "The engine requires AVX-512 F/CD/BW/DQ/VL. Build on a compatible host "
+            "or use GGML_NATIVE=OFF and GGML_AVX512_VNNI=ON for a deployment target.")
     endif()
 endif()
 
@@ -300,12 +277,12 @@ if(NOT DEFINED GGML_AVX512_VNNI)
         message(STATUS "ZeroMoE: host CPU has no AVX-512 VNNI; defaulting GGML_AVX512_VNNI=OFF")
     endif()
 elseif(GGML_AVX512_VNNI AND ZEROMOE_HOST_AVX512_VNNI STREQUAL "OFF")
-    if(ZEROMOE_CHECK_HOST_CPU)
+    if(_ZEROMOE_AVX512_DEPLOYMENT_TARGET)
+        message(STATUS "ZeroMoE: GGML_AVX512_VNNI=ON for a non-VNNI build host; "
+                       "deployment target must support VNNI")
+    else()
         message(WARNING "ZeroMoE: GGML_AVX512_VNNI=ON but this host CPU has no AVX-512 "
                         "VNNI; ggml will emit VNNI instructions that fault here")
-    else()
-        message(STATUS "ZeroMoE: GGML_AVX512_VNNI=ON for a non-VNNI build host "
-                       "(ZEROMOE_CHECK_HOST_CPU=OFF); the target must support VNNI")
     endif()
 endif()
 if(ZEROMOE_APPLE_SILICON AND GGML_AVX512_VNNI)
@@ -353,10 +330,8 @@ find_package(OpenMP)
 set(ZEROMOE_GGML_COMMIT "8baabd53b77d1c48c6ef8d3b620436292f3f6231" CACHE STRING "llama.cpp commit whose ggml/ directory is built (used when the third_party/llama.cpp submodule is absent)")
 set(ZEROMOE_GGML_ROOT "" CACHE PATH "Path to a local ggml checkout (fetched automatically if empty)")
 
-# Disable everything we do not need for a CPU decode assistant. GGML_CUDA
-# follows the derived ZEROMOE_USE_GGML_CUDA and must be set BEFORE the
-# subproject is configured.
-set(GGML_CUDA        ${ZEROMOE_USE_GGML_CUDA} CACHE BOOL "" FORCE)
+# Disable ggml backends not used by this engine. GGML_CUDA is initialized
+# before the ggml subproject is configured and remains the user's build switch.
 set(GGML_CUDA_GRAPHS ON CACHE BOOL "" FORCE)
 message(STATUS "ZeroMoE: GGML_CUDA_GRAPHS=ON (required for CUDA full-graph runtime)")
 set(GGML_HIPBLAS     OFF CACHE BOOL "" FORCE)
@@ -445,7 +420,7 @@ endif()
 # already-applied patches are detected by a reverse apply check.
 # Link an already-built ggml instead of compiling it in-tree. The prebuilt tree must come
 # from the same ZEROMOE_GGML_ROOT (its headers are used) and ggml patches are NOT re-applied.
-set(ZEROMOE_GGML_PREBUILT_DIR "" CACHE PATH "Directory holding prebuilt libggml*.so (skips building ggml)")
+set(ZEROMOE_GGML_PREBUILT_DIR "" CACHE PATH "Directory holding prebuilt libggml*.so (must include ZeroMoE patches)")
 if(ZEROMOE_GGML_PREBUILT_DIR)
     foreach(_lib ggml ggml-base ggml-cpu)
         add_library(${_lib} SHARED IMPORTED GLOBAL)
@@ -460,7 +435,38 @@ if(ZEROMOE_GGML_PREBUILT_DIR)
         IMPORTED_LOCATION "${ZEROMOE_GGML_PREBUILT_DIR}/src/ggml-cuda/libggml-cuda.so"
         INTERFACE_INCLUDE_DIRECTORIES "${ZEROMOE_GGML_ROOT}/include"
         INTERFACE_LINK_LIBRARIES "ggml-base")
-    message(STATUS "ZeroMoE: linking PREBUILT ggml from ${ZEROMOE_GGML_PREBUILT_DIR} (no ggml compile)")
+    if(CMAKE_NM)
+        set(_zeromoe_prebuilt_nm "${CMAKE_NM}")
+    else()
+        find_program(_zeromoe_prebuilt_nm NAMES nm llvm-nm REQUIRED)
+    endif()
+    execute_process(
+        COMMAND "${_zeromoe_prebuilt_nm}" -D
+                "${ZEROMOE_GGML_PREBUILT_DIR}/src/libggml-base.so"
+        RESULT_VARIABLE _zeromoe_base_nm_rc
+        OUTPUT_VARIABLE _zeromoe_base_symbols
+        ERROR_QUIET)
+    string(FIND "${_zeromoe_base_symbols}"
+        "ggml_backend_sched_early_cpu_supported" _zeromoe_sched_hook_pos)
+    if(NOT _zeromoe_base_nm_rc EQUAL 0 OR _zeromoe_sched_hook_pos EQUAL -1)
+        message(FATAL_ERROR
+            "ZeroMoE: prebuilt GGML lacks the required host-node scheduler hook "
+            "ggml_backend_sched_early_cpu_supported; rebuild it with scripts/build_ggml.sh")
+    endif()
+    execute_process(
+        COMMAND "${_zeromoe_prebuilt_nm}" -D
+                "${ZEROMOE_GGML_PREBUILT_DIR}/src/ggml-cuda/libggml-cuda.so"
+        RESULT_VARIABLE _zeromoe_cuda_nm_rc
+        OUTPUT_VARIABLE _zeromoe_cuda_symbols
+        ERROR_QUIET)
+    string(FIND "${_zeromoe_cuda_symbols}"
+        "zeromoe_qwen4exp_cuda_host_node_enqueue" _zeromoe_cuda_hook_pos)
+    if(NOT _zeromoe_cuda_nm_rc EQUAL 0 OR _zeromoe_cuda_hook_pos EQUAL -1)
+        message(FATAL_ERROR
+            "ZeroMoE: prebuilt ggml-cuda lacks the required host-node bridge hook "
+            "zeromoe_qwen4exp_cuda_host_node_enqueue; rebuild it with scripts/build_ggml.sh")
+    endif()
+    message(STATUS "ZeroMoE: linking PREBUILT ggml from ${ZEROMOE_GGML_PREBUILT_DIR} (no compile or patch; libraries must already include ZeroMoE patches)")
 else()
     include(cmake/ZeroMoEGgmlPatches.cmake)
     zeromoe_apply_ggml_patches("${ZEROMOE_GGML_ROOT}")
@@ -516,7 +522,7 @@ include_directories(${ZEROMOE_INCLUDE_DIRS})
 # ---------------------------------------------------------------------------
 # Full engine build (Linux + CUDA Toolkit)
 # ---------------------------------------------------------------------------
-if(NOT ZEROMOE_CPU_ONLY)
+if(GGML_CUDA)
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 17)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
@@ -590,7 +596,8 @@ if(NOT ZEROMOE_CPU_ONLY)
     endif()
 
     # Upstream ExLlamaV3 EXL3 kernels behind the launch_exl3_mul1_* API.
-    # Runtime opt-out: ZEROMOE_EXL3_UPSTREAM=0 (legacy kernels).
+    # Optional source provides the upstream EXL3 capability; this compile
+    # definition guards its declarations and implementations.
     include(cmake/ZeroMoEExl3Upstream.cmake)
     if(TARGET zeromoe_exl3_upstream)
         list(APPEND ZEROMOE_CUDA_SRCS backends/exl3/exl3_upstream_ops.cu)
@@ -718,7 +725,6 @@ if(NOT ZEROMOE_CPU_ONLY)
     target_compile_options(zeromoe PRIVATE ${ZEROMOE_AVX512_FLAGS})
     target_compile_definitions(zeromoe PRIVATE
         ZEROMOE_EXL3_CUDA=1
-        ZEROMOE_ENGINE_CUDA=1
         ZEROMOE_BUILD_TYPE="$<CONFIG>"
         ${ZEROMOE_VERSION_DEFINITIONS})
     set_target_properties(zeromoe PROPERTIES
@@ -1442,11 +1448,9 @@ else()
     add_library(zeromoe_cpu_api STATIC backends/cpu/cpu_api.cpp)
     target_link_libraries(zeromoe_cpu_api PUBLIC zeromoe_cpu_runtime zeromoe_server)
     target_link_libraries(zeromoe_cpu PRIVATE zeromoe_cpu_api)
-    if(ZEROMOE_SERVER_TESTS)
         add_executable(cpu_api_tests tests/cpu_api_test.cpp)
         target_link_libraries(cpu_api_tests PRIVATE zeromoe_cpu_api)
         add_test(NAME cpu_api_tests COMMAND cpu_api_tests)
-    endif()
 endif()
 
 # EXL3 bench targets compile backends/exl3/exl3_upstream_ops.cu directly and need the

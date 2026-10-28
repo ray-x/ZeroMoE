@@ -7,11 +7,15 @@ set -uo pipefail
 bin=$(readlink -f "${1:?engine}"); tag=${2:?tag}; shift 2
 runtime_env=()
 graph_args=()
+verbosity_args=()
 while (($#)); do
   case "$1" in
     --graph-*)
       (($# >= 2)) || { echo "$1 requires a value" >&2; exit 2; }
       graph_args+=("$1" "$2"); shift 2 ;;
+    --verbosity)
+      (($# >= 2)) || { echo "$1 requires a value" >&2; exit 2; }
+      verbosity_args+=("$1" "$2"); shift 2 ;;
     *=*) runtime_env+=("$1"); shift ;;
     *) echo "unsupported run option: $1" >&2; exit 2 ;;
   esac
@@ -55,5 +59,5 @@ printf '%s\n:q\n' "$PROMPT" | env \
   --graph-offload-pinned-fraction 0.5 --graph-offload-policy lru \
   --graph-offload-store "$STORE" --graph-offload-model "$MODEL" \
   --graph-offload-usage-file "$USAGE" --graph-offload-async 1 \
-  "${graph_args[@]}" --predict "${NGEN:-48}" > "$out/$tag.stdout" 2>&1
+  "${graph_args[@]}" "${verbosity_args[@]}" --predict "${NGEN:-48}" > "$out/$tag.stdout" 2>&1
 echo "exit=$?"; grep -h 'decode=' "$out/$tag.engine.log" | tail -1 | sed -E 's/.*(decode=[0-9.]+ tok\/s).*/\1/'

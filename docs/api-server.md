@@ -27,7 +27,7 @@ macOS/CPU:
 
 ```bash
 cmake -S . -B build-cpu -DCMAKE_BUILD_TYPE=Release \
-  -DZEROMOE_CPU_ONLY=ON
+  -DGGML_CUDA=OFF
 cmake --build build-cpu --target zeromoe_cpu server_tests cpu_api_tests \
   -j"$(sysctl -n hw.ncpu)"
 ctest --test-dir build-cpu --output-on-failure

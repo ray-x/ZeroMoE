@@ -112,10 +112,6 @@ void report_layer_miss_stats() {
 // column unless depth=2 was explicitly enabled this run -- printing 0.0%
 // there would misleadingly read as "DEPTH-2 predicts this layer badly"
 // instead of "DEPTH-2 wasn't even running".
-// See EngineConfig::prefill_dispatch_lookahead_tokens's own comment for the
-// full mechanism. Prints only if the feature ever actually ran (added>0 or
-// skipped>0) -- silent (matching report_moe_bucket_stats's own convention)
-// when the feature is off or no prefill call happened this run.
 // EngineConfig::pilot_widen_all_tokens -- see that field's own comment,
 // and each n_pilot_wide_* counter's own comment above, for the full
 // mechanism and the 2026-08-30 recall-mislabeling fix. Silent when the
@@ -154,43 +150,7 @@ void report_pilot_wide_stats() {
              hint_suffix.c_str());
 }
 
-void report_prefill_lookahead_stats() {
-    auto& p = perf();
-    uint64_t added = p.n_prefill_lookahead_added.load(std::memory_order_relaxed);
-    uint64_t sk_vram = p.n_prefill_lookahead_skipped_vram.load(std::memory_order_relaxed);
-    uint64_t sk_ram = p.n_prefill_lookahead_skipped_ram.load(std::memory_order_relaxed);
-    uint64_t sk_dup = p.n_prefill_lookahead_skipped_dup.load(std::memory_order_relaxed);
-    uint64_t total = added + sk_vram + sk_ram + sk_dup;
-    if (total == 0) return;
-    LOG_INFO("[PREFILL-LOOKAHEAD] %llu candidate(s) scanned across upcoming tokens: %llu (%.1f%%) added "
-             "as genuine extra RAM-warm fetches, %llu already VRAM-resident, %llu already RAM-resident, "
-             "%llu already in the same combined call -- added ones get real extra lead time before "
-             "their own token's turn, never dispatched by the token that triggered the scan.\n",
-             (unsigned long long)total, (unsigned long long)added,
-             total > 0 ? 100.0 * (double)added / (double)total : 0.0,
-             (unsigned long long)sk_vram, (unsigned long long)sk_ram, (unsigned long long)sk_dup);
-
-    // The "was it actually used" half -- see MoEExpertBlock::loaded_by_
-    // lookahead's own comment. NOT a full partition of `added` (a slot
-    // still resident, un-evicted, at shutdown falls into neither bucket) --
-    // read this as a lower bound on the used/wasted split, and the gap
-    // between (used+wasted) and `added` as "still resident, outcome not
-    // yet known" rather than assuming it's accounted for either way.
-    uint64_t used = p.n_prefill_lookahead_first_hit.load(std::memory_order_relaxed);
-    uint64_t wasted = p.n_prefill_lookahead_loaded_evicted_unused.load(std::memory_order_relaxed);
-    uint64_t known_outcome = used + wasted;
-    LOG_INFO("[PREFILL-LOOKAHEAD] Of %llu added: %llu (%.1f%% of added) later confirmed USED (the future "
-             "token that needed it found it still resident), %llu (%.1f%% of added) confirmed WASTED "
-             "(evicted again before anyone ever claimed it a second time -- pure lost disk I/O), %llu "
-             "still resident/outcome unknown at shutdown.\n",
-             (unsigned long long)added, (unsigned long long)used,
-             added > 0 ? 100.0 * (double)used / (double)added : 0.0,
-             (unsigned long long)wasted,
-             added > 0 ? 100.0 * (double)wasted / (double)added : 0.0,
-             (unsigned long long)(added > known_outcome ? added - known_outcome : 0));
-}
-
-// MEASUREMENT ONLY -- see PerfCounters::n_moe_bucket_unique_experts's own
+// MEASUREMENT ONLY -- see PerfCounters::n_moe_bucket_unique_experts' own
 // comment for the full motivation (the "how would llama.cpp's -ub/mul_mat_id
 // batching apply here" investigation). Real per-layer lines are printed live
 // (LOG_INFO, [MOE-BUCKET] tag, execution_layer.cpp's Phase 1) during any

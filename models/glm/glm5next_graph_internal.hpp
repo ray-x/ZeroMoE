@@ -257,7 +257,6 @@ struct FullGraph : zeromoe::graph::GraphCore {
   std::vector<ggml_backend_buffer_t> gpu1_buffers;
   std::unordered_map<int, ggml_tensor *> stage_pred; // layer -> pilot ids predicted for it (built one layer earlier)
   std::vector<ggml_backend_buffer_t> ridge_buffers;   // device copies of the pilot ridge corrections (one per corrected layer)
-  std::vector<std::pair<int, ggml_tensor *>> probe_x;  // ZEROMOE_GLM5NEXT_PROBE_DUMP: (layer, pre-FFN hidden) read back after every decode token
   size_t gpu1_bytes = 0;
   int indexer_heads = 0;
   int indexer_key_length = 0;
@@ -564,7 +563,6 @@ struct FullGraph : zeromoe::graph::GraphCore {
       if (b)
         ggml_backend_buffer_free(b);
     ridge_buffers.clear();
-    probe_x.clear();
     if (expert.buffer) {
       ggml_backend_buffer_free(expert.buffer);
       expert.buffer = nullptr;

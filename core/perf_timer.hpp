@@ -132,7 +132,6 @@ struct NamedTimerScope {
 void report_named_timers();
 void report_layer_miss_stats();
 void report_pilot_wide_stats();
-void report_prefill_lookahead_stats();
 void report_prefill_window_stats();
 void report_moe_bucket_stats();
 void report_pilot_recall_by_layer();

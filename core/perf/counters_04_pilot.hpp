@@ -363,33 +363,4 @@ struct PerfCountersPart04 : PerfCountersPart03 {
     // (this one, only live when depth-2 is turned on for real).
     std::atomic<uint64_t> n_pilot2_hints_pushed{0};
 
-    // EngineConfig::prefill_dispatch_lookahead_tokens -- real counts for the
-    // additive, prefill-only widening of each token's own get_experts_batch
-    // call to also opportunistically warm the RAM tier for upcoming tokens'
-    // not-yet-resident picks. n_prefill_lookahead_added is real work done
-    // (a genuine extra fetch that wouldn't otherwise have happened this
-    // call); the three _skipped_ counters break down why a scanned
-    // candidate was NOT added, so a report line that doesn't sum to the
-    // total number of candidates scanned is itself a bug signal (see this
-    // project's own standing "a report line that doesn't reconcile is a
-    // bug, not an inconvenience" lesson).
-    std::atomic<uint64_t> n_prefill_lookahead_added{0};
-    std::atomic<uint64_t> n_prefill_lookahead_skipped_vram{0};   // already VRAM-resident
-    std::atomic<uint64_t> n_prefill_lookahead_skipped_ram{0};    // already RAM-resident
-    std::atomic<uint64_t> n_prefill_lookahead_skipped_dup{0};    // already in THIS call's own combined list
-
-    // The "was it actually used" half of the lookahead measurement --
-    // MoEExpertBlock::loaded_by_lookahead's own comment has the full design.
-    // n_prefill_lookahead_first_hit (claim_or_wait's Hit branch): the future
-    // token this fetch was FOR reached it and found it resident -- a real
-    // "prefetch worked" event. n_prefill_lookahead_loaded_evicted_unused
-    // (the two RAM-tier eviction-victim-selection sites, mirroring
-    // n_ram_prefetch_loaded_evicted_unused's own design exactly): evicted
-    // again before anyone ever claimed it a second time -- pure wasted disk
-    // I/O. Neither is a full accounting of n_prefill_lookahead_added above
-    // (a slot that's still resident, un-evicted, at shutdown falls into
-    // neither bucket) -- read the sum of these two against n_prefill_
-    // lookahead_added as a lower bound on the used/wasted split, not an
-    // exact partition.
-    std::atomic<uint64_t> n_prefill_lookahead_first_hit{0};
 };

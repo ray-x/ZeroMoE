@@ -3,9 +3,9 @@
 #
 # On Linux with the NVIDIA CUDA Toolkit, this builds the full engine and the
 # native CUDA test harness.  On macOS the root CMakeLists.txt automatically
-# switches to ZEROMOE_CPU_ONLY=ON and builds the tools plus the CPU-only
+# switches to GGML_CUDA=OFF and builds the tools plus the CPU-only
 # component tests (no CUDA required).  The CPU-only path also works on Linux
-# by passing ZEROMOE_CPU_ONLY=ON to CMake manually.
+# by passing -DGGML_CUDA=OFF to CMake manually.
 BUILD_TYPE ?= Release
 JOBS       := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 

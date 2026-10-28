@@ -757,10 +757,6 @@ bool MoeRouterService::route(MoePipelineContext &context) {
       // partially resident/lazy configurations retain their old behavior.
       const int scheduler_device =
           moe_ggml_device() >= 0 ? moe_ggml_device() : 0;
-      const bool no_external_shared_weights = [] {
-        const char *e = zeromoe::graphcfg::env("ZEROMOE_GGML_SHARED_NO_EXTERNAL");
-        return e && e[0] == '1';
-      }();
       const int shared_inter = moe_inter * c.n_expert_shared;
       auto make_decode_shared_ref =
           [&](const std::string &name, int64_t ne0,
@@ -779,7 +775,7 @@ bool MoeRouterService::route(MoePipelineContext &context) {
         out.ne0 = ne0;
         out.ne1 = ne1;
         out.nbytes = w.meta.size_bytes;
-        if (!no_external_shared_weights && engine.gpu &&
+        if (engine.gpu &&
             engine.gpu->get_core_device() == scheduler_device &&
             w.device_ptr) {
           out.device_data = w.device_ptr;
@@ -811,7 +807,7 @@ bool MoeRouterService::route(MoePipelineContext &context) {
                       ? (int64_t)w.meta.shape[1]
                       : 1;
         out.nbytes = w.meta.size_bytes;
-        if (!no_external_shared_weights && engine.gpu &&
+        if (engine.gpu &&
             engine.gpu->get_core_device() == scheduler_device &&
             w.device_ptr) {
           out.device_data = w.device_ptr;
@@ -1047,18 +1043,11 @@ bool MoeRouterService::route(MoePipelineContext &context) {
     // data.  Keep this handoff explicitly Qwen+HC-only; other families and
     // any future norm-bearing variant remain on the established host route.
     // The graph also implements only the Qwen softmax semantics.
-    // CPU-affinity controls expert execution, not necessarily route
-    // selection.  llama.cpp's CPU expert split receives IDs/weights produced
-    // by the CUDA graph.  Keep that option available for Qwen too: when
-    // qwen4exp_decode_gpu_router is enabled during S==1 decode, a
-    // CPU-affinity layer still executes all routed expert projections on the
-    // CPU, but obtains the compact route table from the existing CUDA router.
-    // The default flag is false, so the established host-router behavior is
-    // unchanged unless a Qwen profile explicitly opts into this A/B.
-    const bool qwen_decode_gpu_router =
-        (S > 1 && !is_cpu_affinity_layer(layer_idx)) ||
-        (S == 1 && engine.qwen4exp_decode_gpu_router);
-    if (moe_ggml_gpu_router() && qwen_decode_gpu_router &&
+    // Qwen's GPU router is used for batched prefill. On single-token decode,
+// the tested default is the host router because GPU launch/synchronization and
+// route readback were slower than the AVX-512 host router on the reference GPU.
+const bool qwen_prefill_gpu_router = S > 1 && !is_cpu_affinity_layer(layer_idx);
+if (moe_ggml_gpu_router() && qwen_prefill_gpu_router &&
         c.gating_func == GatingFunc::Softmax &&
         engine.family_ops.family == ModelFamily::Qwen4Exp &&
         engine.family_ops.uses_hyper_connections &&

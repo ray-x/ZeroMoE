@@ -3,14 +3,14 @@
 Three layers, each using the one below it:
 
 1. **The per-request stats record**: the engine measures every request it serves.
-2. **`zeromoe --bench`**: runs a fixed set of requests in one process and summarises their records.
-3. **`bench/perf_report.py`**: runs `--bench` on a quiet machine, adds the machine and build description, and renders tables.
+2. **`zeromoe bench`**: runs a fixed set of requests in one process and summarises their records.
+3. **`bench/perf_report.py`**: runs `zeromoe bench` on a quiet machine, adds the machine and build description, and renders tables.
 
 ## 1. The per-request stats record
 
 `core/request_stats.hpp`. Every request produces one record when it ends (also when it fails: `status` is then `error`).
 It is written to the log as a single `[STATS] {json}` line, appended to a file as one JSON object per line when you pass
-`--stats-file PATH`, and kept in memory for in-process callers.
+`zeromoe bench --stats-file PATH`, and kept in memory for in-process callers.
 
 | Field | Meaning |
 | --- | --- |
@@ -33,10 +33,10 @@ A value that does not apply is `null`, never 0: the decode figures of a 2-token 
 
 Engine code adds to `extra` with `zeromoe::stats::note("key", value)`.
 
-## 2. `zeromoe --bench`
+## 2. `zeromoe bench`
 
 ```sh
-zeromoe --config configs/qwen38-flash.toml --bench \
+zeromoe bench --config configs/qwen38-flash.toml \
     --bench-prompt bench/prompts/short.txt --bench-prompt bench/prompts/mid.txt --bench-prompt bench/prompts/long.txt \
     --bench-ngen 200 --bench-reps 3 --bench-warmup 1 --bench-long 1500 --bench-out result.json
 ```
@@ -63,7 +63,7 @@ bench/perf_report.py run --name qwen38-flash --config configs/qwen38-flash.toml 
 bench/perf_report.py render bench/results/*.json        # Markdown for README / PERFORMANCE.md
 ```
 
-It runs `zeromoe --bench` (text prompts, then random tokens), reads the engine's records, and adds what only an outside
+It runs `zeromoe bench` (text prompts, then random tokens), reads the engine's records, and adds what only an outside
 observer can: the CPU with AVX-512 flags, RAM, GPUs (PCIe link, power limit, which were used), OS, CUDA, ZeroMoE and ggml
 commits (and whether the binary matches HEAD), model files, the config with its checksum, every override and environment
 variable, and the engine's resolved-settings log lines. It also decides whether the machine was quiet: every request is
@@ -93,7 +93,7 @@ the interface.
 
 ## Pitfalls
 
-- **The first request of a process is slower** (graph and kernel set-up, cold caches). `--bench` runs a warmup request and
+- **The first request of a process is slower** (graph and kernel set-up, cold caches). `zeromoe bench` runs a warmup request and
   reports a warm process, which is what a running server sees; a fresh-process-per-request measurement reads prefill 3 to 15%
   lower.
 - **Noise.** A compile or another model server on the same machine changes decode by 10% or more, and a single stall can

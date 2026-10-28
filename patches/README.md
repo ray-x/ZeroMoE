@@ -7,15 +7,15 @@ it does not carry a modified copy of ggml.
 - Patch paths are relative to the `ggml/` directory (`a/src/ggml-cuda/...`).
 - Applied automatically at configure time by `cmake/ZeroMoEGgmlPatches.cmake`
   (idempotent: a patch that already applies in reverse is skipped).
-- Manual: `cd <llama.cpp>/ggml && for p in <repo>/patches/ggml/*.patch; do patch -p1 < $p; done`
+- Manual: from `<llama.cpp>/ggml`, apply both `patches/ggml/*.patch` and `patches/ggml-host-node/*.patch` in filename order; `scripts/build_ggml.sh` is preferred.
 
 ## Layout
 
 | Directory | Applied by CMake | Purpose |
 |---|---|---|
 | `ggml/` | always (required) | Core series |
-| `ggml-host-node/` | `ZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES` (default ON), required | CUDA-graph host-node bridge for the Qwen4Exp CPU/GPU split |
-| `ggml-host-node-beellama/` | same option, best effort | Needs beellama-only scheduler profiling helpers (`ggml_backend_sched_profile_is_cpu`, ...); **does not apply to plain upstream** — see "Pending port" |
+| `ggml-host-node/` | Always applied; required | CUDA-graph host-node bridge for ZeroMoE CPU/GPU expert offload paths |
+| `ggml-host-node-beellama/` | Always attempted; best effort | Needs beellama-only scheduler profiling helpers (`ggml_backend_sched_profile_is_cpu`, ...); **does not apply to plain upstream** — see "Pending port" |
 | `debug/` | never applied | Retired profiling and benchmark patches kept for historical provenance; no build option exposes them |
 | `experimental/` | never | Spikes and A/B experiments |
 | `obsolete/` | never | Superseded or stale; kept for reference |

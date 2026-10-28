@@ -502,9 +502,8 @@ int cmd_plan(int argc, char **argv) {
            std::max(dense_total_native, best_case_total) / 1e9 + 0.5);
   }
   printf("  KV cache is NOT estimated here (needs architecture constants "
-         "this lightweight tool doesn't parse) -- check a real run's own "
-         "\"[GRAPH] KV cache: ... GB\" log line for your target context/"
-         "kv_bits.\n\n");
+         "this lightweight tool doesn't parse) -- check a real run's "
+         "[GRAPH] KV cache log at the target context.\n\n");
 
   // ---- MoE / routed-expert requirement ----
   const auto embedding = M.tensors.find("token_embd.weight");

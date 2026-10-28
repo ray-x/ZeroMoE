@@ -115,8 +115,6 @@ struct GraphSettings {
 
 // Diagnostics: never hashed, never drift-checked.
 struct DiagnosticSettings {
-  Resolved<long> verify_alias;             // bool
-  Resolved<long> node_trace;
   Resolved<std::string> usage_record_file;  // survey mode: write per-expert route counts here at shutdown
   Resolved<long> preflight_strict;         // bool: a preflight finding aborts instead of warning
 };
@@ -223,10 +221,6 @@ inline const std::vector<Field<long>> &long_fields() {
       {"gpu_assist2_slots", ZEROMOE_SETTINGS_REF(tun.gpu_assist2_slots), 1, Parse::IntAtoi,
        claims_for(F::Glm, F::MiMo2),
        {}, false},
-      {"verify_alias", ZEROMOE_SETTINGS_REF(diag.verify_alias), 1, Parse::FlagUnlessOff,
-       claims_for(F::MiMo2), {}, true},
-      {"node_trace", ZEROMOE_SETTINGS_REF(diag.node_trace), 0, Parse::IntStrict,
-       claims_for(F::MiMo2), {}, true},
       {"preflight_strict", ZEROMOE_SETTINGS_REF(diag.preflight_strict), 0, Parse::FlagOn,
        kClaimAll, {}, true},
   };
@@ -354,8 +348,6 @@ inline const char *meaning(const std::string &name) {
       {"offload_ddr_gib", "Host expert offload budget in GiB, or \"auto\". Separate from VRAM and pinned fractions."},
       {"offload_usage_file", "Historical expert-routing counts used to choose the hot set."},
       {"usage_record_file", "Diagnostic route-survey output path; empty disables recording. Excluded from default hashes."},
-      {"verify_alias", "MiMo diagnostic alias checks; leave enabled unless performing a controlled experiment."},
-      {"node_trace", "MiMo diagnostic node-trace level; 0 disables it and avoids instrumentation overhead."},
       {"preflight_strict", "Fail on graph health/performance findings rather than only warning. Does not weaken safety checks."},
   };
   const auto it = descriptions.find(name);

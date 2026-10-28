@@ -15,6 +15,7 @@
 #include "cuda_raii.hpp"
 #include "nvtx_range.hpp"
 #include "graph_config.hpp"
+#include "logger.hpp"
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -25,10 +26,11 @@
 #include "moe_routed_ggml.hpp"
 #include "pilot_ridge.hpp"
 #include "cold_moe_strategy.hpp"  // the lane's strategy view (adapter-first migration)
-#include <cstdio>
 #include <functional>
+#include <cstdint>
 #include <map>
 #include <memory>
+#include <string>
 #include <vector>
 
 extern "C" int ggml_backend_sched_early_cpu_supported() __attribute__((weak));
@@ -56,13 +58,13 @@ struct GpuAssistShared {
   }
 };
 
-// ZEROMOE_GLM5NEXT_ROUTE_TRACE=<file>: "P <pos>" at the start of each decode token, then "R <layer> <ids...>" per layer.
-inline FILE *route_trace_file() {
-  static FILE *f = [] {
-    const char *path = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_ROUTE_TRACE");
-    return path && path[0] ? std::fopen(path, "a") : nullptr;
-  }();
-  return f;
+inline void log_moe_route_trace_record(int layer, const int32_t *ids, int count) {
+  if (!Logger::instance().would_log(LogLevel::DEBUG))
+    return;
+  std::string route = "[MOE-ROUTE-TRACE] R " + std::to_string(layer);
+  for (int i = 0; i < count; ++i)
+    route += " " + std::to_string(ids[i]);
+  LOG_DEBUG("%s\n", route.c_str());
 }
 
 struct EarlyReadyLane {
@@ -115,7 +117,7 @@ struct EarlyReadyLane {
   // Tokens per call: 1 for ordinary decode, S for an MTP verification window
   // (ids/weights are token-major [k, n_tok], the input is [d, n_tok]).
   int n_tok = 1;
-  int trace_layer = -1;  // layer index for ZEROMOE_GLM5NEXT_ROUTE_TRACE lines
+  int trace_layer = -1;  // layer index for the DEBUG route trace
   bool completed = false;
   bool residency_ready = false;  // residency complete (owned experts resident, safe to compute) —
                                  // distinct from `completed`, which marks run() finished (§3.8)
@@ -537,13 +539,7 @@ struct EarlyReadyLane {
     if (status != cudaSuccess)
       GGML_ABORT("early-ready input event: %s", cudaGetErrorString(status));
     GGML_ASSERT(expected_pos < 0 || *position == expected_pos);
-    // ZEROMOE_GLM5NEXT_ROUTE_TRACE=<file>: one line per (decode token, layer): "pos layer id id ..." (all k routed ids).
-    if (FILE *route_trace = route_trace_file()) {
-      std::fprintf(route_trace, "R %d", trace_layer);
-      for (int i = 0; i < k; ++i) std::fprintf(route_trace, " %d", ids[i]);
-      std::fputc('\n', route_trace);
-      std::fflush(route_trace);
-    }
+    log_moe_route_trace_record(trace_layer, ids, k);
     if (stage_source)
       stage_source->request(calls + 1, prediction_ids, prediction_epoch, prediction_ready);
     if (stage_target) {

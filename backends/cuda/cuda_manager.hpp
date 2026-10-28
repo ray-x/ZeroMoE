@@ -204,8 +204,6 @@ public:
     int32_t* d_glm_router_ids = nullptr;   size_t d_glm_router_ids_cap = 0;
     float* d_glm_router_weights = nullptr; size_t d_glm_router_weights_cap = 0;
 
-    // qwen4exp chunkwise GDN scratch (qwen4exp_gdn_gpu_host). Grow-only,
-    // shared across all 36 GDN layers and every chunk. Freed in the destructor.
     // Per-layer routed-expert output accumulator, one per GPU (experts for one
     // layer can land on different devices in the dual-role config). Grow-only.
     static constexpr int kMaxAccumGpus = 8;
@@ -2499,16 +2497,6 @@ public:
 
     void set_dense_async_copies(bool enabled) {
         dense_async_copies_enabled = enabled;
-        // Keep command-line A/B runs independent of a temporary config edit.
-        // An explicit environment override is useful for regression checks;
-        // absent the variable, the config remains authoritative.
-        if (const char *override_value = zeromoe::graphcfg::env("ZEROMOE_DENSE_ASYNC_COPIES")) {
-            dense_async_copies_enabled = (override_value[0] == '1' ||
-                                          override_value[0] == 'y' ||
-                                          override_value[0] == 'Y' ||
-                                          override_value[0] == 't' ||
-                                          override_value[0] == 'T');
-        }
     }
 
     bool ensure_dense_async_resources() {

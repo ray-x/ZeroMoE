@@ -18,6 +18,7 @@
 #include "ggml-cuda.h"
 #include "ggml_moe_backend.hpp"
 #include "mimo2_spec.hpp"
+#include "logger.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -155,8 +156,7 @@ bool configure_ingraph_moe(StreamingEngine &e, ModelState &m) {
   opt.secondary_device = m.gpu1 ? dev1 : -1; // second GPU's cache is a second hot set
   if (!m.placement.configure(e, *m.topology, opt))
     throw std::runtime_error("expert placement configuration failed");
-  if (st.diag.verify_alias.value &&
-      m.placement.verify_against_model(e) != 0)
+  if (m.placement.verify_against_model(e) != 0)
     throw std::runtime_error("aliased VRAM experts differ from the model file");
   OffloadProfile prof;
   prof.first_layer = c.first_dense;
@@ -610,19 +610,20 @@ std::unique_ptr<Graph> create_graph(StreamingEngine &e, int tokens) {
     build_output_head(*g, cur, [&](ggml_tensor *x) { return norm(*g, x, "output_norm.weight"); },
                       weight(*g->model, "output.weight"), [&](ggml_tensor *t) { return on_gpu(*g, t); });
   }
-  if (const long trace = st.diag.node_trace.value) {
-    // Debug aid. 1: name each node before it runs (use with CUDA_LAUNCH_BLOCKING=1).
-    // 2: after each F32 node, report the first few nodes holding non-finite / huge values.
+  if (Logger::instance().would_log(LogLevel::DEBUG)) {
+    // DEBUG enables all MiMo node diagnostics: node names, route IDs, the
+    // route grid, and non-finite/large F32 reports. This callback affects
+    // scheduling and is intentionally absent at lower log levels.
     static long mode = 0;
-    mode = trace;
+    mode = 15;
     ggml_backend_sched_set_eval_callback(g->sched, [](ggml_tensor *t, bool ask, void *) {
-      if (mode == 1 && ask) {
+      if ((mode & 1) && ask) {
         std::fprintf(stderr, "[MIMO2-TRACE] %s op=%s shape=[%lld,%lld,%lld] src0=%s src1=%s\n", t->name,
                      ggml_op_name(t->op), (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2],
                      t->src[0] ? t->src[0]->name : "-", t->src[1] ? t->src[1]->name : "-");
         std::fflush(stderr);
       }
-      if (mode == 4 && !ask && t->op == GGML_OP_MUL_MAT_ID && t->src[0] && t->src[2] && t->type == GGML_TYPE_F32) {
+      if ((mode & 8) && !ask && t->op == GGML_OP_MUL_MAT_ID && t->src[0] && t->src[2] && t->type == GGML_TYPE_F32) {
         static int shown4 = 0;
         if (shown4 < 2) {
           ++shown4;
@@ -649,7 +650,7 @@ std::unique_ptr<Graph> create_graph(StreamingEngine &e, int tokens) {
           std::fflush(stderr);
         }
       }
-      if (mode == 3 && !ask && t->op == GGML_OP_MUL_MAT_ID && t->src[0] && t->src[2]) {
+      if ((mode & 4) && !ask && t->op == GGML_OP_MUL_MAT_ID && t->src[0] && t->src[2]) {
         static int shown = 0;
         if (shown < 3) {
           ++shown;
@@ -665,7 +666,7 @@ std::unique_ptr<Graph> create_graph(StreamingEngine &e, int tokens) {
           std::fflush(stderr);
         }
       }
-      if (mode == 2 && !ask && t->type == GGML_TYPE_F32 && ggml_nelements(t) <= (1 << 22)) {
+      if ((mode & 2) && !ask && t->type == GGML_TYPE_F32 && ggml_nelements(t) <= (1 << 22)) {
         static int reported = 0;
         if (reported < 8) {
           std::vector<float> v(size_t(ggml_nelements(t)));

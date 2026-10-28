@@ -79,8 +79,9 @@ missing measurement or an out-of-band rate. Coherence is *not* auto-checked — 
 - **Build must link the host-node hook.** See the note above; verify with
   `nm -D build/zeromoe | grep sched_early_cpu`.
 - **Preflight RAM margin.** `startup_preflight` needs `host_ram_gb + 21.5 GiB` of `MemAvailable`;
-  several recipes exceed it on a 125 GiB box, so the gate runs them under `scripts/run_capped.sh`
-  with `--force-start` (kernel `MemoryMax` + `MemorySwapMax=0` bounds the risk).
+  several recipes exceed it on a 125 GiB box. The regression gate uses
+  `--force-start` under `scripts/run_capped.sh`, which applies `MemoryMax` and
+  `MemorySwapMax=0` to bound the benchmark process.
 - **Benign teardown crash.** DeepSeek and GLM 5.3 abort at `exit()` with `CUDA error: driver
   shutting down` (a `ggml` CUDA buffer freed in a static/`unique_ptr` destructor during teardown).
   Decode completes and all metrics print first; it is pre-existing, not a merge regression.

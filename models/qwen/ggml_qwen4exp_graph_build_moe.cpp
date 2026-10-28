@@ -65,7 +65,6 @@ ggml_tensor *build_qwen4exp_host_node(
   // callback runner borrows it; FullGraph remains responsible for teardown.
   node_ctx->shared_cpu_threadpool = g.cpu_threadpool;
   node_ctx->shared_cpu_threads = g.cpu_threads;
-  node_ctx->transport_diag = env_host_node_transport_diag_enabled(layer);
   node_ctx->projection_compact = arena->projection_compact;
   LOG_INFO("[QWEN4EXP-HOST-NODE] layer=%d allocating callback context "
            "arena=%p bytes=%zu layout=%s gate_stride=%zu up_stride=%zu "

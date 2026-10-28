@@ -4,9 +4,9 @@
 #   scripts/build_with_ggml.sh <build-dir> [cmake build args...]
 #
 # Environment:
-#   GGML_ROOT      ggml source tree (headers; patched in place when GGML_PREBUILT is empty)
+#   GGML_ROOT      ggml source tree (headers; patched in place when GGML_PREBUILT is empty; otherwise libraries must already be built from patched GGML_ROOT)
 #                  default: <main-checkout>/build_ggmlcuda/ggml-src/ggml
-#   GGML_PREBUILT  directory holding the already built libggml*.so (<dir>/src/lib*.so,
+#   GGML_PREBUILT  directory holding already built, ZeroMoE-patched libggml*.so (<dir>/src/lib*.so,
 #                  <dir>/src/ggml-cuda/libggml-cuda.so). Default: the master-level build kept in the
 #                  main checkout. Set to "" to compile ggml from GGML_ROOT and apply patches/ggml
 #                  (cmake/ZeroMoEGgmlPatches.cmake) into it.
@@ -35,7 +35,7 @@ fi
 cmake -S . -B "$BUILD" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" \
-  -DZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES=ON \
+  -DGGML_AVX512_VNNI=ON \
   -DZEROMOE_GGML_ROOT="$GGML_ROOT" -DZEROMOE_GGML_PREBUILT_DIR="$GGML_PREBUILT"
 cmake --build "$BUILD" -j"$(nproc)" --target zeromoe "$@"
 

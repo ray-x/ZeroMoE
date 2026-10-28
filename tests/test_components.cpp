@@ -455,7 +455,6 @@ device_id = 0
 name = "RTX 3090"
 role = "dense+moe"
 vram_gb = 24.0
-kv_bits = 4
 
 [[gpus]]
 device_id = 1
@@ -502,7 +501,6 @@ moe_cache_gb = 23.0
   assert(gpu_tables[0].get_str("name") == "RTX 3090");
   assert(gpu_tables[0].get_str("role") == "dense+moe");
   assert(std::abs(gpu_tables[0].get_double("vram_gb") - 24.0) < 1e-5);
-  assert(gpu_tables[0].get_int("kv_bits") == 4);
 
   assert(gpu_tables[1].get_int("device_id") == 1);
   assert(gpu_tables[1].get_str("role") == "moe");
@@ -2757,13 +2755,19 @@ void test_exl3_mul1_matmul() {
         {q8_matrix, input.data(), q8_output.data()},
         {q8_matrix, input.data() + input_features,
          q8_output.data() + output_features}};
-    assert(exl3_mul1_q8_matmul_batch(q8_items, 2));
-    double predecoded_error = 0.0;
-    for (int index = 0; index < 2 * output_features; ++index) {
-      const double error = q8_output[index] - direct[index];
-      predecoded_error += error * error;
+    // The predecoded-Q8 batch is an x86 VNNI kernel with no scalar fallback:
+    // it returns false by design elsewhere, so there is nothing to compare on
+    // arm64 or on an x86 host without AVX-512 VNNI. The predecode itself is
+    // portable and is still checked above.
+    if (exl3_cpu_vnni_available()) {
+      assert(exl3_mul1_q8_matmul_batch(q8_items, 2));
+      double predecoded_error = 0.0;
+      for (int index = 0; index < 2 * output_features; ++index) {
+        const double error = q8_output[index] - direct[index];
+        predecoded_error += error * error;
+      }
+      assert(std::sqrt(predecoded_error / std::max(exact_energy, 1e-20)) < 0.04);
     }
-    assert(std::sqrt(predecoded_error / std::max(exact_energy, 1e-20)) < 0.04);
 
     std::vector<uint8_t> packed = exl3_mul1_pack_matrix(matrix);
     assert(!packed.empty());

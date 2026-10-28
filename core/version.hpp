@@ -38,7 +38,7 @@ inline void zeromoe_print_host_cpu() {
 }
 
 inline void zeromoe_print_version() {
-#if defined(ZEROMOE_ENGINE_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
   constexpr const char *kEngine = "CUDA";
 #else
   constexpr const char *kEngine = "CPU-only";

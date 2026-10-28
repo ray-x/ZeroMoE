@@ -11,7 +11,6 @@
 #include "perf/counters_04_pilot.hpp"
 
 struct PerfCountersPart05 : PerfCountersPart04 {
-    std::atomic<uint64_t> n_prefill_lookahead_loaded_evicted_unused{0};
 
     // EngineConfig::pilot_widen_all_tokens -- three different comparisons
     // against the SAME widened (union-of-all-tokens) prediction, see

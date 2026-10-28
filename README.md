@@ -41,7 +41,7 @@ limits by streaming expert weights from DDR & NVMe, executed through a whole-mod
 | OS | Linux x86-64 for the CUDA engine. macOS (Apple Silicon) builds the CPU engine (`build-macos/zeromoe_cpu`) and tests. |
 | GPU | NVIDIA GPU supported by the installed CUDA toolkit. Tested on RTX 3090 (`sm_86`) and RTX 5060 Ti (`sm_120a`). |
 | CUDA | CUDA Toolkit and driver. The reference build uses CUDA 13.3.73 with driver 610.57.04. |
-| CPU | x86-64 with AVX-512 F/CD/BW/DQ/VL, or Apple Silicon. Configure reads the host CPU and stops with the missing flags if the baseline is absent. AVX-512 VNNI is enabled only when the host has it; override detection with `-DZEROMOE_CHECK_HOST_CPU=OFF` (e.g. to build for another machine). |
+| CPU | x86-64 with AVX-512 F/CD/BW/DQ/VL, or Apple Silicon. Configure checks the host CPU and stops if the required baseline is absent. AVX-512 VNNI is enabled only when the host has it; use `./setup.sh --cpu-only --release-binary` to build a non-native deployment binary. |
 | RAM | Host RAM is the expert cache for models larger than VRAM. 64 GB or more is recommended for the largest checkpoints; a full-fit model like the quick-start example needs little beyond the GGUF's page cache. |
 | Disk | NVMe SSD. Keep the GGUF and any repacked stores outside the repository. |
 | Build tools | CMake ≥ 3.25, GNU Make, `git`, GNU `patch`, Python 3, and a C++23-capable host compiler (tested with GCC 16.2 and nvcc 13.3). |
@@ -207,8 +207,7 @@ the [configuration guide](docs/configuration.md).
 Configure reads the host CPU: a machine without the AVX-512 F/CD/BW/DQ/VL
 baseline stops with the missing flags, and AVX-512 VNNI is enabled only when
 the host has it (in ZeroMoE and ggml CPU kernels alike). Override with
-`-DGGML_AVX512_VNNI=ON|OFF`, or `-DZEROMOE_CHECK_HOST_CPU=OFF` when building
-for another machine.
+`-DGGML_AVX512_VNNI=ON|OFF`; use `./setup.sh --cpu-only --release-binary` for a non-native deployment build.
 
 The published Linux binaries are reproducible from source with:
 
@@ -444,7 +443,7 @@ regression witness, and where to record results - is in
 | Symptom | Fix |
 |---|---|
 | `nvcc is missing` from `setup.sh` | Install the CUDA Toolkit, or build the CPU engine with `./setup.sh --cpu-only`. |
-| `host CPU lacks -mavx512f ...` at configure | The machine cannot execute the engine's kernels. Build on an AVX-512 host, or pass `-DZEROMOE_CHECK_HOST_CPU=OFF` to build a binary for a different machine. |
+| `host CPU lacks -mavx512f ...` at configure | The machine cannot execute the engine's kernels. Build on an AVX-512 host, or use `./setup.sh --cpu-only --release-binary` to build a non-native deployment binary. |
 | `model_path not set` | Pass `--model /path/to/model.gguf`, or set `model_path` in the profile. |
 | `does not support this model topology` | The GGUF's `general.architecture` has no registered adapter; see [Supported models](#supported-models). |
 | `Insufficient` graph memory | The model does not fit in VRAM as a full graph. A non-graph-only family falls back to layered decode and streams experts from NVMe; a graph-only family fails startup by design. |

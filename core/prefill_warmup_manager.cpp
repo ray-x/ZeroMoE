@@ -217,7 +217,6 @@ void PrefillWarmupManager::prepare(MoePipelineContext &context) {
     // (2026-08-12 prefill investigation, see CLAUDE.md: active_up was
     // ~29% of prefill's own wall time, the single largest bucket).
     // No resource-competition risk with the main-cache loop below
-    // (unlike prefill_opportunistic_promote's reverted mistake) --
     // these are two independent VRAM pools with no shared gate.
     // Scoped to THIS layer only, entirely inside Phase 2 -- by the
     // time Phase 3 begins a few lines below, sync_active_layer_batch
@@ -368,12 +367,8 @@ void PrefillWarmupManager::prepare(MoePipelineContext &context) {
         // candidates come up once VRAM happens to be full,
         // forcing that layer's real Phase-3 miss to pay for a
         // synchronous disk read from scratch instead of finding
-        // it already RAM-resident. No VRAM-competition risk here
-        // (unlike prefill_opportunistic_promote, which DID
-        // compete for VRAM capacity and was reverted for exactly
-        // that reason) -- this only ever adds queue pressure on
-        // the prefetcher's own worker threads, not VRAM slots.
-        // UNVERIFIED on real hardware -- watch "Prefetch pickup"
+        // This only adds queue pressure on the prefetcher's own workers.
+// UNVERIFIED on real hardware -- watch "Prefetch pickup"
         // (avg ms/backlog) for a WORSE queue backlog than before
         // (this could push MORE total hints than previously,
         // since the loop no longer breaks early), which would
@@ -383,26 +378,6 @@ void PrefillWarmupManager::prepare(MoePipelineContext &context) {
           continue;
         async_io_queue.push_hint(layer_idx, expert_id);
         perf().n_prefill_hint_pushed.fetch_add(1, std::memory_order_relaxed);
-        // Track for cross-layer opportunistic VRAM promotion (see
-        // LayerScratch::pending_prefill_promotions's own comment,
-        // and the follow-up pass above). Silently drops the newest
-        // hint if the small pending list is already full rather
-        // than growing unbounded -- Phase 3's synchronous dispatch
-        // is always the correctness backstop either way, so a
-        // dropped tracking entry only forgoes the OPPORTUNISTIC
-        // early promotion for that one expert, never correctness.
-        if (!engine.prefill_opportunistic_promote) {
-          // Not tracked at all -- see EngineConfig::prefill_
-          // opportunistic_promote's own comment for the A/B this
-          // gate exists to enable.
-        } else if (scratch.pending_prefill_count <
-                   LayerScratch::PENDING_PREFILL_CAP) {
-          scratch.pending_prefill_promotions[scratch.pending_prefill_count++] =
-              {layer_idx, expert_id, 0};
-        } else {
-          perf().n_prefill_pending_cap_dropped.fetch_add(
-              1, std::memory_order_relaxed);
-        }
         continue;
       }
 
@@ -465,100 +440,6 @@ void PrefillWarmupManager::prepare(MoePipelineContext &context) {
         perf().n_prefill_warm_failed.fetch_add(1, std::memory_order_relaxed);
       ram_mgr.apply_promotion_bookkeeping(*blk, layer_idx, expert_id, promoted);
       ram_mgr.ram_unpin(*blk);
-    }
-
-    // Cross-layer follow-up for LayerScratch::pending_prefill_promotions
-    // (see that field's own comment) -- runs AFTER the candidate loop
-    // above, not before. ORDERING FIX (2026-08-12): running this FIRST
-    // (the original placement) let it consume vram_cache->has_free_slot()
-    // capacity before THIS layer's own hint-pushing loop got to decide
-    // how much of that shared budget it wanted -- confirmed via a real
-    // A/B to starve LATER layers of hints entirely (n_prefill_hint_pushed
-    // nearly halved, 420 vs ~930), a genuine regression (see CLAUDE.md).
-    // Running it AFTER means the candidate loop above always gets first
-    // claim on whatever's free; this pass only ever mops up whatever's
-    // left, which can never come at another layer's expense. Still
-    // fires every Phase-2 entry regardless of THIS layer's own
-    // prefill_warm_via_prefetcher status, since a pending entry can
-    // reference an EARLIER layer. Cheap no-op when the list is empty.
-    if (engine.prefill_opportunistic_promote &&
-        scratch.pending_prefill_count > 0) {
-      constexpr int PENDING_PREFILL_MAX_AGE =
-          12; // layers; starting guess, unverified on hardware
-      int write = 0;
-      for (int i = 0; i < scratch.pending_prefill_count; ++i) {
-        auto &pend = scratch.pending_prefill_promotions[i];
-        ++pend.age_layers;
-        bool resolved = false;
-
-        if (ram_mgr.vram_cache->find_expert(pend.layer_idx, pend.expert_id)) {
-          perf().n_prefill_pending_already_resident.fetch_add(
-              1, std::memory_order_relaxed);
-          resolved = true; // something else already promoted it (e.g. a
-                           // reactive hit) -- fine
-        } else if (!ram_mgr.vram_cache->has_free_slot()) {
-          perf().n_prefill_pending_no_free_slot.fetch_add(
-              1, std::memory_order_relaxed);
-          resolved = true; // cache is warm now -- opportunistic promotion is
-                           // moot for the rest of this run
-        } else {
-          const uint8_t *ready_slab = nullptr;
-          MoEExpertBlock *ready = ram_mgr.find_ram_slot_if_ready_held(
-              engine.layers_experts[pend.layer_idx],
-              (size_t)ram_mgr.cap_for_layer(pend.layer_idx), pend.layer_idx,
-              pend.expert_id, &ready_slab, nullptr);
-          if (!ready) {
-            perf().n_prefill_pending_still_loading.fetch_add(
-                1, std::memory_order_relaxed);
-            resolved = (pend.age_layers >= PENDING_PREFILL_MAX_AGE);
-            if (resolved)
-              perf().n_prefill_pending_aged_out.fetch_add(
-                  1, std::memory_order_relaxed);
-          } else {
-            size_t p2_gb = 0, p2_ub = 0, p2_db = 0;
-            const GGUFTensor *p2_gM = nullptr, *p2_uM = nullptr,
-                             *p2_dM = nullptr;
-            bool ready_gpu_capable =
-                engine.expert_layer_geometry(pend.layer_idx, p2_gb, p2_ub,
-                                             p2_db, p2_gM, p2_uM, p2_dM) &&
-                gpu_type_supported(p2_gM->type) &&
-                gpu_type_supported(p2_uM->type) &&
-                gpu_type_supported(p2_dM->type);
-            resolved = true; // decided one way or the other below, either way
-                             // don't re-check it again
-            if (ready_gpu_capable && ready_slab) {
-              // Real total, not slab_capacity -- see decode_async_prewarm's
-              // own fix comment for the full incident.
-              ExpertLocation *promoted =
-                  ram_mgr.vram_cache->upload_expert_async(
-                      pend.layer_idx, pend.expert_id, ready_slab,
-                      ready->gate_proj.meta.size_bytes +
-                          ready->up_proj.meta.size_bytes +
-                          ready->down_proj.meta.size_bytes,
-                      -1, ready->slab_pinned);
-              // 2026-08-30 diagnostic -- see MoEExpertBlock::
-              // consumed_by_vram_upload (engine.hpp).
-              if (promoted)
-                ram_mgr.mark_consumed_by_vram_upload(*ready);
-              if (promoted)
-                perf().n_prefill_pending_promoted.fetch_add(
-                    1, std::memory_order_relaxed);
-              ram_mgr.apply_promotion_bookkeeping(*ready, pend.layer_idx,
-                                                  pend.expert_id, promoted);
-            }
-            // The async main-cache upload has either transferred its source
-            // protection to pending_copy_event (apply_promotion_bookkeeping)
-            // or did not issue a copy. In both cases this lookup hold is no
-            // longer needed once the bookkeeping transition is complete.
-            ram_mgr.ram_unpin(*ready);
-          }
-        }
-
-        if (!resolved)
-          scratch.pending_prefill_promotions[write++] =
-              pend; // keep, still legitimately pending
-      }
-      scratch.pending_prefill_count = write;
     }
 
     PERF_END(prefill_warm, t_prefill_warm_time);

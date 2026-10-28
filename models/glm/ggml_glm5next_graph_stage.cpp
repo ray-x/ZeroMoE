@@ -198,16 +198,12 @@ void stage_miss_cb(ggml_tensor *dst, const ggml_tensor *a, const ggml_tensor *b,
   int staged = 0;
   int32_t staged_ids[8] = {};
   StageResult &res = st->result[site->layer];
-  // ZEROMOE_GLM5NEXT_ROUTE_TRACE=<file>: one "R <layer> <ids...>" line per decode token and layer (all routed ids).
-  if (const char *tp = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_ROUTE_TRACE"); tp && tp[0]) {
-    static FILE *tf = std::fopen(tp, "a");
-    if (tf) {
-      std::fprintf(tf, "R %d", site->layer);
-      for (int i = 0; i < n; ++i)
-        std::fprintf(tf, " %d", *(const int32_t *)((const char *)b->data + i * b->nb[0]));
-      std::fputc('\n', tf);
-      std::fflush(tf);
-    }
+  if (Logger::instance().would_log(LogLevel::DEBUG)) {
+    std::vector<int32_t> route_ids((size_t)n);
+    for (int i = 0; i < n; ++i)
+      route_ids[(size_t)i] =
+          *(const int32_t *)((const char *)b->data + i * b->nb[0]);
+    log_moe_route_trace_record(site->layer, route_ids.data(), n);
   }
   {
     StageRuntime::Cand &cd = st->cand[site->layer];

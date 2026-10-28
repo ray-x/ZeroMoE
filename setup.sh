@@ -109,7 +109,7 @@ fi
 echo "[2/3] Configuring..."
 cmake_args=(-S . -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release)
 if [[ "$CPU_ONLY" -eq 1 ]]; then
-    cmake_args+=(-DZEROMOE_CPU_ONLY=ON)
+    cmake_args+=(-DGGML_CUDA=OFF)
 fi
 if [[ "$RELEASE_BINARY" -eq 1 ]]; then
     # A distributed binary must not be sized to whichever machine built it:
@@ -122,7 +122,7 @@ if [[ "$RELEASE_BINARY" -eq 1 ]]; then
         # with a bare executable must not also need libggml-*.so on the path.
         # GGML_NATIVE=OFF is required too: -march=native would bake in whatever
         # extensions the build machine happens to have.
-        cmake_args+=(-DZEROMOE_CHECK_HOST_CPU=OFF -DGGML_AVX512_VNNI=ON
+        cmake_args+=(-DGGML_AVX512_VNNI=ON
                      -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF)
     fi
 fi

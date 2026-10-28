@@ -7,9 +7,9 @@
 #   neither              -> tree diverged from the patch's base; reported, not applied
 #
 # Patch directories (applied in filename order):
-#   patches/ggml                     always; REQUIRED (warns loudly if one cannot apply)
-#   patches/ggml-host-node           ZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES; REQUIRED
-#   patches/ggml-host-node-beellama  ZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES; best effort.
+#   patches/ggml                     always; REQUIRED (configuration fails if one cannot apply)
+#   patches/ggml-host-node           always; REQUIRED for CUDA host-node offload
+#   patches/ggml-host-node-beellama  best effort (beellama-only scheduler helpers)
 #                                    These use beellama-only scheduler profiling
 #                                    helpers and do not apply to plain upstream.
 # patches/experimental and patches/obsolete are never applied.
@@ -54,10 +54,10 @@ function(_zeromoe_ggml_apply_dir dir required)
             continue()
         endif()
         if(required)
-            message(WARNING
+            message(FATAL_ERROR
                 "ZeroMoE: required ggml patch ${dir}/${_name} neither applies nor is "
-                "already applied -- the ggml tree differs from the series base (see "
-                "docs/build-ggml.md). Expect link errors for the symbols it provides.")
+                "already applied -- the ggml tree differs from the supported patch base "
+                "(see docs/build-ggml.md). Use a compatible ggml source tree.")
         else()
             message(STATUS "ZeroMoE: skipped optional ggml patch ${dir}/${_name} "
                            "(does not apply to this ggml tree)")
@@ -72,8 +72,8 @@ function(zeromoe_apply_ggml_patches ggml_root)
     # earlier one), so the applied state is recorded: a stamp holding the hash of every patch file that
     # was applied. A tree with the same stamp is left alone; a changed series on a patched tree is an error.
     set(_stamp_files "")
-    # Keep the retired debug patch bytes in the stamp so existing default-OFF
-    # build trees remain valid after the user-facing option was removed.
+    # Include the retired debug patch bytes so the stamp remains stable for
+    # build trees that recorded the earlier patch series.
     foreach(_dir IN ITEMS ggml ggml-host-node ggml-host-node-beellama debug)
         file(GLOB _p "${CMAKE_CURRENT_SOURCE_DIR}/patches/${_dir}/*.patch")
         list(SORT _p)
@@ -84,7 +84,7 @@ function(zeromoe_apply_ggml_patches ggml_root)
         file(SHA256 "${_f}" _h)
         string(APPEND _stamp "${_h}\n")
     endforeach()
-    string(APPEND _stamp "host_node=${ZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES} debug=OFF\n")
+    string(APPEND _stamp "host_node=ON debug=OFF\n")
     set(_stamp_file "${ggml_root}/.zeromoe_patches_applied")
     if(EXISTS "${_stamp_file}")
         file(READ "${_stamp_file}" _have)
@@ -92,14 +92,22 @@ function(zeromoe_apply_ggml_patches ggml_root)
             message(STATUS "ZeroMoE: ggml patch series already applied to ${ggml_root} (stamp matches)")
             return()
         endif()
-        message(FATAL_ERROR "ZeroMoE: ${ggml_root} carries a different ggml patch series than patches/. "
-                            "Use a fresh ggml tree (scripts/build_ggml.sh makes one).")
+        # Upgrade trees stamped by the former host-node OFF option. Their
+        # ggml base patches remain applied; the required host-node series below
+        # is applied now before the stamp is rewritten.
+        string(REPLACE "host_node=ON debug=OFF\n" "host_node=OFF debug=OFF\n"
+                       _legacy_unpatched_stamp "${_stamp}")
+        if(_have STREQUAL _legacy_unpatched_stamp)
+            message(STATUS "ZeroMoE: upgrading ${ggml_root} to the required host-node patch series")
+            file(REMOVE "${_stamp_file}")
+        else()
+            message(FATAL_ERROR "ZeroMoE: ${ggml_root} carries a different ggml patch series than patches/. "
+                                "Use a fresh ggml tree (scripts/build_ggml.sh makes one).")
+        endif()
     endif()
 
     _zeromoe_ggml_apply_dir(ggml TRUE)
-    if(ZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES)
-        _zeromoe_ggml_apply_dir(ggml-host-node TRUE)
-        _zeromoe_ggml_apply_dir(ggml-host-node-beellama FALSE)
-    endif()
+    _zeromoe_ggml_apply_dir(ggml-host-node TRUE)
+    _zeromoe_ggml_apply_dir(ggml-host-node-beellama FALSE)
     file(WRITE "${_stamp_file}" "${_stamp}")
 endfunction()
