@@ -1,7 +1,7 @@
 # Timeline of an MTP verify window (Qwen4Exp, promotion on)
 
 Capture: `mtp_nsys.sh` (nsys, `--trace=cuda,nvtx,osrt --cuda-graph-trace=node`), palindrome prompt, MTP with 3
-drafts, `qwen4exp_expert_promotion=on`, 3090 only; 33 steady windows. NVTX ranges: `mtp.verify_window`,
+drafts, `expert_promotion=on` (then `qwen4exp_expert_promotion`), 3090 only; 33 steady windows. NVTX ranges: `mtp.verify_window`,
 `win.run/submit/sync/readback/commit`, `promo.step`, `mtp.draft_step`, `mtp.sampling` (`core/nvtx_range.hpp`).
 Analyzer: `tools/nsys_window_breakdown.py <export.sqlite>`. The raw trace is in
 `~/Projects/ZeroMoE-results/promotion-study/nsys/`. nsys stretches the window from 41.9 ms (unprofiled) to

@@ -6,7 +6,7 @@ binary or citing a result.
 ## v0.0.1 baseline: plain decode and MTP (2026-10-28, locally measured)
 
 This supersedes every rate quoted further down. Measured source: `ea2b200` = master `197cdfa` merged with `swap-b`, plus two compile fixes to master (`2528868` `core/main.cpp`, `ea2b200` GLM5NEXT decode diagnostics; master did not build without them); the tagged `v0.0.1` commit adds only documentation on top. Built in a clean worktree; the binary passes `tools/build_provenance.py check` (source `ea2b200`, `dirty=False`, ggml base `8baabd53b`, native `sm_86` only). Toolchain: CUDA 13.3, driver 610.57.04, GCC 16.2, RTX 3090 only (`CUDA_VISIBLE_DEVICES=0`; the 5060 Ti is not used), Xeon W-2235 (6C/12T, DDR4). ggml: `patches/ggml` 0001-0017 plus `patches/ggml-host-node` 0001-0003, built with `scripts/build_ggml.sh`.
-Config: `configs/bench/qwen38-flash-q2_0-mtp.toml` (13,000-expert global hot set, `qwen4exp_expert_promotion = "on"`, 3 draft tokens, Q4_K_M draft). Greedy decoding, 3 passes per cell, medians (min-max), tok/s:
+Config: `configs/bench/qwen38-flash-q2_0-mtp.toml` (13,000-expert global hot set, `expert_promotion = "on"`, 3 draft tokens, Q4_K_M draft). Greedy decoding, 3 passes per cell, medians (min-max), tok/s:
 
 | prompt | prompt tok | generated tok | plain decode | MTP decode | speed-up | draft acceptance | MTP end-to-end* | prefill (MTP run) |
 |---|---|---|---|---|---|---|---|---|
@@ -34,8 +34,9 @@ Tried and rejected (details in `docs/design/mtp-window-timeline.md`): draft coun
 reduction (-480 nodes, no speed change), more hot experts (13,500 fails at preload), faster IQ3_S dot (<=1.11x), bit-identical window kernels (-4% with a BF16 vector-kernel patch).
 
 Open items and owners:
-- **Promotion default.** `qwen4exp_expert_promotion` is `"off"` on master and worth +4% (leetcode) to +104% (story): +7% palindrome, +19% review, +39% B-tree, +61% math (MTP without it: 77.2 / 66.2 / 56.9 / 50.3 / 69.8 / 31.6 for palindrome / review / B-tree / math / leetcode / story, pass 1).
-  Flipping the default, and renaming the key to a model-neutral name, is a config-owner decision (the settings cleanup is another session's).
+- **Promotion default (done after v0.0.1).** The key is now `expert_promotion` (the old `qwen4exp_expert_promotion` is rejected at startup with a rename message; it is not `graph_expert_promotion` because root keys starting with `graph_` are reserved for the typed graph-settings table and are rejected as unknown settings unless registered there) and defaults to `auto`: on when graph-native MTP is on, off otherwise; an explicit value wins,
+  and the engine logs the resolved mode (`[EXPERT-PROMOTION] ...`). Promotion is worth +4% (leetcode) to +104% (story), +61% on math (MTP without it: 77.2 / 66.2 / 56.9 / 50.3 / 69.8 / 31.6 for palindrome / review / B-tree / math / leetcode / story, pass 1).
+  The env override `ZEROMOE_QWEN4EXP_EXPERT_PROMOTION` is unchanged. `docs/design/configuration-knob-audit.json` still lists the old key until its owner regenerates it.
 - **Text equality.** Plain and MTP greedy output are identical on the palindrome prompt but differ on story (character 55) and math (character 46); a per-column exactness experiment (branch `exact-window-wip`, row 0 byte-identical) did not remove it,
   so rows 1-3 of the window or another S-dependent path still differ. Speculation here is therefore not yet output-exact.
 - `graph_settings_test` aborts on master itself (`--graph-offload-async: expected true or false`), unchanged by this merge; `graph_settings_binding` reports BAD_COMMAND under ctest. Owner: the settings session.

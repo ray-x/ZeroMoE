@@ -53,6 +53,11 @@ add_executable(expert_promotion_test EXCLUDE_FROM_ALL
 target_include_directories(expert_promotion_test PRIVATE models/graph)
 add_test(NAME expert_promotion COMMAND expert_promotion_test)
 
+add_executable(expert_promotion_mode_test EXCLUDE_FROM_ALL
+    tests/test_expert_promotion_mode.cpp)
+target_include_directories(expert_promotion_mode_test PRIVATE core)
+add_test(NAME expert_promotion_mode COMMAND expert_promotion_mode_test)
+
 add_executable(mtp_speculation_test EXCLUDE_FROM_ALL
     tests/test_mtp_speculation.cpp)
 target_include_directories(mtp_speculation_test PRIVATE

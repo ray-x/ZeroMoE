@@ -2,7 +2,7 @@
 # This is the config behind the v0.0.1 baseline in configs/bench/perf-baselines.md (run from the repository root: the
 # pin files are relative paths). For plain decode (no draft) set spec_type = "none"; the other MTP keys are then ignored.
 # Set model_path, spec_draft_model and (if needed) the usage-survey pin files for your machine. Run with CUDA_VISIBLE_DEVICES=0.
-# Notes: qwen4exp_expert_promotion = "on" is part of the baseline (the code default is "off"); the hot set is 13,000 experts
+# Notes: expert_promotion = "on" is part of the baseline (the code default is "off"); the hot set is 13,000 experts
 # because 14,000 leave no room for the draft graph.
 # Qwen 3.8 Flash starter profile: Q2_0 global expert hotset, single 3090.
 # The benchmark-specific profile and measured results are in configs/bench/.
@@ -113,7 +113,7 @@ spec_type = "draft-mtp"
 mtp_graph = true
 spec_draft_n_max = 3
 spec_draft_model = "/path/to/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf"
-qwen4exp_expert_promotion = "on"
+expert_promotion = "on"
 
 [[gpus]]
 device_id = 0

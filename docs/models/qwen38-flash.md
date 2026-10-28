@@ -62,7 +62,7 @@ Frozen baseline (3 passes per cell, medians, tok/s; details and caveats in `conf
 
 Gotchas:
 
-- `qwen4exp_expert_promotion` defaults to `"off"` on master; this baseline needs `"on"`. Without it MTP drops to 77 / 66 / 57 / 50 / 70 / 32.
+- `expert_promotion` (formerly `qwen4exp_expert_promotion`, now rejected at startup) defaults to `auto`: on when MTP is on, off otherwise; an explicit `on`/`observe`/`off` wins. The plain-decode baseline sets it to `"on"` explicitly. Without promotion MTP drops to 77 / 66 / 57 / 50 / 70 / 32.
 - The old `mtp_*` TOML keys were renamed: `spec_type = "draft-mtp"`, `spec_draft_model`, `spec_draft_n_max`. The old names are rejected at startup.
 - The graph CPU team defaults to the physical core count (6 here). A seventh thread lands on an SMT sibling and costs about 8%.
 - `ZEROMOE_*` graph switches from the earlier recipes (`..._FULL_GRAPH`, `..._GRAPH_PRELOAD_LAYERS`) are gone; placement comes from the TOML keys above.

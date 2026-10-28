@@ -28,7 +28,7 @@ Prefetch ring on (2 sets, drain, chunk 2), DDR pool 60-76 GiB, batch default 204
 
 ## Qwen 3.8 Flash Next (GSQ-RCO Q2_0), single 3090, plain decode and MTP (v0.0.1 baseline)
 
-Config: `configs/bench/qwen38-flash-q2_0-mtp.toml` (global Option-B hot set of 13,000 experts, `qwen4exp_expert_promotion = "on"`, context 1536; the plain rows set `spec_type = "none"`
+Config: `configs/bench/qwen38-flash-q2_0-mtp.toml` (global Option-B hot set of 13,000 experts, `expert_promotion = "on"`, context 1536; the plain rows set `spec_type = "none"`
 and drop the MTP keys), `CUDA_VISIBLE_DEVICES=0`, 6-thread graph CPU team (the default), 10 OpenMP threads, MTP draft Q4_K_M checkpoint with 3 draft tokens. Source `ea2b200`
 (master `197cdfa` + `swap-b`, plus two compile fixes to master), ggml `8baabd53b` + `patches/ggml` 0001-0017 + `patches/ggml-host-node`, CUDA 13.3, driver 610.57.04, sm_86, GCC 16.2. Measured 2026-10-28, tok/s.
 Artifacts (exact TOML, prompts, command, stdout, engine logs, manifest): `build_mtp_results/2026-10-28-ea2b200-mtp-suite/ (MTP), 2026-10-28-ea2b200-plain-suite/ (plain); the same suites on the previous build are in 2026-10-28-1950bee-*-suite/, and 2026-10-28-1950bee-mtp-suite-promotion-off/ is an invalid first attempt kept for the record`.
@@ -48,9 +48,8 @@ Artifacts (exact TOML, prompts, command, stdout, engine logs, manifest): `build_
 * Greedy decoding (temperature 0), 500-token cap (leetcode stops at EOS after 246), 3 passes per cell, each a fresh process; ranges are min-max over the passes.
 
 Before this baseline: the first merged MTP window gave 53.5 tok/s wall (57.7 steady) on the palindrome prompt (2026-10-27 handoff); the `swap-b` fused cold-expert op raised it to 59-68 tok/s on five of the six prompts and 49 on story. The Q2_0 dot, the draft-row change and the vectorised selector took it to the table above.
-With promotion left at the master default (`"off"`), MTP decode is 77.2 / 66.2 / 56.9 / 50.3 / 69.8 / 31.6 for palindrome / review / B-tree / math / leetcode / story (pass 1), so promotion is worth
-+4% (leetcode) to +104% (story): +7% palindrome, +19% review, +39% B-tree, +61% math; the shipped default should be revisited.
-Regression check: the same suites on the previous build (`1950bee`, before master's last cleanup commit) agree within +-2.5% per cell; the worst cell is -0.5% for MTP and -0.7% for plain decode (rule: report anything below -5%). Draft acceptance is identical on every prompt. Nothing to report to the owner on the 5% rule. Plain vs MTP generated text is not identical on story and math (open, see the handoff).
+Without promotion (the old default, `qwen4exp_expert_promotion = "off"`; pass 1 of the first attempt), MTP decode is 77.2 / 66.2 / 56.9 / 50.3 / 69.8 / 31.6 for palindrome / review / B-tree / math / leetcode / story, so promotion is worth
++4% (leetcode) to +104% (story): +7% palindrome, +19% review, +39% B-tree, +61% math. The key is now `expert_promotion` and defaults to `auto`: on when MTP is on, off otherwise (plain decode needs `"on"` to reproduce the plain rows above).
 
 ## Qwen 3.8 Flash (UD-IQ1_M), single 3090
 

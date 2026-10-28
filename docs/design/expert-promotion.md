@@ -100,7 +100,7 @@ Wall decode rate (tok/s, includes one-time decode-graph/draft setup), promotion 
 
 `tools/bench_qwen4exp_mtp_suite.py`: six prompts, plain and MTP (3 drafts), fresh process each, exactly 256 generated
 tokens, 3 repeats, medians of decode-wall tok/s (includes ~240 ms of draft setup for MTP). RTX 3090 only, Q2_0,
-K=13,000, context 1536. Two configs: static hot set, and `qwen4exp_expert_promotion = "on"`. Raw logs, configs and
+K=13,000, context 1536. Two configs: static hot set, and `expert_promotion = "on"` (then `qwen4exp_expert_promotion`). Raw logs, configs and
 manifests: `~/Projects/ZeroMoE-results/promotion-study/matrix-6751f3c/{static,promo}/` (binary SHA
 `af6bf5c7f11a...`, source `b5eee36`, ggml `8baabd53b`).
 
@@ -154,7 +154,7 @@ arena at prefill would be the case to watch.
 ## Output check under promotion (teacher-forced, `tools/check_adaptive_placement_accuracy.py`)
 
 Static hot set (K=13,000) generates 256 tokens per prompt; the same tokens are forced through the same binary with
-`qwen4exp_expert_promotion=on` (cap 12, burst 20) and the per-step logits are compared. Binary `6751f3c`, 3090,
+`expert_promotion=on` (then `qwen4exp_expert_promotion`) (cap 12, burst 20) and the per-step logits are compared. Binary `6751f3c`, 3090,
 six prompts of `bench/prompts/mtp_suite`; raw per-token data in
 `~/Projects/ZeroMoE-results/promotion-study/gate-promotion/`.
 

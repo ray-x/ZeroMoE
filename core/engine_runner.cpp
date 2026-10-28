@@ -2,6 +2,7 @@
 // Split from the former run_engine() in src/main.cpp; bodies are unchanged except where
 // a former local became an EngineRunner member of the same name.
 #include "engine_runner.hpp"
+#include "expert_promotion_mode.hpp"
 #include "graph_settings_global.hpp"
 #include <cstdlib>
 
@@ -326,9 +327,13 @@ std::expected<void, std::string> EngineRunner::apply_engine_config() {
       engine.qwen4exp_gpu_stage_layers.end());
   engine.qwen4exp_track_router_usage = config.qwen4exp_track_router_usage;
   {
-    std::string mode = config.qwen4exp_expert_promotion;
+    std::string mode = config.expert_promotion;
     if (const char *env = std::getenv("ZEROMOE_QWEN4EXP_EXPERT_PROMOTION")) mode = env;
-    engine.qwen4exp_expert_promotion = mode == "on" ? 2 : mode == "observe" ? 1 : 0;
+    const bool mtp_graph = config.mtp_graph && config.mtp_enabled;
+    engine.qwen4exp_expert_promotion = zeromoe::graph::resolve_expert_promotion_mode(mode, mtp_graph);
+    static const char *const level_names[] = {"off", "observe", "on"};
+    LOG_INFO("[EXPERT-PROMOTION] expert_promotion=%s, graph-native MTP %s -> %s\n", mode.c_str(),
+             mtp_graph ? "on" : "off", level_names[engine.qwen4exp_expert_promotion]);
   }
   engine.glm5next_kda_gpu = config.glm5next_kda_gpu;
   engine.glm5next_router_gpu = config.glm5next_router_gpu;

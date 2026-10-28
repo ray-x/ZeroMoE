@@ -5,6 +5,7 @@
 #include "logger.hpp"
 #include "resident_memory_policy.hpp"
 #include "graph_settings_config.hpp"
+#include "expert_promotion_mode.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -464,9 +465,10 @@ struct EngineConfig {
   bool qwen4exp_track_router_usage = false;
 
   // Adaptive promotion of missed experts into the static per-layer VRAM set (docs/design/expert-promotion.md).
-  // "off" (default): static set. "observe": count misses, never swap (frozen set, for A/B and validation).
-  // "on": swap. Environment override: ZEROMOE_QWEN4EXP_EXPERT_PROMOTION=off|observe|on.
-  std::string qwen4exp_expert_promotion = "off";
+  // "auto" (default): on when graph-native MTP is on, off otherwise. "on": swap. "observe": count misses, never swap
+  // (frozen set, for A/B and validation). "off": static set. An explicit value always wins over MTP.
+  // Environment override: ZEROMOE_QWEN4EXP_EXPERT_PROMOTION=auto|off|observe|on. Replaces qwen4exp_expert_promotion.
+  std::string expert_promotion = "auto";
 
   // prompt_cache: reuse the previous request's end-of-prompt state when the
   // new prompt EXTENDS it (or repeats it), so only the new suffix is
@@ -2354,6 +2356,7 @@ inline bool EngineConfig::load(const std::string &path) {
       {"mtp_enabled", "spec_type"},
       {"mtp_model_path", "spec_draft_model"},
       {"mtp_draft_tokens", "spec_draft_n_max"},
+      {"qwen4exp_expert_promotion", "expert_promotion"},
   };
   for (const auto &[old_key, new_key] : removed_spec_keys) {
     if (doc.root.has(old_key)) {
@@ -2705,8 +2708,13 @@ inline bool EngineConfig::load(const std::string &path) {
       doc.root.get_int_array("qwen4exp_gpu_stage_layers");
   qwen4exp_track_router_usage = doc.root.get_bool(
       "qwen4exp_track_router_usage", qwen4exp_track_router_usage);
-  qwen4exp_expert_promotion = doc.root.get_str(
-      "qwen4exp_expert_promotion", qwen4exp_expert_promotion);
+  expert_promotion =
+      doc.root.get_str("expert_promotion", expert_promotion);
+  if (!zeromoe::graph::expert_promotion_mode_valid(expert_promotion)) {
+    std::cerr << "[CONFIG] expert_promotion must be \"auto\", \"on\", \"observe\" or \"off\" (got \""
+              << expert_promotion << "\")\n";
+    return false;
+  }
   qwen4exp_cpu_offload_ring_slots = (int)doc.root.get_int(
       "qwen4exp_cpu_offload_ring_slots", qwen4exp_cpu_offload_ring_slots);
   if (qwen4exp_cpu_offload_ring_slots < 1)
