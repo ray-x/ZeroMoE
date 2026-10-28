@@ -1842,7 +1842,7 @@ public:
                 // Every caller writes `total` bytes into slab_buffer right
                 // after this returns and none can report failure, so a
                 // refused growth that keeps the old, smaller slab overruns it
-                // (SIGSEGV in a 426-token GLM-5.3 prefill). The guard's 20 GiB
+                // (SIGSEGV in a 426-token GLM-5.3 prefill). The guard's 10 GiB
                 // admission reserve is far above what a few-MB slab needs;
                 // grow outside the ledger while the kernel still has a hard
                 // 2 GiB of MemAvailable, and only keep the old slab when it

@@ -3107,7 +3107,7 @@ void test_qwen4exp_ple_hash() {
 
 void test_host_budget_admission() {
   std::cout << "[TEST] host-memory budget admission..." << std::flush;
-  assert(MemoryGuard::effective_stop_limit_mb(4096) == 20480);
+  assert(MemoryGuard::effective_stop_limit_mb(4096) == 10240);
   assert(MemoryGuard::effective_stop_limit_mb(32768) == 32768);
   assert(host_budget_allows(0, 1000, 1000, 1000));
   assert(host_budget_allows(1000, 400, 500, 100));

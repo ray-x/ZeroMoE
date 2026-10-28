@@ -94,7 +94,7 @@ inline bool physical_host_budget_allows(size_t startup_available,
 
 class MemoryGuard {
 public:
-    static constexpr long kMinimumHostReserveMiB = 20 * 1024;
+    static constexpr long kMinimumHostReserveMiB = 10 * 1024;
     static constexpr long effective_stop_limit_mb(long requested_mb) {
         return requested_mb < kMinimumHostReserveMiB
             ? kMinimumHostReserveMiB : requested_mb;
@@ -147,7 +147,7 @@ public:
     void start(long warn_mb, long stop_mb, int poll_ms) {
         if (running_.load()) return;
         stop_mb_ = effective_stop_limit_mb(stop_mb);
-        // Experiment-only override (ZEROMOE_MEM_GUARD_FLOOR_MB): lets an A/B run use a lower host reserve than the 20 GiB default.
+        // Experiment-only override (ZEROMOE_MEM_GUARD_FLOOR_MB): lets an A/B run use a lower host reserve than the 10 GiB default.
         const long v = zeromoe::graphcfg::atol_or("ZEROMOE_MEM_GUARD_FLOOR_MB", -1);
         if (v >= 8 * 1024) stop_mb_ = v;
         warn_mb_ = std::max(warn_mb, stop_mb_);
@@ -316,7 +316,7 @@ private:
     static inline std::atomic<long> last_mb_{-1};
     static inline std::atomic<long> min_mb_{1L << 40};
     static inline std::atomic<uint64_t> n_block_{0};
-    static inline std::atomic<long> stop_limit_mb_{20480};
+    static inline std::atomic<long> stop_limit_mb_{10240};
     static inline std::atomic<size_t> reserved_bytes_{0};
     static inline std::atomic<size_t> host_budget_bytes_{0};
     static inline std::atomic<size_t> startup_available_bytes_{0};
