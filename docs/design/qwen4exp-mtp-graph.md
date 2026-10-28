@@ -319,7 +319,7 @@ Admission order: the target decode graph is built first, then the draft is
 admitted against the remaining device memory (about 2 GiB of NextN weights, K/V
 and workspace). With 22 resident expert layers on a 24 GiB card the draft does
 not fit and the request fails with a clear error; give the target fewer device
-expert layers (`ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS`, 18 was used). Creating
+expert layers (`graph_device_expert_layers`, 18 was used). Creating
 the draft first starves the decode build, which is then declined, and the
 target runs in a different configuration with different numerics.
 

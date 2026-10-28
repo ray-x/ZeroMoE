@@ -27,6 +27,8 @@ them would copy about 46 experts per token (about 63 MB/token), past the point w
 
 ## 2. Token-history predictors (MTP window trace, `tools/expert_lookahead_predictors.py`)
 
+The promotion route/residency trace is tagged `[PROMO-TRACE]` in DEBUG engine logs; use `--verbosity 5` and pass the engine log to `tools/expert_lookahead_predictors.py`.
+
 Palindrome, 463 tokens, 5.9% of routed evaluations cold. Scored on the cold evaluations of the next token:
 
 | predictor | recall | precision | experts per layer |
@@ -60,7 +62,7 @@ Palindrome, 463 tokens, 5.9% of routed evaluations cold. Scored on the cold eval
 
 ## 4. Same predictor in an MTP window (apples to apples)
 
-Router lookahead inside a verify window (lane on, `ZEROMOE_QWEN4EXP_WINDOW_LANE=1`, palindrome, 18,941 samples):
+Router lookahead inside a verify window (historical window-lane experiment (selector removed 2026-10-28), palindrome, 18,941 samples):
 recall@10 64.8%, cold recall 45.7%, cold precision 26.0% - the same as plain decode (64.9% / 44.1% / 24.3%).
 The lower numbers in section 2 are the history predictors, which see less than the router lookahead (no
 activations of the token being processed).

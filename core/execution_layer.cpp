@@ -178,7 +178,6 @@ bool glm_mtp_forward(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     ram_mgr.vram_cache->in_prefill = (S > 1);
   if (S == 1 && pos_base == 0 && gdn_full_ggml())
     GgmlGdnProjRunner::instance().reset_full_device_states();
-  if (S == 1)
   const int layer_idx = c.n_layers;
   if (fam == ModelFamily::GLM5NEXT && glm5next_is_kda_layer(c, layer_idx)) {
     return false; // graph_initializer rejects this, keep the runtime guard too

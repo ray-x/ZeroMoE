@@ -60,10 +60,9 @@ tests unexpectedly report `Skipped (GGML CUDA backend not compiled)`.
 ## 4. Config file
 
 `device_expert_layers` (the whole-GPU-resident layer-block size — the `X`
-in `X/split/plainCPU` naming) is the TOML key
-`graph_device_expert_layers`; the legacy
-`ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS` / `..._PRELOAD_TRAILING` aliases still
-work. Everything else about the split lives in the TOML. See
+in `X/split/plainCPU` naming) uses TOML `graph_device_expert_layers` or CLI
+`--graph-device-expert-layers`. The legacy preload env aliases were removed.
+Everything else about the split lives in the TOML. See
 `configs/testing/qwen4exp_option_b_rightsize_split44_x0.toml`
 in the main repo for a complete worked example; the load-bearing keys are:
 
@@ -92,13 +91,12 @@ paths resolve from).
 ```bash
 cd /tmp/reverify_wt
 echo "Explain what a binary search tree is and give a short example in Python." | \
-ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0 \
 ZEROMOE_BENCH_IGNORE_STOP=1 CUDA_VISIBLE_DEVICES=0 ZEROMOE_CUDA_SCHEDULE=auto \
-./build_ggmlcuda/zeromoe --config path/to/config.toml --predict 40
+./build_ggmlcuda/zeromoe --config path/to/config.toml --graph-device-expert-layers 0 --predict 40
 ```
 
-`ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS` is the `X` for whichever row
-you're testing (e.g. `0` for the `0/44/4` row).
+Use `--graph-device-expert-layers X` for whichever row
+you're testing (e.g. `0` for `0/44/4`).
 
 Before launching, always check the GPU is actually idle
 (`nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv` and
@@ -214,10 +212,7 @@ ggml's `ggml-backend.cpp`) shows ~37 ms/token of "CPU compute" over 49 CPU split
 **Things that do NOT help 0/44/4 (measured, order-balanced A/B, 4 runs per side):**
 - `OMP_WAIT_POLICY=active GOMP_SPINCOUNT=10000000`: 35.33 vs 35.32 tok/s.
 - Decode-only HC stream-mean fusion (permute+cont+mean): 35.45 vs 35.66 (+0.6%, noise).
-- `ZEROMOE_QWEN4EXP_DECODE_RECREATE_GRAPH_ARENA=1`: explicitly restores the
-  older separate-arena behavior. The default is to borrow the completed
-  prefill graph's dense/expert arenas; split configurations should only use
-  this override when arena borrowing is incompatible with the selected split.
+- Historical separate-arena A/B runs used `ZEROMOE_QWEN4EXP_DECODE_RECREATE_GRAPH_ARENA=1`; that env override was removed 2026-10-28 after adding the fresh-arena retry for borrowed-build failures.
 - CPU kernel rewrites: cold-path kernels are ~3.5% of samples here, so there is nothing to win.
 
 Bisect recipe if the number drops again: run an older `build/zeromoe` on the same config
@@ -375,7 +370,7 @@ Changes (all in `src/ggml_qwen4exp_graph.cpp`):
 - Prefill borrows the retained dense arena when this graph has no resident expert layers (saves a second 3.3 GiB dense arena and ~400 ms in prefill).
 - Per-prompt VRAM policy (`manage_decode_arena_for_prefill`): prefill workspace is ~0.5 GiB + 7.5 MiB/token (measured 0.69 GiB at S=20, 13.18 GiB at S=1747), which cannot coexist with the 13.3 GiB arena. Short prompts (roughly <= ~120 tokens on a 24 GiB card) keep the arena resident; a longer prompt releases it first (that request pays the old ~3.1-3.6 s decode build), and the arena is re-retained from the live decode graph when the next short prompt arrives.
 Verified sequence in one session (short, 1747 tokens, short): decode setup 97 ms, arena released + 25 s prefill OK + 3103 ms decode build, then 98 ms again; exit 0. WITHOUT the per-prompt policy the long prompt crashed (CUDA OOM, exit 134).
-Current startup opt-out: `ZEROMOE_QWEN4EXP_GRAPH_BOOTSTRAP=0` skips startup preparation. The force-recreate override was removed on 2026-10-28; prompt activation-copy sizing remains a possible follow-up.
+Startup preparation is fixed on for eligible Qwen full-graph decode; the former lazy-bootstrap env opt-out was removed on 2026-10-28. The force-recreate override was removed on 2026-10-28; prompt activation-copy sizing remains a possible follow-up.
 
 ## 19. Host-node gap investigation: it was thread placement, not the signaling (2026-10-02, late)
 

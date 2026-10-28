@@ -19,6 +19,9 @@ cd "$(dirname "$0")/.."
 
 CXX="${CXX:-c++}"                 # c++ -> clang++ on macOS, g++ on most Linux
 BIN="${BIN:-./build/test_components}"
+# Mirror CMakeLists.txt's ZEROMOE_INCLUDE_DIRS. The headers are split by
+# component under the repo root; there is no top-level include/ directory.
+REPO_INC="-Icore -Imemory -Imodels/base -Imodels/graph -Imodels/qwen -Imodels/glm -Imodels/mimo -Imodels/deepseek -Ibackends/cpu -Ibackends/cuda -Ibackends/ggml -Ibackends/exl3"
 SRC="tests/test_components.cpp"
 SUPPORT_SRCS="backends/exl3/exl3_cpu.cpp backends/exl3/exl3_model_loader.cpp models/base/safetensors_adapter.cpp"
 
@@ -74,11 +77,22 @@ else
     # rather than failing with a wall of undefined references.
     EXTRA_SRCS="backends/cpu/ggml_grids.cpp"
     # ggml_grids.cpp includes ggml-common.h, which lives in the fetched
-    # ggml source tree (not in include/), so add it to the search path.
+    # ggml source tree, so add it to the search path. Look in the default
+    # CMake build directories used on Linux and macOS.
+    if [ -z "${GGML_SRC_DIR:-}" ]; then
+        for d in build/_deps/ggml-src/src build-macos/_deps/ggml-src/src build-cpu/_deps/ggml-src/src; do
+            [ -d "$d" ] && { GGML_SRC_DIR="$d"; break; }
+        done
+    fi
     GGML_SRC_DIR="${GGML_SRC_DIR:-build/_deps/ggml-src/src}"
     [ -d "$GGML_SRC_DIR" ] && INC_FLAGS="-I$GGML_SRC_DIR -I$GGML_SRC_DIR/../include"
+    if [ -z "${GGML_LIB_DIR:-}" ]; then
+        for d in build/ggml-build/src build-macos/ggml-build/src build-cpu/ggml-build/src; do
+            compgen -G "$d/libggml-base.*" >/dev/null && { GGML_LIB_DIR="$d"; break; }
+        done
+    fi
     GGML_LIB_DIR="${GGML_LIB_DIR:-build/ggml-build/src}"
-    if [ -f "$GGML_LIB_DIR/libggml-base.so" ]; then
+    if compgen -G "$GGML_LIB_DIR/libggml-base.*" >/dev/null; then
         GGML_LIB_DIR="$(cd "$GGML_LIB_DIR" && pwd)"
         EXTRA_LDFLAGS="-L$GGML_LIB_DIR -lggml-cpu -lggml-base -Wl,-rpath,$GGML_LIB_DIR"
     else
@@ -103,8 +117,8 @@ if "$CXX" -std=c++23 -fopenmp -c -x c++ /dev/null -o /dev/null 2>/dev/null; then
 fi
 
 mkdir -p "$(dirname "$BIN")"
-echo "[run_components] $CXX -std=c++23 -O2 -Iinclude $INC_FLAGS $ARCH_FLAGS $METAL_FLAGS $OMP_FLAGS $SRC $SUPPORT_SRCS $KERNEL_SRC $EXTRA_SRCS $EXTRA_LDFLAGS -> $BIN"
-"$CXX" -std=c++23 -O2 -Iinclude $INC_FLAGS $ARCH_FLAGS $METAL_FLAGS $OMP_FLAGS -o "$BIN" "$SRC" $SUPPORT_SRCS "$KERNEL_SRC" $EXTRA_SRCS $EXTRA_LDFLAGS
+echo "[run_components] $CXX -std=c++23 -O2 $REPO_INC $INC_FLAGS $ARCH_FLAGS $METAL_FLAGS $OMP_FLAGS $SRC $SUPPORT_SRCS $KERNEL_SRC $EXTRA_SRCS $EXTRA_LDFLAGS -> $BIN"
+"$CXX" -std=c++23 -O2 $REPO_INC $INC_FLAGS $ARCH_FLAGS $METAL_FLAGS $OMP_FLAGS -o "$BIN" "$SRC" $SUPPORT_SRCS "$KERNEL_SRC" $EXTRA_SRCS $EXTRA_LDFLAGS
 
 ROUTE_TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/zeromoe-route-test.XXXXXX")"
 trap 'rm -rf "$ROUTE_TEST_DIR"' EXIT
@@ -122,7 +136,7 @@ done
 if [ "$(uname -s)" = "Linux" ]; then
     CACHE_TEST_BIN="$ROUTE_TEST_DIR/test_expert_dram_cache"
     echo "[run_components] compiling dynamic expert cache tests"
-    "$CXX" -std=c++20 -O2 -pthread -Iinclude \
+    "$CXX" -std=c++20 -O2 -pthread $REPO_INC \
         -o "$CACHE_TEST_BIN" tests/test_expert_dram_cache.cpp
     "$CACHE_TEST_BIN"
 else
@@ -145,7 +159,7 @@ if [ -n "${GGML_SRC_DIR:-}" ] && \
    [ -n "$CUDA_INCLUDE_DIR" ]; then
     SHAPE_TEST_BIN="$ROUTE_TEST_DIR/test_qwen4exp_stage_shape_pool"
     echo "[run_components] compiling shared shape-class pool tests"
-    "$CXX" -std=c++23 -O2 -pthread -Iinclude \
+    "$CXX" -std=c++23 -O2 -pthread $REPO_INC \
         -I"$GGML_SRC_DIR/../include" -I"$GGML_SRC_DIR" \
         -I"$CUDA_INCLUDE_DIR" \
         -o "$SHAPE_TEST_BIN" tests/test_qwen4exp_stage_shape_pool.cpp

@@ -680,19 +680,12 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
 
 bool qwen4exp_full_graph_bootstrap(StreamingEngine &engine) {
   zeromoe::graphcfg::log_effective("qwen4exp-full-graph");
-  const char *bootstrap =
-      zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_GRAPH_BOOTSTRAP");
   // Build and retain the prompt-independent dense/expert arenas during
   // startup. Graph construction must not hide a multi-second GGUF read and
-  // VRAM upload inside the first prefill. Keep the old lazy behavior as an
-  // explicit diagnostic override for profiles that include startup-to-first-
-  // token in their timing boundary.
-  if (bootstrap && std::strcmp(bootstrap, "0") == 0)
-    return true;
+  // VRAM upload inside the first prefill. Full-graph decode prepares the
+  // reusable arenas at startup as part of its fixed initialization policy.
 
-  // The arenas are only reusable across the prefill/decode graph swap when
-  // decode explicitly borrows them. In all other modes bootstrapping would
-  // add startup work without avoiding a later device-weight upload.
+  // Only Qwen full-graph decode consumes these prompt-independent arenas.
   if (engine.family_ops.family != ModelFamily::Qwen4Exp ||
       !qwen4exp_full_graph_decode_enabled())
     return true;

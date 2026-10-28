@@ -217,11 +217,7 @@ a rebase pass over all profiles.
 
 ### Added after step 1
 
-* `usage_record_file` (diagnostic, outside the defaults hash): canonical `graph_usage_record_file`;
-  `ZEROMOE_GLM5NEXT_USAGE_RECORD` remains for the GLM family and is inherited by Ling's shared
-  graph. Turns on the shared route survey
-  (`models/graph/graph_route_survey.hpp`). Only the in-graph MoE path is tapped; MiMo's synchronous fallback
-  (`ZEROMOE_MIMO2_INGRAPH_MOE=0`) and the layered path record nothing, so the file stays empty there.
+* `usage_record_file` (diagnostic, outside the defaults hash): canonical `graph_usage_record_file` TOML/CLI setting; no environment alias. Turns on the shared route survey (`models/graph/graph_route_survey.hpp`). Only the in-graph MoE path is tapped; MiMo's synchronous fallback (`ZEROMOE_MIMO2_INGRAPH_MOE=0`) and layered path record nothing, so the file stays empty there.
 * One prefill-chunk model for graph families: env (`prefill_chunk` aliases) > the TOML's `prefill_batch_tokens` >
   the family override (MiMo 512) > default. MiMo's configs no longer set `prefill_batch_tokens = 16`, which the
   MiMo graph used to ignore and which would otherwise have capped the chunk at 16.

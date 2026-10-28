@@ -6,11 +6,11 @@ set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 llama_cpp_dir="${LLAMA_CPP_DIR:-${repo_dir}/../llama.cpp}"
-moe_build="${ZEROMOE_GGML_BUILD:-${repo_dir}/build_ggmlcuda/ggml-build}"
+moe_build="${ZEROMOE_GGML_BUILD:-${repo_dir}/build/ggml-build}"
 llama_cpp_build="${LLAMA_CPP_GGML_BUILD:-${llama_cpp_dir}/build-qwen38-rtx3090/bin}"
 llama_cpp_include="${llama_cpp_dir}/ggml/include"
 source_file="${repo_dir}/bench/qwen_cpu_moe_ggml_bench.cpp"
-out_dir="${repo_dir}/build_ggmlcuda/bench"
+out_dir="${repo_dir}/build/bench"
 
 mkdir -p "${out_dir}"
 

@@ -14,7 +14,7 @@ This file provides detailed architectural guidance, operational rules, hardware 
 
 ## 1. Overview and Architecture
 
-ZeroMoE is a zero-dependency C++23 / CUDA17 inference engine built to stream Mixture-of-Experts (MoE) GGUF models (e.g., GLM-5.2, DeepSeek-V3, DeepSeek-V4 MLA, Hunyuan, Llama) on consumer hardware.
+ZeroMoE is a native C++23 (host) / CUDA C++17 (device) inference engine built to stream Mixture-of-Experts (MoE) GGUF models (e.g., GLM-5.2, DeepSeek-V3, DeepSeek-V4 MLA, Hunyuan, Llama) on consumer hardware. It builds on ggml from a pinned llama.cpp commit; it is not a llama.cpp fork and does not link `libllama`.
 
 * **Core Paradigm:** Persistent dense layers are held in VRAM/RAM, while massive routed expert matrices are streamed on-demand from NVMe storage through a tiered cache.
 * **MLA Absorbed Attention:** Folds value projection into query projections to compute attention scores in a low-rank latent space, reducing the operational footprint to $O(\text{Context} \times \text{kv\_lora})$.

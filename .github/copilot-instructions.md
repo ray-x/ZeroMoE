@@ -4,16 +4,17 @@
 
 - Linux full-engine build (CUDA, C++23, and ggml):
   ```bash
-  cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DZEROMOE_USE_GGML=ON
+  cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
   cmake --build build -j"$(nproc)"
   make test
   ```
 - CPU-only build:
   ```bash
-  cmake -S . -B build-cpu -DCMAKE_BUILD_TYPE=Release -DZEROMOE_CPU_ONLY=ON -DZEROMOE_USE_GGML=ON
+  cmake -S . -B build-cpu -DCMAKE_BUILD_TYPE=Release -DZEROMOE_CPU_ONLY=ON
   cmake --build build-cpu -j"$(nproc)"
   ./build-cpu/test_components
   ```
+- `./setup.sh` wraps the same configure/build steps and checks the toolchain; `./setup.sh --cpu-only` builds the CPU components on Linux.
 - Fast CPU component suite: `make test-components`.
 - Run one component test by substring, for example: `make test-components ARGS="rope"`. Multiple filters are ORed: `make test-components ARGS="rope dequant"`.
 - `make test` runs the native CUDA suite on a full build, or the component suite when only the CPU test binary is available. The CPU-only component script also runs its independent routing/cache checks.
@@ -32,7 +33,7 @@ Sources and headers are colocated: `core/` owns configuration, scheduling, and e
 
 Keep graph construction and runtime policy separate from replay: the graph fixes tensor topology and bindings, while each replay supplies current inputs, route IDs/weights, and buffer contents. CUDA graph capture retains tensor addresses, so do not retarget captured weight pointers to new placements; keep borrowed buffers alive through pending work and retire/rebuild the scheduler when bindings or placement generations change. GGML owns capture at its backend boundary—do not wrap the whole multi-backend scheduler call in an external CUDA capture.
 
-For the execution lifecycle and adding a family, start with `docs/design/full-graph-model-onboarding.md`; for the capture boundary and CUDA constraints, see `docs/cuda-graph-api-review-2026-10-05.md`. `ZEROMOE_USE_GGML_CUDA` enables the ggml CUDA backend, and `ZEROMOE_ENABLE_CUDA_GRAPHS` controls ggml CUDA graph capture/replay.
+For the execution lifecycle and adding a family, start with `docs/design/full-graph-model-onboarding.md`; for the capture boundary and CUDA constraints, see `docs/cuda-graph-api-review-2026-10-05.md`. `ZEROMOE_USE_GGML_CUDA` is defined by the build when CUDA is enabled. `GGML_CUDA_GRAPHS` is forced ON by CMake and is not a user-selectable option. The host-node ggml patches are controlled by `ZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES` (default ON; required for the Qwen4Exp CPU/GPU split).
 
 ## Repository-specific conventions
 

@@ -4,24 +4,25 @@
 #
 #   scripts/validate_vs_llama.sh <model.gguf> <zeromoe.toml> ["prompt"] [steps] [zeromoe-binary]
 #
-# Env: LLAMA_SRC   llama.cpp source tree        (default ../llama.cpp)
-#      LLAMA_BUILD llama.cpp build with the libs (default $LLAMA_SRC/build-avx512-stock, an UNPATCHED build)
+# Env: LLAMA_SRC   unpatched llama.cpp source at the pinned commit 8baabd53 (default ../llama.cpp)
+#      LLAMA_BUILD llama.cpp build with the libs (default $LLAMA_SRC/build, an UNPATCHED build)
+#      ZEROMOE_BIN ZeroMoE binary (or pass it as the 5th argument; default ./build/zeromoe)
 #      DEVS        CUDA_VISIBLE_DEVICES for ZeroMoE (default 0,1)
 #      MS_ENV      extra environment-only controls for ZeroMoE; use CLI flags for graph settings
 # Needs the machine idle: llama.cpp loads the whole model on the CPU, ZeroMoE then runs it.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 MODEL=${1:?model.gguf} CONFIG=${2:?zeromoe.toml} PROMPT=${3:-The capital of France is} STEPS=${4:-8}
-BIN=${5:-./build_master/zeromoe}
+BIN=${5:-${ZEROMOE_BIN:-./build/zeromoe}}
 LLAMA_SRC=${LLAMA_SRC:-../llama.cpp}
-LLAMA_BUILD=${LLAMA_BUILD:-$LLAMA_SRC/build-avx512-stock}
+LLAMA_BUILD=${LLAMA_BUILD:-$LLAMA_SRC/build}
 OUT=${OUT:-logs/validate_$(date +%Y%m%d_%H%M%S)}
 mkdir -p "$(dirname "$OUT")"
 
 # 1. The reference harness (one file; build once).
 REF=build_logits_ref
 if [[ ! -x $REF || tools/ling_llama_logits.cpp -nt $REF ]]; then
-  g++ -std=c++17 -O1 tools/ling_llama_logits.cpp -o "$REF" \
+  "${CXX:-g++}" -std=c++17 -O1 tools/ling_llama_logits.cpp -o "$REF" \
     -I"$LLAMA_SRC/include" -I"$LLAMA_SRC/ggml/include" \
     -L"$LLAMA_BUILD/bin" -lllama -lggml -lggml-base -Wl,-rpath,"$LLAMA_BUILD/bin"
 fi

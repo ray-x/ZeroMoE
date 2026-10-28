@@ -37,6 +37,13 @@ moe::GgmlMoeTransferManager::~GgmlMoeTransferManager() {
 #endif
 using namespace moe::detail;
 
+namespace {
+// The ZEROMOE_TRACE_PURE_H2D environment knob was retired with the other
+// environment overrides. The timing recorders below stay as no-ops so the
+// transfer accounting and its public getters are unchanged.
+constexpr bool trace_pure_h2d() { return false; }
+}  // namespace
+
 extern "C" cudaError_t launch_ggml_moe_unpack(
     const void *src, void *gate, void *up, void *down, int count,
     size_t src_stride, size_t gate_bytes, size_t up_bytes, size_t down_bytes,

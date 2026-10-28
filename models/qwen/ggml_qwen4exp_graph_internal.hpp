@@ -115,8 +115,6 @@ void CUDART_CB qwen4exp_cuda_gpu_stage_callback(void *user_data);
 bool qwen4exp_cuda_gpu_stage_node_enqueue(const ggml_tensor *node, cudaStream_t stream);
 void CUDART_CB qwen4exp_cuda_usage_track_callback(void *user_data);
 bool qwen4exp_cuda_usage_track_node_enqueue(const ggml_tensor *node, cudaStream_t stream);
-int env_partial_graph_layer();
-bool env_partial_graph_enabled(int layer);
 bool qwen4exp_host_node_timing_enabled();
 double qwen4exp_host_node_ordinary_cpu_wait_ms_since_last();
 double qwen4exp_host_node_gate_wait_ms_since_last();
@@ -198,7 +196,9 @@ ggml_tensor *build_gdn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur, int la
 ggml_tensor *build_full_attention(FullGraph &g, ggml_context *ctx, ggml_tensor *cur, int layer, ggml_tensor *w_q, ggml_tensor *w_k, ggml_tensor *w_v, ggml_tensor *w_qn, ggml_tensor *w_kn, ggml_tensor *w_o, ggml_tensor **k_cache, ggml_tensor **v_cache);
 ggml_tensor *build_full_attention_decode( FullGraph &g, ggml_context *ctx, ggml_tensor *cur, int layer, ggml_tensor *w_q, ggml_tensor *w_k, ggml_tensor *w_v, ggml_tensor *w_qn, ggml_tensor *w_kn, ggml_tensor *w_o, ggml_tensor *k_storage, ggml_tensor *v_storage);
 bool prepare_ple_embedding(FullGraph &g, std::vector<float> &embedding, int S, int pos_base, const int *token_ids);
-ggml_tensor *build_qwen4exp_host_node( FullGraph &g, ggml_context *ctx, ggml_tensor *cur, ggml_tensor *ids, ggml_tensor *weights, int layer, bool partial_cold_only = false, ggml_tensor *gate_exps_for_cpu = nullptr, ggml_tensor *up_exps_for_cpu = nullptr, ggml_tensor *down_exps_for_cpu = nullptr, ggml_tensor *remap_cpu_for_cpu = nullptr, ggml_tensor *mask_cpu_for_cpu = nullptr);
+ggml_tensor *build_qwen4exp_host_node(FullGraph &g, ggml_context *ctx,
+                                      ggml_tensor *cur, ggml_tensor *ids,
+                                      ggml_tensor *weights, int layer);
 int build_gpu_stage_node(FullGraph &g, ggml_context *ctx, ggml_tensor *ids, int layer);
 ExpertSplitTables build_expert_split_tables(FullGraph &g, ggml_context *ctx, int n_experts, const std::vector<int> &gpu_ids, bool safe_dummy_fill = false);
 bool exl3_ggml_bridge_requested(const FullGraph &g, int layer, std::string &model_path);
@@ -274,18 +274,6 @@ struct Qwen4ExpCudaHostNodeContext {
   // CPU returns unweighted [D, topk] expert outputs; the GPU weights and
   // reduces them after the marker (saves the CPU reduce tail).
   bool gpu_reduce = false;
-  // The milestone-2 callback projects an immutable per-token classification
-  // into private CPU-graph inputs. The original D2H route snapshot remains
-  // untouched for diagnostics and exact-once accounting.
-  bool partial_cold_only = false;
-  std::unique_ptr<EarlyReadyLane> partial_cpu_graph;
-  std::vector<int32_t> resident_expert_index;
-  std::vector<int32_t> staged_expert_index;
-  std::vector<int32_t> route_snapshot_ids;
-  std::vector<float> route_snapshot_weights;
-  std::vector<float> route_output;
-  moe_partial::RouteClassification route_classification;
-  uint64_t route_slot_generation = 0;
   // The full graph owns this pool. The host-node runner borrows it for the
   // callback and never frees or pauses it.
   ggml_threadpool_t shared_cpu_threadpool = nullptr;

@@ -354,6 +354,10 @@ void qwen_cpu_direct_sample_end(GgmlQwenDirectWorkerSample &sample,
 #endif
 }
 
+} // namespace
+
+void qwen_cpu_moe_diag_set_layer(int layer) { qwen_cpu_diag_layer = layer; }
+
 GgmlQwenCpuMoeRunner &GgmlQwenCpuMoeRunner::instance() {
   static GgmlQwenCpuMoeRunner runner;
   return runner;

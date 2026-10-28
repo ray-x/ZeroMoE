@@ -340,10 +340,14 @@ original router weight on exactly one target and reuses preallocated output
 buffers. The opt-in callback uses that projection without mutating the raw
 D2H IDs/weights or the graph's immutable remap/mask tables.
 
-## Milestone 2: DDR-only partial-layer graph prototype
+## Retired milestone 2: DDR-only partial-layer graph prototype
 
-An opt-in prototype now uses `ZEROMOE_QWEN4EXP_PARTIAL_GRAPH=1` together
-with `ZEROMOE_QWEN4EXP_PARTIAL_GRAPH_LAYER=13`. It keeps the static resident
+The prototype, env selectors, and partial-only host-node callback path were removed on 2026-10-28. The following results are retained as historical rejection evidence.
+
+
+The historical prototype used `ZEROMOE_QWEN4EXP_PARTIAL_GRAPH=1` together
+with `ZEROMOE_QWEN4EXP_PARTIAL_GRAPH_LAYER=13`; both selectors were removed
+on 2026-10-28 after the measured candidate was rejected. It kept the static resident
 CUDA branch and inserts a bounded `cudaLaunchHostFunc` callback for the DDR
 complement. The callback uses a prepared GGML CPU graph with immutable CPU
 route tables, then uploads a per-route weighted cold result for the graph
@@ -378,8 +382,8 @@ tok/s early-ready versus 26.70 tok/s partial, −21.61% mean paired gain, 0/6
 wins. All six token files match and every partial run reports 63 successful
 host callbacks. Full data and input hashes are in
 `logs/option_b_partial_layer13_activation_fix_perf_tty/manifest.json` and
-`results.json`. The partial graph remains opt-in and rejected for production
-because its bounded callback and graph-stream serialization cost about 21.6%.
+`results.json`. The partial-graph prototype and callback implementation were removed because
+the bounded callback and graph-stream serialization cost about 21.6%.
 
 The existing Phase-2 prefix/suffix graph can provide the pure-CUDA conditional
 body while the suffix CPU graph carries the host callback. A top-256 proof

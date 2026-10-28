@@ -397,6 +397,13 @@ if(NOT ZEROMOE_CPU_ONLY)
         ERROR_VARIABLE _zeromoe_snapshot_error
         OUTPUT_STRIP_TRAILING_WHITESPACE)
     if(NOT _zeromoe_snapshot_result EQUAL 0)
+        if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+            message(FATAL_ERROR
+                "Could not snapshot source for build provenance: this source tree has no .git directory.\n"
+                "CUDA builds require a git checkout. Clone the repository with git instead of "
+                "building from a GitHub ZIP archive or an exported tarball.\n"
+                "Original error: ${_zeromoe_snapshot_error}")
+        endif()
         message(FATAL_ERROR "Could not snapshot source for build provenance: ${_zeromoe_snapshot_error}")
     endif()
     string(JSON ZEROMOE_CONFIGURED_SOURCE_COMMIT GET "${_zeromoe_source_snapshot}" source_commit)

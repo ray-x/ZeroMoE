@@ -288,21 +288,6 @@ bool qwen4exp_cuda_usage_track_node_enqueue(const ggml_tensor *node,
 // Experimental milestone-2 graph: one static split layer keeps its resident
 // GPU branch in the graph and sends the complement through a bounded DDR host
 // callback. It is deliberately separate from the validated early-ready path.
-int env_partial_graph_layer() {
-  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PARTIAL_GRAPH_LAYER");
-  if (!v || !v[0]) return -1;
-  char *end = nullptr;
-  const long layer = std::strtol(v, &end, 10);
-  return end != v && *end == '\0' && layer >= 0 && layer < 10000
-             ? static_cast<int>(layer)
-             : -1;
-}
-
-bool env_partial_graph_enabled(int layer) {
-  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PARTIAL_GRAPH");
-  return v && v[0] == '1' && env_partial_graph_layer() == layer;
-}
-
 bool qwen4exp_host_node_timing_enabled() {
   return Logger::instance().would_log(LogLevel::DEBUG);
 }
@@ -435,11 +420,10 @@ void CUDART_CB qwen4exp_cuda_host_node_callback(void *user_data) {
         ++resident;
     }
     LOG_INFO("[QWEN4EXP-HOST-NODE-ROUTES] layer=%d routed=%d resident=%d "
-             "cold=%d static_hot=%zu callback_mode=%s\n",
+             "cold=%d static_hot=%zu callback_mode=full-cpu\n",
              ctx->layer_index, ctx->topk, resident, ctx->topk - resident,
-             ctx->gpu_resident_experts.size(),
-             ctx->partial_cold_only ? "partial-cold" : "full-cpu");
-    if (resident > 0 && !ctx->partial_cold_only) {
+             ctx->gpu_resident_experts.size());
+    if (resident > 0) {
       LOG_WARN("[QWEN4EXP-HOST-NODE-ROUTES] layer=%d host marker is "
                "computing routes that have a static GPU copy; this marker "
                "does not yet compact the cold subset\n",
@@ -447,177 +431,13 @@ void CUDART_CB qwen4exp_cuda_host_node_callback(void *user_data) {
     }
   }
   qwen_cpu_moe_diag_set_layer(ctx->layer_index);
+  GgmlQwenCpuMoeRunner *runner = ctx->cpu_runner;
   bool ok = false;
-  if (ctx->partial_cold_only) {
-    ++ctx->route_slot_generation;
-    if (ctx->route_slot_generation == 0)
-      ++ctx->route_slot_generation;
-  }
-  if (ctx->partial_cpu_graph) {
-    auto &cpu_graph = *ctx->partial_cpu_graph;
-    std::memcpy(cpu_graph.input, ctx->host_input, ctx->input_bytes);
-    bool routes_ready = true;
-    bool skip_cpu_compute = false;
-    if (ctx->partial_cold_only) {
-      routes_ready = moe_partial::RouteClassification::build(
-                         ctx->host_ids, ctx->host_weights,
-                         static_cast<size_t>(ctx->topk),
-                         ctx->resident_expert_index,
-                         ctx->staged_expert_index,
-                         ctx->route_slot_generation,
-                         &ctx->route_classification) &&
-                     ctx->route_classification.exact_once() &&
-                     ctx->route_classification.write_branch_routes(
-                         moe_partial::RouteTarget::Cpu, 0, cpu_graph.ids,
-                         cpu_graph.weights,
-                         static_cast<size_t>(ctx->topk),
-                         /*preserve_unowned_route_ids=*/true);
-      const size_t cpu_route_count =
-          routes_ready
-              ? ctx->route_classification.count(moe_partial::RouteTarget::Cpu)
-              : 0;
-      if (!routes_ready) {
-        LOG_ERROR("[QWEN4EXP-PARTIAL-CLASSIFY] layer=%d rejected invalid or "
-                  "non-exact route snapshot; refusing this graph replay\n",
-                  ctx->layer_index);
-        std::fill_n(ctx->host_output,
-                    ctx->output_bytes / sizeof(float), 0.0f);
-      } else if (qwen4exp_host_node_timing_enabled()) {
-        LOG_DEBUG("[QWEN4EXP-PARTIAL-CLASSIFY] layer=%d routes=%zu "
-                 "resident=%zu staged=%zu cpu=%zu cpu_compute=%s "
-                 "generation=%llu\n",
-                 ctx->layer_index, ctx->route_classification.size(),
-                 ctx->route_classification.count(
-                     moe_partial::RouteTarget::ResidentGpu),
-                 ctx->route_classification.count(
-                     moe_partial::RouteTarget::StagedGpu),
-                 cpu_route_count, cpu_route_count == 0 ? "skip" : "run",
-                 static_cast<unsigned long long>(
-                     ctx->route_slot_generation));
-      }
-      if (routes_ready && cpu_route_count == 0) {
-        // Keep the existing marker/copy/merge topology for this prototype,
-        // but avoid running the prepared CPU graph when every route belongs
-        // to a GPU branch. The zero contribution is freshly initialized for
-        // every replay, so it cannot expose a prior token's output.
-        skip_cpu_compute = true;
-        std::fill_n(ctx->host_output,
-                    ctx->output_bytes / sizeof(float), 0.0f);
-      }
-    } else {
-      std::memcpy(cpu_graph.ids, ctx->host_ids, ctx->ids_bytes);
-      std::memcpy(cpu_graph.weights, ctx->host_weights, ctx->weights_bytes);
-    }
-    ok = routes_ready &&
-         (skip_cpu_compute || cpu_graph.compute_host_callback());
-    if (ok && !skip_cpu_compute)
-      std::memcpy(ctx->host_output, cpu_graph.output->data,
-                  ctx->output_bytes);
-  } else {
-  bool routes_ready = true;
-  bool skip_cpu_compute = false;
-  if (ctx->partial_cold_only) {
-    routes_ready = ctx->route_snapshot_ids.size() ==
-                       static_cast<size_t>(ctx->topk) &&
-                   ctx->route_snapshot_weights.size() ==
-                       static_cast<size_t>(ctx->topk);
-    if (routes_ready) {
-      std::memcpy(ctx->route_snapshot_ids.data(), ctx->host_ids,
-                  ctx->ids_bytes);
-      std::memcpy(ctx->route_snapshot_weights.data(), ctx->host_weights,
-                  ctx->weights_bytes);
-      routes_ready = moe_partial::RouteClassification::build(
-                         ctx->route_snapshot_ids.data(),
-                         ctx->route_snapshot_weights.data(),
-                         static_cast<size_t>(ctx->topk),
-                         ctx->resident_expert_index,
-                         ctx->staged_expert_index,
-                         ctx->route_slot_generation,
-                         &ctx->route_classification) &&
-                     ctx->route_classification.exact_once();
-    }
-    if (routes_ready) {
-      routes_ready = ctx->route_classification.write_branch_routes(
-          moe_partial::RouteTarget::Cpu, 0, ctx->host_ids, ctx->host_weights,
-          static_cast<size_t>(ctx->topk),
-          /*preserve_unowned_route_ids=*/true);
-    }
-    const size_t cpu_routes =
-        routes_ready
-            ? ctx->route_classification.count(moe_partial::RouteTarget::Cpu)
-            : 0;
-    skip_cpu_compute = routes_ready && cpu_routes == 0;
-    if (!routes_ready) {
-      LOG_ERROR("[QWEN4EXP-PARTIAL-CLASSIFY] layer=%d rejected invalid or "
-                "non-exact parent-graph route snapshot\n",
-                ctx->layer_index);
-      std::fill_n(ctx->host_output,
-                  ctx->output_bytes / sizeof(float), 0.0f);
-    } else if (qwen4exp_host_node_timing_enabled()) {
-      LOG_INFO("[QWEN4EXP-PARTIAL-CLASSIFY] layer=%d routes=%zu resident=%zu "
-               "staged=%zu cpu=%zu cpu_compute=%s generation=%llu\n",
-               ctx->layer_index, ctx->route_classification.size(),
-               ctx->route_classification.count(
-                   moe_partial::RouteTarget::ResidentGpu),
-               ctx->route_classification.count(
-                   moe_partial::RouteTarget::StagedGpu),
-               cpu_routes, skip_cpu_compute ? "skip" : "run",
-               static_cast<unsigned long long>(ctx->route_slot_generation));
-    }
-  }
-  GgmlQwenCpuMoeRunner *runner = nullptr;
-  if (!routes_ready) {
-    ok = false;
-  } else if (skip_cpu_compute) {
-    std::fill_n(ctx->host_output, ctx->output_bytes / sizeof(float), 0.0f);
-    ok = true;
-  } else if (ctx->partial_cold_only) {
-    // The standalone parent-graph runner is built for one selected expert.
-    // Call it only for CPU-owned route slots, so hot/staged experts never
-    // incur duplicate CPU matmuls. Accumulate each original router weight
-    // into the single cold-branch output buffer.
-    runner = ctx->cpu_runner;
-    if (!runner || ctx->route_output.size() !=
-                       static_cast<size_t>(ctx->d_model)) {
-      ok = false;
-    } else {
-      if (!runner->uses_external_threadpool())
-        runner->resume_workers();
-      std::fill_n(ctx->host_output,
-                  ctx->output_bytes / sizeof(float), 0.0f);
-      ok = true;
-      for (const auto &assignment : ctx->route_classification.assignments()) {
-        if (assignment.target != moe_partial::RouteTarget::Cpu)
-          continue;
-        ctx->host_ids[0] = assignment.expert_id;
-        ctx->host_weights[0] = assignment.router_weight;
-        const bool route_ok = ctx->projection_compact
-            ? runner->run_strided_planes(
-                  ctx->host_input, ctx->route_output.data(), ctx->layer,
-                  ctx->gate_plane, ctx->up_plane, ctx->down_plane,
-                  ctx->host_ids, ctx->n_experts, ctx->host_weights,
-                  ctx->d_model, ctx->d_ff, 1, ctx->gate_stride,
-                  ctx->up_stride, ctx->down_stride)
-            : runner->run_strided(
-                  ctx->host_input, ctx->route_output.data(), ctx->layer,
-                  ctx->gate_plane, ctx->up_plane, ctx->down_plane,
-                  ctx->host_ids, ctx->n_experts, ctx->host_weights,
-                  ctx->d_model, ctx->d_ff, 1, ctx->expert_stride);
-        if (!route_ok) {
-          ok = false;
-          break;
-        }
-        for (int i = 0; i < ctx->d_model; ++i)
-          ctx->host_output[i] += ctx->route_output[static_cast<size_t>(i)];
-      }
-    }
-  } else if (ctx->projection_compact) {
-    runner = ctx->cpu_runner;
+  if (ctx->projection_compact) {
     if (!runner)
       runner = &GgmlQwenCpuMoeRunner::instance_for_strided_planes(
           ctx->layer, ctx->n_experts, ctx->d_model, ctx->d_ff, ctx->topk,
-          ctx->gate_stride, ctx->up_stride, ctx->down_stride,
-          ctx->gpu_reduce);
+          ctx->gate_stride, ctx->up_stride, ctx->down_stride, ctx->gpu_reduce);
     if (!runner->uses_external_threadpool())
       runner->resume_workers();
     if (ctx->gpu_reduce)
@@ -627,13 +447,12 @@ void CUDART_CB qwen4exp_cuda_host_node_callback(void *user_data) {
           ctx->d_model, ctx->d_ff, ctx->topk, ctx->gate_stride,
           ctx->up_stride, ctx->down_stride);
     else
-    ok = runner->run_strided_planes(
-        ctx->host_input, ctx->host_output, ctx->layer, ctx->gate_plane,
-        ctx->up_plane, ctx->down_plane, ctx->host_ids, ctx->n_experts,
-        ctx->host_weights, ctx->d_model, ctx->d_ff, ctx->topk,
-        ctx->gate_stride, ctx->up_stride, ctx->down_stride);
+      ok = runner->run_strided_planes(
+          ctx->host_input, ctx->host_output, ctx->layer, ctx->gate_plane,
+          ctx->up_plane, ctx->down_plane, ctx->host_ids, ctx->n_experts,
+          ctx->host_weights, ctx->d_model, ctx->d_ff, ctx->topk,
+          ctx->gate_stride, ctx->up_stride, ctx->down_stride);
   } else {
-    runner = ctx->cpu_runner;
     if (!runner)
       runner = &GgmlQwenCpuMoeRunner::instance_for_strided(
           ctx->layer, ctx->n_experts, ctx->d_model, ctx->d_ff, ctx->topk,
@@ -646,15 +465,15 @@ void CUDART_CB qwen4exp_cuda_host_node_callback(void *user_data) {
           ctx->up_plane, ctx->down_plane, ctx->host_ids, ctx->n_experts,
           ctx->d_model, ctx->d_ff, ctx->topk, ctx->expert_stride);
     else
-    ok = runner->run_strided(
-        ctx->host_input, ctx->host_output, ctx->layer, ctx->gate_plane,
-        ctx->up_plane, ctx->down_plane, ctx->host_ids, ctx->n_experts,
-        ctx->host_weights, ctx->d_model, ctx->d_ff, ctx->topk,
-        ctx->expert_stride);
+      ok = runner->run_strided(
+          ctx->host_input, ctx->host_output, ctx->layer, ctx->gate_plane,
+          ctx->up_plane, ctx->down_plane, ctx->host_ids, ctx->n_experts,
+          ctx->host_weights, ctx->d_model, ctx->d_ff, ctx->topk,
+          ctx->expert_stride);
   }
   if (runner && !runner->uses_external_threadpool())
     runner->pause_workers();
-  }
+  qwen_cpu_moe_diag_set_layer(-1);
   const double cpu_ms = std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - start)
                             .count();
@@ -772,14 +591,8 @@ extern "C" bool zeromoe_qwen4exp_cuda_host_node_enqueue(
       return qwen4exp_cuda_usage_track_node_enqueue(node, stream);
   }
   auto *ctx = static_cast<Qwen4ExpCudaHostNodeContext *>(node->extra);
-  const bool needs_host_weights = !ctx->gpu_reduce || ctx->partial_cold_only;
-  // The partial cold-only marker uses a dummy CPY source with the same
-  // [D, topk] shape as its per-route output. Its real [D] activation is an
-  // additional graph dependency at src[4]; reading src[0] here would compute
-  // the cold experts from that uninitialized dummy instead of this token's
-  // post-attention hidden state.
-  ggml_tensor *activation =
-      ctx->partial_cold_only ? node->src[4] : node->src[0];
+  const bool needs_host_weights = !ctx->gpu_reduce;
+  ggml_tensor *activation = node->src[0];
   if (ctx->magic != Qwen4ExpCudaHostNodeContext::kMagic ||
       !node->data || !activation || !node->src[2] ||
       (needs_host_weights && !node->src[3]) ||

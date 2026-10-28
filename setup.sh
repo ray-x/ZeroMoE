@@ -1,60 +1,151 @@
 #!/usr/bin/env bash
-# setup.sh — ZeroMoE Engine Installation and Automated Build Script
-set -e
+# setup.sh — ZeroMoE build helper
+#
+# Checks the toolchain, fetches the pinned ggml source (via CMake), applies the
+# ggml patch series, and builds a Release binary.
+#
+#   ./setup.sh                  # Linux + CUDA (or macOS CPU-only)
+#   ./setup.sh --cpu-only       # CPU-only build on Linux
+#   ./setup.sh --build-dir DIR  # custom build directory
+#   ./setup.sh --jobs N         # parallel build jobs
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: ./setup.sh [options]
+
+  --cpu-only          Build CPU-only components (default on macOS)
+  --build-dir DIR     Build directory (default: build, or build-macos on macOS)
+  --jobs N            Parallel build jobs (default: all logical CPUs)
+  -h, --help          Show this help
+
+The CUDA engine fetches ggml from a pinned llama.cpp commit on first
+configure. Model weights are not downloaded; point a profile at your own GGUF.
+EOF
+}
+
+BUILD_DIR=""
+CPU_ONLY=0
+JOBS=""
+UNAME_S="$(uname -s)"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --cpu-only) CPU_ONLY=1; shift ;;
+        --build-dir) BUILD_DIR="${2:?--build-dir needs a path}"; shift 2 ;;
+        --jobs) JOBS="${2:?--jobs needs a number}"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "Error: unknown option: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+if [[ "$UNAME_S" == "Darwin" ]]; then
+    CPU_ONLY=1
+fi
+if [[ -z "$BUILD_DIR" ]]; then
+    if [[ "$UNAME_S" == "Darwin" ]]; then BUILD_DIR="build-macos"; else BUILD_DIR="build"; fi
+fi
+if [[ -z "$JOBS" ]]; then
+    JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+fi
+
+# Build relative to the repository, regardless of the caller's directory.
+cd "$(dirname "$0")"
+
+fail() { echo "  Error: $*" >&2; exit 1; }
 
 echo "  ZeroMoE Engine — Setup and Compilation"
 echo "----------------------------------------"
+echo "[1/3] Checking build prerequisites..."
 
-# 1. Dependency Toolchain Verification
-echo "[1/4] Checking system compiler dependencies..."
-command -v cmake >/dev/null || { echo "  Error: cmake is missing."; exit 1; }
-command -v g++ >/dev/null || { echo "  Error: g++ is missing."; exit 1; }
-command -v python3 >/dev/null || { echo "  Error: python3 is missing."; exit 1; }
+command -v cmake >/dev/null || fail "cmake is missing (need >= 3.25). Debian/Ubuntu: sudo apt install cmake, or pip install cmake."
+command -v patch >/dev/null || fail "GNU patch is missing; the ggml patch series cannot be applied. Debian/Ubuntu: sudo apt install patch."
+command -v python3 >/dev/null || fail "python3 is missing; build provenance and helper scripts need it. Debian/Ubuntu: sudo apt install python3."
 
-# macOS has no NVIDIA CUDA SDK; CPU-only builds are the only option there.
-if [[ "$(uname -s)" == "Darwin" ]]; then
-    echo "  -> macOS detected; skipping nvcc check (CPU-only build)"
-else
-    command -v nvcc >/dev/null || { echo "  Error: NVIDIA CUDA Compiler (nvcc) is missing."; exit 1; }
-    echo "  -> nvcc: $(nvcc --version | grep release | awk '{print $5, $6}')"
-fi
+CXX_BIN="${CXX:-c++}"
+command -v "$CXX_BIN" >/dev/null || fail "C++ compiler '$CXX_BIN' is missing. Debian/Ubuntu: sudo apt install build-essential, or set CXX to your compiler."
+command -v make >/dev/null || fail "make is missing. Debian/Ubuntu: sudo apt install build-essential."
 
-echo "  -> cmake: $(cmake --version | head -n 1)"
-echo "  -> g++: $(g++ -dumpversion)"
+cmake_version="$(cmake --version | head -n 1 | awk '{print $3}')"
+awk -v v="$cmake_version" 'BEGIN {
+    split(v, a, ".")
+    if (a[1] < 3 || (a[1] == 3 && a[2] < 25)) exit 1
+}' || fail "cmake $cmake_version is too old; version 3.25 or newer is required."
 
-# 2. Optional Python environment for the API gateway
-if [ -f "api/api_server.py" ] && [ -f "api/requirements.txt" ]; then
-    echo "[2/4] Setting up Python virtual environment for the API..."
-    if [ ! -d "api/venv" ]; then
-        python3 -m venv api/venv
-        api/venv/bin/pip install --quiet --upgrade pip
-        api/venv/bin/pip install --quiet -r api/requirements.txt
-        echo "  -> Python virtual environment created and packages installed successfully."
-    else
-        echo "  -> Python virtual environment already exists. Skipping environment creation."
+if [[ "$CPU_ONLY" -eq 0 ]]; then
+    command -v nvcc >/dev/null || fail "nvcc is missing. Install the CUDA Toolkit (https://developer.nvidia.com/cuda-downloads) or use --cpu-only."
+    command -v git >/dev/null || fail "git is missing. A git checkout is required for build provenance. Debian/Ubuntu: sudo apt install git."
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        fail "CUDA builds require a git checkout (found no .git directory).
+         GitHub ZIP archives cannot provide the pinned ggml source or build provenance.
+         Clone the repository with git instead: git clone <repo-url>"
     fi
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        echo "  Warning: nvidia-smi not found. Set -DCMAKE_CUDA_ARCHITECTURES explicitly."
+    fi
+    echo "  -> nvcc: $(nvcc --version | grep -o 'release [0-9.]*' | head -n 1)"
 else
-    echo "[2/4] API server or requirements not present; skipping optional Python setup."
+    if [[ ! -f third_party/llama.cpp/ggml/CMakeLists.txt ]]; then
+        command -v git >/dev/null || fail "git is missing and the pinned ggml source is not present."
+    fi
+    echo "  -> CPU-only build (no CUDA required)"
 fi
 
-# 3. C++/CUDA Binary Compilation via CMake
-echo "[3/4] Triggering CMake build pipeline..."
-mkdir -p build
-cd build
+echo "  -> cmake: $cmake_version"
+echo "  -> C++:   $("$CXX_BIN" --version | head -n 1)"
+echo "  -> jobs:  $JOBS"
+echo "  -> build: $BUILD_DIR"
 
-# ggml is always fetched and built; ZEROMOE_GGML_ROOT can supply a local tree
-# instead of the pinned download.
-cmake -DCMAKE_BUILD_TYPE=Release ..
-echo "[4/4] Compiling high-performance target binary..."
-make -j$(nproc)
-cd ..
+echo "[2/3] Configuring..."
+cmake_args=(-S . -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release)
+if [[ "$CPU_ONLY" -eq 1 ]]; then
+    cmake_args+=(-DZEROMOE_CPU_ONLY=ON)
+fi
+cmake "${cmake_args[@]}"
+
+echo "[3/3] Compiling..."
+cmake --build "$BUILD_DIR" --parallel "$JOBS"
 
 echo "----------------------------------------"
-echo "  ZeroMoE compilation complete!"
-echo "  -> Engine Core Executable: ./build/zeromoe"
-if [ -f "api/api_server.py" ]; then
-    echo "  -> API Gateway: ./api/api_server.py"
-    echo ""
-    echo "To serve the Anthropic API endpoint, execute:"
-    echo "  python3 api/api_server.py"
+echo "  ZeroMoE build complete."
+if [[ "$CPU_ONLY" -eq 1 ]]; then
+    if [[ -x "$BUILD_DIR/zeromoe_cpu" ]]; then
+        echo "  -> CPU engine:      ./$BUILD_DIR/zeromoe_cpu"
+    fi
+    echo "  -> Component tests: ./$BUILD_DIR/test_components"
+    echo "  -> GGUF tool:       ./$BUILD_DIR/gguf_tool"
+else
+    echo "  -> Engine:          ./$BUILD_DIR/zeromoe"
+    echo "  -> Test harness:    ./$BUILD_DIR/zeromoe_tests"
+fi
+if [[ "$CPU_ONLY" -eq 1 ]]; then
+cat <<EOF
+
+Next steps:
+  1. Pick a CPU-capable starter profile in configs/ and set model_path (and any
+     usage, mirror, or expert-store paths) for your machine. Model weights are
+     not included or downloaded by this script.
+  2. Run a prompt:
+       ./$BUILD_DIR/zeromoe_cpu --config configs/qwen38-flash.toml --prompt "Hello" --predict 32
+  3. Serve the OpenAI/Anthropic APIs:
+       ./$BUILD_DIR/zeromoe_cpu --config configs/qwen38-flash.toml --serve --port 8080
+  4. Supported models: docs/models/README.md
+     Configuration:   docs/configuration.md
+     Validation:      scripts/validate_vs_llama.sh
+EOF
+else
+cat <<EOF
+
+Next steps:
+  1. Pick a starter profile in configs/ and set model_path (and any usage,
+     mirror, or expert-store paths) for your machine. Model weights are not
+     included or downloaded by this script.
+  2. Run a prompt:
+       ./$BUILD_DIR/zeromoe --config configs/qwen38-flash.toml --prompt "Hello" --predict 32
+  3. Serve the OpenAI/Anthropic APIs:
+       ./$BUILD_DIR/zeromoe --config configs/qwen38-flash.toml --serve --port 8080
+  4. Supported models: docs/models/README.md
+     Configuration:   docs/configuration.md
+     Validation:      scripts/validate_vs_llama.sh
+EOF
 fi

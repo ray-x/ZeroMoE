@@ -28,9 +28,7 @@ Prefetch ring on (2 sets, drain, chunk 2), DDR pool 60-76 GiB, batch default 204
 
 ## Qwen 3.8 Flash (UD-IQ1_M), single 3090
 
-Config: `configs/qwen4exp_3090_only.toml` (`moe_cache_gb = 11.5`, `context_size = 8192`), env as in the Qwen decode
-harness: `ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ..._FULL_GRAPH_DECODE=1 ..._GRAPH_PRELOAD_LAYERS=0 ..._GRAPH_PRELOAD_TRAILING=1
-ZEROMOE_QWEN_CPU_THREADS=10 ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT=1`. Since 2026-10-16 the prefill scheduler runs the
+Config: `configs/qwen4exp_3090_only.toml` (`moe_cache_gb = 11.5`, `context_size = 8192`). The 2026-10-16 harness used retired full-graph/preload environment names; full graph is now the default, and placement uses `graph_device_expert_layers` / `graph_device_expert_trailing` in TOML or `--graph-device-expert-layers` / `--graph-device-expert-trailing` on CLI. Other recorded settings include `ZEROMOE_QWEN_CPU_THREADS=10` and `ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT=1`. Since 2026-10-16 the prefill scheduler runs the
 host-resident experts on the GPU (`ZEROMOE_QWEN4EXP_PREFILL_OP_OFFLOAD`, default 1; one pipeline copy; ggml patch 0007).
 
 | metric | baseline | date | notes |
@@ -46,8 +44,7 @@ host-resident experts on the GPU (`ZEROMOE_QWEN4EXP_PREFILL_OP_OFFLOAD`, default
 
 ### Qwen decode baselines by placement (measured 2026-10-16, `build_native`, 3090 only, 10 CPU threads)
 
-Env for all rows: `CUDA_VISIBLE_DEVICES=0 ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ..._FULL_GRAPH_DECODE=1 ..._GRAPH_PRELOAD_TRAILING=1`
-(`GRAPH_PRELOAD_LAYERS=40` for the split, `0` for the hybrid), `ZEROMOE_BENCH_SILENT=1 ZEROMOE_BENCH_IGNORE_STOP=1`.
+Historical 2026-10-16 runs used the retired full-graph/preload env aliases. Current equivalent: full graph default plus `graph_device_expert_layers` / `graph_device_expert_trailing` in TOML or generic `--graph-*` CLI options; the recorded placement used 40 layers for split and 0 for hybrid. Other env settings were `CUDA_VISIBLE_DEVICES=0`, `ZEROMOE_BENCH_SILENT=1`, and `ZEROMOE_BENCH_IGNORE_STOP=1`.
 
 | placement | config | metric | baseline | notes |
 |---|---|---|---|---|

@@ -1983,8 +1983,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "engine/ggml CPU dot-product ISA selection and executable hardware compatibility. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: removed the ZeroMoE CMake alias. The upstream GGML_AVX512_VNNI option now controls the ZeroMoE and ggml CPU VNNI flags; ZeroMoE keeps its validated x86 default and disables it by default on Apple Silicon.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0019"
     },
@@ -2064,8 +2064,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: removed the CMake toggle. CUDA builds force GGML_CUDA_GRAPHS=ON because full graph capture is required for the ZeroMoE CUDA runtime; CPU-only builds remain unaffected.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0020"
     },
@@ -2226,8 +2226,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "ggml diagnostic patch series and patched dependency identity. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: deleted the CMake option, optional patch application and build-provenance branch. The two patch files remain inactive as historical provenance and are excluded from applied-patch manifests; the default-OFF patch stamp is preserved for existing builds.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0022"
     },
@@ -2307,8 +2307,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "CMakeLists.txt execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: removed the ZeroMoE CMake alias. Use the upstream GGML_OPENMP setting directly; ZeroMoE defaults it ON.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0023"
     },
@@ -5451,8 +5451,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "API-advertised model identifier/routing name, not detected GGUF architecture. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: Replaced by llama.cpp-compatible --alias.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0037"
     },
@@ -6557,8 +6557,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "backends/core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: Replaced by llama.cpp-compatible -c/--ctx-size.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0051"
     },
@@ -7154,8 +7154,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: Replaced by llama.cpp-compatible --main-gpu for single-device recipes.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0059"
     },
@@ -7529,8 +7529,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: Replaced by llama.cpp-compatible numeric --verbosity; TOML log_level remains a config key.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0065"
     },
@@ -7599,8 +7599,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: Replaced by llama.cpp-compatible --log-file.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0066"
     },
@@ -7902,8 +7902,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "backends/core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: Replaced by llama.cpp-compatible -n/--predict and --n-predict.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0068"
     },
@@ -9855,8 +9855,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "tokenization, request semantics, generation and sampling. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: Replaced by llama.cpp-compatible --top-p.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0088"
     },
@@ -9925,8 +9925,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: configurable debug abort removed; non-finite diagnostics remain logged.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0089"
     },
@@ -9995,8 +9995,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: tensor trace tags are all emitted at verbose level and can be filtered in the captured log.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0090"
     },
@@ -10065,8 +10065,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: MoE cache-hit messages now follow the standard verbosity threshold instead of a separate flag.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0091"
     },
@@ -10497,7 +10497,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "API authentication and non-loopback bind authorization. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "KEEP: retain ZEROMOE_API_KEY under the ZeroMoE project namespace; do not rename it to LLAMA_API_KEY.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0097"
@@ -11075,8 +11075,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: diagnostic logging now follows common DEBUG verbosity.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0100"
     },
@@ -11234,8 +11234,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: removed runtime environment reads. Runtime CPU mode remains available through TOML cpu_only=true; CMake ZEROMOE_CPU_ONLY is build-only.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0101"
     },
@@ -11792,7 +11792,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "REMOVED env gate 2026-10-28; decode logits hash is computed and emitted at DEBUG verbosity (CLI --verbosity 5).",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0105"
@@ -15041,8 +15041,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "EXL3: model graph equations/operator implementation and routing. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: route-readback timing and accounting now follow common DEBUG verbosity.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0144"
     },
@@ -15557,8 +15557,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "EXL3: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: converted EXL3 graph tracing to common DEBUG verbosity; removed its environment selector.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0146"
     },
@@ -15746,7 +15746,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: measured Qwen regression supports fixed synchronization policy; grouped-async route unchanged.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0149"
@@ -16969,7 +16969,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "REMOVED 2026-10-27: async_graph_reuse() had no call sites and the HC override it read was write-only. Deleted the env reader, function and override. The setter remains a documented no-op because the shared ggml_async_graph_reuse TOML key is consumed by routed-MoE graphs.",
+      "review_decision": "REMOVED 2026-10-28: deleted the environment reader and override together with the retired async graph-reuse feature.",
       "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0162"
@@ -17032,7 +17032,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "expert storage, I/O and CPU/GPU transfer pipeline. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "REMOVED 2026-10-27: two measurements (2026-09-05 and re-verified 2026-09-10 against the post-fix baseline) found no effect outside the OFF run-to-run spread. Deleted the independent environment alias; the config-driven ggml_async_graph_reuse override remains the only switch.",
+      "review_decision": "REMOVED 2026-10-28: backend-stream copy mode is fixed off and its config selector was removed after repeated runs showed no separate decode gain.",
       "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0163"
@@ -17851,7 +17851,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "prompt batching/prefill execution. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: generic packed-staging A/B override deleted; validated Qwen decode setting remains.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0176"
@@ -17914,7 +17914,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "model graph equations/operator implementation and routing. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: force-host diagnostic override deleted; host fallback on device failure remains.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0177"
@@ -17977,7 +17977,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "model graph equations/operator implementation and routing. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: force-host HC pre-mix diagnostic override deleted.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0178"
@@ -18040,8 +18040,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "model graph equations/operator implementation and routing. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: GDN numeric diagnostics now follow common DEBUG verbosity.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0179"
     },
@@ -18568,7 +18568,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "model graph equations/operator implementation and routing. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: duplicate host/device pre-output comparison mode deleted; explicit HC compare remains.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0185"
@@ -18754,8 +18754,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "model graph equations/operator implementation and routing. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: deleted the environment switch that disabled external HC weights; validated external rebinds remain enabled when available.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0187"
     },
@@ -18817,8 +18817,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "model graph equations/operator implementation and routing. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: deleted the per-call graph rebuild diagnostic; graph shape changes still use the normal rebuild path.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0188"
     },
@@ -18880,8 +18880,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: removed environment alias and typed selector for the retired async graph-reuse experiment.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0189"
     },
@@ -19006,8 +19006,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "backends execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: removed the direct MoE input environment branch; the established copy path remains.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0191"
     },
@@ -19195,7 +19195,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: debug hit-rate opt-out removed; batch D2D residency reuse is the default path.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0194"
@@ -19258,7 +19258,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: mmap WILLNEED syscall A/B opt-out removed; default page-advice policy fixed.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0195"
@@ -19321,8 +19321,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "backends execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: removed the duplicate environment input; typed moe_ggml_planar_copies remains.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0196"
     },
@@ -19384,8 +19384,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "model graph equations/operator implementation and routing. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: deleted the unvalidated direct-router tensor retargeting branch and its environment switch; the existing asynchronous tensor copy remains.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0197"
     },
@@ -19630,8 +19630,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "backends execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: removed the direct shared input environment branch; the established copy path remains.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0199"
     },
@@ -20416,7 +20416,7 @@
       ],
       "affected_if_removed": "GLM: models execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include models/glm/ggml_glm5next_graph_settings.cpp, models/graph/graph_settings.hpp, models/mimo/ggml_mimo2_graph.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: legacy env alias removed; canonical graph setting remains available through TOML and generic --graph-* CLI, and maintained ZeroMoE callers were migrated.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0207"
@@ -20695,7 +20695,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "GLM: host/VRAM accounting, residency, expert cache and transfer lifetime. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: diagnostic route capture follows DEBUG verbosity; dynamic-cache mode still enables the bookkeeping it requires.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0210"
@@ -21094,8 +21094,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "GLM: diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: decode-output summary now follows DEBUG verbosity instead of a family-specific environment switch.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0213"
     },
@@ -21157,8 +21157,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "GLM: diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: removed the expensive one-off scheduler eval callback for per-node NaN inspection; ordinary finite checks and error logs remain.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0214"
     },
@@ -21280,8 +21280,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "GLM: diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: partial-cache diagnostic dumps now follow DEBUG verbosity instead of a family-specific environment switch.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0215"
     },
@@ -21440,7 +21440,7 @@
       ],
       "affected_if_removed": "GLM: host/VRAM accounting, residency, expert cache and transfer lifetime. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include models/glm/ggml_glm5next_graph_settings.cpp, models/graph/graph_settings.hpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: legacy env alias removed; canonical graph setting remains available through TOML and generic --graph-* CLI, and maintained ZeroMoE callers were migrated.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0216"
@@ -22639,7 +22639,7 @@
       ],
       "affected_if_removed": "GLM: expert storage, I/O and CPU/GPU transfer pipeline. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include models/glm/ggml_glm5next_graph_build.cpp, models/glm/ggml_glm5next_graph_decode.cpp, models/glm/ggml_glm5next_graph_run.cpp, models/glm/ggml_glm5next_graph_settings.cpp (+8 other files).",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: legacy env alias removed; canonical graph setting remains available through TOML and generic --graph-* CLI, and maintained ZeroMoE callers were migrated.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0221"
@@ -23018,7 +23018,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "GLM: models execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: fixed measured fused HC implementation (6,131 graph nodes vs 31,061 unfused); removed alternate implementation and A/B env selector.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0225"
@@ -23862,7 +23862,7 @@
       ],
       "affected_if_removed": "GLM: models execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include models/glm/ggml_glm5next_graph_settings.cpp, models/graph/graph_settings.hpp, models/mimo/ggml_mimo2_graph.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: legacy env alias removed; canonical graph setting remains available through TOML and generic --graph-* CLI, and maintained ZeroMoE callers were migrated.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0232"
@@ -24029,8 +24029,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "GLM: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: replaced the per-layer timing environment selector with common DEBUG verbosity (`--verbosity 5`).",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0234"
     },
@@ -24274,7 +24274,7 @@
       ],
       "affected_if_removed": "GLM: models execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include models/glm/ggml_glm5next_graph_settings.cpp, models/graph/graph_settings.hpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: legacy env alias removed; canonical graph setting remains available through TOML and generic --graph-* CLI, and maintained ZeroMoE callers were migrated.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0237"
@@ -24542,7 +24542,7 @@
       ],
       "affected_if_removed": "GLM: expert storage, I/O and CPU/GPU transfer pipeline. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include models/glm/ggml_glm5next_graph_settings.cpp, models/graph/graph_settings.hpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: legacy env alias removed; canonical graph setting remains available through TOML and generic --graph-* CLI, and maintained ZeroMoE callers were migrated.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0239"
@@ -24661,7 +24661,7 @@
       ],
       "affected_if_removed": "GLM: expert storage, I/O and CPU/GPU transfer pipeline. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include models/glm/ggml_glm5next_graph_offload.cpp, models/graph/graph_settings.hpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: legacy env alias removed; canonical graph setting remains available through TOML and generic --graph-* CLI, and maintained ZeroMoE callers were migrated.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0240"
@@ -24941,7 +24941,7 @@
       ],
       "affected_if_removed": "GLM: host/VRAM accounting, residency, expert cache and transfer lifetime. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include models/glm/ggml_glm5next_graph_offload.cpp, models/graph/graph_settings.hpp, models/mimo/ggml_mimo2_graph.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: legacy env alias removed; canonical graph setting remains available through TOML and generic --graph-* CLI, and maintained ZeroMoE callers were migrated.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0241"
@@ -25034,8 +25034,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "GLM: expert storage, I/O and CPU/GPU transfer pipeline. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: offload cache diagnostics now follow DEBUG verbosity rather than a family-specific environment switch.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0242"
     },
@@ -25224,7 +25224,7 @@
       ],
       "affected_if_removed": "GLM: expert storage, I/O and CPU/GPU transfer pipeline. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include models/glm/ggml_glm5next_graph_settings.cpp, models/graph/graph_settings.hpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: legacy env alias removed; canonical graph setting remains available through TOML and generic --graph-* CLI, and maintained ZeroMoE callers were migrated.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0243"
@@ -25328,7 +25328,7 @@
       ],
       "affected_if_removed": "GLM: expert storage, I/O and CPU/GPU transfer pipeline. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement. Member-name references to inspect include models/glm/ggml_glm5next_graph_offload.cpp, models/graph/graph_settings.hpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: no maintained env caller; graph_offload_mirror TOML/generic CLI setting remains.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0244"
@@ -25492,7 +25492,7 @@
       ],
       "affected_if_removed": "GLM: expert storage, I/O and CPU/GPU transfer pipeline. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement. Member-name references to inspect include models/glm/ggml_glm5next_graph_offload.cpp, models/graph/graph_settings.hpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: legacy env alias removed; canonical graph setting remains available through TOML and generic --graph-* CLI, and maintained ZeroMoE callers were migrated.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0245"
@@ -25637,7 +25637,7 @@
       ],
       "affected_if_removed": "GLM: host/VRAM accounting, residency, expert cache and transfer lifetime. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include models/glm/ggml_glm5next_graph_offload.cpp, models/graph/graph_settings.hpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: legacy env alias removed; canonical graph setting remains available through TOML and generic --graph-* CLI, and maintained ZeroMoE callers were migrated.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0246"
@@ -25838,7 +25838,7 @@
       ],
       "affected_if_removed": "GLM: host/VRAM accounting, residency, expert cache and transfer lifetime. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include models/glm/ggml_glm5next_graph_offload.cpp, models/graph/graph_settings.hpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: legacy env alias removed; canonical graph setting remains available through TOML and generic --graph-* CLI, and maintained ZeroMoE callers were migrated.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0247"
@@ -26013,7 +26013,7 @@
       ],
       "affected_if_removed": "GLM: expert storage, I/O and CPU/GPU transfer pipeline. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include models/glm/ggml_glm5next_graph_offload.cpp, models/graph/graph_settings.hpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: legacy env alias removed; canonical graph setting remains available through TOML and generic --graph-* CLI, and maintained ZeroMoE callers were migrated.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0248"
@@ -26132,7 +26132,7 @@
       ],
       "affected_if_removed": "GLM: expert storage, I/O and CPU/GPU transfer pipeline. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include models/glm/ggml_glm5next_graph_offload.cpp, models/graph/graph_settings.hpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: legacy env alias removed; canonical graph setting remains available through TOML and generic --graph-* CLI, and maintained ZeroMoE callers were migrated.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0249"
@@ -26236,7 +26236,7 @@
       ],
       "affected_if_removed": "GLM: expert storage, I/O and CPU/GPU transfer pipeline. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include models/glm/ggml_glm5next_graph_offload.cpp, models/graph/graph_settings.hpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: no maintained env caller; graph_offload_seed_gpu1_hot TOML/generic CLI setting remains.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0250"
@@ -26370,7 +26370,7 @@
       ],
       "affected_if_removed": "GLM: expert storage, I/O and CPU/GPU transfer pipeline. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include models/glm/ggml_glm5next_graph_offload.cpp, models/graph/graph_settings.hpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: legacy env alias removed; canonical graph setting remains available through TOML and generic --graph-* CLI, and maintained ZeroMoE callers were migrated.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0251"
@@ -26534,7 +26534,7 @@
       ],
       "affected_if_removed": "GLM: expert storage, I/O and CPU/GPU transfer pipeline. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement. Member-name references to inspect include models/glm/ggml_glm5next_graph_offload.cpp, models/graph/graph_settings.hpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: legacy env alias removed; canonical graph setting remains available through TOML and generic --graph-* CLI, and maintained ZeroMoE callers were migrated.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0252"
@@ -26653,7 +26653,7 @@
       ],
       "affected_if_removed": "GLM: expert storage, I/O and CPU/GPU transfer pipeline. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include models/glm/ggml_glm5next_graph_offload.cpp, models/graph/graph_settings.hpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: legacy env alias removed; canonical graph setting remains available through TOML and generic --graph-* CLI, and maintained ZeroMoE callers were migrated.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0253"
@@ -26922,7 +26922,7 @@
       ],
       "affected_if_removed": "GLM: expert storage, I/O and CPU/GPU transfer pipeline. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include models/glm/ggml_glm5next_graph_decode.cpp, models/glm/ggml_glm5next_graph_offload.cpp, models/graph/graph_settings.hpp, models/mimo/ggml_mimo2_graph.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: legacy env alias removed; canonical graph setting remains available through TOML and generic --graph-* CLI, and maintained ZeroMoE callers were migrated.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0254"
@@ -27015,8 +27015,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "GLM: diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: detailed GLM per-op profiling now follows common DEBUG verbosity.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0255"
     },
@@ -27078,7 +27078,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "GLM: models execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: fixed the benchmarked bit-identical sentinel policy, measured 1% faster; removed force-dummy A/B selector.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0256"
@@ -27258,7 +27258,7 @@
       ],
       "affected_if_removed": "GLM: expert prefetch prediction, admission and I/O overlap. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include models/glm/ggml_glm5next_graph_settings.cpp, models/graph/graph_settings.hpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: legacy env alias removed; canonical graph setting remains available through TOML and generic --graph-* CLI, and maintained ZeroMoE callers were migrated.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0257"
@@ -27954,8 +27954,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "GLM: expert prefetch prediction, admission and I/O overlap. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: prefetch timing/stream diagnostics now follow DEBUG verbosity rather than a family-specific environment switch.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0264"
     },
@@ -28811,7 +28811,7 @@
       ],
       "affected_if_removed": "GLM: expert storage, I/O and CPU/GPU transfer pipeline. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include models/glm/ggml_glm5next_graph_offload.cpp, models/graph/graph_settings.hpp, models/mimo/ggml_mimo2_graph.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: legacy env alias removed; canonical graph setting remains available through TOML and generic --graph-* CLI, and maintained ZeroMoE callers were migrated.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0273"
@@ -29966,8 +29966,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "GLM: diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: deleted the selected-layer GLM scheduler split dump and environment selector.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0288"
     },
@@ -30096,7 +30096,7 @@
       ],
       "affected_if_removed": "GLM: models execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include models/glm/ggml_glm5next_graph_settings.cpp, models/graph/graph_settings.hpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: retained split_load as TOML/generic CLI setting, removed legacy env alias, updated resolver test and benchmark runner to CLI.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0289"
@@ -30159,7 +30159,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "GLM: models execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: fixed measured fused HC implementation (6,131 graph nodes vs 31,061 unfused); removed alternate implementation and A/B env selector.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0290"
@@ -30309,7 +30309,7 @@
       ],
       "affected_if_removed": "GLM: models execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement. Member-name references to inspect include models/glm/ggml_glm5next_graph_build.cpp, models/graph/graph_settings.hpp, models/mimo/ggml_mimo2_graph.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: no maintained env caller; route survey remains at graph_usage_record_file TOML/generic CLI setting.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0291"
@@ -30372,8 +30372,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "GLM: diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: graph workspace live-set dump now follows DEBUG verbosity.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0292"
     },
@@ -30776,8 +30776,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "model graph equations/operator implementation and routing. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: HC path trace now follows DEBUG verbosity.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0297"
     },
@@ -37004,8 +37004,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "model loading, format detection and family/backend selection. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: removed the runtime environment fallback. Use llama-style --model <path> or TOML model_path; benchmark shell wrappers now pass --model explicitly.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0344"
     },
@@ -37157,7 +37157,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: route-set capture and tagged prompt/required-set fingerprints now follow DEBUG verbosity; no maintained script caller.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0345"
@@ -37220,8 +37220,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "expert prefetch prediction, admission and I/O overlap. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: transient prefetch summaries now follow DEBUG verbosity rather than a separate environment switch.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0346"
     },
@@ -39665,7 +39665,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: compatible arena borrowing is fixed; the existing fresh-arena retry handles borrowed graph build failures.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0367"
@@ -40002,7 +40002,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: layer-0 CPU tensor summaries follow DEBUG verbosity; explicit binary dump directory remains.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0370"
@@ -40728,8 +40728,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: GPU-stage timing now follows common DEBUG verbosity.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0375"
     },
@@ -40854,7 +40854,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: eligible Qwen full-graph decode always bootstraps reusable prompt-independent arenas at startup; the lazy-bootstrap timing override is gone.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0377"
@@ -40917,7 +40917,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: warmup shape fixed at min(16, context_limit), the documented common prefill shape; lazy-bootstrap control remains.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0378"
@@ -41002,7 +41002,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: pageable-buffer A/B override removed; full graph always uses CUDA host buffers.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0379"
@@ -41102,8 +41102,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: replaced the per-layer timing environment selector with common DEBUG verbosity (`--verbosity 5`).",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0380"
     },
@@ -41187,8 +41187,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: replaced verbose per-layer timing environment selector with common DEBUG verbosity (`--verbosity 5`).",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0381"
     },
@@ -41272,7 +41272,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: force override removed; mixed-placement reference topology is selected automatically.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0382"
@@ -41357,8 +41357,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: the optional CUDA merged-projection path showed only +1.7% end-to-end, within measurement noise; removed its build-graph branch and environment setting. Separate projections remain.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0383"
     },
@@ -41472,7 +41472,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: measured faster parallel scheduler fixed on; prefill op-offload retains its required serial scheduler.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0384"
@@ -41557,8 +41557,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: dead reader had no call sites; phase timing environment variable and declaration deleted.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0385"
     },
@@ -43932,7 +43932,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: duplicate-free compact Qwen graph arena layout is fixed; legacy scheduler CPU-offload guard remains.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0389"
@@ -44017,8 +44017,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: removed the Phase 2 replay timing environment variable and its one-off ledger.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0390"
     },
@@ -44080,8 +44080,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: deleted the diagnostic sizing probe, which declined full-graph execution after measuring workspace sizes.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0391"
     },
@@ -44165,7 +44165,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: unvalidated grouped IQ4_NL down-projection A/B path deleted; established cpu_quant_matmul retained.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0392"
@@ -44488,7 +44488,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: fixed measured GPU reduction policy (+1.65% host-node decode).",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0395"
@@ -44551,7 +44551,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: diagnostic topology override removed; validated host-node topology selection is fixed.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0396"
@@ -44699,7 +44699,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: debug mode that returned zero CPU results was not a supported inference route; normal host-node CPU compute remains.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0398"
@@ -44762,8 +44762,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: host-node timing and related diagnostics now follow common DEBUG verbosity.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0399"
     },
@@ -44825,8 +44825,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: host/VRAM accounting, residency, expert cache and transfer lifetime. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: replaced the environment selector with common VERBOSE logging (`--verbosity 4`).",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0400"
     },
@@ -44888,7 +44888,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: rejected partial-graph prototype selector removed; standard split/early-ready path remains. Prototype builder path and partial-only host-node callback removed 2026-10-28.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0401"
@@ -44951,7 +44951,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: layer selector for rejected partial-graph prototype removed. Prototype builder path and partial-only host-node callback removed 2026-10-28.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0402"
@@ -45677,8 +45677,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: model graph equations/operator implementation and routing. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: Qwen PLE path diagnostics now follow DEBUG verbosity.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0410"
     },
@@ -46352,7 +46352,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: model graph equations/operator implementation and routing. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "REMOVED env gate 2026-10-28; [ROUTE-HIT] diagnostics use DEBUG verbosity (CLI --verbosity 5).",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0418"
@@ -46500,8 +46500,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: PLE timing now follows common DEBUG verbosity.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0420"
     },
@@ -46563,8 +46563,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: usage-track timing now follows common DEBUG verbosity.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0421"
     },
@@ -46711,7 +46711,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: CPU graph layout follows actual arena projection_compact metadata; removed replay override.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0423"
@@ -46796,7 +46796,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: CPU worker pools, affinity and scheduling. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: the dedicated worker pool owns all direct phases; removed caller-thread participation mode.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0424"
@@ -46881,8 +46881,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: Qwen CPU direct-worker diagnostics now follow DEBUG verbosity.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0425"
     },
@@ -46966,7 +46966,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: models execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: direct pool persists between requests and is released at engine shutdown.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0426"
@@ -47211,7 +47211,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: direct grouped CPU route retains measured overlap-worker bypass; removed unvalidated probe.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0428"
@@ -47296,7 +47296,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: models execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: direct workers always park while idle; removed the busy-spin opt-out.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0429"
@@ -47381,7 +47381,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: host/VRAM accounting, residency, expert cache and transfer lifetime. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: removed direct-worker affinity override; OS scheduling is fixed behavior.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0430"
@@ -47626,7 +47626,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: expert prefetch prediction, admission and I/O overlap. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: removed unmaintained software-prefetch A/B path.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0432"
@@ -47711,7 +47711,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: CPU worker pools, affinity and scheduling. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: removed separate worker cap; direct workers use the existing Qwen CPU group and hardware default.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0433"
@@ -47796,8 +47796,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: direct CPU timing now follows common DEBUG verbosity.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0434"
     },
@@ -47881,8 +47881,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: models execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: removed the CPU merged gate/up opt-out. Compatible contiguous planes use the existing merged view; incompatible layouts still use separate planes.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0435"
     },
@@ -47966,7 +47966,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: removed per-kernel env override; the typed grouped-kernel TOML setting remains the only grouped-kernel configuration.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0436"
@@ -48051,7 +48051,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: removed per-kernel env override; the typed grouped-kernel TOML setting remains the only grouped-kernel configuration.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0437"
@@ -48136,7 +48136,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: removed per-kernel env override; the typed grouped-kernel TOML setting remains the only grouped-kernel configuration.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0438"
@@ -48221,7 +48221,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: removed per-kernel env override; the typed grouped-kernel TOML setting remains the only grouped-kernel configuration.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0439"
@@ -48306,7 +48306,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: removed unused optional down-graph/GPU-combine branch; normal CPU weighted combine remains.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0440"
@@ -48391,7 +48391,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: persistent GGML CPU graph is fixed when supported; diagnostic compare/forced fallback modes deleted; safety fallback remains.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0441"
@@ -48476,8 +48476,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: deleted the one-shot Qwen CPU graph timing state, atomic counters, clocks and report after its investigation-only measurements were recorded in the handoff.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0442"
     },
@@ -48591,8 +48591,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: grouped CPU timing now follows common DEBUG verbosity.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0443"
     },
@@ -48676,7 +48676,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: removed per-kernel env override; the typed grouped-kernel TOML setting remains the only grouped-kernel configuration.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0444"
@@ -49092,8 +49092,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: model graph equations/operator implementation and routing. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: removed the Qwen CPU-affinity local CPU-router A/B branch and environment selector; the established dense_proj route remains.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0446"
     },
@@ -49155,8 +49155,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: model graph equations/operator implementation and routing. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: removed the unverified device-input CUDA GEMV branch and environment selector; the established dense_proj route remains.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0447"
     },
@@ -49218,8 +49218,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: Qwen per-layer timing now follows common DEBUG verbosity.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0448"
     },
@@ -50315,7 +50315,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: expert storage, I/O and CPU/GPU transfer pipeline. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: synthetic DMA-delay stress hook and CUDA delay kernel deleted.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0459"
@@ -50501,7 +50501,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: expert storage, I/O and CPU/GPU transfer pipeline. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: redundant cap deleted; topk and pool slots already bound staging candidates.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0461"
@@ -50564,7 +50564,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: expert storage, I/O and CPU/GPU transfer pipeline. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: synthetic no-request selector deleted; normal stage-source request is fixed.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0462"
@@ -50720,7 +50720,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: CPU worker pools, affinity and scheduling. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: synthetic worker-delay stress hook deleted.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0464"
@@ -51490,8 +51490,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: removed the unfinished shared-input reuse environment selector, executor path, dense dispatch helpers, CUDA upload/reuse methods and lifetime state. The established independent projection upload path remains.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0474"
     },
@@ -51701,8 +51701,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: replaced ZEROMOE_REPETITION_PENALTY with llama-compatible --repeat-penalty and TOML repeat_penalty. The default remains 1.0 (disabled).",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0477"
     },
@@ -52046,8 +52046,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: removed the duplicate environment output-path alias; use --stats-file <path>.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0482"
     },
@@ -52794,7 +52794,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "CPU worker pools, affinity and scheduling. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: removed opt-in thread naming/affinity setup and all call sites; OS scheduling is the fixed behavior.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0487"
@@ -52857,7 +52857,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "CPU worker pools, affinity and scheduling. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: removed nice priority override with thread-profile helper.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0488"
@@ -52920,7 +52920,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "CPU worker pools, affinity and scheduling. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "REMOVED 2026-10-28: removed RT priority override with thread-profile helper.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0489"
@@ -53140,8 +53140,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: replaced the token-loop diagnostic environment switch with common DEBUG verbosity; output is now requested through --verbosity 5.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0490"
     },
@@ -53203,8 +53203,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: deleted the environment reader and declaration; the helper had no call sites.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0491"
     },
@@ -72841,8 +72841,8 @@
       ],
       "affected_if_removed": "full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/main.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: removed the typed async graph-reuse key, survey setting, setters and direct-input/route-stage reuse paths. The measured backend-stream copy variant did not produce a separate decode gain; the unverified direct-input variant was retired.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0599"
     },
@@ -80189,8 +80189,8 @@
       ],
       "affected_if_removed": "speculative decoding/MTP and acceptance state. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement. Member-name references to inspect include core/engine_runner.cpp, core/generation_loop.hpp, core/mtp_speculative.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: Replaced by llama.cpp-compatible spec_draft_n_max.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0637"
     },
@@ -80769,8 +80769,8 @@
       ],
       "affected_if_removed": "speculative decoding/MTP and acceptance state. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement. Member-name references to inspect include core/attention_layer.cpp, core/engine_runner.cpp, core/engine_runner_cache.cpp, core/engine_runner_model.cpp (+9 other files).",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: Replaced by llama.cpp-compatible spec_type = \"none\" or \"draft-mtp\".",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0638"
     },
@@ -80909,8 +80909,8 @@
       ],
       "affected_if_removed": "speculative decoding/MTP and acceptance state. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement. Member-name references to inspect include core/engine_runner_model.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: Replaced by llama.cpp-compatible spec_draft_model.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0639"
     },
@@ -101288,8 +101288,8 @@
       ],
       "affected_if_removed": "host/VRAM accounting, residency, expert cache and transfer lifetime. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner_ram.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: the recorded same-prompt A/B found no material change to eviction count, waste, or decode speed; removed the bonus setting and scoring term.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0737"
     },
@@ -101408,8 +101408,8 @@
       ],
       "affected_if_removed": "host/VRAM accounting, residency, expert cache and transfer lifetime. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner_ram.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: the recorded same-prompt A/B found no benefit from a RAM load grace window; removed the setting, token clock, and per-slot load timestamp.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0738"
     },
@@ -108196,8 +108196,8 @@
       ],
       "affected_if_removed": "diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_config.hpp, core/main.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: configurable debug abort removed; non-finite diagnostics remain logged.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0773"
     },
@@ -108356,8 +108356,8 @@
       ],
       "affected_if_removed": "diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement. Member-name references to inspect include core/engine_config.hpp, core/main.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: tensor trace tags are all emitted at verbose level and can be filtered in the captured log.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0774"
     },
@@ -108856,8 +108856,8 @@
       ],
       "affected_if_removed": "diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement. Member-name references to inspect include core/engine_runner.cpp, core/main.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: per-hit MoE cache logging is controlled by DEBUG verbosity.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0777"
     },
@@ -132087,6 +132087,374 @@
       "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K1148"
+    },
+    {
+      "surface": "environment",
+      "name": "ZEROMOE_MTP_PROFILE",
+      "evidence": [
+        {
+          "path": "core/qwen4exp_graph_mtp.cpp",
+          "line": 500,
+          "worktrees": [
+            "current master"
+          ],
+          "role": "former per-phase MTP timing selector; now replaced by common DEBUG verbosity",
+          "tooling": false,
+          "nearby_function_candidate": "qwen4exp_graph_mtp_run",
+          "excerpt": "MTP phase accounting is emitted under Logger::would_log(LogLevel::DEBUG)."
+        }
+      ],
+      "action": "REMOVE environment selector; use common DEBUG verbosity for the timing output.",
+      "proposed_owner": "MTP runtime diagnostics",
+      "rationale": "The setting controlled only per-phase timing and duplicated the shared logging verbosity surface.",
+      "risk": "LOW",
+      "risk_reason": "No inference, scheduling, or numerical behavior changes; the diagnostic is still available with --verbosity 5.",
+      "assessment_status": "REVIEWED",
+      "component": "Qwen4Exp MTP",
+      "when_used": "Only when graph-native MTP is invoked and DEBUG logging is enabled.",
+      "primary_reference": "core/qwen4exp_graph_mtp.cpp",
+      "worktrees": [
+        "current master"
+      ],
+      "aliases_to": [],
+      "description": "Per-phase timing output for graph-native MTP.",
+      "related_interfaces": [
+        "--verbosity 5"
+      ],
+      "declaration_evidence": [],
+      "current_read_excerpt": "Logger::instance().would_log(LogLevel::DEBUG) gates the profile line.",
+      "member_name_occurrences": [],
+      "affected_if_removed": "Diagnostic timing output only; no generation behavior changes.",
+      "required_validation": "Source inspection confirms the old environment read and benchmark injection are removed.",
+      "review_decision": "REMOVED 2026-10-28: environment selector deleted; timing follows common DEBUG verbosity. The benchmark suite no longer enables it implicitly.",
+      "removal_status": "REMOVED",
+      "read_context_status": "Current source and benchmark harness inspected.",
+      "id": "K1149"
+    },
+    {
+      "surface": "environment",
+      "name": "ZEROMOE_QWEN4EXP_WINDOW_TIMING",
+      "evidence": [
+        {
+          "path": "models/qwen/ggml_qwen4exp_graph_window.cpp",
+          "line": 88,
+          "worktrees": [
+            "current master"
+          ],
+          "role": "former timing-only environment selector",
+          "tooling": false,
+          "nearby_function_candidate": "qwen4exp_full_graph_window_run",
+          "excerpt": "Window decode timing is gated by Logger::would_log(LogLevel::DEBUG)."
+        }
+      ],
+      "action": "REMOVE environment selector; timing follows common DEBUG verbosity.",
+      "proposed_owner": "Qwen MTP/window diagnostics",
+      "rationale": "The setting exposed only one optional timing line and duplicated the shared logging verbosity surface.",
+      "risk": "LOW",
+      "risk_reason": "No inference behavior changes; the timing output remains available at DEBUG.",
+      "assessment_status": "REVIEWED",
+      "component": "Qwen4Exp graph window",
+      "when_used": "Only in graph-window decode with DEBUG logging enabled.",
+      "primary_reference": "models/qwen/ggml_qwen4exp_graph_window.cpp",
+      "worktrees": [
+        "current master"
+      ],
+      "aliases_to": [],
+      "description": "Timing for graph-window decode compute and readback.",
+      "related_interfaces": [
+        "--verbosity 5"
+      ],
+      "declaration_evidence": [],
+      "current_read_excerpt": "Logger::instance().would_log(LogLevel::DEBUG) gates the timing line.",
+      "member_name_occurrences": [],
+      "affected_if_removed": "Diagnostic timing line only; no inference behavior changes.",
+      "required_validation": "Source inspection confirms the former environment reader is removed.",
+      "review_decision": "REMOVED 2026-10-28: timing follows common DEBUG verbosity.",
+      "removal_status": "REMOVED",
+      "read_context_status": "Current source inspected.",
+      "id": "K1150"
+    },
+    {
+      "surface": "environment",
+      "name": "ZEROMOE_GRAPH_OP_HISTOGRAM",
+      "evidence": [
+        {
+          "path": "models/qwen/ggml_qwen4exp_graph_build.cpp",
+          "line": 1359,
+          "worktrees": [
+            "current master"
+          ],
+          "role": "former graph-op histogram selector",
+          "tooling": false,
+          "nearby_function_candidate": "qwen4exp graph construction",
+          "excerpt": "Graph operation histogram is gated by Logger::would_log(LogLevel::DEBUG)."
+        }
+      ],
+      "action": "REMOVE environment selector; use common DEBUG verbosity.",
+      "proposed_owner": "Qwen graph-build diagnostics",
+      "rationale": "A per-build histogram is diagnostic output and duplicates the common logging threshold.",
+      "risk": "LOW",
+      "risk_reason": "Only diagnostic logging selection changes; graph construction and operation sequence are unchanged.",
+      "assessment_status": "REVIEWED",
+      "component": "Qwen4Exp graph diagnostics",
+      "when_used": "Graph construction with DEBUG logging enabled.",
+      "primary_reference": "models/qwen/ggml_qwen4exp_graph_build.cpp",
+      "worktrees": [
+        "current master"
+      ],
+      "aliases_to": [],
+      "description": "Prints the operation-count histogram for a built Qwen graph.",
+      "related_interfaces": [
+        "--verbosity 5"
+      ],
+      "declaration_evidence": [],
+      "current_read_excerpt": "Logger::instance().would_log(LogLevel::DEBUG) gates the histogram.",
+      "member_name_occurrences": [],
+      "affected_if_removed": "Diagnostic output selection only.",
+      "required_validation": "Source inspection confirms the environment read is removed and logger threshold gates the same output.",
+      "review_decision": "REMOVED 2026-10-28: histogram follows common DEBUG verbosity (`--verbosity 5`).",
+      "removal_status": "REMOVED",
+      "read_context_status": "Current source inspected.",
+      "id": "K1151"
+    },
+    {
+      "surface": "environment",
+      "name": "ZEROMOE_PROMO_PROBE_N",
+      "evidence": [
+        {
+          "path": "models/qwen/ggml_qwen4exp_graph_run.cpp",
+          "line": 14,
+          "worktrees": [
+            "current master"
+          ],
+          "role": "synthetic H2D bandwidth/interference probe",
+          "tooling": false,
+          "nearby_function_candidate": "qwen4exp_full_graph_decode_run",
+          "excerpt": "Former probe copied N experts of arena bytes to a side stream after each decode token; implementation removed."
+        }
+      ],
+      "action": "REMOVE synthetic copy probe and environment input after its A/B measurements were recorded.",
+      "proposed_owner": "Qwen promotion diagnostics",
+      "rationale": "The setting only injected artificial copies to measure transfer interference and was not an inference feature.",
+      "risk": "LOW",
+      "risk_reason": "No model state or selected routes changed; only artificial benchmark traffic and its reporting were removed.",
+      "assessment_status": "REVIEWED",
+      "component": "Qwen expert promotion",
+      "when_used": "Formerly only when explicitly set during decode.",
+      "primary_reference": "models/qwen/ggml_qwen4exp_graph_run.cpp",
+      "worktrees": [
+        "current master"
+      ],
+      "aliases_to": [],
+      "description": "Artificial host-to-device copy probe for promotion traffic.",
+      "related_interfaces": [],
+      "declaration_evidence": [],
+      "current_read_excerpt": "No runtime reader remains.",
+      "member_name_occurrences": [],
+      "affected_if_removed": "Synthetic timing/traffic measurement only.",
+      "required_validation": "Source scan confirms the probe and environment reader are removed.",
+      "review_decision": "REMOVED 2026-10-28: synthetic probe removed after historical measurements were recorded.",
+      "removal_status": "REMOVED",
+      "read_context_status": "Current source and tool consumers inspected.",
+      "id": "K1152"
+    },
+    {
+      "surface": "environment",
+      "name": "ZEROMOE_PROMO_TRACE",
+      "evidence": [
+        {
+          "path": "models/qwen/ggml_qwen4exp_graph_promote.cpp",
+          "line": 109,
+          "worktrees": [
+            "current master"
+          ],
+          "role": "route/residency trace output path",
+          "tooling": false,
+          "nearby_function_candidate": "qwen4exp_promotion_step",
+          "excerpt": "Writes promotion route/residency records consumed by tools/expert_lookahead_predictors.py."
+        }
+      ],
+      "action": "REMOVE the output-path environment variable; retain trace output under common DEBUG verbosity.",
+      "proposed_owner": "Expert-promotion tooling",
+      "rationale": "The record format remains useful to the maintained offline expert-lookahead analysis, but a dedicated environment path is unnecessary because engine logs can carry the tagged records.",
+      "risk": "LOW",
+      "risk_reason": "Disabled unless an output path is provided; it does not alter inference when unset.",
+      "assessment_status": "REVIEWED",
+      "component": "Qwen expert promotion",
+      "when_used": "Explicitly set during graph-native Qwen decode for offline predictor analysis.",
+      "primary_reference": "models/qwen/ggml_qwen4exp_graph_promote.cpp",
+      "worktrees": [
+        "current master"
+      ],
+      "aliases_to": [],
+      "description": "Tagged per-token/per-layer route and residency records for the offline expert-lookahead predictor analysis.",
+      "related_interfaces": [
+        "--verbosity 5",
+        "tools/expert_lookahead_predictors.py ENGINE_LOG"
+      ],
+      "declaration_evidence": [],
+      "current_read_excerpt": "Logger::instance().would_log(LogLevel::DEBUG) gates [PROMO-TRACE] records; the path environment reader is removed.",
+      "member_name_occurrences": [],
+      "affected_if_removed": "Would remove the trace input consumed by the offline predictor analysis tool.",
+      "required_validation": "Confirm the offline tool remains maintained before retiring this interface.",
+      "review_decision": "REMOVED 2026-10-28: deleted ZEROMOE_PROMO_TRACE as a file-path setting. The tagged trace is emitted at DEBUG and tools/expert_lookahead_predictors.py filters it from engine logs.",
+      "removal_status": "REMOVED",
+      "read_context_status": "Current producer and tool consumer inspected.",
+      "id": "K1153"
+    },
+    {
+      "surface": "environment",
+      "name": "ZEROMOE_MTP_WINDOW_PROBE",
+      "evidence": [
+        {
+          "path": "core/qwen4exp_graph_mtp.cpp",
+          "line": 345,
+          "worktrees": [
+            "current master"
+          ],
+          "role": "timing-only MTP window probe",
+          "tooling": false,
+          "nearby_function_candidate": "qwen4exp_graph_mtp_run",
+          "excerpt": "Probe rebuilt and repeatedly ran the prompt-tail window, reported timing, then returned false before generation; removed."
+        }
+      ],
+      "action": "REMOVE the timing-only probe and environment selector.",
+      "proposed_owner": "MTP developer timing",
+      "rationale": "This was not a generation mode and duplicated standalone performance measurement; it only rebuilt/ran a prompt window repeatedly.",
+      "risk": "LOW",
+      "risk_reason": "Normal MTP generation path is unchanged; only an early-return diagnostic probe is removed.",
+      "assessment_status": "REVIEWED",
+      "component": "Qwen4Exp graph-native MTP",
+      "when_used": "Formerly only when explicitly set before graph-native MTP startup.",
+      "primary_reference": "core/qwen4exp_graph_mtp.cpp",
+      "worktrees": [
+        "current master"
+      ],
+      "aliases_to": [],
+      "description": "Repeated a prompt-tail graph window to time increasing MTP verification sizes.",
+      "related_interfaces": [
+        "--verbosity 5 for standard diagnostics"
+      ],
+      "declaration_evidence": [],
+      "current_read_excerpt": "No environment read or probe branch remains.",
+      "member_name_occurrences": [],
+      "affected_if_removed": "Probe output only; regular MTP generation unchanged.",
+      "required_validation": "Source scan confirms the probe reader and early-return block are removed.",
+      "review_decision": "REMOVED 2026-10-28: deleted probe and environment selector.",
+      "removal_status": "REMOVED",
+      "read_context_status": "Current source inspected.",
+      "id": "K1154"
+    },
+    {
+      "surface": "environment",
+      "name": "ZEROMOE_QWEN4EXP_MTP_WINDOW",
+      "evidence": [
+        {
+          "path": "core/qwen4exp_graph_mtp.cpp",
+          "line": 350,
+          "worktrees": [
+            "current master"
+          ],
+          "role": "selects stepwise versus multi-token windowed target verification",
+          "tooling": false,
+          "nearby_function_candidate": "qwen4exp_graph_mtp_run",
+          "excerpt": "A leading 0 forces the stepwise target; otherwise the window is derived from max_draft."
+        },
+        {
+          "path": "docs/handoff/qwen4exp-mtp-current.md",
+          "line": 133,
+          "worktrees": [
+            "current master"
+          ],
+          "role": "correctness comparison record",
+          "tooling": false,
+          "nearby_function_candidate": "",
+          "excerpt": "Stepwise mode matched plain; this isolated the then-current failure to batched target window/prefix commit."
+        }
+      ],
+      "action": "KEEP for correctness isolation and document as a ZeroMoE-specific comparison control.",
+      "proposed_owner": "Qwen4Exp graph-native MTP validation",
+      "rationale": "This distinguishes windowed target execution from stepwise target execution while keeping graph-native MTP enabled; `spec_draft_n_max` does not select this graph execution shape.",
+      "risk": "MEDIUM",
+      "risk_reason": "Changing the verification shape can affect performance and is a useful correctness isolation while the windowed path is being validated.",
+      "assessment_status": "REVIEWED",
+      "component": "Qwen4Exp MTP",
+      "when_used": "Only for graph-native Qwen4Exp MTP; a leading 0 forces stepwise verification.",
+      "primary_reference": "core/qwen4exp_graph_mtp.cpp",
+      "worktrees": [
+        "current master"
+      ],
+      "aliases_to": [],
+      "description": "Selects stepwise versus multi-token windowed target verification for graph-native MTP.",
+      "related_interfaces": [
+        "spec_draft_n_max",
+        "--spec-draft-n-max"
+      ],
+      "declaration_evidence": [],
+      "current_read_excerpt": "window_env is consulted only to force use_window false when its first character is 0.",
+      "member_name_occurrences": [],
+      "affected_if_removed": "Would remove the stepwise graph-target correctness comparison while retaining windowed MTP.",
+      "required_validation": "Keep documented until the windowed target/prefix-commit path passes correctness comparison.",
+      "review_decision": "KEEP for user review: ZeroMoE-specific MTP correctness comparison control; stepwise mode previously isolated a windowed-path issue.",
+      "removal_status": "NOT STARTED",
+      "read_context_status": "Current reader and versioned MTP handoff inspected.",
+      "id": "K1155"
+    },
+    {
+      "surface": "environment",
+      "name": "ZEROMOE_QWEN4EXP_WINDOW_LANE",
+      "evidence": [],
+      "action": "REMOVE completed experiment switch; fix the measured default.",
+      "when_used": "Only the Qwen graph branch that previously read this environment value.",
+      "component": "Qwen full graph / CPU routed expert path",
+      "primary_reference": "models/qwen/ggml_qwen4exp_graph_build_moe.cpp",
+      "aliases_to": [],
+      "description": "Removed experiment selector.",
+      "related_interfaces": [],
+      "declaration_evidence": [],
+      "current_read_excerpt": "",
+      "member_name_occurrences": [],
+      "affected_if_removed": "Alternative execution behavior removed; documented default retained.",
+      "required_validation": "Static source scan and full-graph numerical/performance acceptance before future behavior changes.",
+      "review_decision": "REMOVED 2026-10-28: multi-token early-ready diverged from plain decode for about 2 ms saved; early-ready is fixed to single-token decode.",
+      "removal_status": "REMOVED 2026-10-28",
+      "read_context_status": "Current source no longer reads the environment name.",
+      "risk": "MEDIUM",
+      "risk_reason": "Numerical and performance path; source records existing comparison evidence.",
+      "proposed_owner": "Qwen graph",
+      "rationale": "Environment selector only exposed a completed A/B alternative.",
+      "worktrees": [
+        "current master"
+      ],
+      "id": "K1156"
+    },
+    {
+      "surface": "environment",
+      "name": "ZEROMOE_QWEN4EXP_COLD_FUSED",
+      "evidence": [],
+      "action": "REMOVE completed experiment switch; fix the measured default.",
+      "when_used": "Only the Qwen graph branch that previously read this environment value.",
+      "component": "Qwen full graph / CPU routed expert path",
+      "primary_reference": "models/qwen/ggml_qwen4exp_graph_build_moe.cpp",
+      "aliases_to": [],
+      "description": "Removed experiment selector.",
+      "related_interfaces": [],
+      "declaration_evidence": [],
+      "current_read_excerpt": "",
+      "member_name_occurrences": [],
+      "affected_if_removed": "Alternative execution behavior removed; documented default retained.",
+      "required_validation": "Static source scan and full-graph numerical/performance acceptance before future behavior changes.",
+      "review_decision": "REMOVED 2026-10-28: opt-out removed; use the tested bit-identical fused cold CPU node for supported shapes.",
+      "removal_status": "REMOVED 2026-10-28",
+      "read_context_status": "Current source no longer reads the environment name.",
+      "risk": "MEDIUM",
+      "risk_reason": "Numerical and performance path; source records existing comparison evidence.",
+      "proposed_owner": "Qwen graph",
+      "rationale": "Environment selector only exposed a completed A/B alternative.",
+      "worktrees": [
+        "current master"
+      ],
+      "id": "K1157"
     }
   ]
 }

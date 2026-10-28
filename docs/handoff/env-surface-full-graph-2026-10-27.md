@@ -39,18 +39,15 @@ CUDA graph is compiled and selectable", not a CPU execution path.
 | `ZEROMOE_LING_FULL_GRAPH` | Ling full graph is the default; `ZEROMOE_LING_NATIVE_GRAPH` selects the implementation. |
 | `ZEROMOE_DEEPSEEK_V41_FULL_GRAPH` | DeepSeek-V4.1 prefill graph is the default; the decode override remains. |
 
-The Qwen preload aliases were kept, with changed defaults:
+At this handoff date, the Qwen preload environment aliases still existed. They were
+removed on 2026-10-28; the typed graph settings remain canonical:
 
-- `ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS` (legacy alias for
-  `graph_device_expert_layers`): default `2`. `0` is the explicit
-  "no whole-layer block" sentinel used by the global-pool recipe. An enabled
-  block must be at least 2 layers: env `1` is raised to 2 with a warning, TOML
-  `1` is rejected by the typed resolver.
-- `ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING` (legacy alias for
-  `graph_device_expert_trailing`): default `false`. It only affects placement
-  when the layer count is nonzero.
+- `graph_device_expert_layers`: default `2`; `0` means no whole-layer block.
+  Enabled blocks must be at least two layers.
+- `graph_device_expert_trailing`: default `false`; controls placement only when
+  the layer count is nonzero.
 
-## Why `PRELOAD_TRAILING` exists
+## Why `graph_device_expert_trailing` exists
 
 It is the placement side of `device_expert_layers`, not an independent
 feature. ZeroMoE historically put the whole-layer GPU-resident block at the

@@ -5,8 +5,10 @@ build-api-asan/
 build_*/
 /build-cpu/
 /build-cuda/
+/build-macos/
 /build-ling/
 /builds*/*
+/build_logits_ref
 /.worktrees/
 /.exl3-runtime/
 tests/bench_outproj

@@ -23,15 +23,9 @@ namespace qwen4exp_graph {
 // single-token contract and the scheduler-split prefill path remains unchanged.
 ggml_tensor *build_qwen4exp_host_node(
     FullGraph &g, ggml_context *ctx, ggml_tensor *cur, ggml_tensor *ids,
-    ggml_tensor *weights, int layer, bool partial_cold_only,
-    ggml_tensor *gate_exps_for_cpu,
-    ggml_tensor *up_exps_for_cpu,
-    ggml_tensor *down_exps_for_cpu,
-    ggml_tensor *remap_cpu_for_cpu,
-    ggml_tensor *mask_cpu_for_cpu)  {
+    ggml_tensor *weights, int layer) {
   if (!g.decode_mode || g.S != 1 || !g.engine ||
-      (!partial_cold_only &&
-       !g.engine->qwen4exp_cpu_offload_layer_enabled(layer)))
+      !g.engine->qwen4exp_cpu_offload_layer_enabled(layer))
     return nullptr;
 
   const auto &c = g.engine->model_file.architecture_config;
@@ -64,47 +58,9 @@ ggml_tensor *build_qwen4exp_host_node(
 
   auto node_ctx = std::make_unique<Qwen4ExpCudaHostNodeContext>();
   node_ctx->layer_index = layer;
-  node_ctx->partial_cold_only = partial_cold_only;
-  if (partial_cold_only) {
-    if (!gate_exps_for_cpu || !up_exps_for_cpu || !down_exps_for_cpu ||
-        !remap_cpu_for_cpu || !mask_cpu_for_cpu)
-      return nullptr;
-    node_ctx->partial_cpu_graph = std::make_unique<EarlyReadyLane>();
-    if (!node_ctx->partial_cpu_graph->prepare(
-            g.cpu, g.device, g.D, c.topk, gate_exps_for_cpu,
-            up_exps_for_cpu, down_exps_for_cpu, remap_cpu_for_cpu,
-            mask_cpu_for_cpu))
-      return nullptr;
-    node_ctx->resident_expert_index.assign(
-        static_cast<size_t>(c.n_experts), -1);
-    node_ctx->staged_expert_index.assign(
-        static_cast<size_t>(c.n_experts), -1);
-    node_ctx->route_classification.reserve(static_cast<size_t>(c.topk));
-  }
   const auto split_resident_it = g.split_gpu_expert_ids.find(layer);
-  if (split_resident_it != g.split_gpu_expert_ids.end()) {
+  if (split_resident_it != g.split_gpu_expert_ids.end())
     node_ctx->gpu_resident_experts = split_resident_it->second;
-    if (partial_cold_only) {
-      for (size_t slot = 0; slot < node_ctx->gpu_resident_experts.size();
-           ++slot) {
-        const int expert = node_ctx->gpu_resident_experts[slot];
-        if (expert < 0 || expert >= c.n_experts ||
-            node_ctx->resident_expert_index[static_cast<size_t>(expert)] >= 0) {
-          LOG_ERROR("[QWEN4EXP-PARTIAL-CLASSIFY] layer=%d has invalid or "
-                    "duplicate resident expert id=%d; refusing graph build\n",
-                    layer, expert);
-          return nullptr;
-        }
-        node_ctx->resident_expert_index[static_cast<size_t>(expert)] =
-            static_cast<int32_t>(slot);
-      }
-    }
-  } else if (partial_cold_only) {
-    LOG_ERROR("[QWEN4EXP-PARTIAL-CLASSIFY] layer=%d has no resident expert "
-              "table; refusing partial graph build\n",
-              layer);
-    return nullptr;
-  }
   // Reuse the persistent CPU pool already owned by this FullGraph.  The
   // callback runner borrows it; FullGraph remains responsible for teardown.
   node_ctx->shared_cpu_threadpool = g.cpu_threadpool;
@@ -300,11 +256,9 @@ ggml_tensor *build_qwen4exp_host_node(
   // In GPU-reduce mode only row 0 is a real copy target; the bridge H2D
   // fills all topk rows of the destination from the callback's output.
   ggml_tensor *copy_dst =
-      (gpu_reduce && !partial_cold_only)
-          ? ggml_view_2d(ctx, destination, g.D, 1, destination->nb[1], 0)
-          : destination;
-  ggml_tensor *marker_source =
-      partial_cold_only ? ggml_dup_tensor(ctx, destination) : input3;
+      gpu_reduce ? ggml_view_2d(ctx, destination, g.D, 1, destination->nb[1], 0)
+                 : destination;
+  ggml_tensor *marker_source = input3;
   ggml_tensor *marker = ggml_cpy(ctx, marker_source, copy_dst);
   if (!marker)
     return nullptr;
@@ -313,15 +267,13 @@ ggml_tensor *build_qwen4exp_host_node(
   // pinned route buffers before the callback; the ordinary CPY backend never
   // sees this marker because the bridge consumes it first.
   marker->src[2] = route_ids;
-  if (!gpu_reduce || partial_cold_only)
+  if (!gpu_reduce)
     marker->src[3] = route_weights;
-  if (partial_cold_only)
-    marker->src[4] = input3;
   ggml_set_name(marker,
                 ("qwen4exp_host_moe_marker_l" + std::to_string(layer))
                     .c_str());
   ggml_tensor *result = marker;
-  if (gpu_reduce && !partial_cold_only) {
+  if (gpu_reduce) {
     // [D, topk] unweighted expert outputs -> weight and sum over topk.
     ggml_tensor *per_expert =
         ggml_view_3d(ctx, marker, g.D, c.topk, 1, destination->nb[1],
@@ -672,21 +624,10 @@ bool exl3_ggml_bridge_requested(const FullGraph &g, int layer,
   return true;
 }
 
-// The early-ready CPU lane for multi-token decode windows is opt-in
-// (ZEROMOE_QWEN4EXP_WINDOW_LANE=1): with it on, the text of a window run diverged from plain
-// decoding on the test prompt (investigation open), and it saved only ~2 ms per window.
-// The cold branch's ggml node chain is replaced by one fused CPU node (qwen4exp_cold::build) whenever the
-// expert tensors are Q2_0; ZEROMOE_QWEN4EXP_COLD_FUSED=0 turns it off. Bit-identical to the chain
-// (tests/test_cold_ffn_fused.cpp); 5-23% faster MTP windows (docs/design/mtp-window-timeline.md).
-static bool cold_fused_enabled() {
-  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_COLD_FUSED");
-  return !(v && v[0] == '0');
-}
-
-static bool window_lane_enabled() {
-  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_WINDOW_LANE");
-  return v && v[0] == '1';
-}
+// Early-ready remains single-token only because the multi-token verify
+// experiment diverged from plain decoding. For supported Q2_0 cold routes,
+// the fused CPU node is bit-identical to the node chain and measured 5-23%
+// faster, so use it whenever its type/shape predicate accepts the layer.
 
 ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                        int layer, ggml_tensor *router,
@@ -962,15 +903,7 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
           ((early_env && early_env[0] == '1' && layer == 13) ||
            (!all_early_env || all_early_env[0] != '0')) &&
           g.decode_mode && g.S >= 1 &&
-          (g.S == 1 || window_lane_enabled());
-      const bool partial_requested =
-          g.decode_mode && g.S == 1 && env_partial_graph_enabled(layer);
-      if (partial_requested && early_requested) {
-        LOG_WARN("[QWEN4EXP-PARTIAL-GRAPH] layer=%d cannot combine "
-                 "partial host callback with early-ready in one A/B\n",
-                 layer);
-        return nullptr;
-      }
+          g.S == 1;
       std::unique_ptr<EarlyReadyLane> early;
       ExpertSplitTables route_tab = tab;
       if (early_requested) {
@@ -1040,24 +973,6 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
           ggml_mul(ctx, weights, lookup_like_weights(route_tab.mask_cpu));
 
       ggml_tensor *cold_weighted = nullptr;
-      if (partial_requested) {
-        // DDR-only partial milestone: the callback reduces the cold
-        // complement while the resident CUDA branch below computes hot
-        // routes. SSD service and staged publication are intentionally absent
-        // from this first graph; a missing DDR arena declines the build.
-        cold_weighted = build_qwen4exp_host_node(
-            g, ctx, cur, ids, weights, layer, /*partial_cold_only=*/true,
-            gate_exps, up_exps, down_exps, tab.remap_cpu, tab.mask_cpu);
-        if (!cold_weighted) {
-          LOG_WARN("[QWEN4EXP-PARTIAL-GRAPH] layer=%d declined: DDR "
-                   "cold callback could not be built\n",
-                   layer);
-          return nullptr;
-        }
-        LOG_INFO("[QWEN4EXP-PARTIAL-GRAPH] layer=%d resident CUDA + "
-                 "cold DDR host callback\n",
-                 layer);
-      }
       if (early) {
         auto *dst = ggml_dup_tensor(ctx, cur);
         early->device_buffer = ggml_backend_alloc_buffer(g.cuda, ggml_nbytes(dst));
@@ -1146,10 +1061,10 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         // Submit hot work before the independent private CPU marker.
         ggml_build_forward_expand(g.graph, hot_weighted);
       } else {
-        // Opt-in fused cold branch (ZEROMOE_QWEN4EXP_COLD_FUSED=1): one CPU node for the whole branch.
+        // One fused CPU node for supported cold branches.
         // Resident-expert routes and the recorded masks are read from the same host tables as below.
         ggml_tensor *fused = nullptr;
-        if (cold_fused_enabled() && g.decode_mode && !g.stage_route_ids &&
+        if (g.decode_mode && !g.stage_route_ids &&
             qwen4exp_cold::supported(gate_exps, up_exps, down_exps, c.topk, g.S)) {
           std::shared_ptr<qwen4exp_cold::Context> owner;
           fused = qwen4exp_cold::build(

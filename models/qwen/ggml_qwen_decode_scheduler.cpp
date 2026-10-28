@@ -32,6 +32,12 @@
 #endif
 using namespace moe::detail;
 
+namespace {
+bool qwen_decode_sched_debug() {
+  return Logger::instance().would_log(LogLevel::DEBUG);
+}
+}  // namespace
+
 // Qwen decode scheduler graph (full-graph CPU-affinity topology)
 // ---------------------------------------------------------------------------
 

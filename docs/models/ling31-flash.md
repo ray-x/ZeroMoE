@@ -14,7 +14,7 @@ LING_GPU0_CACHE_GIB=3.0 LING_GPU1_CACHE_GIB=12.5 \
 LING_PINNED_VRAM_CAPACITY=3700 LING_OFFLOAD_PINNED=0.5 \
 LING_GPU_ASSIST=3 LING_ASSIST2_SLOTS=1 LING_CPU_THREADS=10 \
 LING_USAGE_FILE="$PWD/bench/ling/reference-audit/usage-hi-there-robust4.pin" \
-LING_LOG=/tmp/ling-short.log LING_BIN=./build_master/zeromoe \
+LING_LOG=/tmp/ling-short.log LING_BIN=./build/zeromoe \
 bench/ling/reference-audit/run.sh
 ```
 

@@ -9,7 +9,7 @@
 ## Canonical recipe (decode baseline)
 
 ```bash
-ZEROMOE_BIN=./build_master/zeromoe bench/qwen_decode_baselines.sh split 10 400
+ZEROMOE_BIN=./build/zeromoe bench/qwen_decode_baselines.sh split 10 400
 ```
 
 The script sets `CUDA_VISIBLE_DEVICES=0`, passes

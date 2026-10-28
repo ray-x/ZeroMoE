@@ -19,7 +19,7 @@
 #   bench/regression_gate.sh [BIN] [--models qwen38,glm53flash,ling31,dsv41,glm53,mimo26]
 #   bench/regression_gate.sh [BIN] --help
 #
-#   BIN        defaults to ./build_master/zeromoe (the merged-master release build;
+#   BIN        defaults to ./build/zeromoe (the merged-master release build;
 #              must link the prebuilt ggml with the host-node hook — see docs/models/README.md)
 #   --models   comma-separated subset (test only these models); default is all five.
 #              Every selected model is REQUIRED: a launch error or a missing decode
@@ -54,7 +54,7 @@ EOF
 
 cd "$(dirname "$0")/.."   # repository root
 
-BIN="${GATE_BIN:-./build_master/zeromoe}"
+BIN="${GATE_BIN:-./build/zeromoe}"
 MODELS="${MODELS-qwen38,glm53flash,ling31,dsv41,glm53,mimo26}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -258,7 +258,7 @@ wants() { [[ ",$MODELS," == *",$1,"* ]]; }
 
 # A neutral-named symlink to BIN: bench/glm53/preflight.sh greps process command
 # lines for the literal string "zeromoe", so a wrapper that spells the path
-# ./build_master/zeromoe trips its own guard. Run through a symlink instead.
+# ./build/zeromoe trips its own guard. Run through a symlink instead.
 # Keep it in an invocation-private directory: a shared /tmp name lets a concurrent
 # gate replace the link mid-run, so gate A would execute candidate B while reporting
 # candidate A's hash.

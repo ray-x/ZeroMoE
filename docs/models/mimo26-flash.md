@@ -239,7 +239,7 @@ kernels); the text is coherent in both.
 ### Parity against llama.cpp, 2026-10-23 (passed)
 
 Prompt `The capital of France is` (ids 785 6722 315 9625 374), 8 greedy steps, `--raw-prompt --temp 0`. ZeroMoE:
-dual-GPU in-graph config (3090 cache 12 GiB), `build_master`-era tree; llama.cpp `b9739`-class unpatched CPU build
+dual-GPU in-graph config (3090 cache 12 GiB), an earlier local build tree; llama.cpp `b9739`-class unpatched CPU build
 (`build_mimo/mimo26-llama-logits`, `tools/compare_logits.py`; recipe in README, "Validating a new model").
 
 | step | max_abs | rmse | cosine | top-1 (ZeroMoE / llama.cpp) |

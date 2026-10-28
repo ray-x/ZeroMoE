@@ -11,7 +11,7 @@ set -euo pipefail
 # Usage: bench/run_ring_spin_sweep.sh [iterations] [d_model] [slots] [cpu_compute_us]
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-bin="${repo_dir}/build_ggmlcuda/qwen_cpu_offload_ring_spin_bench"
+bin="${repo_dir}/build/qwen_cpu_offload_ring_spin_bench"
 iterations="${1:-500}"
 d_model="${2:-2560}"
 slots="${3:-2}"
@@ -19,7 +19,7 @@ cpu_compute_us="${4:-1000}"
 
 if [[ ! -x "${bin}" ]]; then
     echo "missing ${bin}; build with:" >&2
-    echo "  cmake --build build_ggmlcuda --target qwen_cpu_offload_ring_spin_bench" >&2
+    echo "  cmake --build build --target qwen_cpu_offload_ring_spin_bench" >&2
     exit 1
 fi
 

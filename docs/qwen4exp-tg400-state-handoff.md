@@ -91,7 +91,6 @@ to repeat the test exactly. Runtime switches used for the measured runs:
 ```text
 CUDA_VISIBLE_DEVICES=0
 # Full-graph prefill/decode are now engine defaults (no switch).
-ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40
 ZEROMOE_PROMPT_TOKEN_INPUT_FILE=/tmp/tg400_qwen_prompt_tokens.txt
 ZEROMOE_TEACHER_FORCE_TOKEN_FILE=<quantization-specific 400-token file>
 ZEROMOE_TEACHER_FORCE_SKIP_SAMPLING=1
@@ -110,19 +109,16 @@ The ZeroMoE measured-run shape is:
 ```bash
 { printf 'TG400 timing run\n:q\n'; } | env \
   CUDA_VISIBLE_DEVICES=0 \
-  ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40 \
   ZEROMOE_PROMPT_TOKEN_INPUT_FILE=/tmp/tg400_qwen_prompt_tokens.txt \
   ZEROMOE_TEACHER_FORCE_TOKEN_FILE=/tmp/zeromoe_q2_0_tg400_decode_tokens_20261002.txt \
   ZEROMOE_TEACHER_FORCE_SKIP_SAMPLING=1 \
   ZEROMOE_BENCH_SILENT=1 \
   ZEROMOE_BENCH_IGNORE_STOP=1 \
-  ./build-tg400/zeromoe --config configs/testing/qwen4exp_tg400_q2_0_22_26.toml
+  ./build-tg400/zeromoe --config configs/testing/qwen4exp_tg400_q2_0_22_26.toml --graph-device-expert-layers 40
 ```
 
 Decode borrows compatible prefill dense/expert arenas. If the decode graph cannot be built from a borrowed arena, the runtime releases retained owners and retries with fresh decode arenas.
-Full-graph decode also prepares those prompt-independent arenas during startup
-by default; set `ZEROMOE_QWEN4EXP_GRAPH_BOOTSTRAP=0` to restore lazy
-preparation for a diagnostic run.
+Full-graph decode prepares these prompt-independent arenas during startup; lazy-bootstrap env override was removed on 2026-10-28.
 
 For IQ1_M, switch to its config and continuation file. To capture a fresh
 continuation, set `ZEROMOE_GENERATED_TOKEN_FILE` and omit both teacher-force
@@ -216,12 +212,7 @@ decode setup and its recurrent-state seed above.
   4-token prompt such as "Tell a story."). The profile's `context_size` is 416: with a 17-token
   prompt the last token overflows the KV capacity, drops to the legacy path (~1.4 s) and the run
   reads ~24 tok/s, a fake ~11% gap. Check `[PREFILL-DONE] 16 tokens`.
-- Required switches beyond the doc's list: `ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40`,
-  plus `..._BORROW_PREFILL_ARENAS=1` and `..._GRAPH_BOOTSTRAP=1` for the 54 ms setup
-  (borrow alone fails the 1 GiB VRAM floor and falls back to a degenerate layered
-  decode; neither flag works on per-expert split configs). Full-graph
-  prefill/decode are now defaults; the old `ZEROMOE_QWEN4EXP_FULL_GRAPH*` names
-  were removed.
+- The historical measurement used 40 device-expert layers; the current setting is `graph_device_expert_layers` / `--graph-device-expert-layers 40`. Arena borrowing and bootstrap now follow the fixed full-graph policy.
 - Measured: ZeroMoE 26.17 / 26.44 / 26.89 tok/s over 400 tokens (setup included) vs Bee
   `llama-bench -p 0 -n 400 -r 3` 26.96-27.06 (build 43fed6726, same 26-layer CPU mask).
   Per token: graph run ~36.3 ms + ~0.5 ms sampling. GPU kernels ~12.9 ms (about 3,900 kernels),

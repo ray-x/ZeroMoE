@@ -132,12 +132,8 @@ or blocks results; the engine's preflight refuses to start if free RAM/VRAM is i
 
 ## Decode graph setup: arena borrowing and bootstrap (defaults)
 
-By default the engine prepares reusable device arenas at startup and the first decode graph borrows them, so decode graph construction
-takes ~0.1 s instead of 3+ s. This is controlled by two switches in the opt-out direction:
-
-| Variable | Effect |
-|---|---|
-| `ZEROMOE_QWEN4EXP_GRAPH_BOOTSTRAP=0` | Skip the startup preparation (lazy: the first request pays the upload). |
+The engine prepares reusable device arenas at startup and the first decode graph borrows compatible arenas, so graph construction
+ takes ~0.1 s instead of 3+ s. If a borrowed build fails, it releases retained owners and retries with fresh arenas. This policy is fixed; the lazy-bootstrap and force-recreate env overrides were retired.
 
 For Option-B per-expert split configs the startup step also uploads the ~13 GiB split arena once (+~2.7 s startup) and keeps it resident while prompts
 are short; a long prompt (roughly more than ~120 tokens on a 24 GiB card) releases it before prefill and rebuilds it for that request's decode.

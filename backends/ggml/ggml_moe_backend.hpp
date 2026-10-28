@@ -702,6 +702,7 @@ class GgmlMoeRunner : private moe::GgmlMoeTransferManager {
   // GGML CUDA stream and are ordered directly before the MoE graph. While it
   // is enabled, the caller uses pinned staging sources so RAM-tier blocks do
   // not need to remain held after the CPU staging memcpy.
+  bool backend_stream_copies() const { return backend_stream_copies_; }
 
   ~GgmlMoeRunner();
 

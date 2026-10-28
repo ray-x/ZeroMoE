@@ -453,7 +453,7 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
     int tokens = 0;
   };
   static LayerTimer lt;
-  const bool layer_timing_on = layer_timing_env() && !nan_probe_on;
+  const bool layer_timing_on = layer_timing_env();
   if (layer_timing_on) {
     lt.g = &g;
     if (lt.attn_ms.size() != (size_t)g.n_layers) {
@@ -488,7 +488,7 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
   };
   static OpProf op;
   const bool op_prof_on = Logger::instance().would_log(LogLevel::DEBUG) &&
-                          !layer_timing_on && !nan_probe_on &&
+                          !layer_timing_on &&
                           op.tokens < 30;
   if (op_prof_on) {
     ggml_backend_sched_set_eval_callback(
@@ -590,10 +590,6 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
                  v[i].second.second / 30.0,
                  1000.0 * v[i].second.first / v[i].second.second);
     }
-  }
-  if (nan_probe_on) {
-    ggml_backend_sched_set_eval_callback(g.sched, nullptr, nullptr);
-    probe.reported = std::max(probe.reported, 1);
   }
   if (layer_timing_on) {
     ggml_backend_sched_set_eval_callback(g.sched, nullptr, nullptr);

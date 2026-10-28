@@ -1,18 +1,122 @@
 # ZeroMoE
 
-ZeroMoE is an ultra-fast, zero-dependency inference engine written from the ground up in native C++ and CUDA. It is specifically designed to stream frontier-class Mixture-of-Experts (MoE) GGUF models on consumer-grade hardware.
+ZeroMoE is a native C++23/CUDA inference engine for Mixture-of-Experts (MoE) GGUF models. It keeps dense weights and KV state resident while streaming routed expert matrices from NVMe on demand, so models far larger than VRAM can run on consumer hardware.
 
-By implementing strict graph-level memory isolation, ZeroMoE maps and holds core persistent network blocks directly in physical VRAM and RAM, while dynamically streaming massive routed expert matrices directly from NVMe storage on an on-demand basis.
+It is **not a fork of llama.cpp** and does not link `libllama`. It builds on **ggml**, the tensor library underneath llama.cpp, from a pinned upstream commit, and adds a whole-model execution graph, expert streaming, and graph-level host/device offload on top.
+
+- **GGUF-native loader:** parses binary tensor offsets and the embedded BPE tokenizer straight from the GGUF metadata; no separate JSON or weight config maps.
+- **Lock-free asynchronous prefetching:** an SPSC atomic ring buffer checks layer $L$ activations against layer $L+1$ router parameters to preload upcoming expert matrices via non-blocking DMA.
+- **Fused AVX-512 / VNNI compute core:** dequantizes GGUF blocks directly in CPU registers using hardware integer dot products (`_mm512_dpbusd_epi32`).
+- **RTX 3090 integer acceleration:** an Ampere-native CUDA kernel using `__dp4a` and register warp-shuffles for dense projections.
+- **MLA weight absorption:** calculates Multi-head Latent Attention directly in the lower-dimensional latent space, reducing the attention scanning footprint.
 
 ---
 
-## Architectural Performance Foundations
+## Requirements
 
-- **Zero-Dependency GGUF Engine:** Automatically parses binary tensor offsets and extracts embedded BPE tokenizers straight from the GGUF file metadata header array. No external json or weight config maps required.
-- **Lock-Free Asynchronous Prefetching:** Utilizes a highly optimized Single-Producer/Single-Consumer (SPSC) atomic ring buffer to dispatch prefetch instructions ahead of execution. It checks Layer $L$ activations against Layer $L+1$ router parameters to preload upcoming expert matrices via non-blocking DMA.
-- **Fused AVX-512 / VNNI Compute Core:** Eliminates intermediate vector allocation overhead by dequantizing GGUF blocks directly inside physical CPU registers using hardware-accelerated integer dot products (`_mm512_dpbusd_epi32`).
-- **RTX 3090 Integer Acceleration:** Features an advanced Ampere-native CUDA kernel leveraging the hardware-level `__dp4a` instruction alongside register warp-shuffles to handle dense projections instantly.
-- **MLA Weight Absorption:** Reduces the operational scanning footprint of Multi-head Latent Attention layers from $O(\text{Context} \times H \times D)$ down to a compact $O(\text{Context} \times \text{kv\_lora})$ by calculating attention directly in the lower-dimensional latent space.
+| Component | Requirement |
+|---|---|
+| OS | Linux x86-64 for the CUDA engine. macOS (Apple Silicon) builds the CPU-only tools and tests. |
+| GPU | NVIDIA GPU supported by the installed CUDA toolkit. Tested on RTX 3090 (`sm_86`) and RTX 5060 Ti (`sm_120a`). |
+| CUDA | CUDA Toolkit and driver. The reference build uses CUDA 13.3.73 with driver 610.57.04. |
+| CPU | x86-64 with AVX-512 F/CD/BW/DQ/VL. AVX-512 VNNI is on by default; disable it with `-DGGML_AVX512_VNNI=OFF` on CPUs without VNNI. |
+| RAM | 64 GB or more recommended. Host RAM is used as the expert cache; test profiles assume 125 GiB. |
+| Disk | NVMe SSD. Keep the GGUF and any repacked stores outside the repository. |
+| Build tools | CMake ≥ 3.25, GNU Make, `git`, GNU `patch`, Python 3, and a C++23-capable host compiler (tested with GCC 16.2 and nvcc 13.3). |
+
+**ggml is required.** Every CUDA build compiles and links ggml's CUDA backend. You do not install ggml yourself: CMake fetches it from pinned llama.cpp commit `8baabd53b77d1c48c6ef8d3b620436292f3f6231` (ggml 0.27.0), copies it into the build tree, and applies ZeroMoE's patch series. A normal build also fetches pinned `nlohmann/json` and `cpp-httplib` for the built-in API server. Model weights are never downloaded.
+
+## Quick start
+
+```bash
+git clone <repository-url> ZeroMoE
+cd ZeroMoE
+./setup.sh
+```
+
+`setup.sh` checks the toolchain, then configures and builds a Release binary at
+`build/zeromoe` (on macOS it builds the CPU-only tools in `build-macos/`). It
+fetches the pinned ggml source on the first run, so that step needs network
+access.
+
+Point a starter profile at your GGUF, then run:
+
+```bash
+$EDITOR configs/qwen38-flash.toml   # set model_path; adjust budgets for your hardware
+./build/zeromoe --config configs/qwen38-flash.toml --prompt "Hello" --predict 32
+```
+
+- Supported families and profiles: [docs/models/README.md](docs/models/README.md)
+- Manual build commands and options: [Build and installation](#build-and-installation)
+- Configuration keys and precedence: [docs/configuration.md](docs/configuration.md)
+- Environment variables: [docs/env-vars.md](docs/env-vars.md)
+
+> **Clone with git.** GitHub "Download ZIP" archives contain neither the pinned ggml sources nor a git revision, and the CUDA build stops at its build-provenance check. A normal `git clone` builds.
+
+### Getting model weights
+
+ZeroMoE does not bundle or download weights. Converted GGUFs for the supported
+families are published on Hugging Face by their respective authors; download the
+quantization you want with your preferred client and keep it outside the
+repository:
+
+```bash
+# Replace with the repository and file you have access to.
+hf download <org>/<repo> <model>.gguf --local-dir ~/models
+```
+
+Set `model_path` in the profile to that file, or to a directory containing split
+shards (`*-00001-of-0000N.gguf`). At startup the engine checks the exact
+`general.architecture` and tensor topology against its registered
+`FullGraphModel` adapters and refuses an unsupported model.
+
+For `--direct-io`, repack the model into the per-expert layout first, then point
+`model_path` at the output directory:
+
+```bash
+./build/gguf_tool pack model.gguf ./model-packed --verify-all
+```
+
+See [tools/README.md](tools/README.md) for packing, verification, and the I/O
+benchmark.
+
+## Supported models
+
+| Model | GGUF `general.architecture` | Starter profile |
+|---|---|---|
+| Qwen 3.8 Flash | `qwen4exp` | [`configs/qwen38-flash.toml`](configs/qwen38-flash.toml) |
+| Qwen3.6 35B-A3B | `qwen35moe` | [`configs/bench/qwen36_35b_a3b_iq2m_5060_tg400.toml`](configs/bench/qwen36_35b_a3b_iq2m_5060_tg400.toml) |
+| GLM 5.3 Flash | `glm5next` | [`configs/glm53-flash.toml`](configs/glm53-flash.toml) |
+| Ling 3.1 Flash | `bailingmoe3` | [`configs/ling31-flash.toml`](configs/ling31-flash.toml) |
+| DeepSeek 4.1 Flash | `deepseek41` | [`configs/deepseek41-flash.toml`](configs/deepseek41-flash.toml) |
+| GLM 5.3 | `glm-dsa` | [`configs/glm53-dsa.toml`](configs/glm53-dsa.toml) |
+| MiMo V2.6 Flash RL (experimental) | `mimo2` | [`configs/mimo26-flash.toml`](configs/mimo26-flash.toml) |
+
+Exact quantizations, measured decode bands, and per-model gotchas are in [docs/models/README.md](docs/models/README.md). A model is only supported when its exact `general.architecture` and tensor topology have a registered `FullGraphModel` adapter; a shared family label is not proof of compatibility.
+
+## Relationship to llama.cpp and ggml
+
+ZeroMoE borrows heavily from llama.cpp's design while keeping its own runtime:
+
+- **ggml is the backend layer.** The CUDA engine always builds and links ggml's CUDA backend. ggml is fetched from a pinned llama.cpp commit and patched at configure time; the submodule is copied, never modified. See [docs/build-ggml.md](docs/build-ggml.md) and [patches/README.md](patches/README.md).
+- **Formats follow ggml.** GGUF parsing, quantization block layouts (Q2_0, IQ1_S, IQ2_*, MXFP4, ...), and CPU reference dequantization use ggml's definitions. The IQ2 dequantizer in `kernels/quant/iq2_matmul.cu` is a port of ggml's `dequantize_row_iq2_*`.
+- **Full CUDA graph design.** The engine follows llama.cpp's approach of letting ggml's CUDA backend capture pure-CUDA graph spans and replay them, then extends it with a whole-model parent graph and graph-level offload (next section).
+- **Partial CLI compatibility.** `--ctx-size`, `--predict`, `--threads`, `--main-gpu`, `--log-file`, and `--verbosity` match llama.cpp names. ZeroMoE is not a drop-in replacement for `llama-cli`.
+- **llama.cpp is the correctness oracle.** [`scripts/validate_vs_llama.sh`](scripts/validate_vs_llama.sh) runs an unpatched llama.cpp build on the same GGUF and compares per-step logits: `cosine`, `max_abs`, `rmse`, and the top-1 token. See [Logits against llama.cpp](#2-logits-against-llamacpp-the-oracle-for-a-new-model).
+- **llama.cpp is the performance reference.** A model is not accepted until steady-state decode reaches at least 90% of llama.cpp on the same GGUF, GPU, context, prompt length, and thread count; see `AGENTS.md` and `tools/check_full_graph_moe_perf.py`.
+
+## Full CUDA graph and host-node offload
+
+The CUDA path is graph-only. Each supported family registers a `FullGraphModel` adapter that builds a whole-model ggml graph, and there is no layer-by-layer expert executor behind it. If the graph does not fit, the adapter must report `Insufficient` with required/available byte counts before layered fallback is allowed; unsupported architectures fail startup.
+
+On top of ggml's CUDA graph capture, ZeroMoE adds:
+
+- **Conditional device subgraphs.** Resident and staged expert branches are separate CUDA child graphs selected by device-side predicates in a parent graph.
+- **Host nodes (`HostNode`).** A patched ggml CUDA backend expands a marker op into device-to-host copy → `cudaLaunchHostFunc` → host-to-device copy. This runs CPU work (cold-expert FFN, activation, or usage tracking) in the middle of a captured graph without leaving it. See [`patches/ggml-host-node/`](patches/ggml-host-node/) and [`models/qwen/ggml_qwen4exp_graph_host_node.cpp`](models/qwen/ggml_qwen4exp_graph_host_node.cpp).
+- **Early-ready CPU lane.** Cold experts execute on the CPU in parallel with the GPU branch instead of serializing after it (`patches/ggml-host-node/0003-*`).
+- **Staging and telemetry callbacks.** Host callbacks mark GPU stage boundaries and record routing/placement usage for the next request.
+
+Host nodes are not permitted inside conditional bodies, and capture retains tensor addresses; the boundary and lifetime rules are in [docs/cuda-graph-api-review-2026-10-05.md](docs/cuda-graph-api-review-2026-10-05.md), with measured host-node behavior in [docs/runtime-settings.md](docs/runtime-settings.md). The adapter contract for adding a family is in [docs/design/full-graph-model-onboarding.md](docs/design/full-graph-model-onboarding.md).
 
 ---
 
@@ -36,16 +140,18 @@ ZeroMoE/
 ├── scripts/                       # Build and validation helpers
 ├── patches/                       # ggml patch series
 ├── docs/                          # Design notes and model recipes
-└── server/                        # Native C++ OpenAI/Anthropic API server
+├── server/                        # Native C++ OpenAI/Anthropic API server
+└── THIRD_PARTY_NOTICES.md         # Licenses for bundled/ported third-party code
 
 ```
 
-## Build and Installation Pipeline
+## Build and installation
 
 ### Linux + CUDA (full engine)
 
-Run the automated setup tool. It validates the required compilers (`g++`,
-`nvcc`) and builds the engine, including the native C++ HTTP server:
+Run the automated setup tool. It checks the toolchain (`cmake`, `git`, `patch`,
+`python3`, `c++`, `nvcc`), configures the pinned ggml source and patch series,
+and builds the engine together with the native C++ HTTP server:
 
 ```bash
 chmod +x setup.sh
@@ -95,6 +201,7 @@ The main `zeromoe` engine requires NVIDIA CUDA and cannot build on macOS.
 However, the root `CMakeLists.txt` automatically detects Apple platforms and
 switches to a CPU-only build that compiles:
 
+* `zeromoe_cpu` — CPU inference engine and API server
 * `gguf_tool` — pack / verify / io-bench utility (cross-platform)
 * `test_components` — CPU-only component and kernel tests
 
@@ -110,17 +217,13 @@ Or, equivalently, with CMake directly:
 cmake -S . -B build-macos -DCMAKE_BUILD_TYPE=Release
 cmake --build build-macos -j$(sysctl -n hw.ncpu)
 ./build-macos/test_components
+./build-macos/zeromoe_cpu --config /path/to/model.toml --prompt "Hello"
 ./build-macos/gguf_tool --help
 ```
 
 On Apple Silicon (M1/M2/M3/M4/M5) the CPU kernel backend uses ARM NEON +
-SDOT for the f32 and integer-dot-product paths.  ggml integration for optimized
-quantized (MOE) expert decoding is enabled by default on macOS:
-
-```bash
-cmake -S . -B build
-cmake --build build -j$(sysctl -n hw.ncpu)
-```
+SDOT for the f32 and integer-dot-product paths. ggml integration for optimized
+quantized (MoE) expert decoding is enabled by default on macOS.
 
 `ZEROMOE_METAL` defaults ON on Apple Silicon: prefill-sized F32 matmuls
 (`S >= 32`) are dispatched to Metal/MPS, while decode and small batches stay
@@ -131,11 +234,13 @@ on NEON.  Configure with `-DZEROMOE_METAL=OFF` for a NEON-only build.
 Every CUDA build links ggml's CUDA backend, so the ggml-backed full-graph prefill/decode path is always available and is the default; no runtime switch is required:
 
 ```bash
-cmake -S . -B build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
+# or use the checked-in preset:
+cmake --preset cuda && cmake --build --preset cuda
 ```
 
-CUDA builds always enable ggml CUDA graph capture/replay. ggml's own default for `GGML_CUDA_GRAPHS` is OFF for consumers other than llama.cpp, which silently removes the captured-graph path and regresses this project's measured Qwen4Exp decode from about 20 tok/s to 8 tok/s. CMake now forces the required setting ON; it is not a user-selectable build mode.
+CUDA builds always enable ggml CUDA graph capture/replay. ggml's own default for `GGML_CUDA_GRAPHS` is OFF for consumers other than llama.cpp, which silently removes the captured-graph path and regresses this project's measured Qwen4Exp decode from about 20 tok/s to 8 tok/s. CMake forces the required setting ON; it is not a user-selectable build mode.
 
 CUDA architecture selection defaults to automatic detection from
 `nvidia-smi` before any CUDA targets, including ggml-cuda, are configured.
@@ -155,14 +260,14 @@ defaults, measurements and recommended combinations are in [docs/runtime-setting
 
 ### Qwen EXL3 safetensors decode
 
-EXL3 is experimental and its example TOML profiles are maintainer-local files
-under the ignored `configs/testing/` directory; they are not included in the
-public repository. Supply your own EXL3 profile to run these examples.
+EXL3 is experimental. The example profiles are maintainer-local files under the
+ignored `configs/testing/` directory and are not shipped; the paths below are
+placeholders for your own profiles. Setup, metadata requirements, and same-split
+benchmarking are documented in [docs/exllamav3-backend.md](docs/exllamav3-backend.md).
 
 To reuse ExLlamaV3's **complete optimized execution backend**, including its
-GPU attention/cache/decode and AVX-512/VNNI CPU expert worker, use
-`configs/testing/qwen4exp_exllamav3_26_22.toml`. Setup, metadata requirements, and
-same-split benchmarking are documented in [docs/exllamav3-backend.md](docs/exllamav3-backend.md).
+GPU attention/cache/decode and AVX-512/VNNI CPU expert worker, add the
+ExLlamaV3-specific keys described there to your profile.
 The native EXL3 path described below remains available as the default.
 
 Qwen3.8-Flash-Next EXL3 checkpoints can run through CPU or CUDA matrix dispatch
@@ -176,16 +281,18 @@ This checkpoint directory has no HF `config.json`, so the provided profile uses
 Qwen GGUF. Its GGUF weight payloads are not used for EXL3 inference.
 
 ```bash
-./build_ggmlcuda/zeromoe --config configs/testing/qwen4exp_exl3_decode.toml \
-    --prompt "Hello" --predict 8
+# Point these at your own local profiles; they are not in the repository.
+EXL3_PROFILE=/path/to/qwen4exp_exl3_decode.toml
+EXL3_GPU_PROFILE=/path/to/qwen4exp_exl3_gpu.toml
+
+./build/zeromoe --config "$EXL3_PROFILE" --prompt "Hello" --predict 8
 ```
 
-`configs/testing/qwen4exp_exl3_load.toml` retains the catalog/payload smoke mode.
-For GPU projections, use a CUDA build and `configs/testing/qwen4exp_exl3_gpu.toml`:
+A load-only profile retains the catalog/payload smoke mode. For GPU
+projections, use a CUDA build and the GPU profile:
 
 ```bash
-./build_ggmlcuda/zeromoe --config configs/testing/qwen4exp_exl3_gpu.toml \
-    --prompt "Hello" --predict 8
+./build/zeromoe --config "$EXL3_GPU_PROFILE" --prompt "Hello" --predict 8
 ```
 
 `exl3_gpu = true` enables direct packed `mul1` CUDA matmul with 128-wide
@@ -206,8 +313,8 @@ use AVX-512 VNNI `mul1` decoding and a bounded host cache controlled by
 `exl3_cpu_expert_cache_gb` (24 GiB in the profile; set 0 to disable).
 `exl3_cpu_expert_int8_vnni` enables VNNI byte-dot products with int8
 activations and bypasses the per-weight FP16 codebook rounding step; the
-synthetic matrix parity bound is 3% RMS. It is enabled in the supplied 26/22
-profile; set it false for exact CPU matmuls. Unquantized F32
+synthetic matrix parity bound is 3% RMS. It was enabled in the local 26/22
+profile used for these measurements; set it false for exact CPU matmuls. Unquantized F32
 projections use cuBLAS. The default `exl3_gpu = false` retains CPU reference
 dispatch; requesting GPU dispatch in a CPU-only build fails explicitly.
 
@@ -252,7 +359,7 @@ HyperConnection down/up/injection weights:
 the low-rank SiLU activation, sigmoid gate and stream mixing stay on the GPU.
 The block and output-head paths retain their respective division orders.
 `hc_mixes` in the GPU statistics confirms that this path is selected.
-The default is false. `configs/testing/qwen4exp_exl3_gpu_hc_experiment.toml` enables
+The default is false. A local `qwen4exp_exl3_gpu_hc_experiment.toml` profile enables
 the chain with the same 26/22 expert split. A 128-token checkpoint run used
 the chain but first diverged from the previous greedy token sequence at
 step 37; model-level accuracy assessment remains required before enabling
@@ -267,7 +374,7 @@ parity tests cover integer bitrates 1–8, multiple rows, optional bias and cach
 eviction. To run just those tests:
 
 ```bash
-ZEROMOE_TEST_EXL3_ONLY=1 OMP_NUM_THREADS=4 ./build_ggmlcuda/zeromoe_tests
+ZEROMOE_TEST_EXL3_ONLY=1 OMP_NUM_THREADS=4 ./build/zeromoe_tests
 ```
 
 To benchmark the EXL3 CUDA kernels without opening a model, use synthetic
@@ -275,8 +382,8 @@ To benchmark the EXL3 CUDA kernels without opening a model, use synthetic
 layers on device 0; the second represents seven layers on device 1:
 
 ```bash
-make bench-exl3 BUILD_DIR=build_ggmlcuda ARGS="--device 0 --layers 15 --experts 10 --bits 3"
-make bench-exl3 BUILD_DIR=build_ggmlcuda ARGS="--device 1 --layers 7 --experts 10 --bits 3"
+make bench-exl3 BUILD_DIR=build ARGS="--device 0 --layers 15 --experts 10 --bits 3"
+make bench-exl3 BUILD_DIR=build ARGS="--device 1 --layers 7 --experts 10 --bits 3"
 ```
 
 The benchmark reports gate/down matmul time, a gate projection with activation
@@ -294,15 +401,15 @@ The CPU expert path has a separate synthetic benchmark using the same
 2560×640 matrices and 26-layer/10-expert count:
 
 ```bash
-make bench-exl3-cpu BUILD_DIR=build_ggmlcuda ARGS="--threads 6 --bits 3"
-make bench-exl3-cpu BUILD_DIR=build_ggmlcuda ARGS="--threads 12 --bits 3"
+make bench-exl3-cpu BUILD_DIR=build ARGS="--threads 6 --bits 3"
+make bench-exl3-cpu BUILD_DIR=build ARGS="--threads 12 --bits 3"
 ```
 
 HyperConnection dispatch has a model-free benchmark with the checkpoint's
 width 2560, four streams and rank 320:
 
 ```bash
-make bench-exl3-hc BUILD_DIR=build_ggmlcuda ARGS="--device 0 --blocks 97 --iterations 10"
+make bench-exl3-hc BUILD_DIR=build ARGS="--device 0 --blocks 97 --iterations 10"
 ```
 
 Add `--omp-threads 12` to prime an OpenMP team before each GPU dispatch and
@@ -328,9 +435,9 @@ weight loads. These are host-wall measurements, not CUDA-event
 kernel timings. GPU executor time is also split into standalone projection
 calls and routed FFNs, so dense transfer/synchronization cost can be compared
 with expert computation. `[EXL3-PLE]` reports row reads/cache hits; GPU cache statistics
-include routed FFN calls and reused eviction buffers. The supplied profile uses
+include routed FFN calls and reused eviction buffers. The local profile used for these measurements uses
 the matching 26-CPU/22-GPU routed-expert split, with GPU layers 26–40 on the
-3090 and 41–47 on the 5060 Ti. The profiles use 12 OMP threads. A synthetic
+3090 and 41–47 on the 5060 Ti. The local profiles use 12 OMP threads. A synthetic
 26-layer CPU expert benchmark measured 42.9 ms at 12 threads versus 55.0 ms
 at six threads before the packed-tile grouping optimization. The int8 VNNI
 path now shares activation/decode setup across four adjacent tiles for
@@ -338,14 +445,14 @@ bitrates 1–4 and two tiles for bitrates 5–8. Verify these changes with the f
 that isolated gain as end-to-end throughput. The remaining attention/GDN and orchestration
 path still runs through the CPU decoder rather than Bee's full GPU graph.
 
-### GGUF generation
+### Running the engine
 
-Launch the standalone engine directly by pointing it at your local GGUF model, either via a TOML config (preferred) or legacy CLI flags:
+Launch the engine directly by pointing it at your local GGUF model, either via a TOML config (preferred) or legacy CLI flags:
 
 ```bash
 ./build/zeromoe --config configs/single_gpu.toml
 # or, legacy CLI flags:
-./build/zeromoe --model /nvme/glm-5.2-iq2_m.gguf --ram 48.0 --ctx-size 4096
+./build/zeromoe --model /path/to/model.gguf --ram 48.0 --ctx-size 4096
 ```
 
 #### Command-Line Arguments
@@ -378,6 +485,11 @@ checks warm prefill and matched first-to-last decode performance against Bee.
 | `--top-p <F>` | Nucleus sampling top-p threshold (default: 0.90). |
 | `--repeat-penalty <F>` | Repetition penalty (default: 1.0, disabled). |
 | `--main-gpu <ID>` | CUDA device ID for single-GPU mode (default: 0). |
+| `--serve` | Serve the OpenAI Chat Completions and Anthropic Messages APIs from the loaded model. |
+| `--host <addr>` | API bind address (default `127.0.0.1`; a non-loopback bind requires `--api-key` or `ZEROMOE_API_KEY`). |
+| `--port <port>` | API port (default 8080). |
+| `--alias <name>` | API model name (default `zeromoe`). |
+| `--api-key <key>` | API key checked on API routes; also read from `ZEROMOE_API_KEY`. |
 | `--spec-type <none|draft-mtp>` | Speculative mode supported by ZeroMoE. |
 | `--spec-draft-model <path>` | Optional external draft checkpoint. |
 | `--spec-draft-n-max <N>` | Maximum speculative draft length (default: 3). |
@@ -389,7 +501,7 @@ checks warm prefill and matched first-to-last decode performance against Bee.
 | `--pin-threshold <N>` | VRAM-resident hit-count before permanently pinning an expert (never evicted; default: 8, `0` = off). |
 | `--pin-file <file>` | Usage-frequency file for VRAM hot-set preload at startup (default: `.zeromoe_usage`). |
 | `--expert-fetch-threads <N>` | OMP threads for parallel disk reads of a layer's top-k cache misses (default: 4). |
-| `--raw-prompt` | Skip the chat-template wrap; tokenize stdin verbatim. Needed by `api_server.py` (which already applies its own formatting) and useful for token-count-fair benchmarking against other engines. |
+| `--raw-prompt` | Skip the chat-template wrap; tokenize stdin verbatim. Useful for token-count-fair benchmarking and for clients that apply their own chat formatting. |
 | `--system-prompt <text>` | Prepend a system-role message ahead of the user turn (chat-template modes only; ignored with `--raw-prompt`). Empty by default — ZeroMoE never invents one on its own. Use this to steer behavior/language, e.g. `--system-prompt "Respond in English unless asked otherwise."` |
 | `--log-file <file>` | Redirect logging to a file instead of stderr (llama.cpp-compatible name). |
 | `--verbosity <0..5>` | Set log threshold (llama.cpp-compatible numeric verbosity). |
@@ -401,11 +513,18 @@ At DEBUG (`--verbosity 5`), numerical decode comparisons include
 
 > Most of these flags have a matching TOML key of the same name (e.g. `raw_prompt`, `system_prompt`, `pin_threshold`) for use with `--config`; a config file's values are used unless the equivalent CLI flag is also passed, in which case the CLI flag wins. Run `--gen-config` to see the full set of TOML-only options (e.g. `unpacked_expert_format`, `pin_strategy`) that have no CLI-flag equivalent.
 
-### Optional API gateway
+### Serving the model
 
-The API server is not included in this repository snapshot. `setup.sh` skips
-API dependency installation unless both `api/api_server.py` and
-`api/requirements.txt` are present.
+The API server is compiled into `zeromoe`; there is no separate gateway and no
+Python environment to install. Start it with `--serve`:
+
+```bash
+./build/zeromoe --config configs/qwen38-flash.toml --serve \
+  --host 127.0.0.1 --port 8080 --alias zeromoe
+```
+
+See [docs/api-server.md](docs/api-server.md) for endpoints, authentication,
+SSE, and current limits.
 
 ## Testing
 
@@ -413,7 +532,7 @@ ZeroMoE ships two test harnesses, split by what hardware they need.
 
 ### Full engine suite (Linux + CUDA + AVX-512)
 
-`src/main_test.cpp` exercises the real CUDA DP4A / fused kernels, AVX-512
+`tests/native/main_test.cpp` exercises the real CUDA DP4A / fused kernels, AVX-512
 dequantization against a reference, and cuBLAS BF16 dense matmul
 (`[Test 1]`–`[Test 10]`). It cannot build on macOS (hard CUDA / AVX-512 deps).
 
@@ -527,8 +646,8 @@ insufficient-memory plan and its reason.
 ### 1. Unit and structure checks (seconds, no model)
 
 ```bash
-make quant_table_test graph_settings_test layer_plan_test    # in your build dir
-./quant_table_test && ./graph_settings_test tests/graph_settings_defaults.snapshot && ./layer_plan_test
+cmake --build build --target quant_table_test graph_settings_test layer_plan_test
+./build/quant_table_test && ./build/graph_settings_test tests/graph_settings_defaults.snapshot && ./build/layer_plan_test
 make moe_conformance                                         # shared-code rules (no family checks, no direct env reads)
 ```
 
@@ -536,10 +655,12 @@ make moe_conformance                                         # shared-code rules
 
 llama.cpp runs the same GGUF on the CPU; ZeroMoE dumps the raw decode logits (before repetition penalty and
 sampling) with `ZEROMOE_DECODE_LOGITS_DUMP`. `tools/ling_llama_logits.cpp` is the reference harness (greedy,
-one logits row per step, same binary row format) and `tools/compare_logits.py` compares the two files.
+one logits row per step, same binary row format) and `tools/compare_logits.py` compares the two files. Build the
+reference from an **unpatched** llama.cpp checkout at the pinned commit `8baabd53b77d1c48c6ef8d3b620436292f3f6231`
+(the harness uses that revision's `llama_batch_ext` API).
 
 ```bash
-scripts/validate_vs_llama.sh <model.gguf> <zeromoe.toml> "The capital of France is" 8 ./build_master/zeromoe
+scripts/validate_vs_llama.sh <model.gguf> <zeromoe.toml> "The capital of France is" 8 ./build/zeromoe
 # env: LLAMA_SRC, LLAMA_BUILD (an UNPATCHED llama.cpp build), DEVS, MS_ENV="ZEROMOE_<NAME>=..." for model-specific knobs
 ```
 
@@ -599,3 +720,8 @@ Put the oracle comparison (prompt, steps, cosine range, first divergence) and th
 
 ZeroMoE is licensed under the GNU General Public License, version 3 only.
 See [LICENSE](LICENSE) for the complete terms.
+
+The engine builds on MIT-licensed third-party code (llama.cpp/ggml, ExLlamaV3,
+nlohmann/json, and cpp-httplib) and contains ports of ggml quantization code.
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the notices and
+upstream licenses.
