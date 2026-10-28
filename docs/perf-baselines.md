@@ -426,7 +426,13 @@ workload. `bench/expert_cost_by_quant_bench.cpp` (ggml `MUL_MAT_ID` on the CPU b
 shape (`BENCH_D=2048 BENCH_F=512 BENCH_NE=256 BENCH_TOPK=8`), 6 threads pinned to cores 0-5, 3 alternating runs of stock vs patched ggml:
 IQ3_XXS 69/69/68 -> 55/56/56 us per expert (-19%; one valid expert 135/136/132 -> 121/118/121 us, ten 691/693/678 -> 550/559/563 us); the
 IQ2_XXS control is unchanged (41/41/42 vs 41/41/42 us). The dot is bit-identical (`bench/iq3k/iq3_dot_bench.c`: 0 mismatching rows).
-End to end on Qwen3.6-35B-A3B is not measurable here: the validated recipe keeps every expert on the GPU, so the CPU dot never runs.
+End to end on Qwen3.6-35B-A3B is not measurable here. The validated recipe keeps every expert on the GPU, so no CPU dot runs: on the 3090 (series build from
+`scripts/build_ggml.sh`, patches 0001-0017, native sm_86) decode is 158.0 / 157.6 tok/s against 157.9 with the previous ggml build, and
+`tools/check_full_graph_moe_run.py --full-fit --require-all-expert-layers-on-device --require-full-graph-prefill` passes. With 16 GiB of the 3090 held by another
+process the planner reports `memory_plan=insufficient` and falls back (3.15 tok/s decode), but that layered path does not use ggml's `ggml_vec_dot_iq3_xxs_q8_K`
+(patch 0017): `perf` shows ZeroMoE's own FP32-activation `dot_iq3_xxs_f32_avx512` (3.5% of samples) and `dot_iq2_xxs_f32_avx512` (5.3%) next to dense
+`matmul_q6_k_fused` (39%) and `matmul_q5_k_fused` (12%), i.e. dense layers run on the CPU too. Patch 0017 only matters where cold experts go through ggml's
+`MUL_MAT_ID` on the CPU backend (the Qwen4Exp hot/cold split), and no IQ3_XXS model of that family is available.
 
 ### Trial 26: decode CPU profile and lane thread count
 
