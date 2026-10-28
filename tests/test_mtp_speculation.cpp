@@ -9,6 +9,11 @@
 #include "mtp_speculation.hpp"
 
 #include <cstdio>
+#include <span>
+#include <random>
+#include <cmath>
+#include <algorithm>
+#include <array>
 #include <map>
 
 using namespace zeromoe::graph;
@@ -522,6 +527,67 @@ int run_all(int mode) {
   return failures;
 }
 
+
+// The scalar selector the vectorised one replaced, kept verbatim as the reference.
+int reference_greedy(std::span<const float> logits, const std::vector<int> &context, size_t prompt_tokens,
+                     float penalty) {
+  if (logits.empty()) return -1;
+  std::array<int, 64> repeated{};
+  size_t repeated_count = 0;
+  if (penalty != 1.0f) {
+    const size_t window_start = context.size() > repeated.size() ? context.size() - repeated.size() : 0;
+    const size_t start = std::max(prompt_tokens, window_start);
+    for (size_t i = start; i < context.size(); ++i) {
+      const int token = context[i];
+      if (token >= 0 && size_t(token) < logits.size()) repeated[repeated_count++] = token;
+    }
+    std::sort(repeated.begin(), repeated.begin() + repeated_count);
+  }
+  size_t repeated_i = 0;
+  const auto adjusted = [&](size_t i) {
+    float value = logits[i];
+    while (repeated_i < repeated_count && size_t(repeated[repeated_i]) == i) {
+      value = value > 0.0f ? value / penalty : value * penalty;
+      ++repeated_i;
+    }
+    return value;
+  };
+  int best = 0;
+  float best_value = adjusted(0);
+  for (size_t i = 1; i < logits.size(); ++i) {
+    const float value = adjusted(i);
+    if (best_value < value) { best = int(i); best_value = value; }
+  }
+  return best;
+}
+
+int check_greedy_selector() {
+  std::mt19937 rng(12345);
+  int failures = 0;
+  for (int trial = 0; trial < 4000; ++trial) {
+    const size_t V = 1 + rng() % 600;
+    std::vector<float> logits(V);
+    const int style = trial % 4;  // 0 random, 1 many exact ties, 2 all equal, 3 negatives
+    for (auto &x : logits) {
+      const float u = float(rng() % 2001) / 100.0f - 10.0f;
+      x = style == 1 ? float(int(u) / 3) : style == 2 ? 1.5f : style == 3 ? -std::fabs(u) - 0.1f : u;
+    }
+    std::vector<int> context(rng() % 200);
+    for (auto &t : context) t = int(rng() % (V + 5)) - 2;  // includes out-of-range and negative ids
+    const size_t prompt_tokens = rng() % (context.size() + 1);
+    const float penalty = trial % 5 == 0 ? 1.0f : 1.0f + float(rng() % 50) / 100.0f;
+    const int want = reference_greedy(logits, context, prompt_tokens, penalty);
+    const int got = zeromoe::graph::detail::greedy_argmax_with_repetition_penalty(logits, context, prompt_tokens, penalty);
+    if (want != got) {
+      if (failures < 5)
+        std::fprintf(stderr, "greedy selector mismatch: trial %d V=%zu want %d got %d\n", trial, V, want, got);
+      ++failures;
+    }
+  }
+  std::fprintf(stderr, "-- greedy selector vs scalar reference: %s\n", failures ? "FAIL" : "ok");
+  return failures;
+}
+
 }  // namespace
 
 int main() {
@@ -531,6 +597,7 @@ int main() {
     std::fprintf(stderr, "-- %s verification\n", names[mode]);
     failures += run_all(mode);
   }
+  failures += check_greedy_selector();
   std::printf("MTP speculation: %s\n", failures ? "FAIL" : "PASS");
   return failures ? 1 : 0;
 }
