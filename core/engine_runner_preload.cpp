@@ -1227,13 +1227,7 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
       constexpr int PRELOAD_URING_CHUNK =
           (int)(io_uring_backend::Ring::CAPACITY / 3); // 21
       io_uring_backend::Ring preload_ring;
-      // Keep a deterministic escape hatch for diagnosing model-specific
-      // preload failures.  The normal path uses batched reads, while a
-      // disabled batch ring exercises the original one-expert loader
-      // without changing runtime inference behavior.
-      const bool disable_preload_batch =
-          zeromoe::graphcfg::env("ZEROMOE_DISABLE_PRELOAD_BATCH") != nullptr;
-      bool preload_ring_ok = !disable_preload_batch && preload_ring.init();
+      bool preload_ring_ok = preload_ring.init();
       if (preload_ring_ok) {
         preload_ring.register_iowq_workers(
             config.expert_fetch_threads > 0
