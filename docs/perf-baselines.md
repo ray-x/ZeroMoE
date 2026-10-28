@@ -713,3 +713,16 @@ MiMo's first prefill 45 s). Build and patch recipe: `docs/build-ggml.md`.
 
 Ling long-prompt prefill (1,771 tokens, 64 GiB DDR pool, 2026-10-23): 22.2 tok/s as one graph, 21.4 tok/s in 512-token
 chunks, 21.6 tok/s with chunks and `PREFILL_OP_OFFLOAD=1` (no effect: the Ling graph does not engage op-offload).
+
+### CPU quant kernels vs stock ggml: where to write our own (2026-10-28)
+
+Rule adopted: use ggml's CPU kernel unless it is clearly far from what the hardware allows. Measurements, RTX 3090 + Xeon W-2235 (6C/12T, DDR4, ~60 GB/s), llama.cpp `8baabd53b` + ZeroMoE's CPU quant patches:
+
+* Stock ggml `MUL_MAT_ID` on the CPU backend, Qwen3.6-35B expert shape (D=2048, F=512, 256 experts, top-8), 6 threads, 8 valid slots, us per layer, 3 runs within 3%:
+  Q4_K 360, IQ4_XS 389 (+8%), Q4_0 405 (+12%), IQ4_NL 431 (+20%), Q8_0 537, Q2_K 288. These are within 8-20% of Q4_K: **adopt ggml, no kernel work for IQ4_XS or IQ4_NL.**
+  (The one-thread, cache-warm rate table suggested IQ4_XS was 30% slower than Q4_K; at 6 threads on expert-sized matrices it is not.)
+* `Qwen3.6-35B-A3B-UD-IQ4_XS.gguf` (experts: IQ3_S gate/up in 40 layers, IQ4_XS down in 37, Q6_K down in 3; dense Q8_0), `llama-bench`, dense on the GPU, experts of the first N layers on the CPU:
+  N=0 156.9 tok/s, N=10 70.9, N=40 27.1. `perf` at N=40: `ggml_vec_dot_iq3_s_q8_K` 54% of samples (about 82% of the dot time), `ggml_vec_dot_iq4_xs_q8_K` 11%,
+  `ggml_vec_dot_q6_K_q8_K` 1%, thread-barrier waiting most of the rest. IQ3_S runs at 2-3 GB/s per thread against 9-12 for the 4-bit types: **it is the one type here where ggml is far from the hardware.**
+* ggml's repack path (interleaved Q4_0/Q4_K/Q2_K/Q8_0/IQ4_NL weights): `llama-bench --repack 0/1` with all layers on the CPU gives 10.85 vs 10.84 tok/s on that model (only dense Q8_0 is covered; IQ3_S, IQ4_XS and Q6_K have no repack path), so no effect.
+  For experts it does not fit ZeroMoE's cold path as is: its `MUL_MAT_ID` asserts `i02 >= 0` (ZeroMoE passes -1 for experts resident on the GPU; patch 0002 adds that skip only to the stock path), and the arenas are plain host buffers. An isolated expert-level repack test was not completed (a harness crash that was not debugged).
