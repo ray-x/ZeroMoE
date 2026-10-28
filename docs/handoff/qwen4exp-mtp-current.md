@@ -5,24 +5,22 @@ binary or citing a result.
 
 ## v0.0.1 baseline: plain decode and MTP (2026-10-28, locally measured)
 
-This supersedes every rate quoted further down. Source: master `f689ae2` merged with `swap-b` (merge commit `1950bee` plus the baseline docs commit), built in a clean worktree. The binary
-passes `tools/build_provenance.py check` (source `1950bee`, `dirty=False`, ggml base `8baabd53b`, native `sm_86` only). Toolchain: CUDA 13.3, driver 610.57.04, GCC 16.2, RTX 3090 only
-(`CUDA_VISIBLE_DEVICES=0`; the 5060 Ti is not used), Xeon W-2235 (6C/12T, DDR4). ggml: `patches/ggml` 0001-0017 plus `patches/ggml-host-node` 0001-0003, built with `scripts/build_ggml.sh`.
+This supersedes every rate quoted further down. Measured source: `ea2b200` = master `197cdfa` merged with `swap-b`, plus two compile fixes to master (`2528868` `core/main.cpp`, `ea2b200` GLM5NEXT decode diagnostics; master did not build without them); the tagged `v0.0.1` commit adds only documentation on top. Built in a clean worktree; the binary passes `tools/build_provenance.py check` (source `ea2b200`, `dirty=False`, ggml base `8baabd53b`, native `sm_86` only). Toolchain: CUDA 13.3, driver 610.57.04, GCC 16.2, RTX 3090 only (`CUDA_VISIBLE_DEVICES=0`; the 5060 Ti is not used), Xeon W-2235 (6C/12T, DDR4). ggml: `patches/ggml` 0001-0017 plus `patches/ggml-host-node` 0001-0003, built with `scripts/build_ggml.sh`.
 Config: `configs/bench/qwen38-flash-q2_0-mtp.toml` (13,000-expert global hot set, `qwen4exp_expert_promotion = "on"`, 3 draft tokens, Q4_K_M draft). Greedy decoding, 3 passes per cell, medians (min-max), tok/s:
 
 | prompt | prompt tok | generated tok | plain decode | MTP decode | speed-up | draft acceptance | MTP end-to-end* | prefill (MTP run) |
 |---|---|---|---|---|---|---|---|---|
-| palindrome (code, low miss) | 29 | 463 | 48.6 (48.4-49.2) | **82.3** (81.6-82.4) | 1.70x | 79.3% | 71.7 | 0.74 s |
-| code review | 115 | 500 | 49.1 (48.7-49.2) | **78.5** (75.5-78.8) | 1.60x | 70.9% | 52.0 | 3.18 s |
-| B-tree | 47 | 500 | 50.2 (49.9-50.3) | **79.1** (78.0-79.8) | 1.57x | 68.1% | 52.9 | 3.07 s |
-| math | 89 | 500 | 46.6 (45.7-47.0) | **80.8** (80.3-81.4) | 1.73x | 84.0% | 53.1 | 3.14 s |
-| leetcode | 128 | 246 | 44.7 (44.4-45.7) | **72.5** (71.3-72.6) | 1.62x | 86.8% | 36.9 | 3.21 s |
-| story (high entropy) | 43 | 500 | 48.9 (48.8-50.3) | **64.4** (64.1-64.5) | 1.32x | 52.4% | 46.0 | 3.07 s |
+| palindrome (code, low miss) | 29 | 463 | 48.3 (47.7-48.6) | **83.0** (83.0-83.3) | 1.72x | 79.3% | 72.8 | 0.73 s |
+| code review | 115 | 500 | 49.3 (49.1-50.3) | **78.3** (77.9-79.3) | 1.59x | 70.9% | 52.0 | 3.18 s |
+| B-tree | 47 | 500 | 50.0 (49.8-50.6) | **79.9** (79.6-80.1) | 1.60x | 68.1% | 53.3 | 3.05 s |
+| math | 89 | 500 | 47.1 (46.8-47.3) | **80.7** (80.6-81.9) | 1.71x | 84.0% | 53.3 | 3.12 s |
+| leetcode | 128 | 246 | 45.0 (44.8-45.8) | **74.3** (73.7-74.3) | 1.65x | 86.8% | 37.4 | 3.20 s |
+| story (high entropy) | 43 | 500 | 48.6 (48.4-49.5) | **64.1** (63.4-64.5) | 1.32x | 52.4% | 45.8 | 3.07 s |
 
 * End-to-end is the engine's `Rates: overall=` (prompt plus generated tokens over prefill plus decode, model load excluded). Decode is `[REQUEST-DECODE-WALL]`, which includes the one-time decode-graph setup (plus about 0.23 s of
   draft-graph setup with MTP); no separate steady-state rate is logged. Prefill is 0.74 s for the 29-token prompt but about 3.1 s for 43-128 tokens (probably a one-time prefill-graph build; not investigated).
 
-Engine gate line on every MTP run: `policy=required memory_plan=unknown layered_s1_forwards=0 legacy_s1_expert_dispatches=0`. `tools/check_full_graph_moe_run.py` has only `--full-fit` and `--allow-memory-fallback`
+Engine gate line on every run (36 of 36): `policy=required memory_plan=unknown layered_s1_forwards=0 legacy_s1_expert_dispatches=0`. `tools/check_full_graph_moe_run.py` has only `--full-fit` and `--allow-memory-fallback`
 modes, neither of which fits a hot/cold split with an Unknown plan, so it was not run. The llama.cpp ratio required by `AGENTS.md` was not measured for this model (no matched reference build).
 
 What changed since the 2026-10-27 baseline below (53.5 wall / 57.7 steady on the palindrome prompt):
@@ -43,7 +41,9 @@ Open items and owners:
 - `graph_settings_test` aborts on master itself (`--graph-offload-async: expected true or false`), unchanged by this merge; `graph_settings_binding` reports BAD_COMMAND under ctest. Owner: the settings session.
 - GLM-5.3-Flash (`/data/sda/models/glm53flash/GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf`, Q2_K experts, no MTP head) is the next target; which of these optimizations carry over is assessed in the session notes, not yet measured.
 
-Artifacts (exact TOML, prompts, command, stdout, engine log, manifest, environment record): `build_mtp_results/2026-10-28-1950bee-mtp-suite/`, `...-plain-suite/`, and `...-mtp-suite-promotion-off/` (the invalid first attempt, kept for the record).
+Regression check: the same suites on the previous build (`1950bee`, before master's last cleanup commit) agree within +-2.5% per cell; the worst cell is -0.5% for MTP and -0.7% for plain decode (rule: report anything below -5%). Draft acceptance is identical on every prompt.
+
+Artifacts (exact TOML, prompts, command, stdout, engine log, manifest, environment record): `build_mtp_results/2026-10-28-ea2b200-mtp-suite/` and `...-plain-suite/` (the numbers above); the same suites on the previous build are in `2026-10-28-1950bee-*-suite/`, and `2026-10-28-1950bee-mtp-suite-promotion-off/` is the invalid first attempt (promotion left at its default), kept for the record.
 The suites were run from the worktree `ZeroMoE-wt-land` (binary `build/zeromoe`, sha256 in `environment.txt`); the raw per-run summaries are `summary.csv` in each directory.
 
 ## Master status (2026-10-27)
