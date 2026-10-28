@@ -159,3 +159,15 @@ Acceptance is unchanged on every prompt. (A first-pass leet "old" run of 6.8 was
 Other quant types (single thread, 2,560 weights per row, G weights/s): Q2_0 21.5, Q2_K 29.5, Q4_K 22.7, IQ4_XS 17.3,
 IQ2_XXS 15.1, IQ1_S 12.9, IQ1_M 13.0, IQ2_XS 11.3, IQ2_S 11.7, IQ3_XXS 8.5, IQ3_S 6.9. The IQ codebook types sit 4-10x
 below the memory ceiling (~16 GB/s per thread), so their CPU dots are unpack-bound too, but they need their own kernels.
+
+## Keep the draft's own rows after verify (mtp_speculation.hpp)
+
+After a verify the draft head used to re-run one step per accepted token (about 2.4 per cycle, ~1.5 ms each) to rewrite its
+rows from the target's true hidden states. It now keeps the rows it wrote while drafting (they were computed from its own
+predicted hidden state) and only drops rows past the accepted prefix. The target verifies every token, so the text cannot
+change; only acceptance can. A/B with a temporary toggle (removed), modes 0 = full rebuild, 1 = keep all but the last row,
+2 = keep all; mean tok/s, 1-2 runs per cell: palindrome 77.3 / 80.9 / 79.1, review 75.2 / 77.8 / 75.9,
+btree 73.6 / 70.5 / 74.3, math 74.9 / 78.6 / 79.5, leet 69.2 / 71.5 / 71.9, story 57.2 / 53.7 / 62.1. Mode 2 was never
+below mode 0, so it is the only behaviour. Committed-state re-measure, two passes (tok/s, acceptance): palindrome 80.2 / 80.3
+(79.3%), review 75.7 / 76.0 (70.9%), btree 77.2 / 76.8 (68.1%), math 78.5 / 78.9 (84.0%), leet 72.2 / 71.5 (86.8%),
+story 63.0 / 62.9 (52.4%). tests/mtp_speculation_test passes.
