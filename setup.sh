@@ -8,6 +8,7 @@
 #   ./setup.sh --cpu-only       # CPU-only build on Linux
 #   ./setup.sh --build-dir DIR  # custom build directory
 #   ./setup.sh --jobs N         # parallel build jobs
+#   ./setup.sh --release-binary # build for distribution (AVX-512 VNNI forced on)
 set -euo pipefail
 
 usage() {
@@ -17,6 +18,10 @@ Usage: ./setup.sh [options]
   --cpu-only          Build CPU-only components (default on macOS)
   --build-dir DIR     Build directory (default: build, or build-macos on macOS)
   --jobs N            Parallel build jobs (default: all logical CPUs)
+  --release-binary    Build the portable released binary: forces the AVX-512
+                      VNNI baseline instead of reading the host CPU, so the
+                      result runs on any AVX-512 VNNI machine (Skylake-X+,
+                      Zen 4+). It will SIGILL on hosts without VNNI.
   -h, --help          Show this help
 
 The CUDA engine fetches ggml from a pinned llama.cpp commit on first
@@ -27,6 +32,7 @@ EOF
 BUILD_DIR=""
 CPU_ONLY=0
 JOBS=""
+RELEASE_BINARY=0
 UNAME_S="$(uname -s)"
 
 while [[ $# -gt 0 ]]; do
@@ -34,6 +40,7 @@ while [[ $# -gt 0 ]]; do
         --cpu-only) CPU_ONLY=1; shift ;;
         --build-dir) BUILD_DIR="${2:?--build-dir needs a path}"; shift 2 ;;
         --jobs) JOBS="${2:?--jobs needs a number}"; shift 2 ;;
+        --release-binary) RELEASE_BINARY=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Error: unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -95,11 +102,29 @@ echo "  -> cmake: $cmake_version"
 echo "  -> C++:   $("$CXX_BIN" --version | head -n 1)"
 echo "  -> jobs:  $JOBS"
 echo "  -> build: $BUILD_DIR"
+if [[ "$RELEASE_BINARY" -eq 1 ]]; then
+    echo "  -> target: release binary (AVX-512 VNNI baseline, host detection off)"
+fi
 
 echo "[2/3] Configuring..."
 cmake_args=(-S . -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release)
 if [[ "$CPU_ONLY" -eq 1 ]]; then
     cmake_args+=(-DZEROMOE_CPU_ONLY=ON)
+fi
+if [[ "$RELEASE_BINARY" -eq 1 ]]; then
+    # A distributed binary must not be sized to whichever machine built it:
+    # require the AVX-512 VNNI baseline the release notes advertise, and skip
+    # the host-CPU guard that would otherwise refuse a runner without it.
+    if [[ "$UNAME_S" == "Darwin" ]]; then
+        echo "  -> --release-binary: macOS ships the NEON engine; VNNI flags do not apply"
+    else
+        # Static ggml keeps the distributed binary self-contained: a tarball
+        # with a bare executable must not also need libggml-*.so on the path.
+        # GGML_NATIVE=OFF is required too: -march=native would bake in whatever
+        # extensions the build machine happens to have.
+        cmake_args+=(-DZEROMOE_CHECK_HOST_CPU=OFF -DGGML_AVX512_VNNI=ON
+                     -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF)
+    fi
 fi
 cmake "${cmake_args[@]}"
 

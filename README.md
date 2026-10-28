@@ -1,6 +1,7 @@
 # ZeroMoE
 
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
+[![CI](https://github.com/ray-x/ZeroMoE/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/ray-x/ZeroMoE/actions/workflows/ci.yml)
 
 **Bare-metal inference for massive Mixture-of-Experts (MoE) models on consumer GPUs.**
 
@@ -40,7 +41,7 @@ limits by streaming expert weights from DDR & NVMe, executed through a whole-mod
 | OS | Linux x86-64 for the CUDA engine. macOS (Apple Silicon) builds the CPU engine (`build-macos/zeromoe_cpu`) and tests. |
 | GPU | NVIDIA GPU supported by the installed CUDA toolkit. Tested on RTX 3090 (`sm_86`) and RTX 5060 Ti (`sm_120a`). |
 | CUDA | CUDA Toolkit and driver. The reference build uses CUDA 13.3.73 with driver 610.57.04. |
-| CPU | x86-64 with AVX-512 F/CD/BW/DQ/VL. AVX-512 VNNI is on by default; disable it with `-DGGML_AVX512_VNNI=OFF` on CPUs without VNNI. |
+| CPU | x86-64 with AVX-512 F/CD/BW/DQ/VL, or Apple Silicon. Configure reads the host CPU and stops with the missing flags if the baseline is absent. AVX-512 VNNI is enabled only when the host has it; override detection with `-DZEROMOE_CHECK_HOST_CPU=OFF` (e.g. to build for another machine). |
 | RAM | Host RAM is the expert cache for models larger than VRAM. 64 GB or more is recommended for the largest checkpoints; a full-fit model like the quick-start example needs little beyond the GGUF's page cache. |
 | Disk | NVMe SSD. Keep the GGUF and any repacked stores outside the repository. |
 | Build tools | CMake ≥ 3.25, GNU Make, `git`, GNU `patch`, Python 3, and a C++23-capable host compiler (tested with GCC 16.2 and nvcc 13.3). |
@@ -66,6 +67,14 @@ The first build fetches the pinned ggml source, so it needs network access and
 takes a few minutes. `./setup.sh --cpu-only` builds the CPU engine at
 `build/zeromoe_cpu`; macOS always builds that one. The CPU engine currently
 implements the Qwen families only — the other families need the CUDA engine.
+
+Prebuilt archives are attached to each
+[release](https://github.com/ray-x/ZeroMoE/releases): Linux x86-64 built for
+AVX-512 F/CD/BW/DQ/VL + VNNI with ggml linked statically (Intel Skylake-X or
+Sunny Cove server cores, AMD Zen 4 or newer), and macOS arm64 with NEON. They
+contain `zeromoe_cpu`, `gguf_tool`, the profiles and the user-facing docs; no
+build tools needed. The CUDA engine is source-build only, because it is compiled
+for your GPU architecture.
 
 ### 2. Get a model
 
@@ -195,10 +204,21 @@ For the smaller configuration surface (Release CPU/CUDA presets, normal versus
 advanced help, canonical `graph_*` keys and legacy compatibility), start with
 the [configuration guide](docs/configuration.md).
 
-AVX-512 VNNI is enabled by default for CPU performance. On a CPU without
-AVX-512 VNNI, compiling with it enabled may cause an illegal-instruction
-failure. Configure with `-DGGML_AVX512_VNNI=OFF` to disable VNNI in
-both ZeroMoE and ggml CPU kernels.
+Configure reads the host CPU: a machine without the AVX-512 F/CD/BW/DQ/VL
+baseline stops with the missing flags, and AVX-512 VNNI is enabled only when
+the host has it (in ZeroMoE and ggml CPU kernels alike). Override with
+`-DGGML_AVX512_VNNI=ON|OFF`, or `-DZEROMOE_CHECK_HOST_CPU=OFF` when building
+for another machine.
+
+The published Linux binaries are reproducible from source with:
+
+```bash
+./setup.sh --cpu-only --release-binary
+```
+
+`--release-binary` forces the AVX-512 VNNI baseline instead of reading the
+build host, turns off ggml's `-march=native`, and links ggml statically so the
+result is one portable executable. It faults on a CPU without VNNI by design.
 
 ### OpenAI and Anthropic APIs
 
@@ -424,6 +444,7 @@ regression witness, and where to record results - is in
 | Symptom | Fix |
 |---|---|
 | `nvcc is missing` from `setup.sh` | Install the CUDA Toolkit, or build the CPU engine with `./setup.sh --cpu-only`. |
+| `host CPU lacks -mavx512f ...` at configure | The machine cannot execute the engine's kernels. Build on an AVX-512 host, or pass `-DZEROMOE_CHECK_HOST_CPU=OFF` to build a binary for a different machine. |
 | `model_path not set` | Pass `--model /path/to/model.gguf`, or set `model_path` in the profile. |
 | `does not support this model topology` | The GGUF's `general.architecture` has no registered adapter; see [Supported models](#supported-models). |
 | `Insufficient` graph memory | The model does not fit in VRAM as a full graph. A non-graph-only family falls back to layered decode and streams experts from NVMe; a graph-only family fails startup by design. |

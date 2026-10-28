@@ -1,0 +1,139 @@
+name: CI
+
+# Hosted x86 runners do not guarantee AVX-512, so the Linux job inspects the
+# runner CPU first: when the baseline is missing it verifies that configure
+# refuses the host (by design) instead of building a binary that would SIGILL.
+# macOS arm64 builds the CPU engine unconditionally.
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  docs-and-scripts:
+    name: Docs and scripts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell scripts parse
+        run: |
+          status=0
+          for script in setup.sh tests/run_components.sh scripts/*.sh; do
+            bash -n "$script" || status=1
+          done
+          exit $status
+      - name: Relative links in Markdown resolve
+        run: python3 scripts/check_docs_links.py
+      - name: Starter profile is valid TOML
+        run: |
+          python3 - <<'PY'
+          import tomllib
+
+          with open("configs/starter.toml", "rb") as handle:
+              cfg = tomllib.load(handle)
+          assert cfg["model_path"].startswith("/path/to/"), cfg["model_path"]
+          assert cfg["gpus"][0]["role"] == "dense+moe", cfg["gpus"]
+          print("configs/starter.toml OK:", cfg["model_path"])
+          PY
+
+  linux-x86_64:
+    name: CPU engine (Linux x86-64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Detect AVX-512 on the runner
+        id: cpu
+        run: |
+          flags=" $(grep -m1 '^flags' /proc/cpuinfo | cut -d: -f2) "
+          missing=""
+          for feature in avx512f avx512cd avx512bw avx512dq avx512vl; do
+            case "$flags" in
+              *" $feature "*) ;;
+              *) missing="$missing $feature" ;;
+            esac
+          done
+          if [ -n "$missing" ]; then
+            echo "avx512=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=AVX-512 unavailable on this runner::Missing:$missing. ZeroMoE refuses to configure a build for a host it cannot run on, so the build and tests are skipped here."
+          else
+            echo "avx512=true" >> "$GITHUB_OUTPUT"
+            echo "Runner CPU has the AVX-512 baseline."
+          fi
+
+      - name: Configure must reject a non-AVX-512 host
+        if: steps.cpu.outputs.avx512 == 'false'
+        run: |
+          set +e
+          cmake -S . -B build-guard -DCMAKE_BUILD_TYPE=Release -DZEROMOE_CPU_ONLY=ON > guard.log 2>&1
+          status=$?
+          set -e
+          tail -n 20 guard.log
+          test "$status" -ne 0
+          grep -q "host CPU lacks -mavx512f" guard.log
+
+      - name: Build CPU engine
+        if: steps.cpu.outputs.avx512 == 'true'
+        run: ./setup.sh --cpu-only
+
+      - name: Component tests (CMake build)
+        if: steps.cpu.outputs.avx512 == 'true'
+        run: ./build/test_components
+
+      - name: Component tests (standalone runner)
+        if: steps.cpu.outputs.avx512 == 'true'
+        run: ./tests/run_components.sh
+
+  macos-arm64:
+    name: CPU engine (macOS arm64)
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build CPU engine
+        run: ./setup.sh
+
+      - name: Component tests (CMake build)
+        run: ./build-macos/test_components
+
+      - name: Component tests (standalone runner)
+        env:
+          BIN: ./build-macos/test_components
+        run: ./tests/run_components.sh
+
+  # Opt in by adding a self-hosted runner labelled "gpu" and setting the
+  # repository variable CI_GPU_RUNNER=true. Hosted runners have no NVIDIA GPU,
+  # so the CUDA engine is verified on hardware you provide.
+  cuda-engine:
+    name: CUDA engine (self-hosted GPU)
+    if: vars.CI_GPU_RUNNER == 'true'
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build CUDA engine
+        run: ./setup.sh
+
+      - name: Verify build provenance
+        run: python3 tools/build_provenance.py check --binary build/zeromoe --repo .
+
+      - name: Report version and host CPU
+        run: ./build/zeromoe --version

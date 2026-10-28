@@ -158,9 +158,11 @@ cmake --build --preset cuda --parallel 4
 ```
 
 Both presets select Release and ggml; CUDA additionally builds ggml's CUDA
-backend. They do not change inference tuning. Hardware-specific build choices
-still matter: for example, an x86 CPU without AVX-512 VNNI needs
-`-DGGML_AVX512_VNNI=OFF` when configuring. See
+backend. They do not change inference tuning. Configure detects the host CPU:
+an x86 host without the AVX-512 baseline is rejected with the missing flags,
+and `GGML_AVX512_VNNI` is enabled only when the host has VNNI. Override with
+`-DGGML_AVX512_VNNI=ON|OFF`, or `-DZEROMOE_CHECK_HOST_CPU=OFF` when building
+for a different machine. See
 [the build instructions](../README.md#build-and-installation).
 Manual CMake and existing Make targets remain supported.
 

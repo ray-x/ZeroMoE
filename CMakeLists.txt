@@ -175,25 +175,138 @@ endif()
 # every mainstream AVX-512 CPU since Skylake-X ships together as one unit,
 # unlike the genuinely-later, genuinely-optional extensions (VNNI, VBMI,
 # ...) that arrived piecemeal in Cascade Lake/Ice Lake+ and aren't safe to
-# assume. Checked as one combined flag string (not assumed) so a
-# non-AVX-512 x86 host still configures cleanly; CLAUDE.md documents
-# AVX-512 as a hard requirement for these files, so
-# ZEROMOE_AVX512_FLAGS staying empty here just means the build fails
-# later at these exact source files with a clearer compiler error instead
-# of a silent miscompile. Deliberately NOT -mavx512vnni: the source
+# assume. Checked as one combined flag string (not assumed) so a compiler
+# without AVX-512 support reports it here. CLAUDE.md documents AVX-512 as a
+# hard requirement for these files, so a compiler that rejects the flags is
+# a build failure at these exact sources. Deliberately NOT -mavx512vnni: the source
 # already compile-time-gates its VNNI fast path (#if
 # defined(__AVX512VNNI__)). Keep this separate from the base AVX-512 target:
 # an AVX-512 CPU without VNNI can disable the upstream GGML_AVX512_VNNI option
 # to avoid a SIGILL while retaining the required AVX-512 baseline.
+# ---------------------------------------------------------------------------
+# Host CPU capability detection (x86-64).
+#
+# The compiler accepting -mavx512* says nothing about the machine that will run
+# the binary, and the gap is not a build error: the first kernel call executes
+# an AVX-512 instruction and the process dies with SIGILL. Read the real host
+# feature set here, where the message can name the CPU and the missing flags.
+#
+# Each result is tri-state: ON, OFF, or UNKNOWN when the platform was not
+# inspected (Windows, a cross-compile, an unreadable /proc). UNKNOWN keeps the
+# historical behaviour of trusting the requested flags.
+# ---------------------------------------------------------------------------
+option(ZEROMOE_CHECK_HOST_CPU
+    "Fail configuration when the host x86 CPU lacks the AVX-512 baseline ZeroMoE requires" ON)
+
+set(ZEROMOE_HOST_X86 OFF)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
+    set(ZEROMOE_HOST_X86 ON)
+endif()
+
+# Match whole feature tokens only, so "avx512f" does not match "avx512fp16".
+function(_zeromoe_cpu_has_token haystack token out_var)
+    if(" ${haystack} " MATCHES "[^A-Za-z0-9_]${token}[^A-Za-z0-9_]")
+        set(${out_var} ON PARENT_SCOPE)
+    else()
+        set(${out_var} OFF PARENT_SCOPE)
+    endif()
+endfunction()
+
+set(ZEROMOE_HOST_AVX512 "UNKNOWN")
+set(ZEROMOE_HOST_AVX512_VNNI "UNKNOWN")
+set(_zeromoe_missing_cpu_features "")
+if(ZEROMOE_HOST_X86 AND NOT ZEROMOE_APPLE_SILICON AND NOT CMAKE_CROSSCOMPILING)
+    set(_zeromoe_cpu_features "")
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND EXISTS "/proc/cpuinfo")
+        file(READ /proc/cpuinfo _zeromoe_cpuinfo)
+        string(REGEX MATCHALL "flags[ \t]*:[^\n]*" _zeromoe_flag_lines "${_zeromoe_cpuinfo}")
+        string(REPLACE ";" " " _zeromoe_cpu_features "${_zeromoe_flag_lines}")
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        # Intel Macs keep the classic CPUID leaves in machdep.cpu.features and
+        # AVX-512 (leaf 7) in machdep.cpu.leaf7_features; read both.
+        execute_process(
+            COMMAND sysctl -n machdep.cpu.features machdep.cpu.leaf7_features
+            OUTPUT_VARIABLE _zeromoe_cpu_features
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET)
+        string(REPLACE "\n" " " _zeromoe_cpu_features "${_zeromoe_cpu_features}")
+    endif()
+    # Linux reports lowercase flag names, macOS uppercase ones.
+    string(TOLOWER "${_zeromoe_cpu_features}" _zeromoe_cpu_features)
+
+    if(NOT _zeromoe_cpu_features STREQUAL "")
+        foreach(_feature avx512f avx512cd avx512bw avx512dq avx512vl)
+            _zeromoe_cpu_has_token("${_zeromoe_cpu_features}" "${_feature}" _have)
+            if(NOT _have)
+                string(APPEND _zeromoe_missing_cpu_features " -m${_feature}")
+            endif()
+        endforeach()
+        string(STRIP "${_zeromoe_missing_cpu_features}" _zeromoe_missing_cpu_features)
+        if(_zeromoe_missing_cpu_features)
+            set(ZEROMOE_HOST_AVX512 OFF)
+        else()
+            set(ZEROMOE_HOST_AVX512 ON)
+        endif()
+
+        _zeromoe_cpu_has_token("${_zeromoe_cpu_features}" "avx512_vnni" _have_vnni)
+        if(_have_vnni)
+            set(ZEROMOE_HOST_AVX512_VNNI ON)
+        else()
+            set(ZEROMOE_HOST_AVX512_VNNI OFF)
+        endif()
+
+        if(ZEROMOE_HOST_AVX512)
+            message(STATUS "ZeroMoE: host CPU AVX-512 baseline (F/CD/BW/DQ/VL): yes")
+        else()
+            message(STATUS "ZeroMoE: host CPU AVX-512 baseline (F/CD/BW/DQ/VL): NO "
+                           "(missing ${_zeromoe_missing_cpu_features})")
+        endif()
+        message(STATUS "ZeroMoE: host CPU AVX-512 VNNI: ${ZEROMOE_HOST_AVX512_VNNI}")
+    endif()
+endif()
+
+if(ZEROMOE_HOST_AVX512 STREQUAL "OFF")
+    string(CONCAT _zeromoe_cpu_remedy
+        "ZeroMoE's CPU kernels and the component tests are compiled for the "
+        "Skylake-X AVX-512 baseline and execute those instructions "
+        "unconditionally, so this build would crash with SIGILL on this "
+        "machine.\n"
+        "Build on a host that has AVX-512 F/CD/BW/DQ/VL (Intel Skylake-X or "
+        "Sunny Cove server cores, AMD Zen 4 or newer), or configure with "
+        "-DZEROMOE_CHECK_HOST_CPU=OFF to deliberately build a binary for a "
+        "different machine.")
+    if(ZEROMOE_CHECK_HOST_CPU)
+        message(FATAL_ERROR "ZeroMoE: host CPU lacks ${_zeromoe_missing_cpu_features}.\n${_zeromoe_cpu_remedy}")
+    else()
+        message(WARNING "ZeroMoE: host CPU lacks ${_zeromoe_missing_cpu_features}, "
+                        "continuing because ZEROMOE_CHECK_HOST_CPU=OFF.\n${_zeromoe_cpu_remedy}")
+    endif()
+endif()
+
 if(NOT DEFINED GGML_AVX512_VNNI)
     # Match llama.cpp's option name while keeping ZeroMoE's validated x86
     # default. Apple Silicon uses NEON and must not inherit the x86 setting.
+    # A host without VNNI must not inherit "on": ggml's -mavx512vnni code path
+    # would fault at the first quantized dot product.
     if(ZEROMOE_APPLE_SILICON)
+        set(_zeromoe_vnni_default OFF)
+    elseif(ZEROMOE_HOST_AVX512_VNNI STREQUAL "OFF")
         set(_zeromoe_vnni_default OFF)
     else()
         set(_zeromoe_vnni_default ON)
     endif()
     set(GGML_AVX512_VNNI ${_zeromoe_vnni_default} CACHE BOOL "ggml: enable AVX512-VNNI")
+    if(ZEROMOE_HOST_AVX512_VNNI STREQUAL "OFF")
+        message(STATUS "ZeroMoE: host CPU has no AVX-512 VNNI; defaulting GGML_AVX512_VNNI=OFF")
+    endif()
+elseif(GGML_AVX512_VNNI AND ZEROMOE_HOST_AVX512_VNNI STREQUAL "OFF")
+    if(ZEROMOE_CHECK_HOST_CPU)
+        message(WARNING "ZeroMoE: GGML_AVX512_VNNI=ON but this host CPU has no AVX-512 "
+                        "VNNI; ggml will emit VNNI instructions that fault here")
+    else()
+        message(STATUS "ZeroMoE: GGML_AVX512_VNNI=ON for a non-VNNI build host "
+                       "(ZEROMOE_CHECK_HOST_CPU=OFF); the target must support VNNI")
+    endif()
 endif()
 if(ZEROMOE_APPLE_SILICON AND GGML_AVX512_VNNI)
     message(FATAL_ERROR "GGML_AVX512_VNNI is x86-only; set it OFF on Apple Silicon")

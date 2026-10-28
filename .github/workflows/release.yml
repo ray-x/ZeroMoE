@@ -1,0 +1,172 @@
+name: Release
+
+# Distributes prebuilt CPU engines. The x86-64 archive is built for a fixed
+# target instead of for the machine that built it: AVX-512 F/CD/BW/DQ/VL plus
+# VNNI, with ggml linked statically so the tarball has no shared-library
+# dependencies. That runs on Intel Skylake-X/Sunny Cove server cores and AMD
+# Zen 4 or newer, and faults (SIGILL) on anything older, which the release
+# notes state. Building for a fixed target also means the workflow does not
+# need a VNNI-capable runner.
+#
+# Run it manually (workflow_dispatch) to build and inspect the archives without
+# publishing anything: the publish job only runs for a v* tag.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    name: Linux x86-64 (AVX-512 VNNI)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build release binary
+        run: ./setup.sh --cpu-only --release-binary --build-dir build-release
+
+      - name: Confirm the VNNI target and static ggml
+        run: |
+          set -euo pipefail
+          vnni="$(grep -E '^GGML_AVX512_VNNI:BOOL=' build-release/CMakeCache.txt | cut -d= -f2)"
+          test "$vnni" = "ON"
+          # -march=native would silently retarget the published binary at the
+          # runner's CPU instead of the AVX-512 VNNI baseline in the notes.
+          native="$(grep -E '^GGML_NATIVE:BOOL=' build-release/CMakeCache.txt | cut -d= -f2)"
+          test "$native" = "OFF"
+          if ldd build-release/zeromoe_cpu | grep -q libggml; then
+            echo "release binary still depends on shared ggml:" >&2
+            ldd build-release/zeromoe_cpu >&2
+            exit 1
+          fi
+          echo "GGML_AVX512_VNNI=ON, GGML_NATIVE=OFF, no dynamic ggml dependency"
+
+      - name: Smoke-check the binary
+        run: |
+          set +e
+          ./build-release/zeromoe_cpu --version
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            exit 0
+          fi
+          if [ "$status" -eq 132 ]; then
+            echo "::warning title=Runner CPU lacks AVX-512 VNNI::The release binary targets AVX-512 VNNI hosts, so it was not executed here."
+            exit 0
+          fi
+          exit "$status"
+
+      - name: Pack archive
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="snapshot-$(git rev-parse --short HEAD)"
+          fi
+          stage="zeromoe-${version}-linux-x86_64-vnni"
+          mkdir -p "dist/${stage}/tools"
+          cp build-release/zeromoe_cpu build-release/gguf_tool "dist/${stage}/"
+          cp README.md LICENSE THIRD_PARTY_NOTICES.md "dist/${stage}/"
+          cp -r configs docs patches "dist/${stage}/"
+          cp tools/README.md "dist/${stage}/tools/"
+          tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
+          (cd dist && sha256sum "${stage}.tar.gz" > "${stage}.tar.gz.sha256")
+          cat "dist/${stage}.tar.gz.sha256"
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64-vnni
+          path: dist/*
+          if-no-files-found: error
+
+  macos-arm64:
+    name: macOS arm64 (NEON)
+    runs-on: macos-14
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build release binary
+        run: ./setup.sh --jobs "$(sysctl -n hw.ncpu)"
+
+      - name: Smoke-check the binary
+        run: ./build-macos/zeromoe_cpu --version
+
+      - name: Pack archive
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="snapshot-$(git rev-parse --short HEAD)"
+          fi
+          stage="zeromoe-${version}-macos-arm64"
+          mkdir -p "dist/${stage}/tools"
+          cp build-macos/zeromoe_cpu build-macos/gguf_tool "dist/${stage}/"
+          cp README.md LICENSE THIRD_PARTY_NOTICES.md "dist/${stage}/"
+          cp -r configs docs patches "dist/${stage}/"
+          cp tools/README.md "dist/${stage}/tools/"
+          tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
+          (cd dist && shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256")
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: [linux-x86_64, macos-arm64]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cat > release-notes.md <<'EOF'
+          Prebuilt CPU engine and GGUF tool.
+
+          **x86-64 CPU requirement:** built with AVX-512 F/CD/BW/DQ/VL plus VNNI
+          and linked statically against ggml, so it needs an Intel Skylake-X or
+          Sunny Cove server core, or AMD Zen 4 or newer. Older CPUs fault with
+          SIGILL — build from source instead (`./setup.sh --cpu-only`).
+
+          **macOS:** arm64 (Apple Silicon), NEON kernels.
+
+          The CUDA engine is not part of these archives. Build it on your own
+          machine with `./setup.sh`, because it is compiled for your GPU
+          architecture.
+          EOF
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" dist/*.tar.gz dist/*.sha256 --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --title "ZeroMoE ${GITHUB_REF_NAME#v}" \
+              --notes-file release-notes.md \
+              --verify-tag \
+              dist/*.tar.gz dist/*.sha256
+          fi

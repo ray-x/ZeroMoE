@@ -99,6 +99,35 @@ else
         echo "[run_components] WARNING: $GGML_LIB_DIR/libggml-base.so not found" \
              "(run 'make build' first); backends/cpu/kernels_cpu.cpp will not link."
     fi
+    # The compiler accepting these flags does not mean the machine can execute
+    # them: kernels_cpu.cpp has no runtime dispatch, so the test binary would
+    # die with SIGILL on the first kernel call. CMakeLists.txt refuses to
+    # configure such a host; this script bypasses CMake, so repeat the check.
+    CPU_FEATURES=""
+    if [ -r /proc/cpuinfo ]; then
+        CPU_FEATURES="$(grep -m1 '^flags' /proc/cpuinfo | cut -d: -f2- || true)"
+    elif [ "$(uname -s)" = "Darwin" ]; then
+        CPU_FEATURES="$(sysctl -n machdep.cpu.features machdep.cpu.leaf7_features 2>/dev/null || true)"
+    fi
+    CPU_FEATURES="$(printf '%s' "$CPU_FEATURES" | tr '[:upper:]' '[:lower:]' | tr '\n' ' ')"
+    if [ -n "${CPU_FEATURES// /}" ]; then
+        MISSING_CPU=""
+        for FEATURE in avx512f avx512cd avx512bw avx512dq avx512vl; do
+            case " $CPU_FEATURES " in
+                *" $FEATURE "*) ;;
+                *) MISSING_CPU="$MISSING_CPU $FEATURE" ;;
+            esac
+        done
+        if [ -n "$MISSING_CPU" ]; then
+            echo "[run_components] this host CPU lacks:$MISSING_CPU"
+            echo "[run_components] kernels_cpu.cpp executes AVX-512 unconditionally, so"
+            echo "[run_components] the test binary would crash with SIGILL on this machine."
+            if [ "${ZEROMOE_SKIP_CPU_CHECK:-0}" != "1" ]; then
+                echo "[run_components] run on an AVX-512 host, or set ZEROMOE_SKIP_CPU_CHECK=1 to try anyway."
+                exit 2
+            fi
+        fi
+    fi
     X86_FLAGS="-mavx512f -mavx512cd -mavx512bw -mavx512dq -mavx512vl -mf16c"
     if "$CXX" -std=c++23 $X86_FLAGS -c -x c++ /dev/null -o /dev/null 2>/dev/null; then
         ARCH_FLAGS="$X86_FLAGS"
