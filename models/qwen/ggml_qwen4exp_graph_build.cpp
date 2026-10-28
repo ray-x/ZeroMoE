@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include "ggml_qwen4exp_graph_internal.hpp"
+#include "zm_hc.hpp"
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
 
@@ -267,6 +268,7 @@ static ggml_tensor *build_qwen35moe_graph_layer(FullGraph &g,
 
 bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
   g_qwen4exp_build_graph_retry_smaller_expert_layers = false;
+  zeromoe::graph::ZmHcScope zm_hc_scope(g.decode_mode);  // decode graphs run the hyper-connection chain on the GPU
   // Timing split (2026-09-17): full-graph decode's FIRST call pays a real
   // ~5.3s one-time cost, invisible in any --ngen 400 average (6000/400=
   // 15ms/token) but a genuine multi-second latency cliff for interactive

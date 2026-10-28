@@ -1,4 +1,5 @@
 #pragma once
+#include <limits>
 
 // Target-verified speculative generation for graph-native MTP.
 //
@@ -135,6 +136,18 @@ struct SpecStats {
 
 namespace detail {
 
+// First index of the maximum of logits[lo, hi) (lowest index wins ties), or -1 when empty. Two vectorizable passes: the
+// maximum, then a scan for its first occurrence. NaN never wins, matching the `best < value` scalar loop.
+inline int first_argmax_range(const float *x, size_t lo, size_t hi) {
+  if (lo >= hi) return -1;
+  float m = -std::numeric_limits<float>::infinity();
+#pragma omp simd reduction(max : m)
+  for (size_t i = lo; i < hi; ++i) m = x[i] > m ? x[i] : m;
+  for (size_t i = lo; i < hi; ++i)
+    if (x[i] == m) return static_cast<int>(i);
+  return static_cast<int>(lo);  // all NaN / -inf: the scalar loop keeps its first element
+}
+
 inline int greedy_argmax_with_repetition_penalty(
     std::span<const float> logits, const std::vector<int> &context,
     size_t prompt_tokens, float penalty) {
@@ -153,25 +166,36 @@ inline int greedy_argmax_with_repetition_penalty(
     }
     std::sort(repeated.begin(), repeated.begin() + repeated_count);
   }
-  size_t repeated_i = 0;
-  const auto adjusted = [&](size_t i) {
-    float value = logits[i];
-    while (repeated_i < repeated_count && size_t(repeated[repeated_i]) == i) {
-      value = value > 0.0f ? value / penalty : value * penalty;
-      ++repeated_i;
-    }
-    return value;
-  };
-  int best = 0;
-  float best_value = adjusted(0);
-  for (size_t i = 1; i < logits.size(); ++i) {
-    const float value = adjusted(i);
-    if (best_value < value) {
-      best = static_cast<int>(i);
+  // Penalised entries are few: score them individually (a token listed n times is penalised n times, as before) and
+  // search the untouched stretches between them with the vectorised kernel.
+  int best = -1;
+  float best_value = 0.0f;
+  const auto consider = [&](int index, float value) {
+    if (best < 0 || best_value < value || (!(value < best_value) && !(best_value < value) && index < best)) {
+      best = index;
       best_value = value;
     }
+  };
+  size_t lo = 0, r = 0;
+  while (r < repeated_count) {
+    const size_t token = size_t(repeated[r]);
+    if (token > lo) {
+      const int idx = first_argmax_range(logits.data(), lo, token);
+      if (idx >= 0) consider(idx, logits[size_t(idx)]);
+    }
+    float value = logits[token];
+    while (r < repeated_count && size_t(repeated[r]) == token) {
+      value = value > 0.0f ? value / penalty : value * penalty;
+      ++r;
+    }
+    consider(static_cast<int>(token), value);
+    lo = token + 1;
   }
-  return best;
+  if (lo < logits.size()) {
+    const int idx = first_argmax_range(logits.data(), lo, logits.size());
+    if (idx >= 0) consider(idx, logits[size_t(idx)]);
+  }
+  return best < 0 ? 0 : best;
 }
 
 inline int sample_probs(const std::vector<float> &probs, std::mt19937 &rng) {
@@ -462,7 +486,12 @@ inline bool speculate(SpecTarget &target, SpecDraft &draft,
     stats.accepted += accepted;
 
     // ---- rebuild the draft rows for t_0..t_accepted from true target hiddens ----
-    if (draft.next_position() > pos + 1 && !draft.rewind(pos + 1, error)) return false;
+    // Keep the draft's own rows for the accepted prefix instead of recomputing them from the target's hidden states:
+    // the target verifies every token regardless, so only draft acceptance can change. Measured on the 6-prompt suite
+    // this was never slower than the full rebuild (+0.7 to +4.9 tok/s) and saves about 2.4 draft steps per cycle.
+    // Rows beyond the accepted prefix are dropped.
+    const int keep_rows = pos + accepted + 1;
+    if (draft.next_position() > keep_rows && !draft.rewind(keep_rows, error)) return false;
     for (int j = draft.next_position() - pos; j <= accepted; ++j) {
       const std::span<const float> hidden =
           j == 0 ? std::span<const float>(hidden_prev)

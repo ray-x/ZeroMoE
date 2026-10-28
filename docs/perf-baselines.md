@@ -710,3 +710,35 @@ MiMo's first prefill 45 s). Build and patch recipe: `docs/build-ggml.md`.
 
 Ling long-prompt prefill (1,771 tokens, 64 GiB DDR pool, 2026-10-23): 22.2 tok/s as one graph, 21.4 tok/s in 512-token
 chunks, 21.6 tok/s with chunks and `PREFILL_OP_OFFLOAD=1` (no effect: the Ling graph does not engage op-offload).
+
+### CPU quant kernels vs stock ggml: where to write our own (2026-10-28)
+
+Rule adopted: use ggml's CPU kernel unless it is clearly far from what the hardware allows. Measurements, RTX 3090 + Xeon W-2235 (6C/12T, DDR4, ~60 GB/s), llama.cpp `8baabd53b` + ZeroMoE's CPU quant patches:
+
+* Stock ggml `MUL_MAT_ID` on the CPU backend, Qwen3.6-35B expert shape (D=2048, F=512, 256 experts, top-8), 6 threads, 8 valid slots, us per layer, 3 runs within 3%:
+  Q4_K 360, IQ4_XS 389 (+8%), Q4_0 405 (+12%), IQ4_NL 431 (+20%), Q8_0 537, Q2_K 288. These are within 8-20% of Q4_K: **adopt ggml, no kernel work for IQ4_XS or IQ4_NL.**
+  (The one-thread, cache-warm rate table suggested IQ4_XS was 30% slower than Q4_K; at 6 threads on expert-sized matrices it is not.)
+* `Qwen3.6-35B-A3B-UD-IQ4_XS.gguf` (experts: IQ3_S gate/up in 40 layers, IQ4_XS down in 37, Q6_K down in 3; dense Q8_0), `llama-bench`, dense on the GPU, experts of the first N layers on the CPU:
+  N=0 156.9 tok/s, N=10 70.9, N=40 27.1. `perf` at N=40: `ggml_vec_dot_iq3_s_q8_K` 54% of samples (about 82% of the dot time), `ggml_vec_dot_iq4_xs_q8_K` 11%,
+  `ggml_vec_dot_q6_K_q8_K` 1%, thread-barrier waiting most of the rest. IQ3_S runs at 2-3 GB/s per thread against 9-12 for the 4-bit types: **it is the one type here where ggml is far from the hardware.**
+* ggml's repack path (interleaved Q4_0/Q4_K/Q2_K/Q8_0/IQ4_NL weights): `llama-bench --repack 0/1` with all layers on the CPU gives 10.85 vs 10.84 tok/s on that model (only dense Q8_0 is covered; IQ3_S, IQ4_XS and Q6_K have no repack path), so no effect.
+  For experts it does not fit ZeroMoE's cold path as is: its `MUL_MAT_ID` asserts `i02 >= 0` (ZeroMoE passes -1 for experts resident on the GPU; patch 0002 adds that skip only to the stock path), and the arenas are plain host buffers. An isolated expert-level repack test was not completed (a harness crash that was not debugged).
+
+### IQ3_S dot: restructuring gives at most 1.11x, so ggml's kernel is adopted (2026-10-28)
+
+`bench/iq3k/iq3s_dot_bench.c` copies ggml's AVX2 `ggml_vec_dot_iq3_s_q8_K` verbatim as the reference and times AVX-512BW/VL variants on synthetic blocks (activations include -128), 1 core,
+best of 5, cache-warm (K=2048, 3.6 MB) and cold (K=8192, 57 MB). Every variant is bit-identical to the stock kernel (0 mismatching rows over 4096 and 16384 rows):
+
+| variant | warm | cold |
+|---|---|---|
+| stock AVX2 | 1.00x (6.9 G weights/s) | 1.00x (6.8) |
+| V1: the 32 sign bits of a group as a byte mask, one masked subtract instead of shuffle/and/cmpeq/xor/sub | 1.04-1.06x | 1.03-1.04x |
+| V2: V1 + `_mm256_i32gather_epi32` for the grid lookup | 0.59x | 0.59x |
+| V3: 512-bit, 64 weights per step | 0.83x | 0.85x |
+| V4: V1 + scalar index math, grid loads stored to a buffer, one vector load back | 1.08-1.11x | 1.08x |
+
+The cost is the codebook lookup (16 index extractions and 16 grid loads per 64 weights), not the sign handling, and it is not helped by gather or wider vectors on this CPU (Cascade Lake).
+The IQ2_XXS/IQ3_XXS patches (0009, 0017) won because the stock kernels do scalar `keven_signs` table lookups that the mask restructuring removes; stock IQ3_S has explicit sign bits and stock IQ2_XS
+already derives sign parity 16 groups at a time with a `pshufb` table, so the same trick has little to remove there. Decision: use ggml's IQ3_S kernel as is. A larger gain would need
+amortising the lookup across several activation columns (a multi-column dot, useful for batched/prefill work, not batch-1 decode).
+Not tested: IQ2_XS and IQ2_S on synthetic or real data (prediction only), and other CPUs (Zen 4/5, Golden Cove), where gather and 512-bit costs differ.

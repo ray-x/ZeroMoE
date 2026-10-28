@@ -59,7 +59,7 @@ Reading: the Q2_0 cold-expert compute is real work, about 30% of wall time on ev
 ~11-12 ms per window the hot-set sweeps attributed to cold experts. The rest of the CPU time is waiting: workers
 spin at a barrier for every small op of the cold branch (about 2-3 cold experts per layer and window) while the
 main thread drives the GPU. The Q2_0 dot already has a ZeroMoE AVX-512 VNNI path (1-row and 4-row variants,
-runtime-dispatched on `avx512vnni`); a faster dot is not the lever. Thread count is not either (6 / 8 / 10 threads
+runtime-dispatched on `avx512vnni`). **Correction (2026-10-28): the dot was the lever** - its weight unpack (~28 vector ops per 64 weights) was the limit, see the section below. Thread count is not either (6 / 8 / 10 threads
 gave 59.8 / 58.0 / 58.5 tok/s on palindrome and 57.5 / 55.6 / 57.4 on math, inside the noise).
 
 Levers this leaves on the CPU side: fewer cold evaluations (promotion; the hot-set size is capped near 13,000 by
@@ -81,3 +81,108 @@ produce (the bonus token), so it can only start early on a guess: the draft's ow
 often as the draft accepts (~80% on easy prompts) and only when the whole window was accepted (~50% of cycles for
 3 drafts). Expected saving ~0.4 x 7 ms = ~3 ms of a 56 ms cycle (<=5%), minus GPU contention with the window and
 a draft-KV rollback path. Not worth the complexity.
+
+## Cold-expert CPU time: what was measured (2026-10-28)
+
+* **Overlap:** with an NVTX range around the fused cold op (48 per window), 0% of its 11-12 ms per window overlaps a GPU
+  kernel or copy: layer by layer the window is GPU split -> CPU cold op -> GPU split, strictly serial.
+* **Rate:** the op streams weights at about 15 GB/s (one thread of this box reads 16.6 GB/s, six read 64 GB/s), so it
+  is limited by the Q2_0 dot, about 45 vector ops per 18-byte block.
+* **Faster dot (first A/B invalid):** an unpack that needs 6 ops instead of 28, bit-identical on 16,384 outputs and 2.2x faster
+  on one thread, cut the cold op from 12.5 to 7.4 ms per window but MTP decode went from 69.7 +- 0.3 to
+  68.5 +- 0.5 tok/s (5 alternating runs each). Not adopted.
+* **Threads:** the CPU team size matters more. Palindrome, 4 alternating runs per setting: 5 threads 68.6, 6 threads
+  69.8 (+-0.3), 7 threads 63.8, 10 threads 67.9. Seven threads puts a worker on an SMT sibling of another and loses 8%.
+  The graph's CPU thread count now defaults to the physical core count (sysfs sibling groups) instead of
+  `hardware_concurrency() - 2`; `ZEROMOE_QWEN_CPU_THREADS` still overrides. Six prompts, 6 vs 10 threads: palindrome
+  +1.4, leet +1.5, math +1.0, review 0, btree -0.7, story -0.4 tok/s.
+
+## Fused hyper-connection ops (patches/ggml/0015)
+
+`hc_combine` (SCALE, SIGMOID, SCALE, REPEAT, MUL, ADD) and the tail of `hc_mix` (SIGMOID, MUL, CONT, ADD x3, SCALE) were
+about 1,200 of the ~5,400 compute nodes in a window graph. Each now runs as one CUDA kernel (`zm-hc.cu`, carried on a
+tagged `GGML_OP_ADD` node; `models/graph/zm_hc.hpp` builds it only when the linked ggml exports
+`zeromoe_ggml_cuda_hc_fused_version`). The kernels copy ggml's float sequence (same sigmoid, `scale*x+bias`, separate
+multiply and add roundings).
+
+* **Exactness:** row-0 logits are bit-identical (`cmp`) between the unfused chain and the fused kernels on the math and
+  story prompts, at S=1 and S=4.
+* **Speed, MTP + promotion, 3 drafts, 3090, warm second pass (tok/s, unfused -> fused):** palindrome 67.0 -> 69.2,
+  review 67.3 -> 68.3, btree 64.1 -> 67.1, math 61.3 -> 58.1 (noise: first pass 53.7 -> 64.9), leet 58.6 -> 59.3,
+  story 47.3 -> 50.7. Palindrome alone, three alternating pairs on a correctly built library: 66.6 -> 68.1 mean. The
+  gain is real but small, about +1 to +3 tok/s; first-pass numbers are dominated by cold page cache and are not used.
+* **Measurement note:** an earlier private ggml build was configured without GGML_CUDA_GRAPHS/GGML_AVX512 and ran 4-5
+  tok/s slower; build the private copy with `scripts/build_ggml.sh` flags.
+
+## Levers explored after the hyper-connection fusion (2026-10-28)
+
+Window under nsys, palindrome, fused: 48.6 ms = GPU kernels 18.6 + copies 3.7 + sync 1.6 + other CUDA calls 10.3
+(nsys-inflated) + host-only 14.3 (CPU cold experts + scheduler). 3,611 kernels per window (4,623 before the fusion).
+
+1. **More fusion.** Remaining small kernels total about 3 ms of the 18.6 ms (`k_bin_bcast` 905 x 1.6 us, `rms_norm`
+   208, `unary` 270). Decode-window graph nodes now: ADD 570 (+192 fused hc), CONT 478, MUL 395, CONCAT 192, GET_ROWS 144.
+   The window-only part is the per-token GDN handling (CONT + CONCAT, about 7 nodes per GDN layer that one preallocated
+   CPY target would cut to 4). Realistic saving 300-600 nodes, about 1 ms: +1 to +2 tok/s. Not built.
+2. **CPU/GPU overlap.** The cold CPU node is built after the hot-expert nodes, so the scheduler runs hot experts,
+   then the CPU step, then the rest, serially (0% overlap measured). Per layer the overlappable GPU work (hot MoE kernels
+   3.2 ms + part of the shared expert per window, about 110 us per layer) is smaller than the CPU step (about 155 us),
+   an upper bound of about 5 ms per window; the CPU step has to move into a callback inside the CUDA stream
+   (early-ready lane / host-node), whose copies and callback cost took most of the gain when measured before (about
+   2 ms). Estimate +2 to +4 tok/s, a multi-day change that alters the output text.
+   **Prototyped and rejected (2026-10-28):** the fused cold op as a CUDA host callback inside the GPU stream
+   (GPU-resident CPY marker -> pinned D2H of x/ids/w -> `cudaLaunchHostFunc` running the same op on a spin-waiting
+   worker team -> H2D; ordered `add(cold, hot)` so the ggml-cuda parallel-branch gate could run hot experts alongside).
+   One window's logits were bit-identical to the scheduler-split path, but the serial callback ran 57.4 tok/s against
+   67-68 (the D2H/callback/H2D round trip per layer costs more than the at-most-5 ms the overlap can recover), and with
+   the parallel branch on the real run produced a non-finite window (only layer 0 passed the gate; the allocator
+   reuses buffers the second stream still reads). Code and toggles removed.
+3. **Draft count per prompt.** K=4 vs 3 (tok/s): palindrome +1.0, math +1.4, leet +1.4, review -4, btree -5. A per-prompt
+   oracle gains about +0.6 on average and would need two window graphs resident (VRAM is full). Not worth building.
+
+Exactness check on a correct build (CUDA graphs on, AVX-512 on): BF16 weights on the vector kernel for batch <= 8
+(`ZM_BF16_MMVF_MAXB=8`, experiment in the private ggml) cost 3 tok/s (68.2 -> 65.8 mean of 3 alternating pairs,
+acceptance 81.0% -> 79.8%), not the 14% measured earlier on a library built without CUDA graphs.
+
+## Cheaper Q2_0 unpack (patches/ggml/0016)
+
+The Q2_0 x Q8_0 VNNI dot widened each 64 weights with byte-lane shuffles (~28 vector ops); the multiply-accumulate was a
+handful. It streamed weights at ~15 GB/s per thread on a box that reads 60 GB/s. The new unpack is one 32-bit
+load/shift/ternary-logic sequence (6 ops); accumulation order and rounding points are unchanged, so it is bit-identical
+(16,384 test outputs; decode logits `cmp`-identical on the math and story prompts at S=1 and S=4). Single thread: 2.2x.
+
+The first A/B of this change said "no gain" because it ran on a private ggml built without GGML_CUDA_GRAPHS and
+GGML_AVX512 (see the measurement note above). On a correctly built library, MTP + promotion, 3 drafts, 3090,
+alternating old/new, tok/s (old -> new): palindrome 69.8/69.2 -> 77.3/77.4, review 70.3/71.0 -> 74.3/75.3,
+btree 67.7/67.4 -> 73.8/73.8, math 63.2/66.9 -> 74.3/75.9, leet 61.4 -> 68.0/67.9, story 48.8 -> 56.5.
+Acceptance is unchanged on every prompt. (A first-pass leet "old" run of 6.8 was a disturbed run and is excluded.)
+
+Other quant types (single thread, 2,560 weights per row, G weights/s): Q2_0 21.5, Q2_K 29.5, Q4_K 22.7, IQ4_XS 17.3,
+IQ2_XXS 15.1, IQ1_S 12.9, IQ1_M 13.0, IQ2_XS 11.3, IQ2_S 11.7, IQ3_XXS 8.5, IQ3_S 6.9. The IQ codebook types sit 4-10x
+below the memory ceiling (~16 GB/s per thread), so their CPU dots are unpack-bound too, but they need their own kernels.
+
+## Keep the draft's own rows after verify (mtp_speculation.hpp)
+
+After a verify the draft head used to re-run one step per accepted token (about 2.4 per cycle, ~1.5 ms each) to rewrite its
+rows from the target's true hidden states. It now keeps the rows it wrote while drafting (they were computed from its own
+predicted hidden state) and only drops rows past the accepted prefix. The target verifies every token, so the text cannot
+change; only acceptance can. A/B with a temporary toggle (removed), modes 0 = full rebuild, 1 = keep all but the last row,
+2 = keep all; mean tok/s, 1-2 runs per cell: palindrome 77.3 / 80.9 / 79.1, review 75.2 / 77.8 / 75.9,
+btree 73.6 / 70.5 / 74.3, math 74.9 / 78.6 / 79.5, leet 69.2 / 71.5 / 71.9, story 57.2 / 53.7 / 62.1. Mode 2 was never
+below mode 0, so it is the only behaviour. Committed-state re-measure, two passes (tok/s, acceptance): palindrome 80.2 / 80.3
+(79.3%), review 75.7 / 76.0 (70.9%), btree 77.2 / 76.8 (68.1%), math 78.5 / 78.9 (84.0%), leet 72.2 / 71.5 (86.8%),
+story 63.0 / 62.9 (52.4%). tests/mtp_speculation_test passes.
+
+## Host profile, VRAM headroom and a rejected fusion (2026-10-28)
+
+* **Host CPU profile of a cycle** (perf, palindrome, 75 tok/s under perf): the main thread spends 62% in the CUDA driver
+  (graph launches, sync polling), 18% in ggml CPU kernels (its share of the cold op), 6% in ZeroMoE code. The only
+  surprise, the greedy selector, is fixed (a2b7cfa). `gdn_state_transpose_host` is one-time prefill handoff, not per cycle.
+* **More hot experts:** K=13,500 still dies during the expert preload with the admission floor lowered to 512 MiB
+  (`ZEROMOE_QWEN4EXP_GRAPH_ALLOC_FLOOR_MIB`), so the floor is not the limit; the gain from the few hundred experts that
+  might fit is below 1 tok/s. Closed.
+* **Fusing the routed-expert reduction** (`sum_k((hot_k*w_k)+cold_k)` as one kernel instead of MUL + ADD + 7 chained ADDs
+  per layer, 480 fewer compute nodes per window, 6,765 -> 5,805 graph nodes): bit-identical logits (S=1 and S=4, math and
+  story) but no measurable speed change (two passes, tok/s vs the unfused state: palindrome 83.3/78.3 vs 83.2, review
+  79.7/79.3 vs 79.1/78.4, btree 80.8/80.5 vs 80.1/80.3, math 81.5/81.8 vs 81.1/82.0, leet 71.5/73.2 vs 74.0, story
+  65.3/64.6 vs 65.3). Not committed. Launch count inside the captured CUDA graphs is no longer a bottleneck; further
+  elementwise fusion is not worth building. The GDN CONT/CONCAT pair costs about 0.4 ms per window and was not built.
