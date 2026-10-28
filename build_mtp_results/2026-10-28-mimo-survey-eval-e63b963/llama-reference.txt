@@ -1,0 +1,7 @@
+Reference binary: build_mimo_baseline/llama/bin/llama-bench
+llama.cpp source commit: 8baabd53b77d1c48c6ef8d3b620436292f3f6231 (clean source)
+GGML commit: 8baabd53b77d1c48c6ef8d3b620436292f3f6231 (upstream, unpatched reference build)
+Version/build: 0.7.0-dev, build 11785, GNU 16.2.1, CUDA 13.3.73, native targets 86;120a. NCCL unavailable; dual-GPU reference performance may be suboptimal.
+Placement: --n-cpu-moe 47 (all expert tensors CPU-side), --n-gpu-layers 99, CUDA0/CUDA1, layer split, 60/40 tensor split, six CPU threads, batch/ubatch 512. This llama-bench target does not expose --moe-cache-mib.
+Three-repeat combined pp/tg rates: pp25/tg64 11.22 tok/s (sd 0.05); pp26/tg64 11.15 (sd 0.44); pp17/tg64 6.11 (sd 4.24); pp24/tg64 3.76 (sd 1.74).
+Comparability is provisional: llama-bench sets n_ctx to prompt+generation (81-90 tokens); ZeroMoE profile context_size is 2048. ZeroMoE's pinned VRAM/DDR placement differs from llama.cpp's CPU expert tensors. The two binaries are not kernel-identical; ZeroMoE's applied GGML patch manifest SHA256 is bc15a89242db58386ab4335048ea55bb15233f18c40fe23881802097fe1f4f71.

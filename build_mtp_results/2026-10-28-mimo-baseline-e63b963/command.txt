@@ -1,0 +1,2 @@
+cd /home/ray/Projects/ZeroMoE/.worktrees/mimo-env-cleanup
+CUDA_VISIBLE_DEVICES=0,1 ZEROMOE_DISABLE_ROUTER_BF16=1 ZEROMOE_BENCH_IGNORE_STOP=1 ZEROMOE_BENCH_SILENT=1 scripts/run_capped.sh --limit-gb 110 -- build_mimo_baseline/zeromoe/zeromoe --config build_mtp_results/2026-10-28-mimo-baseline-e63b963/config.toml --predict 64 --temp 0 < build_mtp_results/2026-10-28-mimo-baseline-e63b963/prompt.txt

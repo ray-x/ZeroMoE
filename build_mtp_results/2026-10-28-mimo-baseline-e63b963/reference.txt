@@ -1,0 +1,6 @@
+ZeroMoE source: e63b96329acc58144262a0fade8eae72c90b810c
+GGML base: 8baabd53b77d1c48c6ef8d3b620436292f3f6231
+llama.cpp source: 8baabd53b77d1c48c6ef8d3b620436292f3f6231
+CUDA: 13.3.73; targets 86;120a
+Profile source: configs/bench/mimo26_flash_gsq_rco_3bit_ingraph_dual.toml
+Prompt source: bench/mimo_eval_prompts.txt, first held-out prompt

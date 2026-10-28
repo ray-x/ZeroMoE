@@ -782,10 +782,10 @@ These totals are deliberately broader than the earlier settings-only scan: they 
 Do not add these totals and call them independent user decisions. Tool references/forwarded arguments and capability macros are not necessarily configurable engine controls.
 The table is the pre-merge snapshot; the [removal log](#removal-log) lists the rows already deleted.
 
-### Current native-source inventory (2026-10-28)
+### Current native-source inventory (2026-10-29)
 
 Refreshed with `python3 tools/config_inventory.py` against the active checkout
-at `743ef9cc5e5e7345a2d1c6199078882b701968f3` on `master`, plus working-tree
+at `e63b96329acc58144262a0fade8eae72c90b810c` on `master`, plus documentation-only worktree changes
 changes. The scanner covers `core/`, `memory/`, `models/`, `backends/`,
 `kernels/`, root `CMakeLists.txt`, `server/CMakeLists.txt`, and `cmake/*.cmake`.
 It expands shared GLM environment aliases into concrete names. It does not scan
@@ -795,12 +795,12 @@ proof that a setting is read in a normal run.
 
 | Surface | Names | Notes |
 | --- | ---: | --- |
-| Native environment names | 196 | Exact `ZEROMOE_*` names found by the current scanner |
+| Native environment names | 194 | Exact `ZEROMOE_*` names found by current scanner |
 | ZeroMoE CMake build options | 1 | `ZEROMOE_METAL` |
 | ZeroMoE CMake cache variables | 4 | Dependency paths/source and revision pins; upstream `GGML_CUDA` is outside this project-prefixed count |
 | Compile-time macro names | 7 | Build identity and backend capability guards |
 | Registered graph settings | 36 | Typed TOML fields with generated `--graph-*` aliases |
-| TOML keys | 234 | Lexical parser calls; not all are user tuning knobs |
+| TOML keys | 232 | Lexical parser calls; not all user tuning knobs |
 | Native CLI names | 96 | Includes generated graph flags and benchmark-subcommand flags |
 
 The current inference CLI has no separate test, trace, or timing switch: runtime
@@ -1393,7 +1393,7 @@ Current status (2026-10-27): K0032 is removed; the six remaining source guards a
 | K0328 `ZEROMOE_MIMO2_GPU1` | api, mtp, original, settings | Environment read when the referenced function/path runs; some readers cache once; only matching family/backend and enclosing feature guards. Exact predicates are in linked evidence. | INTERNALIZE validated implementation choice; retain DEV experiment only with active evidence | MiMo: models execution/configuration. Preserve behavior in replacement; full impact/owner in JSON. | MEDIUM | `models/graph/graph_settings.hpp:164` |
 | K0329 `ZEROMOE_MIMO2_GPU_ASSIST` | api, mtp, original, settings | Environment read when the referenced function/path runs; some readers cache once; only matching family/backend and enclosing feature guards. Exact predicates are in linked evidence. | INTERNALIZE validated implementation choice; retain DEV experiment only with active evidence | MiMo: models execution/configuration. Preserve behavior in replacement; full impact/owner in JSON. | MEDIUM | `models/graph/graph_settings.hpp:162` |
 | K0330 `ZEROMOE_MIMO2_GPU_ASSIST2` | api, mtp, original, settings | Environment read when the referenced function/path runs; some readers cache once; only matching family/backend and enclosing feature guards. Exact predicates are in linked evidence. | INTERNALIZE validated implementation choice; retain DEV experiment only with active evidence | MiMo: models execution/configuration. Preserve behavior in replacement; full impact/owner in JSON. | MEDIUM | `models/graph/graph_settings.hpp:188` |
-| K0331 `ZEROMOE_MIMO2_INGRAPH_MOE` | api, mtp, original, settings | Environment read when the referenced function/path runs; some readers cache once; only matching family/backend and enclosing feature guards; near configure_ingraph_moe() (lexical context). Exact predicates are in linked evidence. | INTERNALIZE validated implementation choice; retain DEV experiment only with active evidence | MiMo: full-graph construction/replay, scheduler bindings and state handoff. Preserve behavior in replacement; full impact/owner in JSON. | HIGH | `models/mimo/ggml_mimo2_graph.cpp:137` |
+| K0331 `ZEROMOE_MIMO2_INGRAPH_MOE` | environment | Default-on gate between Mimo in-graph hot/cold MoE and the synchronous cache-backed callback, both inside the full graph. Mimo routed-expert parity and its regression witness are still pending. | KEEP TEMPORARILY; reassess after correctness parity and the regression witness pass. | Same-model implementation comparison during Mimo onboarding. | HIGH | `models/mimo/ggml_mimo2_graph.cpp:137`; `docs/models/mimo26-flash.md` |
 | K0332 `ZEROMOE_MIMO2_NODE_TRACE` | api, mtp, original, settings | Environment read when the referenced function/path runs; some readers cache once; only matching family/backend and enclosing feature guards. Exact predicates are in linked evidence. | COMBINE scoped logging/profiling; preserve explicit costly measurements | MiMo: diagnostics, numerical inspection and performance reporting. Preserve behavior in replacement; full impact/owner in JSON. | MEDIUM | `models/graph/graph_settings.hpp:192` |
 | K0333 `ZEROMOE_MIMO2_OFFLOAD_DDR_GIB` | api, mtp, original, settings | Environment read when the referenced function/path runs; some readers cache once; only matching family/backend and enclosing feature guards; near real_fields() (lexical context). Exact predicates are in linked evidence. | INTERNALIZE startup/runtime policy; remove external tuning input after replacement exists | MiMo: host/VRAM accounting, residency, expert cache and transfer lifetime. Preserve behavior in replacement; full impact/owner in JSON. | HIGH | `models/graph/graph_settings.hpp:202` |
 | K0334 `ZEROMOE_MIMO2_OFFLOAD_PIN` | api, mtp, original, settings | Environment read when the referenced function/path runs; some readers cache once; only matching family/backend and enclosing feature guards. Exact predicates are in linked evidence. | INTERNALIZE startup/runtime policy; remove external tuning input after replacement exists | MiMo: host/VRAM accounting, residency, expert cache and transfer lifetime. Preserve behavior in replacement; full impact/owner in JSON. | HIGH | `models/graph/graph_settings.hpp:156` |

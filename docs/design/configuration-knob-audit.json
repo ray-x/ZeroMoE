@@ -34809,12 +34809,12 @@
           "file_sha256": "3bb99259c94d83323737d773d47eab9b1089e47d8c7dfa60216eb5bfbde33790"
         }
       ],
-      "action": "INTERNALIZE validated implementation choice; retain DEV experiment only with active evidence",
+      "action": "KEEP temporarily as the explicit Mimo implementation comparison path; reassess after parity and the regression witness pass.",
       "proposed_owner": "model adapter/backend policy",
-      "rationale": "Users should not assemble correct operator/backend combinations; settle the supported path before deleting its selector.",
+      "rationale": "The default is the new in-graph hot/cold MoE. Setting this to 0 retains the synchronous cache-backed callback inside the full Mimo graph, which is useful as a same-model correctness comparison while onboarding remains unvalidated.",
       "risk": "HIGH",
       "risk_reason": "Potential numerical/state/graph-binding, asynchronous lifetime, OOM or placement-performance regression.",
-      "assessment_status": "Source-linked candidate; execution conditions inferred from readers/consumers, not runtime-tested.",
+      "assessment_status": "Reviewed 2026-10-28; retained pending Mimo routed-expert parity and regression witness.",
       "component": "MiMo: full-graph construction/replay, scheduler bindings and state handoff",
       "when_used": "Environment read when the referenced function/path runs; some readers cache once; only matching family/backend and enclosing feature guards; near configure_ingraph_moe() (lexical context). Exact predicates are in linked evidence.",
       "primary_reference": "models/mimo/ggml_mimo2_graph.cpp:137",
@@ -34831,9 +34831,9 @@
       "current_read_excerpt": "137:   if (!gc::flag_unless_off(\"ZEROMOE_MIMO2_INGRAPH_MOE\")) return false;",
       "member_name_occurrences": [],
       "affected_if_removed": "MiMo: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
-      "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "required_validation": "Before retiring: compare teacher-forced hidden states and routed expert IDs/weights for both Mimo MoE paths against llama.cpp; capture repeatable correctness and performance runs.",
+      "review_decision": "KEEP PENDING PARITY 2026-10-28: explicit cache-backed callback comparison path remains useful while Mimo correctness parity and regression witness are pending.",
+      "removal_status": "KEPT PENDING PARITY",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0331"
     },
@@ -132458,17 +132458,17 @@
     }
   ],
   "current_inventory": {
-    "generated_at": "2026-10-28",
+    "generated_at": "2026-10-29",
     "source": {
       "branch": "master",
-      "head": "f689ae2b04e608bde4d68615197dc942fb6803a5",
-      "working_tree": "dirty; includes the active settings-cleanup changes"
+      "head": "e63b96329acc58144262a0fade8eae72c90b810c",
+      "working_tree": "source inventory at the master source commit; this commit records documentation and baseline artifacts only"
     },
     "counts": {
       "build_cache": 4,
       "build_option": 1,
       "cli": 96,
-      "environment": 196,
+      "environment": 194,
       "graph_setting": 36,
       "macro": 7,
       "toml": 232
@@ -132485,28 +132485,28 @@
         "kind": "build_cache",
         "name": "ZEROMOE_GGML_COMMIT",
         "locations": [
-          "CMakeLists.txt:330"
+          "CMakeLists.txt:335"
         ]
       },
       {
         "kind": "build_cache",
         "name": "ZEROMOE_GGML_PREBUILT_DIR",
         "locations": [
-          "CMakeLists.txt:423"
+          "CMakeLists.txt:428"
         ]
       },
       {
         "kind": "build_cache",
         "name": "ZEROMOE_GGML_ROOT",
         "locations": [
-          "CMakeLists.txt:331"
+          "CMakeLists.txt:336"
         ]
       },
       {
         "kind": "build_option",
         "name": "ZEROMOE_METAL",
         "locations": [
-          "CMakeLists.txt:85"
+          "CMakeLists.txt:90"
         ]
       },
       {
@@ -133393,13 +133393,6 @@
       },
       {
         "kind": "environment",
-        "name": "ZEROMOE_DISABLE_PRELOAD_BATCH",
-        "locations": [
-          "core/engine_runner_preload.cpp:1235"
-        ]
-      },
-      {
-        "kind": "environment",
         "name": "ZEROMOE_DISABLE_ROUTER_BF16",
         "locations": [
           "core/engine_runner_dense.cpp:205"
@@ -133487,13 +133480,6 @@
         "name": "ZEROMOE_DUMP_ACTIVATION_OUT",
         "locations": [
           "core/gpu_expert_executor.cpp:327"
-        ]
-      },
-      {
-        "kind": "environment",
-        "name": "ZEROMOE_DUMP_LAST_HIDDEN",
-        "locations": [
-          "core/generation_loop.hpp:1041"
         ]
       },
       {
@@ -134062,7 +134048,7 @@
         "kind": "environment",
         "name": "ZEROMOE_MTP_GREEDY_FAST_PATH",
         "locations": [
-          "core/generation_loop.hpp:1189"
+          "core/generation_loop.hpp:1185"
         ]
       },
       {
@@ -134227,7 +134213,7 @@
         "kind": "environment",
         "name": "ZEROMOE_QWEN4EXP_ADAPTIVE_POLICY",
         "locations": [
-          "models/qwen/ggml_qwen4exp_graph_settings.cpp:180"
+          "models/qwen/ggml_qwen4exp_graph_settings.cpp:185"
         ]
       },
       {
@@ -134248,21 +134234,21 @@
         "kind": "environment",
         "name": "ZEROMOE_QWEN4EXP_EXPERT_PROMOTION",
         "locations": [
-          "core/engine_runner.cpp:330"
+          "core/engine_runner.cpp:331"
         ]
       },
       {
         "kind": "environment",
         "name": "ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE_KV_CAPACITY",
         "locations": [
-          "models/qwen/ggml_qwen4exp_graph_settings.cpp:184"
+          "models/qwen/ggml_qwen4exp_graph_settings.cpp:189"
         ]
       },
       {
         "kind": "environment",
         "name": "ZEROMOE_QWEN4EXP_GRAPH_ALLOC_FLOOR_MIB",
         "locations": [
-          "models/qwen/ggml_qwen4exp_graph_build.cpp:1146"
+          "models/qwen/ggml_qwen4exp_graph_build.cpp:1148"
         ]
       },
       {
@@ -134280,7 +134266,7 @@
           "core/engine_runner_ram.cpp:258",
           "core/gpu_topology.hpp:938",
           "models/qwen/ggml_qwen4exp_graph_host_node.cpp:298",
-          "models/qwen/ggml_qwen4exp_graph_settings.cpp:74"
+          "models/qwen/ggml_qwen4exp_graph_settings.cpp:79"
         ]
       },
       {
@@ -134295,29 +134281,29 @@
         "name": "ZEROMOE_QWEN4EXP_PARTIAL_LAYER",
         "locations": [
           "core/moe_router_service.cpp:436",
-          "models/qwen/ggml_qwen4exp_graph_settings.cpp:92"
+          "models/qwen/ggml_qwen4exp_graph_settings.cpp:97"
         ]
       },
       {
         "kind": "environment",
         "name": "ZEROMOE_QWEN4EXP_PARTIAL_LAYER_MIN_COVERAGE",
         "locations": [
-          "models/qwen/ggml_qwen4exp_graph_settings.cpp:122"
+          "models/qwen/ggml_qwen4exp_graph_settings.cpp:127"
         ]
       },
       {
         "kind": "environment",
         "name": "ZEROMOE_QWEN4EXP_PARTIAL_LAYER_PHASE2",
         "locations": [
-          "models/qwen/ggml_qwen4exp_graph_settings.cpp:139",
-          "models/qwen/ggml_qwen4exp_graph_settings.cpp:27"
+          "models/qwen/ggml_qwen4exp_graph_settings.cpp:144",
+          "models/qwen/ggml_qwen4exp_graph_settings.cpp:32"
         ]
       },
       {
         "kind": "environment",
         "name": "ZEROMOE_QWEN4EXP_PARTIAL_LAYER_PREFILL_CAPTURE",
         "locations": [
-          "models/qwen/ggml_qwen4exp_graph_settings.cpp:154"
+          "models/qwen/ggml_qwen4exp_graph_settings.cpp:159"
         ]
       },
       {
@@ -134325,7 +134311,7 @@
         "name": "ZEROMOE_QWEN4EXP_PARTIAL_LAYER_TOP_N",
         "locations": [
           "core/moe_router_service.cpp:458",
-          "models/qwen/ggml_qwen4exp_graph_settings.cpp:103"
+          "models/qwen/ggml_qwen4exp_graph_settings.cpp:108"
         ]
       },
       {
@@ -134353,7 +134339,7 @@
         "kind": "environment",
         "name": "ZEROMOE_QWEN4EXP_PREFILL_DEVICE_STATE",
         "locations": [
-          "models/qwen/ggml_qwen4exp_graph_settings.cpp:25"
+          "models/qwen/ggml_qwen4exp_graph_settings.cpp:30"
         ]
       },
       {
@@ -134367,20 +134353,20 @@
         "kind": "environment",
         "name": "ZEROMOE_QWEN4EXP_PREFILL_STATE_HANDOFF",
         "locations": [
-          "models/qwen/ggml_qwen4exp_graph_settings.cpp:18"
+          "models/qwen/ggml_qwen4exp_graph_settings.cpp:23"
         ]
       },
       {
         "kind": "environment",
         "name": "ZEROMOE_QWEN4EXP_PROBE_DUMP",
         "locations": [
-          "core/generation_loop.hpp:1543",
-          "models/qwen/ggml_qwen4exp_graph_build.cpp:161",
-          "models/qwen/ggml_qwen4exp_graph_build.cpp:183",
-          "models/qwen/ggml_qwen4exp_graph_build.cpp:226",
-          "models/qwen/ggml_qwen4exp_graph_build.cpp:31",
-          "models/qwen/ggml_qwen4exp_graph_build.cpp:435",
-          "models/qwen/ggml_qwen4exp_graph_build.cpp:712",
+          "core/generation_loop.hpp:1539",
+          "models/qwen/ggml_qwen4exp_graph_build.cpp:162",
+          "models/qwen/ggml_qwen4exp_graph_build.cpp:184",
+          "models/qwen/ggml_qwen4exp_graph_build.cpp:227",
+          "models/qwen/ggml_qwen4exp_graph_build.cpp:32",
+          "models/qwen/ggml_qwen4exp_graph_build.cpp:437",
+          "models/qwen/ggml_qwen4exp_graph_build.cpp:714",
           "models/qwen/ggml_qwen4exp_graph_build_blocks.cpp:243",
           "models/qwen/ggml_qwen4exp_graph_build_blocks.cpp:396",
           "models/qwen/ggml_qwen4exp_graph_build_blocks.cpp:72",
@@ -134414,7 +134400,7 @@
         "kind": "environment",
         "name": "ZEROMOE_QWEN4EXP_STORAGE_TIMEOUT_MS",
         "locations": [
-          "models/qwen/ggml_qwen4exp_graph_settings.cpp:169"
+          "models/qwen/ggml_qwen4exp_graph_settings.cpp:174"
         ]
       },
       {
@@ -134632,7 +134618,7 @@
         "kind": "environment",
         "name": "ZEROMOE_TEACHER_FORCE_NLL",
         "locations": [
-          "core/generation_loop.hpp:1384"
+          "core/generation_loop.hpp:1380"
         ]
       },
       {
@@ -134997,7 +134983,7 @@
           "backends/ggml/ggml_resource_guards.hpp:111",
           "backends/ggml/ggml_resource_guards.hpp:9",
           "backends/ggml/ggml_router_runner.cpp:24",
-          "core/engine_runner.cpp:194",
+          "core/engine_runner.cpp:195",
           "core/engine_runner_model.cpp:16",
           "core/nvtx_range.hpp:6",
           "core/qwen4exp_graph_mtp.cpp:6",
@@ -135046,7 +135032,7 @@
           "models/qwen/cpu_qwen4exp.cpp:166",
           "models/qwen/ggml_qwen4exp_graph.cpp:10",
           "models/qwen/ggml_qwen4exp_graph_arena.cpp:9",
-          "models/qwen/ggml_qwen4exp_graph_build.cpp:9",
+          "models/qwen/ggml_qwen4exp_graph_build.cpp:10",
           "models/qwen/ggml_qwen4exp_graph_build_blocks.cpp:9",
           "models/qwen/ggml_qwen4exp_graph_build_moe.cpp:11",
           "models/qwen/ggml_qwen4exp_graph_checkpoint.cpp:16",
@@ -135058,7 +135044,7 @@
           "models/qwen/ggml_qwen4exp_graph_placement.cpp:9",
           "models/qwen/ggml_qwen4exp_graph_promote.cpp:15",
           "models/qwen/ggml_qwen4exp_graph_run.cpp:10",
-          "models/qwen/ggml_qwen4exp_graph_settings.cpp:10",
+          "models/qwen/ggml_qwen4exp_graph_settings.cpp:15",
           "models/qwen/ggml_qwen4exp_graph_window.cpp:13",
           "models/qwen/ggml_qwen_decode_scheduler.cpp:21",
           "models/qwen/ggml_qwen_shared_runner.cpp:25",
@@ -135077,98 +135063,98 @@
         "kind": "toml",
         "name": "active_layer_capacity",
         "locations": [
-          "core/engine_config.hpp:2917"
+          "core/engine_config.hpp:2925"
         ]
       },
       {
         "kind": "toml",
         "name": "active_layer_capacity_slots",
         "locations": [
-          "core/engine_config.hpp:2962"
+          "core/engine_config.hpp:2970"
         ]
       },
       {
         "kind": "toml",
         "name": "active_layer_promote_hit_threshold",
         "locations": [
-          "core/engine_config.hpp:2920"
+          "core/engine_config.hpp:2928"
         ]
       },
       {
         "kind": "toml",
         "name": "active_layer_routing_policy",
         "locations": [
-          "core/engine_config.hpp:2932"
+          "core/engine_config.hpp:2940"
         ]
       },
       {
         "kind": "toml",
         "name": "active_layer_upload_worker_threads",
         "locations": [
-          "core/engine_config.hpp:2934"
+          "core/engine_config.hpp:2942"
         ]
       },
       {
         "kind": "toml",
         "name": "active_layer_weight",
         "locations": [
-          "core/engine_config.hpp:2960"
+          "core/engine_config.hpp:2968"
         ]
       },
       {
         "kind": "toml",
         "name": "attn_pilot_vram_promote_dynamic",
         "locations": [
-          "core/engine_config.hpp:2593"
+          "core/engine_config.hpp:2596"
         ]
       },
       {
         "kind": "toml",
         "name": "attn_pilot_vram_promote_top_k",
         "locations": [
-          "core/engine_config.hpp:2591"
+          "core/engine_config.hpp:2594"
         ]
       },
       {
         "kind": "toml",
         "name": "attn_qabsorb_gpu",
         "locations": [
-          "core/engine_config.hpp:2610"
+          "core/engine_config.hpp:2613"
         ]
       },
       {
         "kind": "toml",
         "name": "attn_qabsorb_gpu_max_vram_gb",
         "locations": [
-          "core/engine_config.hpp:2611"
+          "core/engine_config.hpp:2614"
         ]
       },
       {
         "kind": "toml",
         "name": "attn_score_gpu",
         "locations": [
-          "core/engine_config.hpp:2619"
+          "core/engine_config.hpp:2622"
         ]
       },
       {
         "kind": "toml",
         "name": "attn_score_gpu_max_context",
         "locations": [
-          "core/engine_config.hpp:2753"
+          "core/engine_config.hpp:2761"
         ]
       },
       {
         "kind": "toml",
         "name": "attn_score_gpu_max_vram_gb",
         "locations": [
-          "core/engine_config.hpp:2745"
+          "core/engine_config.hpp:2753"
         ]
       },
       {
         "kind": "toml",
         "name": "attn_score_threads",
         "locations": [
-          "core/engine_config.hpp:2903"
+          "core/engine_config.hpp:2911"
         ]
       },
       {
@@ -135176,161 +135162,161 @@
         "name": "context_size",
         "locations": [
           "backends/cpu/cpu_config.hpp:284",
-          "core/engine_config.hpp:2408"
+          "core/engine_config.hpp:2411"
         ]
       },
       {
         "kind": "toml",
         "name": "cpu_affinity_layers",
         "locations": [
-          "core/engine_config.hpp:2415"
+          "core/engine_config.hpp:2418"
         ]
       },
       {
         "kind": "toml",
         "name": "cpu_offload_max_experts",
         "locations": [
-          "core/engine_config.hpp:2495"
+          "core/engine_config.hpp:2498"
         ]
       },
       {
         "kind": "toml",
         "name": "cpu_only",
         "locations": [
-          "core/engine_config.hpp:2414"
+          "core/engine_config.hpp:2417"
         ]
       },
       {
         "kind": "toml",
         "name": "decode_async_prewarm",
         "locations": [
-          "core/engine_config.hpp:2599"
+          "core/engine_config.hpp:2602"
         ]
       },
       {
         "kind": "toml",
         "name": "decode_async_prewarm_max_batch",
         "locations": [
-          "core/engine_config.hpp:2600"
+          "core/engine_config.hpp:2603"
         ]
       },
       {
         "kind": "toml",
         "name": "decode_async_prewarm_nonblocking",
         "locations": [
-          "core/engine_config.hpp:2602"
+          "core/engine_config.hpp:2605"
         ]
       },
       {
         "kind": "toml",
         "name": "decode_promote_all_misses",
         "locations": [
-          "core/engine_config.hpp:2923"
+          "core/engine_config.hpp:2931"
         ]
       },
       {
         "kind": "toml",
         "name": "dense_async_copies",
         "locations": [
-          "core/engine_config.hpp:2838"
+          "core/engine_config.hpp:2846"
         ]
       },
       {
         "kind": "toml",
         "name": "dense_bf16_kquant",
         "locations": [
-          "core/engine_config.hpp:2738"
+          "core/engine_config.hpp:2746"
         ]
       },
       {
         "kind": "toml",
         "name": "dense_bf16_prefill_gemm",
         "locations": [
-          "core/engine_config.hpp:2837"
+          "core/engine_config.hpp:2845"
         ]
       },
       {
         "kind": "toml",
         "name": "dense_gb",
         "locations": [
-          "core/engine_config.hpp:2956"
+          "core/engine_config.hpp:2964"
         ]
       },
       {
         "kind": "toml",
         "name": "dense_model_path",
         "locations": [
-          "core/engine_config.hpp:2406"
+          "core/engine_config.hpp:2409"
         ]
       },
       {
         "kind": "toml",
         "name": "device_id",
         "locations": [
-          "core/engine_config.hpp:2951"
+          "core/engine_config.hpp:2959"
         ]
       },
       {
         "kind": "toml",
         "name": "direct_io",
         "locations": [
-          "core/engine_config.hpp:2595"
+          "core/engine_config.hpp:2598"
         ]
       },
       {
         "kind": "toml",
         "name": "disk_batch_padding",
         "locations": [
-          "core/engine_config.hpp:2775"
+          "core/engine_config.hpp:2783"
         ]
       },
       {
         "kind": "toml",
         "name": "disk_batch_padding_evict_dup",
         "locations": [
-          "core/engine_config.hpp:2778"
+          "core/engine_config.hpp:2786"
         ]
       },
       {
         "kind": "toml",
         "name": "disk_batch_padding_target",
         "locations": [
-          "core/engine_config.hpp:2777"
+          "core/engine_config.hpp:2785"
         ]
       },
       {
         "kind": "toml",
         "name": "drop_pages",
         "locations": [
-          "core/engine_config.hpp:2413"
+          "core/engine_config.hpp:2416"
         ]
       },
       {
         "kind": "toml",
         "name": "dsv4_outproj_gpu",
         "locations": [
-          "core/engine_config.hpp:2822"
+          "core/engine_config.hpp:2830"
         ]
       },
       {
         "kind": "toml",
         "name": "dsv4_score_gpu",
         "locations": [
-          "core/engine_config.hpp:2761"
+          "core/engine_config.hpp:2769"
         ]
       },
       {
         "kind": "toml",
         "name": "dsv4_score_gpu_max_vram_gb",
         "locations": [
-          "core/engine_config.hpp:2762"
+          "core/engine_config.hpp:2770"
         ]
       },
       {
         "kind": "toml",
         "name": "embedding_device",
         "locations": [
-          "core/engine_config.hpp:2804"
+          "core/engine_config.hpp:2812"
         ]
       },
       {
@@ -135338,7 +135324,7 @@
         "name": "enable_thinking",
         "locations": [
           "backends/cpu/cpu_config.hpp:300",
-          "core/engine_config.hpp:2944"
+          "core/engine_config.hpp:2952"
         ]
       },
       {
@@ -135346,7 +135332,7 @@
         "name": "exl3_backend",
         "locations": [
           "backends/cpu/cpu_config.hpp:250",
-          "core/engine_config.hpp:2373"
+          "core/engine_config.hpp:2376"
         ]
       },
       {
@@ -135354,7 +135340,7 @@
         "name": "exl3_cpu_expert_cache_gb",
         "locations": [
           "backends/cpu/cpu_config.hpp:281",
-          "core/engine_config.hpp:2403"
+          "core/engine_config.hpp:2406"
         ]
       },
       {
@@ -135362,42 +135348,42 @@
         "name": "exl3_cpu_expert_int8_vnni",
         "locations": [
           "backends/cpu/cpu_config.hpp:283",
-          "core/engine_config.hpp:2405"
+          "core/engine_config.hpp:2408"
         ]
       },
       {
         "kind": "toml",
         "name": "exl3_ggml_bridge_layer",
         "locations": [
-          "core/engine_config.hpp:2378"
+          "core/engine_config.hpp:2381"
         ]
       },
       {
         "kind": "toml",
         "name": "exl3_ggml_bridge_layers",
         "locations": [
-          "core/engine_config.hpp:2380"
+          "core/engine_config.hpp:2383"
         ]
       },
       {
         "kind": "toml",
         "name": "exl3_ggml_bridge_model_path",
         "locations": [
-          "core/engine_config.hpp:2375"
+          "core/engine_config.hpp:2378"
         ]
       },
       {
         "kind": "toml",
         "name": "exl3_ggml_graph_capture",
         "locations": [
-          "core/engine_config.hpp:2382"
+          "core/engine_config.hpp:2385"
         ]
       },
       {
         "kind": "toml",
         "name": "exl3_ggml_routed_graph_capture",
         "locations": [
-          "core/engine_config.hpp:2383"
+          "core/engine_config.hpp:2386"
         ]
       },
       {
@@ -135405,7 +135391,7 @@
         "name": "exl3_gpu",
         "locations": [
           "backends/cpu/cpu_config.hpp:269",
-          "core/engine_config.hpp:2391"
+          "core/engine_config.hpp:2394"
         ]
       },
       {
@@ -135413,7 +135399,7 @@
         "name": "exl3_gpu_cache_gb",
         "locations": [
           "backends/cpu/cpu_config.hpp:272",
-          "core/engine_config.hpp:2394"
+          "core/engine_config.hpp:2397"
         ]
       },
       {
@@ -135421,7 +135407,7 @@
         "name": "exl3_gpu_device",
         "locations": [
           "backends/cpu/cpu_config.hpp:271",
-          "core/engine_config.hpp:2393"
+          "core/engine_config.hpp:2396"
         ]
       },
       {
@@ -135429,7 +135415,7 @@
         "name": "exl3_gpu_expert_layer_begin",
         "locations": [
           "backends/cpu/cpu_config.hpp:274",
-          "core/engine_config.hpp:2396"
+          "core/engine_config.hpp:2399"
         ]
       },
       {
@@ -135437,7 +135423,7 @@
         "name": "exl3_gpu_expert_split_layer",
         "locations": [
           "backends/cpu/cpu_config.hpp:276",
-          "core/engine_config.hpp:2398"
+          "core/engine_config.hpp:2401"
         ]
       },
       {
@@ -135445,7 +135431,7 @@
         "name": "exl3_gpu_hc",
         "locations": [
           "backends/cpu/cpu_config.hpp:270",
-          "core/engine_config.hpp:2392"
+          "core/engine_config.hpp:2395"
         ]
       },
       {
@@ -135453,7 +135439,7 @@
         "name": "exl3_gpu_split_cache_gb",
         "locations": [
           "backends/cpu/cpu_config.hpp:279",
-          "core/engine_config.hpp:2401"
+          "core/engine_config.hpp:2404"
         ]
       },
       {
@@ -135461,7 +135447,7 @@
         "name": "exl3_gpu_split_device",
         "locations": [
           "backends/cpu/cpu_config.hpp:277",
-          "core/engine_config.hpp:2399"
+          "core/engine_config.hpp:2402"
         ]
       },
       {
@@ -135469,7 +135455,7 @@
         "name": "exllamav3_cuda_schedule",
         "locations": [
           "backends/cpu/cpu_config.hpp:253",
-          "core/engine_config.hpp:2387"
+          "core/engine_config.hpp:2390"
         ]
       },
       {
@@ -135477,7 +135463,7 @@
         "name": "exllamav3_python",
         "locations": [
           "backends/cpu/cpu_config.hpp:251",
-          "core/engine_config.hpp:2385"
+          "core/engine_config.hpp:2388"
         ]
       },
       {
@@ -135485,7 +135471,7 @@
         "name": "exllamav3_runner_path",
         "locations": [
           "backends/cpu/cpu_config.hpp:252",
-          "core/engine_config.hpp:2386"
+          "core/engine_config.hpp:2389"
         ]
       },
       {
@@ -135493,70 +135479,77 @@
         "name": "expert_fetch_threads",
         "locations": [
           "backends/cpu/cpu_config.hpp:296",
-          "core/engine_config.hpp:2900"
+          "core/engine_config.hpp:2908"
         ]
       },
       {
         "kind": "toml",
         "name": "expert_gpu_activation",
         "locations": [
-          "core/engine_config.hpp:2739"
+          "core/engine_config.hpp:2747"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "expert_promotion",
+        "locations": [
+          "core/engine_config.hpp:2712"
         ]
       },
       {
         "kind": "toml",
         "name": "freeze_usage_stats",
         "locations": [
-          "core/engine_config.hpp:2803"
+          "core/engine_config.hpp:2811"
         ]
       },
       {
         "kind": "toml",
         "name": "gdn_full_ggml",
         "locations": [
-          "core/engine_config.hpp:2835"
+          "core/engine_config.hpp:2843"
         ]
       },
       {
         "kind": "toml",
         "name": "gdn_proj_ggml",
         "locations": [
-          "core/engine_config.hpp:2834"
+          "core/engine_config.hpp:2842"
         ]
       },
       {
         "kind": "toml",
         "name": "glm5next_dense_prefill_fusion",
         "locations": [
-          "core/engine_config.hpp:2624"
+          "core/engine_config.hpp:2627"
         ]
       },
       {
         "kind": "toml",
         "name": "glm5next_kda_gpu",
         "locations": [
-          "core/engine_config.hpp:2620"
+          "core/engine_config.hpp:2623"
         ]
       },
       {
         "kind": "toml",
         "name": "glm5next_moe_prefill_gpu",
         "locations": [
-          "core/engine_config.hpp:2622"
+          "core/engine_config.hpp:2625"
         ]
       },
       {
         "kind": "toml",
         "name": "glm5next_router_gpu",
         "locations": [
-          "core/engine_config.hpp:2621"
+          "core/engine_config.hpp:2624"
         ]
       },
       {
         "kind": "toml",
         "name": "hc_ggml",
         "locations": [
-          "core/engine_config.hpp:2833"
+          "core/engine_config.hpp:2841"
         ]
       },
       {
@@ -135564,28 +135557,28 @@
         "name": "host_ram_gb",
         "locations": [
           "backends/cpu/cpu_config.hpp:288",
-          "core/engine_config.hpp:2782"
+          "core/engine_config.hpp:2790"
         ]
       },
       {
         "kind": "toml",
         "name": "io_uring",
         "locations": [
-          "core/engine_config.hpp:2772"
+          "core/engine_config.hpp:2780"
         ]
       },
       {
         "kind": "toml",
         "name": "io_uring_workers",
         "locations": [
-          "core/engine_config.hpp:2773"
+          "core/engine_config.hpp:2781"
         ]
       },
       {
         "kind": "toml",
         "name": "kv_cache_gb",
         "locations": [
-          "core/engine_config.hpp:2957"
+          "core/engine_config.hpp:2965"
         ]
       },
       {
@@ -135593,7 +135586,7 @@
         "name": "log_level",
         "locations": [
           "backends/cpu/cpu_config.hpp:302",
-          "core/engine_config.hpp:2947"
+          "core/engine_config.hpp:2955"
         ]
       },
       {
@@ -135601,7 +135594,7 @@
         "name": "log_path",
         "locations": [
           "backends/cpu/cpu_config.hpp:303",
-          "core/engine_config.hpp:2946"
+          "core/engine_config.hpp:2954"
         ]
       },
       {
@@ -135609,35 +135602,35 @@
         "name": "max_new_tokens",
         "locations": [
           "backends/cpu/cpu_config.hpp:285",
-          "core/engine_config.hpp:2409"
+          "core/engine_config.hpp:2412"
         ]
       },
       {
         "kind": "toml",
         "name": "mem_guard",
         "locations": [
-          "core/engine_config.hpp:2741"
+          "core/engine_config.hpp:2749"
         ]
       },
       {
         "kind": "toml",
         "name": "mem_guard_poll_ms",
         "locations": [
-          "core/engine_config.hpp:2744"
+          "core/engine_config.hpp:2752"
         ]
       },
       {
         "kind": "toml",
         "name": "mem_guard_stop_mb",
         "locations": [
-          "core/engine_config.hpp:2743"
+          "core/engine_config.hpp:2751"
         ]
       },
       {
         "kind": "toml",
         "name": "mem_guard_warn_mb",
         "locations": [
-          "core/engine_config.hpp:2742"
+          "core/engine_config.hpp:2750"
         ]
       },
       {
@@ -135645,21 +135638,21 @@
         "name": "metadata_model_path",
         "locations": [
           "backends/cpu/cpu_config.hpp:268",
-          "core/engine_config.hpp:2389"
+          "core/engine_config.hpp:2392"
         ]
       },
       {
         "kind": "toml",
         "name": "mirror_coverage_file",
         "locations": [
-          "core/engine_config.hpp:2791"
+          "core/engine_config.hpp:2799"
         ]
       },
       {
         "kind": "toml",
         "name": "mirror_model_path",
         "locations": [
-          "core/engine_config.hpp:2789"
+          "core/engine_config.hpp:2797"
         ]
       },
       {
@@ -135667,14 +135660,14 @@
         "name": "model_format",
         "locations": [
           "backends/cpu/cpu_config.hpp:249",
-          "core/engine_config.hpp:2372"
+          "core/engine_config.hpp:2375"
         ]
       },
       {
         "kind": "toml",
         "name": "model_load_only",
         "locations": [
-          "core/engine_config.hpp:2388"
+          "core/engine_config.hpp:2391"
         ]
       },
       {
@@ -135682,113 +135675,113 @@
         "name": "model_path",
         "locations": [
           "backends/cpu/cpu_config.hpp:248",
-          "core/engine_config.hpp:2371",
-          "core/engine_config.hpp:2954"
+          "core/engine_config.hpp:2374",
+          "core/engine_config.hpp:2962"
         ]
       },
       {
         "kind": "toml",
         "name": "moe_cache_gb",
         "locations": [
-          "core/engine_config.hpp:2958"
+          "core/engine_config.hpp:2966"
         ]
       },
       {
         "kind": "toml",
         "name": "moe_cache_reserve_gb",
         "locations": [
-          "core/engine_config.hpp:2959"
+          "core/engine_config.hpp:2967"
         ]
       },
       {
         "kind": "toml",
         "name": "moe_expert_bf16_gemm",
         "locations": [
-          "core/engine_config.hpp:2836"
+          "core/engine_config.hpp:2844"
         ]
       },
       {
         "kind": "toml",
         "name": "moe_ggml_device",
         "locations": [
-          "core/engine_config.hpp:2832"
+          "core/engine_config.hpp:2840"
         ]
       },
       {
         "kind": "toml",
         "name": "moe_ggml_gpu_router",
         "locations": [
-          "core/engine_config.hpp:2831"
+          "core/engine_config.hpp:2839"
         ]
       },
       {
         "kind": "toml",
         "name": "moe_ggml_mul_mat_id",
         "locations": [
-          "core/engine_config.hpp:2826"
+          "core/engine_config.hpp:2834"
         ]
       },
       {
         "kind": "toml",
         "name": "moe_ggml_planar_copies",
         "locations": [
-          "core/engine_config.hpp:2829"
+          "core/engine_config.hpp:2837"
         ]
       },
       {
         "kind": "toml",
         "name": "moe_ggml_shared_expert",
         "locations": [
-          "core/engine_config.hpp:2827"
+          "core/engine_config.hpp:2835"
         ]
       },
       {
         "kind": "toml",
         "name": "moe_gpu_accum",
         "locations": [
-          "core/engine_config.hpp:2737"
+          "core/engine_config.hpp:2745"
         ]
       },
       {
         "kind": "toml",
         "name": "moe_prefill_batched",
         "locations": [
-          "core/engine_config.hpp:2823"
+          "core/engine_config.hpp:2831"
         ]
       },
       {
         "kind": "toml",
         "name": "moe_prefill_stream",
         "locations": [
-          "core/engine_config.hpp:2824"
+          "core/engine_config.hpp:2832"
         ]
       },
       {
         "kind": "toml",
         "name": "moe_prefill_stream_chunk",
         "locations": [
-          "core/engine_config.hpp:2825"
+          "core/engine_config.hpp:2833"
         ]
       },
       {
         "kind": "toml",
         "name": "move_on_promotion",
         "locations": [
-          "core/engine_config.hpp:2913"
+          "core/engine_config.hpp:2921"
         ]
       },
       {
         "kind": "toml",
         "name": "mtp_graph",
         "locations": [
-          "core/engine_config.hpp:2728"
+          "core/engine_config.hpp:2736"
         ]
       },
       {
         "kind": "toml",
         "name": "name",
         "locations": [
-          "core/engine_config.hpp:2952"
+          "core/engine_config.hpp:2960"
         ]
       },
       {
@@ -135796,21 +135789,21 @@
         "name": "omp_max_threads",
         "locations": [
           "backends/cpu/cpu_config.hpp:297",
-          "core/engine_config.hpp:2901"
+          "core/engine_config.hpp:2909"
         ]
       },
       {
         "kind": "toml",
         "name": "pilot_widen_all_tokens",
         "locations": [
-          "core/engine_config.hpp:2506"
+          "core/engine_config.hpp:2509"
         ]
       },
       {
         "kind": "toml",
         "name": "pin_core_gpu_top_n",
         "locations": [
-          "core/engine_config.hpp:2814"
+          "core/engine_config.hpp:2822"
         ]
       },
       {
@@ -135818,35 +135811,35 @@
         "name": "pin_file",
         "locations": [
           "backends/cpu/cpu_config.hpp:291",
-          "core/engine_config.hpp:2800"
+          "core/engine_config.hpp:2808"
         ]
       },
       {
         "kind": "toml",
         "name": "pin_global_floor_per_layer",
         "locations": [
-          "core/engine_config.hpp:2808"
+          "core/engine_config.hpp:2816"
         ]
       },
       {
         "kind": "toml",
         "name": "pin_global_tiers",
         "locations": [
-          "core/engine_config.hpp:2819"
+          "core/engine_config.hpp:2827"
         ]
       },
       {
         "kind": "toml",
         "name": "pin_ram_fraction",
         "locations": [
-          "core/engine_config.hpp:2817"
+          "core/engine_config.hpp:2825"
         ]
       },
       {
         "kind": "toml",
         "name": "pin_strategy",
         "locations": [
-          "core/engine_config.hpp:2807"
+          "core/engine_config.hpp:2815"
         ]
       },
       {
@@ -135854,7 +135847,7 @@
         "name": "pin_threshold",
         "locations": [
           "backends/cpu/cpu_config.hpp:292",
-          "core/engine_config.hpp:2799"
+          "core/engine_config.hpp:2807"
         ]
       },
       {
@@ -135862,204 +135855,204 @@
         "name": "pin_topk_per_layer",
         "locations": [
           "backends/cpu/cpu_config.hpp:294",
-          "core/engine_config.hpp:2806"
+          "core/engine_config.hpp:2814"
         ]
       },
       {
         "kind": "toml",
         "name": "pin_vram_lru_fraction",
         "locations": [
-          "core/engine_config.hpp:2816"
+          "core/engine_config.hpp:2824"
         ]
       },
       {
         "kind": "toml",
         "name": "pinned_vram_capacity",
         "locations": [
-          "core/engine_config.hpp:2912"
+          "core/engine_config.hpp:2920"
         ]
       },
       {
         "kind": "toml",
         "name": "predict_gpu1_cap_per_layer",
         "locations": [
-          "core/engine_config.hpp:2893"
+          "core/engine_config.hpp:2901"
         ]
       },
       {
         "kind": "toml",
         "name": "predict_gpu1_rank_end",
         "locations": [
-          "core/engine_config.hpp:2892"
+          "core/engine_config.hpp:2900"
         ]
       },
       {
         "kind": "toml",
         "name": "predict_gpu1_rank_start",
         "locations": [
-          "core/engine_config.hpp:2890"
+          "core/engine_config.hpp:2898"
         ]
       },
       {
         "kind": "toml",
         "name": "prefetch_attn_pilot",
         "locations": [
-          "core/engine_config.hpp:2588"
+          "core/engine_config.hpp:2591"
         ]
       },
       {
         "kind": "toml",
         "name": "prefetch_attn_pilot_k",
         "locations": [
-          "core/engine_config.hpp:2590"
+          "core/engine_config.hpp:2593"
         ]
       },
       {
         "kind": "toml",
         "name": "prefetch_pilot_depth",
         "locations": [
-          "core/engine_config.hpp:2569",
-          "core/engine_config.hpp:2578"
+          "core/engine_config.hpp:2572",
+          "core/engine_config.hpp:2581"
         ]
       },
       {
         "kind": "toml",
         "name": "prefetch_pilot_k",
         "locations": [
-          "core/engine_config.hpp:2547"
+          "core/engine_config.hpp:2550"
         ]
       },
       {
         "kind": "toml",
         "name": "prefetch_pilot_k_adaptive",
         "locations": [
-          "core/engine_config.hpp:2550"
+          "core/engine_config.hpp:2553"
         ]
       },
       {
         "kind": "toml",
         "name": "prefetch_pilot_k_adaptive_min_samples",
         "locations": [
-          "core/engine_config.hpp:2556"
+          "core/engine_config.hpp:2559"
         ]
       },
       {
         "kind": "toml",
         "name": "prefetch_pilot_k_adaptive_threshold",
         "locations": [
-          "core/engine_config.hpp:2553"
+          "core/engine_config.hpp:2556"
         ]
       },
       {
         "kind": "toml",
         "name": "prefetch_pilot_k_depth2",
         "locations": [
-          "core/engine_config.hpp:2586"
+          "core/engine_config.hpp:2589"
         ]
       },
       {
         "kind": "toml",
         "name": "prefetch_pilot_k_per_layer",
         "locations": [
-          "core/engine_config.hpp:2549"
+          "core/engine_config.hpp:2552"
         ]
       },
       {
         "kind": "toml",
         "name": "prefetch_widen_all_tokens",
         "locations": [
-          "core/engine_config.hpp:2508"
+          "core/engine_config.hpp:2511"
         ]
       },
       {
         "kind": "toml",
         "name": "prefetch_worker_threads",
         "locations": [
-          "core/engine_config.hpp:2781"
+          "core/engine_config.hpp:2789"
         ]
       },
       {
         "kind": "toml",
         "name": "prefill_batch_tokens",
         "locations": [
-          "core/engine_config.hpp:2512"
+          "core/engine_config.hpp:2515"
         ]
       },
       {
         "kind": "toml",
         "name": "prefill_hint_order_by_earliest_token",
         "locations": [
-          "core/engine_config.hpp:2503"
+          "core/engine_config.hpp:2506"
         ]
       },
       {
         "kind": "toml",
         "name": "prefill_pin_file",
         "locations": [
-          "core/engine_config.hpp:2801"
+          "core/engine_config.hpp:2809"
         ]
       },
       {
         "kind": "toml",
         "name": "prefill_retention_decay",
         "locations": [
-          "core/engine_config.hpp:2525"
+          "core/engine_config.hpp:2528"
         ]
       },
       {
         "kind": "toml",
         "name": "prefill_retention_flat_cut",
         "locations": [
-          "core/engine_config.hpp:2521"
+          "core/engine_config.hpp:2524"
         ]
       },
       {
         "kind": "toml",
         "name": "prefill_retention_min_demand",
         "locations": [
-          "core/engine_config.hpp:2519"
+          "core/engine_config.hpp:2522"
         ]
       },
       {
         "kind": "toml",
         "name": "prefill_retention_peaky_cut",
         "locations": [
-          "core/engine_config.hpp:2523"
+          "core/engine_config.hpp:2526"
         ]
       },
       {
         "kind": "toml",
         "name": "prefill_retention_top_n",
         "locations": [
-          "core/engine_config.hpp:2517"
+          "core/engine_config.hpp:2520"
         ]
       },
       {
         "kind": "toml",
         "name": "prefill_retention_weight",
         "locations": [
-          "core/engine_config.hpp:2516"
+          "core/engine_config.hpp:2519"
         ]
       },
       {
         "kind": "toml",
         "name": "prefill_warm_via_prefetcher",
         "locations": [
-          "core/engine_config.hpp:2596"
+          "core/engine_config.hpp:2599"
         ]
       },
       {
         "kind": "toml",
         "name": "prefill_window_cap",
         "locations": [
-          "core/engine_config.hpp:2510"
+          "core/engine_config.hpp:2513"
         ]
       },
       {
         "kind": "toml",
         "name": "prefill_window_extra_gb",
         "locations": [
-          "core/engine_config.hpp:2514"
+          "core/engine_config.hpp:2517"
         ]
       },
       {
@@ -136067,518 +136060,511 @@
         "name": "promote_hit_threshold",
         "locations": [
           "backends/cpu/cpu_config.hpp:290",
-          "core/engine_config.hpp:2798"
+          "core/engine_config.hpp:2806"
         ]
       },
       {
         "kind": "toml",
         "name": "prompt",
         "locations": [
-          "core/engine_config.hpp:2390"
+          "core/engine_config.hpp:2393"
         ]
       },
       {
         "kind": "toml",
         "name": "prompt_cache",
         "locations": [
-          "core/engine_config.hpp:2716"
+          "core/engine_config.hpp:2724"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_cpu_fused_grouped",
         "locations": [
-          "core/engine_config.hpp:2681"
+          "core/engine_config.hpp:2684"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_cpu_ggml_moe",
         "locations": [
-          "core/engine_config.hpp:2678"
+          "core/engine_config.hpp:2681"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_cpu_gpu_overlap",
         "locations": [
-          "core/engine_config.hpp:2683"
+          "core/engine_config.hpp:2686"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_cpu_gpu_overlap_max_layers",
         "locations": [
-          "core/engine_config.hpp:2685"
+          "core/engine_config.hpp:2688"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_cpu_offload",
         "locations": [
-          "core/engine_config.hpp:2697"
+          "core/engine_config.hpp:2700"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_cpu_offload_event_fence",
         "locations": [
-          "core/engine_config.hpp:2700"
+          "core/engine_config.hpp:2703"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_cpu_offload_layers",
         "locations": [
-          "core/engine_config.hpp:2699"
+          "core/engine_config.hpp:2702"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_cpu_offload_ring_slots",
         "locations": [
-          "core/engine_config.hpp:2710"
+          "core/engine_config.hpp:2718"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_cpu_shared_device",
         "locations": [
-          "core/engine_config.hpp:2694"
+          "core/engine_config.hpp:2697"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_cpu_strided_grouped",
         "locations": [
-          "core/engine_config.hpp:2679"
+          "core/engine_config.hpp:2682"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_decode_batch_stage",
         "locations": [
-          "core/engine_config.hpp:2673"
+          "core/engine_config.hpp:2676"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_decode_device_hc",
         "locations": [
-          "core/engine_config.hpp:2671"
+          "core/engine_config.hpp:2674"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_decode_ggml_moe",
         "locations": [
-          "core/engine_config.hpp:2668"
+          "core/engine_config.hpp:2671"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_decode_scheduler",
         "locations": [
-          "core/engine_config.hpp:2669"
-        ]
-      },
-      {
-        "kind": "toml",
-        "name": "qwen4exp_expert_promotion",
-        "locations": [
-          "core/engine_config.hpp:2708"
+          "core/engine_config.hpp:2672"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_full_graph",
         "locations": [
-          "core/engine_config.hpp:2454"
+          "core/engine_config.hpp:2457"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_full_graph_decode",
         "locations": [
-          "core/engine_config.hpp:2455"
+          "core/engine_config.hpp:2458"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_gdn_conv_gpu",
         "locations": [
-          "core/engine_config.hpp:2626"
+          "core/engine_config.hpp:2629"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_gpu_stage_enabled",
         "locations": [
-          "core/engine_config.hpp:2702"
+          "core/engine_config.hpp:2705"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_gpu_stage_layers",
         "locations": [
-          "core/engine_config.hpp:2705"
+          "core/engine_config.hpp:2708"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_graph_expert_vram_budget_gb",
         "locations": [
-          "core/engine_config.hpp:2416"
+          "core/engine_config.hpp:2419"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_hc_async_readback",
         "locations": [
-          "core/engine_config.hpp:2675"
+          "core/engine_config.hpp:2678"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_option_b_concentrated_only",
         "locations": [
-          "core/engine_config.hpp:2446"
+          "core/engine_config.hpp:2449"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_option_b_disable_legacy_cache",
         "locations": [
-          "core/engine_config.hpp:2443"
+          "core/engine_config.hpp:2446"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_option_b_fill_vram",
         "locations": [
-          "core/engine_config.hpp:2441"
+          "core/engine_config.hpp:2444"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_option_b_global_floor_per_layer",
         "locations": [
-          "core/engine_config.hpp:2430"
+          "core/engine_config.hpp:2433"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_option_b_global_top_k",
         "locations": [
-          "core/engine_config.hpp:2428"
+          "core/engine_config.hpp:2431"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_option_b_layer",
         "locations": [
-          "core/engine_config.hpp:2419"
+          "core/engine_config.hpp:2422"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_option_b_max_layers",
         "locations": [
-          "core/engine_config.hpp:2439"
+          "core/engine_config.hpp:2442"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_option_b_min_coverage",
         "locations": [
-          "core/engine_config.hpp:2423"
+          "core/engine_config.hpp:2426"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_option_b_right_size_top_n",
         "locations": [
-          "core/engine_config.hpp:2425"
+          "core/engine_config.hpp:2428"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_option_b_selected_layers",
         "locations": [
-          "core/engine_config.hpp:2437"
+          "core/engine_config.hpp:2440"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_option_b_stage_count",
         "locations": [
-          "core/engine_config.hpp:2451"
+          "core/engine_config.hpp:2454"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_option_b_stage_expert",
         "locations": [
-          "core/engine_config.hpp:2449"
+          "core/engine_config.hpp:2452"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_option_b_top_n",
         "locations": [
-          "core/engine_config.hpp:2421"
+          "core/engine_config.hpp:2424"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_prefill_state_handoff",
         "locations": [
-          "core/engine_config.hpp:2457"
+          "core/engine_config.hpp:2460"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_router_pilot",
         "locations": [
-          "core/engine_config.hpp:2628"
+          "core/engine_config.hpp:2631"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_router_pilot_k",
         "locations": [
-          "core/engine_config.hpp:2629"
+          "core/engine_config.hpp:2632"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_router_pilot_predict_layers",
         "locations": [
-          "core/engine_config.hpp:2660"
+          "core/engine_config.hpp:2663"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_router_pilot_prefetch",
         "locations": [
-          "core/engine_config.hpp:2641"
+          "core/engine_config.hpp:2644"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_router_pilot_prefetch_exclude_layers",
         "locations": [
-          "core/engine_config.hpp:2658"
+          "core/engine_config.hpp:2661"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_router_pilot_prefetch_k",
         "locations": [
-          "core/engine_config.hpp:2643"
+          "core/engine_config.hpp:2646"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_router_pilot_skip_fully_cached",
         "locations": [
-          "core/engine_config.hpp:2661"
+          "core/engine_config.hpp:2664"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_router_pilot_skip_prefetch_excluded_layers",
         "locations": [
-          "core/engine_config.hpp:2664"
+          "core/engine_config.hpp:2667"
         ]
       },
       {
         "kind": "toml",
         "name": "qwen4exp_track_router_usage",
         "locations": [
-          "core/engine_config.hpp:2706"
+          "core/engine_config.hpp:2709"
         ]
       },
       {
         "kind": "toml",
         "name": "ram_cache_layer_adaptive",
         "locations": [
-          "core/engine_config.hpp:2898"
+          "core/engine_config.hpp:2906"
         ]
       },
       {
         "kind": "toml",
         "name": "ram_cache_total_experts",
         "locations": [
-          "core/engine_config.hpp:2783"
+          "core/engine_config.hpp:2791"
         ]
       },
       {
         "kind": "toml",
         "name": "ram_copy_reclaim_threshold",
         "locations": [
-          "core/engine_config.hpp:2914"
+          "core/engine_config.hpp:2922"
         ]
       },
       {
         "kind": "toml",
         "name": "ram_pin_eager_preregister",
         "locations": [
-          "core/engine_config.hpp:2796"
+          "core/engine_config.hpp:2804"
         ]
       },
       {
         "kind": "toml",
         "name": "ram_pinned_budget_gb",
         "locations": [
-          "core/engine_config.hpp:2793"
+          "core/engine_config.hpp:2801"
         ]
       },
       {
         "kind": "toml",
         "name": "ram_preload_all_experts",
         "locations": [
-          "core/engine_config.hpp:2785"
+          "core/engine_config.hpp:2793"
         ]
       },
       {
         "kind": "toml",
         "name": "ram_vram_promote_adaptive",
         "locations": [
-          "core/engine_config.hpp:2842"
+          "core/engine_config.hpp:2850"
         ]
       },
       {
         "kind": "toml",
         "name": "ram_vram_promote_adaptive_threshold",
         "locations": [
-          "core/engine_config.hpp:2844"
+          "core/engine_config.hpp:2852"
         ]
       },
       {
         "kind": "toml",
         "name": "ram_vram_promote_dynamic_cold_start_k",
         "locations": [
-          "core/engine_config.hpp:2884"
+          "core/engine_config.hpp:2892"
         ]
       },
       {
         "kind": "toml",
         "name": "ram_vram_promote_dynamic_k_floor",
         "locations": [
-          "core/engine_config.hpp:2881"
+          "core/engine_config.hpp:2889"
         ]
       },
       {
         "kind": "toml",
         "name": "ram_vram_promote_dynamic_k_tier1",
         "locations": [
-          "core/engine_config.hpp:2879"
+          "core/engine_config.hpp:2887"
         ]
       },
       {
         "kind": "toml",
         "name": "ram_vram_promote_dynamic_k_tier2",
         "locations": [
-          "core/engine_config.hpp:2877"
+          "core/engine_config.hpp:2885"
         ]
       },
       {
         "kind": "toml",
         "name": "ram_vram_promote_dynamic_k_tier3",
         "locations": [
-          "core/engine_config.hpp:2875"
+          "core/engine_config.hpp:2883"
         ]
       },
       {
         "kind": "toml",
         "name": "ram_vram_promote_dynamic_k_tier4",
         "locations": [
-          "core/engine_config.hpp:2873"
+          "core/engine_config.hpp:2881"
         ]
       },
       {
         "kind": "toml",
         "name": "ram_vram_promote_dynamic_layer",
         "locations": [
-          "core/engine_config.hpp:2859"
+          "core/engine_config.hpp:2867"
         ]
       },
       {
         "kind": "toml",
         "name": "ram_vram_promote_dynamic_min_samples",
         "locations": [
-          "core/engine_config.hpp:2887"
+          "core/engine_config.hpp:2895"
         ]
       },
       {
         "kind": "toml",
         "name": "ram_vram_promote_dynamic_threshold_1",
         "locations": [
-          "core/engine_config.hpp:2871"
+          "core/engine_config.hpp:2879"
         ]
       },
       {
         "kind": "toml",
         "name": "ram_vram_promote_dynamic_threshold_2",
         "locations": [
-          "core/engine_config.hpp:2868"
+          "core/engine_config.hpp:2876"
         ]
       },
       {
         "kind": "toml",
         "name": "ram_vram_promote_dynamic_threshold_3",
         "locations": [
-          "core/engine_config.hpp:2865"
+          "core/engine_config.hpp:2873"
         ]
       },
       {
         "kind": "toml",
         "name": "ram_vram_promote_dynamic_threshold_4",
         "locations": [
-          "core/engine_config.hpp:2862"
+          "core/engine_config.hpp:2870"
         ]
       },
       {
         "kind": "toml",
         "name": "ram_vram_promote_layer_gate",
         "locations": [
-          "core/engine_config.hpp:2848"
+          "core/engine_config.hpp:2856"
         ]
       },
       {
         "kind": "toml",
         "name": "ram_vram_promote_layer_gate_min_samples",
         "locations": [
-          "core/engine_config.hpp:2854"
+          "core/engine_config.hpp:2862"
         ]
       },
       {
         "kind": "toml",
         "name": "ram_vram_promote_layer_gate_threshold",
         "locations": [
-          "core/engine_config.hpp:2851"
+          "core/engine_config.hpp:2859"
         ]
       },
       {
         "kind": "toml",
         "name": "ram_vram_promote_layer_gate_top_fraction",
         "locations": [
-          "core/engine_config.hpp:2857"
+          "core/engine_config.hpp:2865"
         ]
       },
       {
         "kind": "toml",
         "name": "ram_vram_promote_min_samples",
         "locations": [
-          "core/engine_config.hpp:2846"
+          "core/engine_config.hpp:2854"
         ]
       },
       {
         "kind": "toml",
         "name": "ram_vram_promote_top_k",
         "locations": [
-          "core/engine_config.hpp:2840"
+          "core/engine_config.hpp:2848"
         ]
       },
       {
@@ -136586,14 +136572,14 @@
         "name": "raw_prompt",
         "locations": [
           "backends/cpu/cpu_config.hpp:298",
-          "core/engine_config.hpp:2942"
+          "core/engine_config.hpp:2950"
         ]
       },
       {
         "kind": "toml",
         "name": "reactive_promote_gpu1_every_n",
         "locations": [
-          "core/engine_config.hpp:2895"
+          "core/engine_config.hpp:2903"
         ]
       },
       {
@@ -136601,63 +136587,63 @@
         "name": "reasoning_effort",
         "locations": [
           "backends/cpu/cpu_config.hpp:301",
-          "core/engine_config.hpp:2945"
+          "core/engine_config.hpp:2953"
         ]
       },
       {
         "kind": "toml",
         "name": "repeat_penalty",
         "locations": [
-          "core/engine_config.hpp:2412"
+          "core/engine_config.hpp:2415"
         ]
       },
       {
         "kind": "toml",
         "name": "role",
         "locations": [
-          "core/engine_config.hpp:2953"
+          "core/engine_config.hpp:2961"
         ]
       },
       {
         "kind": "toml",
         "name": "spec_draft_model",
         "locations": [
-          "core/engine_config.hpp:2407"
+          "core/engine_config.hpp:2410"
         ]
       },
       {
         "kind": "toml",
         "name": "spec_draft_n_max",
         "locations": [
-          "core/engine_config.hpp:2730"
+          "core/engine_config.hpp:2738"
         ]
       },
       {
         "kind": "toml",
         "name": "spec_type",
         "locations": [
-          "core/engine_config.hpp:2718"
+          "core/engine_config.hpp:2726"
         ]
       },
       {
         "kind": "toml",
         "name": "speculative_active_layer_max_k",
         "locations": [
-          "core/engine_config.hpp:2927"
+          "core/engine_config.hpp:2935"
         ]
       },
       {
         "kind": "toml",
         "name": "speculative_active_layer_promote_on_confirm",
         "locations": [
-          "core/engine_config.hpp:2930"
+          "core/engine_config.hpp:2938"
         ]
       },
       {
         "kind": "toml",
         "name": "speculative_promote_to_active_layer",
         "locations": [
-          "core/engine_config.hpp:2925"
+          "core/engine_config.hpp:2933"
         ]
       },
       {
@@ -136665,7 +136651,7 @@
         "name": "system_prompt",
         "locations": [
           "backends/cpu/cpu_config.hpp:299",
-          "core/engine_config.hpp:2943"
+          "core/engine_config.hpp:2951"
         ]
       },
       {
@@ -136673,7 +136659,7 @@
         "name": "temperature",
         "locations": [
           "backends/cpu/cpu_config.hpp:286",
-          "core/engine_config.hpp:2410"
+          "core/engine_config.hpp:2413"
         ]
       },
       {
@@ -136681,56 +136667,56 @@
         "name": "top_p",
         "locations": [
           "backends/cpu/cpu_config.hpp:287",
-          "core/engine_config.hpp:2411"
+          "core/engine_config.hpp:2414"
         ]
       },
       {
         "kind": "toml",
         "name": "unpacked_expert_format",
         "locations": [
-          "core/engine_config.hpp:2771"
+          "core/engine_config.hpp:2779"
         ]
       },
       {
         "kind": "toml",
         "name": "use_active_layer_area",
         "locations": [
-          "core/engine_config.hpp:2919"
+          "core/engine_config.hpp:2927"
         ]
       },
       {
         "kind": "toml",
         "name": "vram_cache_full_layer_prefix",
         "locations": [
-          "core/engine_config.hpp:2812"
+          "core/engine_config.hpp:2820"
         ]
       },
       {
         "kind": "toml",
         "name": "vram_evict_demote_to_ram",
         "locations": [
-          "core/engine_config.hpp:2821"
+          "core/engine_config.hpp:2829"
         ]
       },
       {
         "kind": "toml",
         "name": "vram_gb",
         "locations": [
-          "core/engine_config.hpp:2955"
+          "core/engine_config.hpp:2963"
         ]
       },
       {
         "kind": "toml",
         "name": "vram_min_free_mb",
         "locations": [
-          "core/engine_config.hpp:2740"
+          "core/engine_config.hpp:2748"
         ]
       },
       {
         "kind": "toml",
         "name": "vram_preload_prefix_layers",
         "locations": [
-          "core/engine_config.hpp:2810"
+          "core/engine_config.hpp:2818"
         ]
       }
     ]

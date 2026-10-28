@@ -1,8 +1,9 @@
 # MiMo V2.6 Flash RL — onboarding in progress
 
 Branch: `feat/mimo-v26-flash`, based on merged R2 (`ac513ac`). This is an
-experimental text-generation implementation. Correctness parity and a regression
-witness are pending; there is no frozen performance baseline yet.
+experimental text-generation implementation. A first provisional throughput
+baseline is recorded below; correctness parity and a regression witness remain
+pending, so there is no frozen or accepted baseline yet.
 
 ## Actual export
 
@@ -56,12 +57,52 @@ fan-out; changing this is a tuning experiment after correctness validation.
 The BF16-router override above preserves original F32 routing for the initial
 comparison, rather than making a claim about the faster setting's accuracy.
 
+## Environment controls retained during correctness work
+
+- `ZEROMOE_MIMO2_INGRAPH_MOE=0` selects the older synchronous cache-backed
+  MoE callback inside the full Mimo graph. The default is the in-graph
+  hot/cold path. Keep this selector while routed-expert parity and the
+  regression witness are pending; it provides a same-model comparison path.
+- `ZEROMOE_DISABLE_ROUTER_BF16=1` keeps Mimo's router weights in F32. The
+  Mimo recipes use it until BF16 route-ID parity and quality are validated.
+  This is a shared engine control, so the Mimo pass does not retire the global
+  reader.
+- `ZEROMOE_SCHED_EVENTS` is set internally when Mimo enables prefill
+  op-offload so GGML schedules its copy events correctly. It is not a user
+  tuning input.
+
 ## GLM 5.3 Flash comparison and MiMo measurements
 
 **Acceptance target: at least 10 tok/s steady-state decode on this machine.**
 MiMo belongs to the DDR+VRAM-resident performance class alongside Qwen 3.8
 Flash, GLM 5.3 Flash and Ling 3.1 Flash. A result below 10 tok/s is an
 optimization failure, not an acceptable model-size limit.
+
+### First provisional baseline (2026-10-28)
+
+The ZeroMoE survey run used four held-out prompts, 64 generated tokens each,
+six CPU threads, the dual-GPU in-graph profile, and a 110 GiB no-swap process
+cap. It prefetched the profile's 3,533 pinned experts from the USB-backed GGUF.
+The run logged 32.21 tok/s prefill and 15.59 tok/s steady graph decode
+(252 decode graph runs in 16.161 s; individual request decode rates were
+13.89–16.29 tok/s). This clears the 10 tok/s target in this sample. Startup
+and profile population took about five minutes and are separate from those
+steady-state rates.
+
+The pinned llama.cpp `8baabd53b` reference was run with 47 CPU MoE layers,
+both GPUs, six threads, and the same prompt token lengths and generation
+length. Its combined prompt+generation rates were 11.22 tok/s at pp25/tg64,
+11.15 at pp26/tg64, 6.11 at pp17/tg64, and 3.76 at pp24/tg64. The latter two
+had high run-to-run variation. The ZeroMoE profile reserves context 2048,
+while llama-bench sizes its context to prompt+generation; this ratio remains
+provisional. The two runtimes also use different expert placement strategies:
+ZeroMoE's pinned VRAM/DDR tiers versus llama.cpp's CPU expert tensors.
+
+The graph gate reported `memory_plan=unknown`, so
+`check_full_graph_moe_run.py --full-fit` did not pass. This measurement does
+not complete Mimo onboarding or correctness acceptance. Raw inputs and logs
+are under `build_mtp_results/2026-10-28-mimo-survey-eval-e63b963/` in the
+ZeroMoE worktree.
 
 The GLM no-offload profile is a useful cache-policy reference. Its
 AJ-IQ2_XXS export is 87.3 GB with 74.21 GiB of routed experts: 42 MoE layers

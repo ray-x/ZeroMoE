@@ -1,0 +1,1 @@
+EXPLORATORY ONLY — not the baseline result. The first invocation omitted the maintained Mimo survey command-line overrides --graph-offload-ddr-gib 100 and --graph-offload-usage-file. It generated only 36/64 tokens before the run ended. Use 2026-10-28-mimo-survey-eval-e63b963 for the corrected profile.
