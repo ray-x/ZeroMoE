@@ -1,0 +1,18 @@
+# ZeroMoE starter configuration.
+#
+# Copy this file, set model_path, and run:
+#   ./build/zeromoe --config my-model.toml --prompt "Hello"
+#
+# Every other value is left at the engine default: one GPU, automatic VRAM and
+# host-RAM sizing, and the default sampling settings. Once the first run works,
+# move to a hardware-tuned profile from configs/ or docs/models/README.md.
+
+model_path = "/path/to/model.gguf"
+
+context_size   = 4096
+max_new_tokens = 256
+temperature    = 0.0    # 0 = greedy; raise for sampling
+
+[[gpus]]
+device_id = 0
+role      = "dense+moe"
