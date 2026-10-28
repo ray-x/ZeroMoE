@@ -100,3 +100,15 @@ python3 tools/check_full_graph_moe_perf.py \
   build_llama_qwen36_sm120a_ref/results/qwen36_pg1_tg400.json \
   --n-prompt 1 --n-gen 400 --device CUDA1 --minimum-tps 110
 ```
+
+## Related checkpoints on the same architecture
+
+Ornith 1.5 (35B-A3B and 122B) reports `general.architecture = qwen35moe`, so it
+routes to this same `Qwen35MoEGraphModel` adapter. Neither checkpoint has been
+validated here: there is no captured gate log, teacher-forced parity run, or
+performance measurement for them, so they are not listed as supported.
+
+The 122B also cannot fit the validated full-fit policy on a 24 GiB + 16 GiB
+machine: its smallest published quantization is 40.4 GB (UD-IQ1_M), already
+larger than the 40 GiB of total VRAM before dense weights, KV/GDN state and
+workspace, and this adapter requires every expert layer to be device-resident.

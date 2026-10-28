@@ -35,7 +35,7 @@ It is **not a fork of llama.cpp** and does not link `libllama`. It builds on **g
 ## Quick start
 
 ```bash
-git clone <repository-url> ZeroMoE
+git clone https://github.com/ray-x/ZeroMoE.git
 cd ZeroMoE
 ./setup.sh
 ```
