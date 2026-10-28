@@ -76,22 +76,22 @@ else
     # configured, so link it opportunistically and say so if it is missing,
     # rather than failing with a wall of undefined references.
     EXTRA_SRCS="backends/cpu/ggml_grids.cpp"
-    # ggml_grids.cpp includes ggml-common.h, which lives in the fetched
-    # ggml source tree, so add it to the search path. Look in the default
-    # CMake build directories used on Linux and macOS.
+    # ggml_grids.cpp includes ggml-common.h, which lives in the ggml source
+    # tree. Find it wherever this checkout put it: a fetched build/_deps tree,
+    # a user-supplied ZEROMOE_GGML_ROOT, or the third_party submodule.
     if [ -z "${GGML_SRC_DIR:-}" ]; then
-        for d in build/_deps/ggml-src/src build-macos/_deps/ggml-src/src build-cpu/_deps/ggml-src/src; do
-            [ -d "$d" ] && { GGML_SRC_DIR="$d"; break; }
-        done
+        GGML_SRC_DIR="$(find . -maxdepth 6 -name ggml-common.h \
+            -not -path './.git/*' -not -path './obsolete/*' 2>/dev/null | head -n 1)"
+        [ -n "$GGML_SRC_DIR" ] && GGML_SRC_DIR="$(dirname "$GGML_SRC_DIR")"
     fi
-    GGML_SRC_DIR="${GGML_SRC_DIR:-build/_deps/ggml-src/src}"
-    [ -d "$GGML_SRC_DIR" ] && INC_FLAGS="-I$GGML_SRC_DIR -I$GGML_SRC_DIR/../include"
+    GGML_SRC_DIR="${GGML_SRC_DIR:-}"
+    [ -n "$GGML_SRC_DIR" ] && INC_FLAGS="-I$GGML_SRC_DIR -I$GGML_SRC_DIR/../include"
     if [ -z "${GGML_LIB_DIR:-}" ]; then
-        for d in build/ggml-build/src build-macos/ggml-build/src build-cpu/ggml-build/src; do
-            compgen -G "$d/libggml-base.*" >/dev/null && { GGML_LIB_DIR="$d"; break; }
-        done
+        GGML_LIB_DIR="$(find . -maxdepth 7 -name 'libggml-base.so*' \
+            -not -path './.git/*' 2>/dev/null | head -n 1)"
+        [ -n "$GGML_LIB_DIR" ] && GGML_LIB_DIR="$(dirname "$GGML_LIB_DIR")"
     fi
-    GGML_LIB_DIR="${GGML_LIB_DIR:-build/ggml-build/src}"
+    GGML_LIB_DIR="${GGML_LIB_DIR:-}"
     if compgen -G "$GGML_LIB_DIR/libggml-base.*" >/dev/null; then
         GGML_LIB_DIR="$(cd "$GGML_LIB_DIR" && pwd)"
         EXTRA_LDFLAGS="-L$GGML_LIB_DIR -lggml-cpu -lggml-base -Wl,-rpath,$GGML_LIB_DIR"

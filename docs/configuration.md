@@ -159,7 +159,7 @@ Both presets select Release and ggml; CUDA additionally builds ggml's CUDA
 backend. They do not change inference tuning. Hardware-specific build choices
 still matter: for example, an x86 CPU without AVX-512 VNNI needs
 `-DGGML_AVX512_VNNI=OFF` when configuring. See
-[the build instructions](../README.md#build-and-installation-pipeline).
+[the build instructions](../README.md#build-and-installation).
 Manual CMake and existing Make targets remain supported.
 
 ## Scope and maintenance

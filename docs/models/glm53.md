@@ -2,7 +2,7 @@
 
 - **Arch / family:** `glm-dsa` → `GLM_DSA`. 78 layers, 75 routed-expert layers, absorbed MLA + DSA,
   routed MoE.
-- **Model:** `/home/ray/vllm-workspace/GLM-5.3-GGUF-align` (6 shards, UD-IQ2_M).
+- **Model:** `/path/to/models/GLM-5.3-GGUF-align` (6 shards, UD-IQ2_M).
 - **Offload store:** `/data/glm53_offload.gguf` (routed experts, first layer 3); experts also read
   from the model files (split reads across both drives).
 - **Placement:** dual GPU — 5060 Ti core (dense/attention/KV/LM head) + 3090 expert vault (22 GiB

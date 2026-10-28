@@ -1,6 +1,6 @@
 {
   "created_utc": "2026-10-21T01:10:00Z",
-  "worktree": "/home/ray/Projects/MoEStream/.worktrees/ling-3.1-flash-nocopy",
+  "worktree": "/path/to/MoEStream/.worktrees/ling-3.1-flash-nocopy",
   "branch": "ling-3.1-flash-nocopy",
   "base_head": "9c69ceaa08ea963889532a9186b45080433ae830",
   "master_at_record": "04e2f6042f2dfa5138f894e91fa73784fb9c7307",

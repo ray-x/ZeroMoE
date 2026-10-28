@@ -138,3 +138,20 @@ The engine prepares reusable device arenas at startup and the first decode graph
 For Option-B per-expert split configs the startup step also uploads the ~13 GiB split arena once (+~2.7 s startup) and keeps it resident while prompts
 are short; a long prompt (roughly more than ~120 tokens on a 24 GiB card) releases it before prefill and rebuilds it for that request's decode.
 See `tests/option_b_split_reverify_howto.md` section 18 for measurements.
+
+## Qwen full-graph prefill state handoff
+
+For Qwen full-graph inference, `qwen4exp_prefill_state_handoff = true` keeps
+prefill GDN state on the GPU for decode and defers host readback until a layered
+fallback needs it. The default is `false`. It retains the prefill scheduler's
+activation workspace during decode (about 0.18 GiB in the latest 3090 pp23
+test, plus reusable GPU zero-state buffers; size depends on prompt shape and
+placement). Fresh prefills use immutable CUDA zero-state inputs instead of
+clearing and uploading recurrent state on every request. KV and PLE host snapshots remain
+available. Prompt caching, MTP, and compact expert staging use the host path.
+`ZEROMOE_QWEN4EXP_PREFILL_STATE_HANDOFF=0` or `1` overrides the TOML setting.
+See [the state-handoff A/B guide](../tests/qwen4exp_state_handoff_howto.md) for
+reproduction commands, measured timings, and the memory tradeoff.
+Full-GPU Qwen graphs omit the artificial CPU staging node and compute the
+prefill output projection on GPU. `tests/qwen4exp_bee_fullgpu_compare.sh`
+checks warm prefill and matched first-to-last decode performance against Bee.

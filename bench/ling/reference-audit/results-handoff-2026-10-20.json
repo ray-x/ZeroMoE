@@ -1,12 +1,12 @@
 {
   "created_utc": "2026-10-20T11:10:25.171698+00:00",
-  "worktree": "/home/ray/Projects/MoEStream/.worktrees/ling-3.1-flash-nocopy",
+  "worktree": "/path/to/MoEStream/.worktrees/ling-3.1-flash-nocopy",
   "branch": "ling-3.1-flash-nocopy",
   "base_head": "9c69ceaa08ea963889532a9186b45080433ae830",
   "master_at_handoff": "04e2f6042f2dfa5138f894e91fa73784fb9c7307",
   "objective_complete": false,
   "config": {
-    "prompt_file": "/home/ray/Projects/MoEStream/.worktrees/ling-3.1-flash-nocopy/bench/ling/reference-audit/prompt.txt",
+    "prompt_file": "/path/to/MoEStream/.worktrees/ling-3.1-flash-nocopy/bench/ling/reference-audit/prompt.txt",
     "prompt_sha256": "ba9d5a6258cef659c36fc0193a6c8c0d33a47762ff99798b01662e306f3ab942",
     "context_size": 64,
     "new_tokens": 32,
@@ -30,35 +30,35 @@
     "full_graph_prefill": true,
     "full_graph_decode": true,
     "graph_owned_moe_weights_bytes": 0,
-    "profile": "/home/ray/Projects/MoEStream/.worktrees/ling-3.1-flash-nocopy/bench/ling/reference-audit/usage-hi-there-robust4.pin",
+    "profile": "/path/to/MoEStream/.worktrees/ling-3.1-flash-nocopy/bench/ling/reference-audit/usage-hi-there-robust4.pin",
     "profile_sha256": "2b03d9a89e51de25eee8a64b90fed2f104745dd207b74ebf4931e450c5b49259",
     "profile_entries": 9943,
     "profile_count_sum": 67456
   },
   "runtime_files": [
     {
-      "path": "/home/ray/Projects/MoEStream/.worktrees/ling-3.1-flash-nocopy/build-ling/moestream",
-      "resolved_path": "/home/ray/Projects/MoEStream/.worktrees/ling-3.1-flash-nocopy/build-ling/moestream",
+      "path": "/path/to/MoEStream/.worktrees/ling-3.1-flash-nocopy/build-ling/moestream",
+      "resolved_path": "/path/to/MoEStream/.worktrees/ling-3.1-flash-nocopy/build-ling/moestream",
       "sha256": "b6f53db2e4cb2a61040babe0d9ddf1b4387acd2c4d8b3f72c4acc8ae9c88c42b"
     },
     {
-      "path": "/home/ray/Projects/MoEStream/.worktrees/ling-3.1-flash/build-ling/ggml-build/src/libggml.so.0",
-      "resolved_path": "/home/ray/Projects/MoEStream/.worktrees/ling-3.1-flash/build-ling/ggml-build/src/libggml.so.0.27.0",
+      "path": "/path/to/MoEStream/.worktrees/ling-3.1-flash/build-ling/ggml-build/src/libggml.so.0",
+      "resolved_path": "/path/to/MoEStream/.worktrees/ling-3.1-flash/build-ling/ggml-build/src/libggml.so.0.27.0",
       "sha256": "0cda6ae45eb6a23951d28960741d1998bc2287e686493a8d27d6872221b2f60c"
     },
     {
-      "path": "/home/ray/Projects/MoEStream/.worktrees/ling-3.1-flash/build-ling/ggml-build/src/libggml-base.so.0",
-      "resolved_path": "/home/ray/Projects/MoEStream/.worktrees/ling-3.1-flash/build-ling/ggml-build/src/libggml-base.so.0.27.0",
+      "path": "/path/to/MoEStream/.worktrees/ling-3.1-flash/build-ling/ggml-build/src/libggml-base.so.0",
+      "resolved_path": "/path/to/MoEStream/.worktrees/ling-3.1-flash/build-ling/ggml-build/src/libggml-base.so.0.27.0",
       "sha256": "e24a110d7dbb2dc24124fbec78e0e8ab05fb70a117bd62ac553e653bd266b7ef"
     },
     {
-      "path": "/home/ray/Projects/MoEStream/.worktrees/ling-3.1-flash/build-ling/ggml-build/src/libggml-cpu.so.0",
-      "resolved_path": "/home/ray/Projects/MoEStream/.worktrees/ling-3.1-flash/build-ling/ggml-build/src/libggml-cpu.so.0.27.0",
+      "path": "/path/to/MoEStream/.worktrees/ling-3.1-flash/build-ling/ggml-build/src/libggml-cpu.so.0",
+      "resolved_path": "/path/to/MoEStream/.worktrees/ling-3.1-flash/build-ling/ggml-build/src/libggml-cpu.so.0.27.0",
       "sha256": "a7af7d04f215aafc51f84e9998c502e163bee42488b05b742eaf61a733f531f9"
     },
     {
-      "path": "/home/ray/Projects/MoEStream/.worktrees/ling-3.1-flash/build-ling/ggml-build/src/ggml-cuda/libggml-cuda.so.0",
-      "resolved_path": "/home/ray/Projects/MoEStream/.worktrees/ling-3.1-flash/build-ling/ggml-build/src/ggml-cuda/libggml-cuda.so.0.27.0",
+      "path": "/path/to/MoEStream/.worktrees/ling-3.1-flash/build-ling/ggml-build/src/ggml-cuda/libggml-cuda.so.0",
+      "resolved_path": "/path/to/MoEStream/.worktrees/ling-3.1-flash/build-ling/ggml-build/src/ggml-cuda/libggml-cuda.so.0.27.0",
       "sha256": "002fd9cd90579eb4c4e60b995eb8c80316e40ae89041b5e5b7bc4cdf3cfe0e01"
     }
   ],

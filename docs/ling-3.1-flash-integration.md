@@ -3,8 +3,8 @@
 ## Inputs inspected
 
 - Worktree: `ling-3.1-flash`, based on `master` at `c03d677`.
-- Model: `/home/ray/vllm-workspace/ling-3.1-flash/Ling-3.1-flash-AD-IQ1_S-00001-of-00004.gguf` and its three companion shards.
-- Reference implementation: `/home/ray/Projects/llama.cpp/src/models/bailingmoe3.cpp`.
+- Model: `/path/to/models/ling-3.1-flash/Ling-3.1-flash-AD-IQ1_S-00001-of-00004.gguf` and its three companion shards.
+- Reference implementation: `/path/to/llama.cpp/src/models/bailingmoe3.cpp`.
 - Existing ZeroMoE references: Qwen3.8 Flash Next (`qwen4exp`) and GLM5Next.
 
 This records the integration and a full-checkpoint full-graph comparison

@@ -18,14 +18,12 @@ SOURCES=(
   tools/gguf_mirror.cpp
 )
 INCLUDES=(
-  -Iinclude
   -Icore
   -Imodels/base
   -Imemory
   -Imodels/graph
   -Ibackends/ggml
   -Ibackends/cpu
-  -Icuda
 )
 
 if (($# == 0)); then

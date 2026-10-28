@@ -7,7 +7,7 @@ output read for coherence before a timing was trusted, page cache dropped before
 
 ## 1. The configuration we run
 
-**Model:** `/home/ray/vllm-workspace/GLM-5.3-Flash/GLM-5.3-Flash-AJ-IQ2_XXS-00001-of-00002.gguf` (+ shard 2), 87.3 GB, IQ2_XXS
+**Model:** `/path/to/models/GLM-5.3-Flash/GLM-5.3-Flash-AJ-IQ2_XXS-00001-of-00002.gguf` (+ shard 2), 87.3 GB, IQ2_XXS
 (2.06 bpw; 8 layers have down in IQ2_S). `glm5-next 320B.A18B`: 45 trunk layers (34 KDA + 11 DSA), dense FFN layers 0-2, MoE layers 3..44
 (42 layers) x 288 routed experts, top-8 + shared expert, hyper-connections hc_mult=4. Routed experts total 74.21 GiB = 12,096 experts of
 ~6.6 MB (planes 2,162,688 / 2,162,688 / 2,686,976 B). Always pass the explicit first-shard path (a directory merges sibling .gguf files).
@@ -21,7 +21,7 @@ output read for coherence before a timing was trusted, page cache dropped before
 | DDR MoE pool | `ZEROMOE_GLM5NEXT_OFFLOAD_DDR_GIB` (virtual arena; 32 default in tests; 46 for a 64 GiB machine) |
 | cache policy | `OFFLOAD_POLICY=lru`, `OFFLOAD_PINNED=0.5` (half the pool pinned by usage ranking), `OFFLOAD_ASYNC=1` |
 | prefetch | off (`PILOT_STAGE` unset) |
-| store | embedded expert blocks in an interleaved model, or a store striped over both NVMes: `OFFLOAD_STORE=/data/moestream-offload/glm53flash-stripe0.gguf:/home/ray/work/nvme1-store/glm53flash-stripe1.gguf` |
+| store | embedded expert blocks in an interleaved model, or a store striped over both NVMes: `OFFLOAD_STORE=/data/moestream-offload/glm53flash-stripe0.gguf:/path/to/path/to/models/glm53flash-stripe1.gguf` |
 | usage file | `docs/ssd-offload/data/glm53flash_usage_combined_old_plus_survey5.txt` |
 | other | `host_ram_gb=16` (>= ~16 needed for the dense tensors), `THP=0`, `CPU_THREADS=8`, `ALLOC_FLOOR_MIB=512`, `CUDA_VISIBLE_DEVICES=0`, `--ngen 96`, 5 topic-shifting prompts in one session |
 | older whole-layer baseline | `configs/bench/glm53flash_AJ_IQ2XXS_wholelayer8_cpu.toml` (8 MoE layers fully in VRAM, rest on CPU), 7.26 tok/s |
@@ -132,7 +132,7 @@ The real AJ file is 6.59 MB/expert, so its measured 128 ms at DDR 32 is slower t
 * Docs: `docs/ssd-offload/05` (graph integration), `07` (CPU cost), `08` (quant model), `09` (summary), `10` (layout, lane, pool, seeding).
 * Drivers: `glm_runs/run_seg_ab.sh`, `run_clean.sh`, queue scripts `run_*_queue.sh`; reports `glm_runs/pinab_report.py`; logs under
   `~/work/moestream-graph/glm_runs/pinab/` (the toml's absolute `log_path` points there).
-* Stores: `/data/glm53flash-il` (interleaved), `/data/moestream-offload/glm53flash-stripe0.gguf` + `~/work/nvme1-store/glm53flash-stripe1.gguf`
+* Stores: `/data/glm53flash-il` (interleaved), `/data/moestream-offload/glm53flash-stripe0.gguf` + `~/work/path/to/models/glm53flash-stripe1.gguf`
   (striped, 37.11 GiB each), `glm53flash-aj-iq2xxs-all12096.gguf` (single full store, 80 GB).
 
 ## 6. Update 2026-10-13: decode profile and two measured wins (graph-framework branch)

@@ -1,5 +1,5 @@
 #!/bin/bash
-cd /home/ray/work/moestream-glm53
+cd /path/to/moestream-glm53
 run() { local N=$1; shift
   sed -i "s/glm53_dsa_graph2gpu_[a-z0-9]*\./glm53_dsa_graph2gpu_$N./g" logs/glm53_dsa_graph2gpu.toml logs/run_dsa_graph2gpu_426.sh
   env MOESTREAM_GLM5NEXT_PILOT_STAGE=8 MOESTREAM_GLM5NEXT_OFFLOAD_ASYNC=1 MOESTREAM_GLM5NEXT_PILOT_PREFETCH=8 MOESTREAM_GLM5NEXT_PILOT_COPY=0 MOESTREAM_GLM5NEXT_PILOT_LOOKAHEAD=2 OFFLOAD_DDR_GIB=54 "$@" ./logs/run_dsa_graph2gpu_426.sh > logs/glm53_dsa_graph2gpu_$N.run.out 2>&1

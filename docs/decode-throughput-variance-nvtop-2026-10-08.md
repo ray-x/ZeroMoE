@@ -48,5 +48,5 @@ NOT proven: the planned synthetic-poller control batch was not run.
 - Optional confirmation: run a batch with nvtop stopped and a synthetic `nvidia-smi -lms 1000` poller; a
   returning tail would point at GPU polling as the mechanism.
 
-Raw data (kept outside the repo, /home/ray/work/moestream-root-snapshot/logs): lowrun2_20261008*, expA_paused_unpinned_20261008*,
+Raw data (kept outside the repo, /path/to/moestream-root-snapshot/logs): lowrun2_20261008*, expA_paused_unpinned_20261008*,
 expC_htop_only_20261008*; analysis: analyze_lowrun2.py, sampler2.py / sampler3.py.

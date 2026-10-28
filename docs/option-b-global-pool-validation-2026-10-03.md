@@ -142,7 +142,7 @@ CUDA_VISIBLE_DEVICES=0 /tmp/option_b_compact_check cuda
 
 ```bash
 ../moestream-build-upstream-master/gguf_tool verify \
-  /data/sdb/models/qwen3.8-flash-next/Q2_0
+  /path/to/models/qwen3.8-flash-next/Q2_0
 python3 tests/test_compare_decode_logits.py
 make test-components ARGS="option_b_global_pool"
 make test BUILD_DIR=../moestream-build-upstream-master JOBS=4

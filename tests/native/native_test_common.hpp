@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <chrono>
 #include <iomanip>
+#include <string>
 #include <unordered_map>
 #include <omp.h>
 #ifdef __linux__
@@ -53,10 +54,17 @@
 void attn_causal_conv1d_silu(const float* x, const float* w, float* out,
                              int S, int channels, int kernel, float* history);
 
+// Real-model checks locate their fixture directory from the environment so a
+// checkout does not carry machine-specific absolute paths. Without the
+// variable the tests skip, which is the same outcome as a missing source.
+inline std::string test_model_dir(const char *env_name) {
+    const char *dir = std::getenv(env_name);
+    return dir ? std::string(dir) : std::string("/nonexistent/zeromoe-test-models");
+}
+
 // ------------------------------------------------------------------
 // External Links to Core Functions
-// ------------------------------------------------------------------
-extern void matmul(float* y, const float* x, const float* W, int S, int I, int O);
+// ------------------------------------------------------------------extern void matmul(float* y, const float* x, const float* W, int S, int I, int O);
 extern void rmsnorm_row(float* out, const float* x, const float* w, int D, float eps);
 extern void softmax_row(float* x, int size);
 extern void extract_gguf_row_q4_0(const QuantizedTensor& tensor, int row_idx, float* __restrict__ out_f32);

@@ -422,7 +422,7 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
   int n_layer_nextn = file.get_config_int("nextn_predict_layers", 0);
   // Qwen4Exp's own "shared" MTP convention (verified against the real
   // mtp-*-shared-*.gguf file and against the correct upstream reference,
-  // /home/ray/Projects/unsloth/llama.cpp branch mtp/qwen4exp-nextn,
+  // /path/to/unsloth/llama.cpp branch mtp/qwen4exp-nextn,
   // qwen4exp.cpp's load_arch_hparams/graph_mtp): the extra NextN block is
   // NOT described by the base model file at all -- its own block_count KV
   // (confirmed 48, real tensor dump) has no nextn_predict_layers entry,
@@ -1730,7 +1730,7 @@ if (fam == ModelFamily::Qwen4Exp) {
       // above), and its tensors live in the SEPARATE mtp_model_file, not
       // `file`. Verified against the real mtp-*-shared-*.gguf file (32
       // tensors, all under blk.48.*) and against
-      // /home/ray/Projects/unsloth/llama.cpp's qwen4exp.cpp (branch
+      // /path/to/unsloth/llama.cpp's qwen4exp.cpp (branch
       // mtp/qwen4exp-nextn): layer 48 is architecturally an ordinary
       // full-attention trunk layer (split attn_q/k/v, not the recurrent
       // attn_qkv-combined GDN layout) plus the nextn.* bridge/head

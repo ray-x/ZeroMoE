@@ -2,7 +2,7 @@
 
 - **Arch / family:** `glm5next` → `GLM5NEXT`. 45 trunk layers (34 KDA + 11 DSA), dense FFN layers
   0-2, MoE layers 3-44 (42) × 288 experts, top-8 + shared expert, `hc_mult=4`.
-- **Model:** `/home/ray/vllm-workspace/GLM-5.3-Flash/GLM-5.3-Flash-AJ-IQ2_XXS-00001-of-00002.gguf` (+ shard 2).
+- **Model:** `/path/to/models/GLM-5.3-Flash/GLM-5.3-Flash-AJ-IQ2_XXS-00001-of-00002.gguf` (+ shard 2).
 - **Placement (whole-layer):** attention/HC/router/shared/head on the 3090; routed experts of
   layers 3-10 in VRAM, layers 11-44 on CPU (`cpu_affinity_layers = [11..44]`).
 

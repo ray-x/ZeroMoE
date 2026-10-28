@@ -24,10 +24,10 @@
 #      ZEROMOE_BENCH_IGNORE_STOP=1 this guarantees >=120 output
 #      tokens/question, the original survey requirement).
 
-model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf"
+model_path = "/path/to/models/qwen3.8-flash-next/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf"
 
 cpu_affinity_layers = []
-log_path = "/home/ray/Projects/ZeroMoE/logs/qwen4exp_survey_106prompts_option_b_layer13.log"
+log_path = "/path/to/ZeroMoE/logs/qwen4exp_survey_106prompts_option_b_layer13.log"
 log_level = "INFO"
 
 context_size = 2048
@@ -52,8 +52,8 @@ prefetch_worker_threads = 4
 # SURVEY: dedicated usage files, not the frozen 7-prompt tuning file the
 # scratch original ships with. freeze_usage_stats=false so this 106-prompt
 # run actually accumulates fresh (layer,expert) hit counts.
-pin_file           = "/home/ray/Projects/ZeroMoE/tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_option_b_layer13"
-prefill_pin_file   = "/home/ray/Projects/ZeroMoE/tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_option_b_layer13_prefill"
+pin_file           = "/path/to/ZeroMoE/tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_option_b_layer13"
+prefill_pin_file   = "/path/to/ZeroMoE/tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_option_b_layer13_prefill"
 freeze_usage_stats = false
 
 qwen4exp_option_b_layer = 13

@@ -19,7 +19,7 @@ real hardware first.
 
 ## What was validated in isolation first
 
-A standalone project, **`/home/ray/Projects/predicated-graph-poc`**
+A standalone project, **`/path/to/predicated-graph-poc`**
 (separate from ZeroMoE, no shared code), built up the mechanism
 incrementally, each step verified on this box's actual RTX 3090 before
 trusting it:
@@ -169,7 +169,7 @@ merged or shared.
    silently disabling CUDA graph capture, diverging decode output) in this
    same area. Explicitly treated as a known, separate issue this session
    (not investigated further) — still open.
-6. Decide what to do with `/home/ray/Projects/predicated-graph-poc` — keep
+6. Decide what to do with `/path/to/predicated-graph-poc` — keep
    it as a reusable mechanism-validation harness (recommended, e.g. for
    re-checking the ggml-handle-stability assumption after a ggml version
    bump), or archive it once the real integration is trusted.

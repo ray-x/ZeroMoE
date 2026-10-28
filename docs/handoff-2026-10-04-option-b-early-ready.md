@@ -1,7 +1,7 @@
 # Handoff: Option-B early-ready graph scheduling
 
 **Date:** 2026-10-04
-**Workspace:** `/home/ray/Projects/ZeroMoE`
+**Workspace:** `/path/to/ZeroMoE`
 **State:** all-split prototype implemented and validated; uncommitted; paused at the user's request.
 
 ## Result

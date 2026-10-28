@@ -187,8 +187,8 @@ patch is also available as a standalone diff for the upstream integration
 checkout. From its root:
 
 ```bash
-git apply /home/ray/Projects/ZeroMoE/patches/ggml-bf16-mmvf-cublas-experiment.patch
-cmake --build /home/ray/Projects/moestream-build-upstream-master --target ggml-cuda -j4
+git apply /path/to/ZeroMoE/patches/ggml-bf16-mmvf-cublas-experiment.patch
+cmake --build /path/to/moestream-build-upstream-master --target ggml-cuda -j4
 GGML_CUDA_BF16_MMVF_CUBLAS=1 CUDA_VISIBLE_DEVICES=1 ./path/to/zeromoe --config path/to/q2_config.toml
 ```
 

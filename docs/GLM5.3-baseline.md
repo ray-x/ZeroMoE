@@ -16,7 +16,7 @@ with a 74 GiB pool. Prefill 12.4-13.5 tok/s on the 426-token prompt (target 10).
 | GPU 0 | RTX 3090 24 GB: ExpertVault (22 GiB hot-expert set on the second device slot, see `ZEROMOE_GLM5NEXT_GPU1_HOT_GIB`) |
 | GPU 1 | RTX 5060 Ti 16 GB: core engine (dense layers, attention, KV, LM head), plus GPU-assist ring |
 | Storage | KIOXIA 1 TB (`/data`, offload store) + Samsung 980 PRO 2 TB (model dir); both PCIe Gen3 x4 (platform limit), about 6.5 GB/s combined raw read |
-| Model | GLM-5.3 UD-IQ2_M, `/home/ray/vllm-workspace/GLM-5.3-GGUF-align` (6 shards), 78 layers, 75 routed-expert layers |
+| Model | GLM-5.3 UD-IQ2_M, `/path/to/models/GLM-5.3-GGUF-align` (6 shards), 78 layers, 75 routed-expert layers |
 | Offload store | `/data/glm53_offload.gguf` (routed experts, first layer 3); experts also read from the model files (split reads across both drives) |
 | ggml | `ggml-0006-early` with patches `0006` + `0007` (early CPU hook), ZeroMoE built Release (`build_g7`) |
 | Swap | runs launched with `systemd-run --user --scope -p MemorySwapMax=0` |

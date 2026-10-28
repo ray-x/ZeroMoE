@@ -430,9 +430,9 @@ bool test_real_expert_iq2xxs_dequant() {
 bool test_mixed_precision_layer() {
     std::cout << "[Test 18] Mixed-Precision-Within-One-Layer (Phase 1: file read + VRAM dispatch)...\n";
 
-    const std::string prod_path = "/home/ray/vllm-workspace/GLM-5.3-GGUF-align";
-    const std::string iq1s_path = "/home/ray/vllm-workspace/GLM-5.3-GGUF-align/"
-        "repacked-GLM-5.3-UD-IQ1_S-00005-of-00006-part00001-of-00001.gguf";
+    const std::string prod_path = test_model_dir("ZEROMOE_TEST_GLM53_DIR");
+    const std::string iq1s_path = prod_path +
+        "/repacked-GLM-5.3-UD-IQ1_S-00005-of-00006-part00001-of-00001.gguf";
 
     struct ExpertSpec { std::string src_path; int src_layer; int src_expert; int out_expert; };
     std::vector<ExpertSpec> specs = {

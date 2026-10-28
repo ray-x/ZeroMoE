@@ -1,6 +1,6 @@
 # Option-B VRAM budget, legacy cache removal and expert-pool sizing (2026-10-05)
 
-Qwen3.8-Flash-Next **Q2_0** (`/data/sdb/models/qwen3.8-flash-next/Q2_0`, verified with `gguf_tool verify`), RTX 3090 24 GiB (220 W power limit),
+Qwen3.8-Flash-Next **Q2_0** (`/path/to/models/qwen3.8-flash-next/Q2_0`, verified with `gguf_tool verify`), RTX 3090 24 GiB (220 W power limit),
 Xeon W-2235, 10 CPU threads, single-GPU full-graph decode (`ZEROMOE_QWEN4EXP_FULL_GRAPH=1`, `..._DECODE=1`, `GRAPH_PRELOAD_LAYERS=0`),
 engine `../moestream-build-upstream-master/moestream` built from this tree. Decode speed = mean of `TOKEN-LOOP-DIAG iter_total`, steps >= 3.
 Related: `docs/handoff-2026-10-03-option-b-global-pool.md` (global pool and the teacher-forced numerics), `docs/runtime-settings.md`.
@@ -75,7 +75,7 @@ Not yet run at K >= 13,100.
 ## 4. How to reproduce
 
 Prerequisites: idle 3090 (the scripts wait for it), quiet CPU, `../moestream-build-upstream-master/moestream` built from this tree (`make -j6 zeromoe` in that directory),
-model verified: `../moestream-build-upstream-master/gguf_tool verify /data/sdb/models/qwen3.8-flash-next/Q2_0`. Run from the repo root. Each script writes under `logs/` and exits non-zero on fallback/error.
+model verified: `../moestream-build-upstream-master/gguf_tool verify /path/to/models/qwen3.8-flash-next/Q2_0`. Run from the repo root. Each script writes under `logs/` and exits non-zero on fallback/error.
 
 ```bash
 python3 bench/option_b_survey_coverage.py                       # F3 sizing and coverage table (needs no GPU)

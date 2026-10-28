@@ -30,7 +30,7 @@ attention and MoE kernels through native callbacks.
 
 ## Initial 80 GiB benchmark configuration
 
-- Model: `/home/ray/vllm-workspace/ling-3.1-flash/Ling-3.1-flash-AD-IQ1_S-00001-of-00004.gguf`
+- Model: `/path/to/models/ling-3.1-flash/Ling-3.1-flash-AD-IQ1_S-00001-of-00004.gguf`
 - Usage profile: `/tmp/ling-3.1-flash-usage-fullgraph.pin` (5,879 expert records)
 - Input: raw `Hi there` (2 tokens); 32 output tokens; context 64; greedy
 - Host budget: 80 GiB DDR, with the engine's 21.5 GiB startup margin

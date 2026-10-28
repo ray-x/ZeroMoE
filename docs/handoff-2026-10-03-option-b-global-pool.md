@@ -80,7 +80,7 @@ whether to raise the default budgets.
   is a different, untested design (my earlier "staging loses" analysis was either/or and wrong for that case).
 - 5060 Ti baseline (pruned checkpoint, 27 GPU / 21 CPU layers): 25.2 tok/s with threads 10-11. 47 CPU layers: 15.8 tok/s. llama.cpp all-experts-CPU (`-ncmoe 48`): UD-IQ1_M 17.3, Q2_0 16.9 tok/s; GLM-5.3-Flash 3.0bit
   (110 GB, needs neurall's llama.cpp for `glm5-next`): 9.8-10.0 tok/s.
-- `/home/ray/Projects/Strata` (same model family) compared: its `run.md`/`bench_inference.py` 42-47 tok/s is inflated (repeated truncated prompt + suffix-draft speculation; `--spec 4` without `--mtp` still drafts);
+- `/path/to/Strata` (same model family) compared: its `run.md`/`bench_inference.py` 42-47 tok/s is inflated (repeated truncated prompt + suffix-draft speculation; `--spec 4` without `--mtp` still drafts);
   real chat decode 29-30 tok/s vs ZeroMoE Q2_0 0/44/4 29.4-29.8 (same prompt): **equal**. Strata is GPU-bound (util 89.5%, mean 201 W at the 220 W cap, mem util 20%), ZeroMoE CPU-bound (util 41.7%).
   Strata's paper numbers need MTP and a Ryzen 5 7600 + DDR5. User decided to set the Strata comparison aside and **not** to test MTP (adds noise).
   Ideas not taken from Strata that fit our design: adaptive expert swapping, doorbell handoff, parallel PCIe share.

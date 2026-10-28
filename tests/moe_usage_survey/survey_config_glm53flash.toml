@@ -1,8 +1,8 @@
 # Deterministic GLM-5.3 Flash MTP control profile. Test-only.
-model_path = "/home/ray/vllm-workspace/GLM-5.3-Flash/GLM-5.3-Flash-AJ-IQ2_XXS-00001-of-00002.gguf"
+model_path = "/path/to/models/GLM-5.3-Flash/GLM-5.3-Flash-AJ-IQ2_XXS-00001-of-00002.gguf"
 reasoning_effort = "low"
 enable_thinking = false
-log_path = "/home/ray/work/moestream-graph/survey_glm53flash_20261008/engine.log"
+log_path = "/path/to/moestream-graph/survey_glm53flash_20261008/engine.log"
 log_level = "INFO"
 context_size = 4096
 max_new_tokens = 160
@@ -21,8 +21,8 @@ mem_guard_stop_mb = 10240
 mem_guard_poll_ms = 500
 
 freeze_usage_stats = false
-pin_file = "/home/ray/work/moestream-graph/survey_glm53flash_20261008/usage_decode"
-prefill_pin_file = "/home/ray/work/moestream-graph/survey_glm53flash_20261008/usage_prefill"
+pin_file = "/path/to/moestream-graph/survey_glm53flash_20261008/usage_decode"
+prefill_pin_file = "/path/to/moestream-graph/survey_glm53flash_20261008/usage_prefill"
 pin_threshold = 6
 pin_topk_per_layer = 12
 pin_strategy = "global_topn"

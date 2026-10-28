@@ -24,7 +24,7 @@ There is no surviving branch named `graph-refactor`. The accepted scheduler
 work was recorded as complete through `490380a` (`Add graph tier telemetry
 and adaptive policy foundation`); the staged/Phase-2 experiments continued
 after that, through the `521d67a` arena-ownership fix. The current surviving
-bug-fix worktree is `/home/ray/work/moestream-claude-perf`, branch
+bug-fix worktree is `/path/to/moestream-claude-perf`, branch
 `claude/staged-coherence-phase2`, still based at `521d67a`.
 
 ## Completed and accepted production path

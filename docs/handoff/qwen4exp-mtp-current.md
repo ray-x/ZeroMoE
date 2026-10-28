@@ -55,7 +55,7 @@ and explain it.” The model received 29 prompt tokens and stopped at EOS after
 
 - Model: Qwen3.8-Flash-Next GSQ-RCO Q2_0, two shards.
 - MTP draft: Q4_K_M shared checkpoint at
-  `/home/ray/vllm-workspace/qwen3.8-flash-next/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf`.
+  `/path/to/models/qwen3.8-flash-next/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf`.
 - Config: context 1536, max_new_tokens 800, temperature 0, top-p 0.95,
   global Option-B K=13,000, host_ram_gb 80 GiB, 10 OpenMP threads, frozen
   usage files, three draft tokens.

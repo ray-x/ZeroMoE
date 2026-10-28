@@ -26,12 +26,12 @@ the hybrid is small, so it is less sensitive).
 | GPU | RTX 3090 24 GB, PCIe Gen3 x16, power limit 350 W; the 5060 Ti is hidden with `CUDA_VISIBLE_DEVICES=0` |
 | source | `graph-framework` at `e0fc5f2` (the binary was built 2026-10-16 03:01:57, the commit is 03:03:33; later commits are docs and the script only) |
 | binary | `build_native/zeromoe` (Release, CUDA, `GGML_AVX512=ON`, `GGML_AVX512_VNNI=ON`, `GGML_AVX2=OFF`, OpenMP on) |
-| ggml | `ZEROMOE_GGML_ROOT=/home/ray/work/ggml-iq2xxs/ggml` at `7bd457fa1` plus uncommitted env-gated trace code (inactive unless `SCHED_TRACE2`/`SERIAL` are set) |
+| ggml | `ZEROMOE_GGML_ROOT=/path/to/ggml-iq2xxs/ggml` at `7bd457fa1` plus uncommitted env-gated trace code (inactive unless `SCHED_TRACE2`/`SERIAL` are set) |
 | engine rule | one `zeromoe` at a time; the script waits for no `zeromoe` / `llama-bench` process |
 
 ## Split: 22 layers fully on the GPU, 26 fully on the CPU
 
-Model: `/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf`.
+Model: `/path/to/models/qwen3.8-flash-next/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf`.
 Config: `configs/bench/qwen4exp_tg400_iq1m_22_26.toml`, with three lines changed by the script (`omp_max_threads = 10`,
 `max_new_tokens = 400`, `log_path`). Settings that define the placement and the fast path:
 
@@ -75,7 +75,7 @@ Expected engine-log lines (check them before trusting a number):
 
 ## Hybrid: usage-ranked hot experts in VRAM
 
-Model: `/data/sdb/models/qwen3.8-flash-next/Q2_0` (directory). Config: `configs/testing/qwen4exp_q2_0_option_b_global_topk48.toml`, with
+Model: `/path/to/models/qwen3.8-flash-next/Q2_0` (directory). Config: `configs/testing/qwen4exp_q2_0_option_b_global_topk48.toml`, with
 `qwen4exp_option_b_global_top_k = 14554`, `omp_max_threads = 10`, `log_path` set by the script.
 
 | key | value | meaning |

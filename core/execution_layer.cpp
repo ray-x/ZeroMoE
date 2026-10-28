@@ -363,7 +363,7 @@ void qwen4exp_hc_mix_impl(StreamingEngine &engine, const std::string &norm_name,
                           const float *in_streams, bool force_original_quant);
 
 // Qwen4Exp shared MTP checkpoint's own extra full-attention+MoE block.
-// Verified against /home/ray/Projects/unsloth/llama.cpp's qwen4exp.cpp
+// Verified against /path/to/unsloth/llama.cpp's qwen4exp.cpp
 // (branch mtp/qwen4exp-nextn, graph_mtp) and a real tensor dump of
 // mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf. Structurally: (1) eh_proj
 // bridges the token embedding and the incoming wide HC state into a fresh

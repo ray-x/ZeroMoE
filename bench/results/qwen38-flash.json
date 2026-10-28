@@ -47,7 +47,7 @@
   "zeromoe_tree_dirty": null,
   "ggml_commit": "8baabd53b77d",
   "ggml_sources_modified": "not checked out",
-  "binary": "/home/ray/Projects/ZeroMoE/.worktrees/stats-record/build_stats/zeromoe",
+  "binary": "/path/to/ZeroMoE/.worktrees/stats-record/build_stats/zeromoe",
   "binary_mtime": "2026-10-26 01:50"
  },
  "model": [

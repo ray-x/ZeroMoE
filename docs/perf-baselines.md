@@ -313,7 +313,7 @@ Same config (`glm53_dsa_core5060.toml`, 426-token prompt, NGEN 40, `PREFILL_GPU1
 | 9 | build_g7, lane off (CPU_LANE unset) | 11.64 | 900 | 0.91 |
 
 Findings:
-- `GlmDsaGraphModel::supports_cpu_lane()` was missing (the lane never existed for GLM_DSA); it is now gated by `ZEROMOE_GLM_DSA_CPU_LANE=1`. The lane also needs a ggml with the `zeromoe_ggml_sched_early_cpu` scheduler hook (`/home/ray/work/ggml-0006-early`, `build_g7`).
+- `GlmDsaGraphModel::supports_cpu_lane()` was missing (the lane never existed for GLM_DSA); it is now gated by `ZEROMOE_GLM_DSA_CPU_LANE=1`. The lane also needs a ggml with the `zeromoe_ggml_sched_early_cpu` scheduler hook (`/path/to/ggml-0006-early`, `build_g7`).
 - With the lane on, the GPU-assist ring runs only ~1.6 experts/token (14 layer-runs per 16 tokens), so the gain over lane-off is ~3% (872 vs 900 ms), within noise. Trial 8's prefill (8.44) is 27% below trials 7/9 (11.4-11.6); not diagnosed (lane on only in 8; variance or a lane side effect). Lane stays off by default.
 - Prediction (pilot l+1 precision by rank): r1 96-97%, r2 89-90%, r3 81-82%, r4 66-69%, r5 56-57%, r6 41-45%, r7 33-34%, r8 25-27%. Misses are already under 1 per layer (~62 SSD loads/token at ~5.2 ms, ~306 ms/token of reads); the rest of the ~900 ms step is CPU cold-expert MUL_MAT_ID plus ~75 ms GPU. GPU utilisation 1-6%. Better prediction is not the lever at this point.
 - The 3090 holds only the 11 GiB hot set (preloaded at boot, 11-12 s); `[VRAM-SLOTS] 0 / 349` in graph mode, i.e. the old usage-ranked pinned/LRU VRAM fill at boot is not replicated.
@@ -389,7 +389,7 @@ A/B on one config (22 GiB hot set, 64 GiB pool, c05 toml, swap-free scope, 22-to
 The offline held-out cold-route fraction dropped (resident set 42.1% -> 32.0%), but the real decode did not follow: -3% tok/s, within run-to-run noise but certainly not a gain. The 22-token benchmark prompt is not in the survey set, and the survey is 18 topical prompts, so the weight-3 counts may over-fit survey topics. Not adopted; the current usage file stays the default. The base arm text is coherent (the refit arm's text was overwritten: both runs share `logs/glm53_dsa_graph2gpu_tke.stdout`).
 
 ### Trial 23: IQ3_XXS AVX-512VL dot (microbench only, not applied) and split-stall analysis
-`bench/iq3k/iq3_dot_bench.c` (standalone, `gcc -O3 -march=native`) compares the stock AVX2 `ggml_vec_dot_iq3_xxs_q8_K` with the same mask-expanded restructuring already used for IQ2_XXS (block sign words and scales expanded once, masked subtract instead of per-group sign vectors). Result on 4096 rows x 4096 K: 0 mismatching rows (bit-identical), 1.26-1.33x faster pinned to one core (about 1.9 ms -> 1.5 ms per matrix). IQ3_XXS cold-expert dots are about 152 of the roughly 340 ms/token of CPU MUL_MAT_ID, so the expected decode gain is +5-7% (about 1.5 tok/s). Not yet applied to the ggml tree (`/home/ray/work/ggml-0006-early`) or measured end to end.
+`bench/iq3k/iq3_dot_bench.c` (standalone, `gcc -O3 -march=native`) compares the stock AVX2 `ggml_vec_dot_iq3_xxs_q8_K` with the same mask-expanded restructuring already used for IQ2_XXS (block sign words and scales expanded once, masked subtract instead of per-group sign vectors). Result on 4096 rows x 4096 K: 0 mismatching rows (bit-identical), 1.26-1.33x faster pinned to one core (about 1.9 ms -> 1.5 ms per matrix). IQ3_XXS cold-expert dots are about 152 of the roughly 340 ms/token of CPU MUL_MAT_ID, so the expected decode gain is +5-7% (about 1.5 tok/s). Not yet applied to the ggml tree (`/path/to/ggml-0006-early`) or measured end to end.
 
 Split stall (about 190 ms/token) is the time `finish_load()` still blocks after phase 1 (`models/graph/early_ready_lane.hpp:662`). Reads run 6.4 ms per load, about 50 loads/token, on two drives; phase 1 only overlaps the resident experts of the same layer. Earlier trials already cover the obvious levers: lookahead 3 and prefetch 3/8 lose, CPU threads 4/10 lose, balanced/chunk split lost, pool above 64 GiB does not fit. What remains is fewer loads (better prediction or more resident experts) rather than more overlap.
 
@@ -406,7 +406,7 @@ Prefill meets the 10 tok/s target on the 426-token prompt. Decode does not meet 
 Exit: after "Generation Complete" the process aborts with `CUDA error: driver shutting down` from `ggml_backend_cuda_buffer_free_buffer` in the static `StageRuntime` destructor at `exit()`. Not diagnosed; does not affect measurements. Same class as the earlier Phase 2 shutdown crash (CUDA globals need early reset).
 
 ### Trial 25: IQ3_XXS AVX-512VL dot applied, no measurable end-to-end gain
-Kernel: `patches/experimental/0011-ggml-cpu-iq3_xxs-avx512vl-dot.patch` (applied to `/home/ray/work/ggml-0006-early`, Release rebuild of `build_g7`; compiled kernel contains the masked `vpsubb`). Config: 22 GiB hot set, 64 GiB pool, c05 toml, swap-free scope, 22-token prompt, NGEN=80, `logs/run_split_queue16.sh`.
+Kernel: `patches/experimental/0011-ggml-cpu-iq3_xxs-avx512vl-dot.patch` (applied to `/path/to/ggml-0006-early`, Release rebuild of `build_g7`; compiled kernel contains the masked `vpsubb`). Config: 22 GiB hot set, 64 GiB pool, c05 toml, swap-free scope, 22-token prompt, NGEN=80, `logs/run_split_queue16.sh`.
 
 | run | decode tok/s (Rates) | first-to-last | compute ms/tok | split stall ms/tok | read ms/tok | loads |
 |---|---|---|---|---|---|---|

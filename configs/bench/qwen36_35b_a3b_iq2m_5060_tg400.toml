@@ -2,7 +2,7 @@
 # Context 401 matches llama-bench -pg 1,400. MTP remains disabled.
 # Set device_id, moe_ggml_device, and GPU name for a different host.
 
-model_path = "/home/ray/vllm-workspace/Qwen3.6-35B-A3B-UD-IQ2_M.gguf"
+model_path = "/path/to/models/Qwen3.6-35B-A3B-UD-IQ2_M.gguf"
 log_path = "build_qwen36_sm120/results/qwen36_fullfit_normfix_context401.log"
 log_level = "INFO"
 

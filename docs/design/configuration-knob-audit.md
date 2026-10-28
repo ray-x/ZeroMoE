@@ -8,7 +8,7 @@ proposal unless called out in the 2026-10-28 refresh below.
 ## Integration status
 
 The settings resolver and subsequent full-graph cleanup are integrated in the
-active checkout. The current scan below uses `/home/ray/Projects/ZeroMoE`,
+active checkout. The current scan below uses `/path/to/ZeroMoE`,
 branch `master`, HEAD `74e56ba0bb6f091fe2b9fc9e111c4faa4174be0b`, plus its
 working-tree changes; the current source inventory has 213 environment names and 4 compile-time macros. The detailed per-control tables and companion JSON still
 contain the earlier four-worktree snapshot; use the fresh counts and removal

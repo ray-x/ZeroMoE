@@ -2,7 +2,7 @@
 
 - **Arch / family:** `deepseek41` → `DeepSeek_V41`. 40 layers, 384 experts, top-6, ratio-1/2
   compressed MLA, hyper-connections, conditional-memory Engram layers.
-- **Model:** `/home/ray/vllm-workspace/DeepSeek-V41-Flash` (7 shards, Q2_K).
+- **Model:** `/path/to/models/DeepSeek-V41-Flash` (7 shards, Q2_K).
 - **Placement:** dual GPU — 3090 (17 GiB main expert pool) + 5060 Ti (13.5 GiB), ~100 GiB DDR,
   active pools 48/16 slots.
 

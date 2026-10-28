@@ -7,7 +7,7 @@ DDR/VRAM expert cache; no graph-owned expert arena or duplicate weight pool.
 
 ## Reference reviewed
 
-`/home/ray/work/moestream-graph-framework`, branch `graph-framework`, head
+`/path/to/moestream-graph-framework`, branch `graph-framework`, head
 `ff96893`. See `docs/ssd-offload/13-glm-decode-results-2026-10-14.md` there.
 The GLM 805-token prefill improvements are GPU batched MoE, transient-expert
 read-ahead, and computing GPU1-hot experts in place. Commit `4570144`
@@ -169,8 +169,8 @@ focused targets with:
 
 ```bash
 cmake -S . -B <build-dir> \
-  -DZEROMOE_GGML_ROOT=/home/ray/Projects/llama.cpp-moestream-b11401/ggml \
-  -DZEROMOE_GGML_PREBUILT_DIR=/home/ray/Projects/ZeroMoE/build_b11401/ggml-build \
+  -DZEROMOE_GGML_ROOT=/path/to/llama.cpp-moestream-b11401/ggml \
+  -DZEROMOE_GGML_PREBUILT_DIR=/path/to/ZeroMoE/build_b11401/ggml-build \
   -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build <build-dir> --target zeromoe zeromoe_tests \
   dsv41_cache_graph_test dsv41_grouped_outproj_test -j4
@@ -181,8 +181,8 @@ the original projection kernels and the two GPU cache views:
 
 ```bash
 python3 bench/build_dsv41_f32_backend.py \
-  --ggml-source /home/ray/work/ggml-iq2xxs/ggml \
-  --ggml-build /home/ray/work/moestream-graph-framework/build_native/ggml-build \
+  --ggml-source /path/to/ggml-iq2xxs/ggml \
+  --ggml-build /path/to/moestream-graph-framework/build_native/ggml-build \
   --out <isolated-backend-dir>
 CUDA_VISIBLE_DEVICES=0,1 NVIDIA_TF32_OVERRIDE=0 \
   LD_LIBRARY_PATH=<isolated-backend-dir> ZEROMOE_TEST_NATIVE_F32=1 \

@@ -16,9 +16,9 @@ branch: bugfix/staged-coherence-521d67a
 HEAD: 521d67a773b3b9e22f48bb5fcad0f6840ca663a6
 ```
 
-The root `/home/ray/Projects/ZeroMoE` is on `cleanup/ggml-exl3-only`, which is the wrong work branch for this investigation. The two checkouts share base commit `521d67a`, but their dirty source trees differ. A six-pair comparison run during this session accidentally used `/home/ray/Projects/ZeroMoE/build_ggmlcuda/zeromoe`; discard that result as evidence for this task.
+The root `/path/to/ZeroMoE` is on `cleanup/ggml-exl3-only`, which is the wrong work branch for this investigation. The two checkouts share base commit `521d67a`, but their dirty source trees differ. A six-pair comparison run during this session accidentally used `/path/to/ZeroMoE/build_ggmlcuda/zeromoe`; discard that result as evidence for this task.
 
-The intended checkout already has `build_ggmlcuda/zeromoe` (the r7 correctness manifest records SHA256 `5bb109b567ca7c155f1a83c644ebea26deb59c7d21af28cbe6ffdd4434366e80`). Its CMake source directory is `/tmp/zeromoe_bugfix_521d67a_20261007`, but its runpath points to prebuilt GGML libraries under the wrong root checkout. The local `ggml-source` copy matched `/home/ray/Projects/beellama.cpp/ggml` in the comparison made on 2026-10-07; still inspect and pin the GGML source/library path in the new clean folder before trusting a rebuilt binary. If rebuilding is needed, use `-j10` and verify `CMakeCache.txt`, `ldd`, and the binary hash afterward. The target branch has no new CUDA source changes in the relevant diff.
+The intended checkout already has `build_ggmlcuda/zeromoe` (the r7 correctness manifest records SHA256 `5bb109b567ca7c155f1a83c644ebea26deb59c7d21af28cbe6ffdd4434366e80`). Its CMake source directory is `/tmp/zeromoe_bugfix_521d67a_20261007`, but its runpath points to prebuilt GGML libraries under the wrong root checkout. The local `ggml-source` copy matched `/path/to/beellama.cpp/ggml` in the comparison made on 2026-10-07; still inspect and pin the GGML source/library path in the new clean folder before trusting a rebuilt binary. If rebuilding is needed, use `-j10` and verify `CMakeCache.txt`, `ldd`, and the binary hash afterward. The target branch has no new CUDA source changes in the relevant diff.
 
 Skip EXL3 changes. The checkout has unrelated EXL3 files and other user modifications; do not include them in this bug-fix scope or commit.
 
@@ -36,7 +36,7 @@ The correct branch's retained r7 comparison is `logs/phase2_bugfix_hidden_pair_2
 
 ## Standard llama.cpp check and its caveat
 
-The reference used here is the CPU path from `/home/ray/Projects/llama.cpp`, HEAD `3cf03257f219afbe7334045ff7c6a06ac68c627d`, build 0.4.1-dev. It loads the same split Q2_0 GGUF and receives explicit prompt/continuation token IDs. The output harnesses and logs are retained in `/tmp/llama_standard_20261007/`.
+The reference used here is the CPU path from `/path/to/llama.cpp`, HEAD `3cf03257f219afbe7334045ff7c6a06ac68c627d`, build 0.4.1-dev. It loads the same split Q2_0 GGUF and receives explicit prompt/continuation token IDs. The output harnesses and logs are retained in `/tmp/llama_standard_20261007/`.
 
 On the same forced token history, the bug-fix branch’s early-ready baseline agrees with incremental llama.cpp on 58/64 top-1 predictions (90.625%); mean KL is `0.105572`. First disagreement is step 3: llama top-1 `9522`, ZeroMoE `4145`, reference margin `0.07019`, KL `0.99987`. Disagreement steps are `[3, 7, 9, 26, 27, 36]`. The staged r7 arm agrees on 57/64 (89.0625%), with the same six disagreements plus step 6. Thus the baseline-to-llama difference is already present before staging; staging adds the step-6 top-1 flip.
 
@@ -72,7 +72,7 @@ Existing staged-path profiling is documented in `docs/phase2-arena-and-prefix-de
 
 ## Reproduction inputs and commands
 
-Machine: Linux, Xeon W-2235, RTX 3090 24 GiB (the tests target GPU 0), RTX 5060 Ti idle; use 10 CPU threads. Model: `/data/sdb/models/qwen3.8-flash-next/Q2_0/`, with first shard `Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf`. Prompt IDs hash `a2f73504...`; continuation IDs hash `5cfb223b...` (64 IDs). The continuation file in the bug-fix checkout is `logs/phase2_layer3_up_weight_verify_20261007/continuation64.tokens`.
+Machine: Linux, Xeon W-2235, RTX 3090 24 GiB (the tests target GPU 0), RTX 5060 Ti idle; use 10 CPU threads. Model: `/path/to/models/qwen3.8-flash-next/Q2_0/`, with first shard `Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf`. Prompt IDs hash `a2f73504...`; continuation IDs hash `5cfb223b...` (64 IDs). The continuation file in the bug-fix checkout is `logs/phase2_layer3_up_weight_verify_20261007/continuation64.tokens`.
 
 The benchmark script itself sets full-graph decode, prompt token input, teacher forcing, and `ZEROMOE_QWEN_CPU_THREADS=10`. From the bug-fix checkout:
 
@@ -103,7 +103,7 @@ Add `--dump-logits` for a correctness run; its timing is invalid. Check actual O
 
 ## Suggested first actions in the next session
 
-1. Start from a clean copy of `bugfix/staged-coherence-521d67a` at `521d67a`, carry over only the relevant uncommitted graph/handoff changes and logs, and exclude EXL3. Do not use `/home/ray/Projects/ZeroMoE` as the task checkout.
+1. Start from a clean copy of `bugfix/staged-coherence-521d67a` at `521d67a`, carry over only the relevant uncommitted graph/handoff changes and logs, and exclude EXL3. Do not use `/path/to/ZeroMoE` as the task checkout.
 2. Configure/build the new folder with the intended GGML source and `-j10`; verify CMake source/root, `ldd`, and executable hash before any inference run.
 3. Reproduce branch early-ready versus standard llama on the same fixed history, then compare staged versus both. Use l_last dumps to trace the first baseline mismatch before treating the staged flip as the root cause.
 4. After coherence is understood, repeat the no-dump six-pair performance A/B with the exact 8,421-expert Option-B set and enable the phase/scheduler profiling above.

@@ -98,9 +98,9 @@ bool test_unpacked_format_relaxed_check() {
 bool test_compute_expert_slab_bytes_max() {
     std::cout << "[Test 20] compute_expert_slab_bytes() returns the layer's TRUE MAX for a mixed layer...\n";
 
-    const std::string prod_path = "/home/ray/vllm-workspace/GLM-5.3-GGUF-align";
-    const std::string iq1s_path = "/home/ray/vllm-workspace/GLM-5.3-GGUF-align/"
-        "repacked-GLM-5.3-UD-IQ1_S-00005-of-00006-part00001-of-00001.gguf";
+    const std::string prod_path = test_model_dir("ZEROMOE_TEST_GLM53_DIR");
+    const std::string iq1s_path = prod_path +
+        "/repacked-GLM-5.3-UD-IQ1_S-00005-of-00006-part00001-of-00001.gguf";
 
     struct ExpertSpec { std::string src_path; int src_layer; int src_expert; int out_expert; };
     // SWAPPED vs Test 18: small (IQ1_S) expert first, large (baseline) expert second.
@@ -381,9 +381,9 @@ bool test_vram_cache_mixed_sizes() {
     std::cout << "[Test 21] Phase 3: real GpuTopology cache (upload_expert/find_expert) with two "
                  "different-sized real experts in one fixed-size slot pool...\n";
 
-    const std::string prod_path = "/home/ray/vllm-workspace/GLM-5.3-GGUF-align";
-    const std::string iq1s_path = "/home/ray/vllm-workspace/GLM-5.3-GGUF-align/"
-        "repacked-GLM-5.3-UD-IQ1_S-00005-of-00006-part00001-of-00001.gguf";
+    const std::string prod_path = test_model_dir("ZEROMOE_TEST_GLM53_DIR");
+    const std::string iq1s_path = prod_path +
+        "/repacked-GLM-5.3-UD-IQ1_S-00005-of-00006-part00001-of-00001.gguf";
 
     struct ExpertSpec { std::string src_path; int src_layer; int src_expert; };
     // expert 0 = large (baseline), expert 1 = small (IQ1_S) -- real sizes,

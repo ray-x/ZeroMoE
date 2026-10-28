@@ -6,7 +6,7 @@
 # (92.0% of llama.cpp). Full-graph/performance gates pass; layer-3 RoPE parity
 # is still under investigation, so model support is not yet accepted.
 
-model_path = "/home/ray/vllm-workspace/Qwen3.6-35B-A3B-UD-IQ2_M.gguf"
+model_path = "/path/to/models/Qwen3.6-35B-A3B-UD-IQ2_M.gguf"
 log_path = "logs/qwen36_35b_a3b_iq2m_5060.log"
 log_level = "INFO"
 

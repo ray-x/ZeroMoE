@@ -102,3 +102,10 @@ bench/results/*.logs/
 bench/results/*.attempts.jsonl
 bench/results/*.runs.jsonl
 bench/results/*.rejected.jsonl
+
+# Maintainer-local notes and helper lists (never published)
+/sideworks.md
+/exclude_list.txt
+
+# CMake-generated in-tree build files
+/tools/Makefile

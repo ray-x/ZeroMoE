@@ -27,7 +27,7 @@ bool glm_mtp_forward(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
 // WIDE (the block's own local multi-stream residual, [S, hc_mult, n_embd]
 // stream-major -- see qwen4exp_hc_mix_impl's own comment), not n_embd
 // wide: Qwen4Exp's NextN block keeps its own independent Hyper-Connections
-// state across calls, verified against /home/ray/Projects/unsloth/
+// state across calls, verified against /path/to/unsloth/
 // llama.cpp's qwen4exp.cpp (branch mtp/qwen4exp-nextn), graph_mtp's own
 // `res->t_h_nextn = res_hc` (the WIDE, pre-collapse state). Caller is
 // responsible for sizing h_input/h_nextn to S*hc_dim floats.

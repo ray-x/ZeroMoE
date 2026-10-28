@@ -14,22 +14,22 @@ remaining 34 MoE layers' experts on the CPU. neurall's llama.cpp on the identica
 | RAM | 125 GB (`host_ram_gb = 106`) |
 | GPU used | RTX 3090, 24 GB, device 0 (single GPU) |
 | GPU not used | RTX 5060 Ti 16 GB (idle in this baseline; see section 8) |
-| Storage | model on NVMe (`/home/ray/vllm-workspace`, nvme1n1p3) |
+| Storage | model on NVMe (local workspace, nvme1n1p3) |
 | Driver / CUDA | 610.57.04 / CUDA 13.3 (nvcc), OS Linux 7.2 |
 | ZeroMoE | commit `2a06c0a` plus uncommitted working-tree changes (see section 9) |
-| ggml (recommended) | `/home/ray/Projects/llama.cpp-moestream-b11401`, branch `zeromoe-ggml-b11401`, HEAD `9fe8a156f` (neurall's b11401 + ZeroMoE fork commit + negative-id-skip commit) |
-| ggml (older, ~1% slower) | `/home/ray/Projects/llama.cpp-moestream-integration`, b11062 + fork commit |
+| ggml (recommended) | `/path/to/llama.cpp-moestream-b11401`, branch `zeromoe-ggml-b11401`, HEAD `9fe8a156f` (neurall's b11401 + ZeroMoE fork commit + negative-id-skip commit) |
+| ggml (older, ~1% slower) | `/path/to/llama.cpp-moestream-integration`, b11062 + fork commit |
 
 ## 2. Model file
 
-`/home/ray/vllm-workspace/GLM-5.3-Flash/GLM-5.3-Flash-AJ-IQ2_XXS-00001-of-00002.gguf` (+ `-00002-of-00002.gguf`)
+`/path/to/models/GLM-5.3-Flash/GLM-5.3-Flash-AJ-IQ2_XXS-00001-of-00002.gguf` (+ `-00002-of-00002.gguf`)
 
 - Shards: 44,665,098,240 B + 42,680,908,320 B, about 87.3 GB total. File type `IQ2_XXS` (2.0625 bpw).
 - Architecture: neurall reports `glm5-next 320B.A18B`; 45 trunk layers (34 KDA + 11 DSA), dense FFN in layers 0-2,
   MoE in layers 3-44 (42 layers), 288 routed experts/layer, top-8, plus a shared expert; hyper-connections hc_mult=4.
 - Routed experts: 34 layers gate/up/down all IQ2_XXS; 8 layers gate/up IQ2_XXS with down IQ2_S. Embedding Q6_K.
 - Always pass the explicit first-shard path. Pointing `model_path` at a directory silently merges sibling `.gguf` files.
-- Other GLM-5.3-Flash files on this box (not baseline): `UD-IQ1_S` (93 GB, /data/sdb/models/GLM-5.3-Flash),
+- Other GLM-5.3-Flash files on this box (not baseline): `UD-IQ1_S` (93 GB, /path/to/models/GLM-5.3-Flash),
   `UD-IQ3_XXS` (partial), `GSQ-RCO-3.0bit` (117 GB).
 
 ## 3. Placement (what runs where)
@@ -47,7 +47,7 @@ cmake -S . -B build_b11401 -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES
   -DGGML_CUDA=ON -DGGML_NATIVE=ON -DGGML_OPENMP=ON \
   -DGGML_CUDA_FA_QUANTS="q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16" \
   -DZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES=OFF -DGGML_AVX512_VNNI=OFF \
-  -DZEROMOE_GGML_ROOT=/home/ray/Projects/llama.cpp-moestream-b11401/ggml
+  -DZEROMOE_GGML_ROOT=/path/to/llama.cpp-moestream-b11401/ggml
 cmake --build build_b11401 --target zeromoe -j12
 ```
 
@@ -97,7 +97,7 @@ setting; this adds synchronization overhead and is not used for the baseline run
 The engine reads the prompt from stdin.
 
 ```
-cd /home/ray/Projects/ZeroMoE
+cd /path/to/ZeroMoE
 nvidia-smi; pgrep -af zeromoe     # GPU co-existence guard: nothing else on the GPU
 export ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512 ZEROMOE_GLM5NEXT_CPU_THREADS=6
 echo "Write an extremely long and detailed 4000-word essay about the history, mathematics and engineering of mixture of experts models. Do not stop early." \

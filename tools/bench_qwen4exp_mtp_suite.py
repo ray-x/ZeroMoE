@@ -167,7 +167,10 @@ def main() -> int:
     p.add_argument("--prompt-dir", type=Path, default=ROOT / "scratchpad/hy/tr")
     p.add_argument("--out-dir", type=Path, required=True)
     p.add_argument("--mtp-model", type=Path,
-                   default=Path("/home/ray/vllm-workspace/qwen3.8-flash-next/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf"))
+                   default=Path(os.environ.get(
+                       "ZEROMOE_MTP_MODEL",
+                       "mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf")),
+                   help="MTP draft GGUF (default: $ZEROMOE_MTP_MODEL)")
     p.add_argument("--tokens", type=int, default=256)
     p.add_argument("--expected-prompts", type=int, default=6)
     p.add_argument("--repeats", type=int, default=3)

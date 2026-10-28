@@ -2,7 +2,7 @@
 
 - **Arch / family:** `qwen4exp` → `Qwen4Exp`. 48 layers, hybrid Gated-DeltaNet + full attention,
   low-rank hyper-connections, PLE n-gram embedding, 512-expert softmax-gated MoE + shared expert.
-- **Model:** `/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf`
+- **Model:** `/path/to/models/qwen3.8-flash-next/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf`
 - **Placement (split 22/26):** 22 layers GPU-resident, 26 layers CPU (`cpu_affinity_layers`),
   `qwen4exp_cpu_gpu_overlap = true`.
 

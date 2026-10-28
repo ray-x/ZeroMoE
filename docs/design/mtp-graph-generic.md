@@ -82,7 +82,7 @@ experts per layer for 1/2/3/4/5-token windows on Qwen4Exp at 13,000 hot
 experts are 0.82/1.49/2.09/2.67/3.23). With a small cold fraction the CPU half
 stays hidden under the GPU half.
 
-Reference point (Strata paper, `/home/ray/Projects/Strata/docs/paper`, Table 5
+Reference point (Strata paper, `/path/to/Strata/docs/paper`, Table 5
 and finding 2; RTX 5070, Q2_0, 4K context): plain decoding 47-57 tok/s, a
 window of up to 4 tokens takes 34 ms (GPU 14.6, CPU experts 13.4, drafting 2.0,
 other 4.3) and yields 3.2 tokens, i.e. 82-92 tok/s, a 1.6-1.8x speedup, with

@@ -88,7 +88,7 @@ Run the matching llama.cpp decode benchmark and both gates:
 
 ```sh
 CUDA_VISIBLE_DEVICES=0,1 build_llama_qwen36_sm120a_ref/bin/llama-bench \
-  --model /home/ray/vllm-workspace/Qwen3.6-35B-A3B-UD-IQ2_M.gguf \
+  --model /path/to/models/Qwen3.6-35B-A3B-UD-IQ2_M.gguf \
   --n-prompt 0 --n-gen 0 -pg 1,400 --repetitions 3 --threads 10 \
   --n-gpu-layers 99 --device CUDA1 --output json \
   > build_llama_qwen36_sm120a_ref/results/qwen36_pg1_tg400.json

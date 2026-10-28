@@ -1,6 +1,6 @@
 #!/bin/bash
 # decode sweep on top of the working pilot-prefetch config
-cd /home/ray/work/moestream-glm53
+cd /path/to/moestream-glm53
 run() { # name, extra env...
   local N=$1; shift
   sed -i "s/glm53_dsa_graph2gpu_[a-z0-9]*\./glm53_dsa_graph2gpu_$N./g" obsolete/glm53-logs-scripts/glm53_dsa_graph2gpu.toml obsolete/glm53-logs-scripts/run_dsa_graph2gpu_426.sh

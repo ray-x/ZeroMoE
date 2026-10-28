@@ -6,14 +6,14 @@
 # caused "blk.13 missing". Re-enable dense_model_path only with a matching
 # GLM-5.2 (79-layer) dense file.
 
-# model_path = "/home/ray/vllm-workspace/GLM-5.2-GGUF/UD-IQ2_M_pack"
+# model_path = "/path/to/models/GLM-5.2-GGUF/UD-IQ2_M_pack"
 # 2026-08-29: primary copy restored after the GLM-5.3 migration at a
 # DIFFERENT path than before -- flat "GLM-5.2-GGUF_align/<shard>.gguf"
 # (matching the mirror's own flat layout at /data/models/UD-IQ2_M_align),
 # not the old "GLM-5.2-GGUF/UD-IQ2_M_align/<shard>.gguf" nesting. The old
 # path is gone; this one is what the user actually copied the 223GB back
 # to. Confirmed real (223GB, matches mirror_model_path's own size exactly).
-model_path = "/home/ray/vllm-workspace/GLM-5.3-GGUF-align"
+model_path = "/path/to/models/GLM-5.3-GGUF-align"
 mirror_model_path = "/data/glm53_mirror_cold50"
 # dense_model_path = "/data/models/GLM-5.2-GGUF/UD-IQ4_XS"
 log_path = "logs/glm53_dsa_graph2gpu_tke.log"
@@ -639,7 +639,7 @@ omp_max_threads = 10
 # Re-enabled for testing (was pin_file="" / pin_threshold=0 -- see
 # glm52_dual.toml's history for why it had been turned off, and re-verify
 # hit rate before/after on this checkpoint given that prior result).
-pin_file = "/home/ray/Projects/ZeroMoE/.zeromoe_usage_glm53_ud_iq2m"
+pin_file = "/path/to/ZeroMoE/.zeromoe_usage_glm53_ud_iq2m"
 pin_threshold = 6
 # prefill_pin_file: NEVER set in this config until now -- confirmed via a
 # filesystem-wide search that .zeromoe_usage_prefill has never existed
@@ -664,7 +664,7 @@ pin_threshold = 6
 # watch `prefill=X tok/s` and the `[PIN] prefill_pin_file (...)` startup log
 # line specifically, not the decode/overall numbers this session has mostly
 # been tracking so far.
-prefill_pin_file = "/home/ray/Projects/ZeroMoE/.zeromoe_usage_glm53_ud_iq2m_prefill"
+prefill_pin_file = "/path/to/ZeroMoE/.zeromoe_usage_glm53_ud_iq2m_prefill"
 # 2026-08-12 finding: prefill_pin_file's merge fix correctly bounds prefill's
 # GUARANTEED share of pinned VRAM to pin_global_floor_per_layer (=1 below,
 # 75 slots total) -- real evidence: "Prefill warm-up: N attempted" in the

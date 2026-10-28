@@ -6,7 +6,7 @@ witness are pending; there is no frozen performance baseline yet.
 
 ## Actual export
 
-`/mnt/usb-ssd/@/home/ray/models/MiMo-V2.6-Flash-RL-GSQ-RCO-3bit.gguf`
+`/path/to/models/MiMo-V2.6-Flash-RL-GSQ-RCO-3bit.gguf`
 
 The header audit and `mimo2_spec_test` confirm:
 

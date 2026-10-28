@@ -11,7 +11,7 @@
 # Caches fill on demand. Graph-owned MoE weight bytes = 0; dense bindings alias
 # the engine's persistent device pool across prefill/decode graph lifetimes.
 
-model_path = "/home/ray/vllm-workspace/DeepSeek-V41-Flash"
+model_path = "/path/to/models/DeepSeek-V41-Flash"
 log_level = "INFO"
 context_size = 4096
 max_new_tokens = 128

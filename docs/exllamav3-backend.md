@@ -19,7 +19,7 @@ The minimal backend-specific settings are:
 ```toml
 model_format = "exl3"
 exl3_backend = "exllamav3"
-exllamav3_source_dir = "/home/ray/Projects/exllamav3"
+exllamav3_source_dir = "/path/to/exllamav3"
 exllamav3_python = "../.exl3-runtime/bin/python"
 exllamav3_gpu_memory_gb = [22.0, 14.0]
 exl3_gpu_expert_layer_begin = 26
@@ -68,9 +68,9 @@ source modification is required:
 uv venv --python 3.12 .exl3-runtime
 uv pip install --python .exl3-runtime/bin/python torch --torch-backend cu130
 uv pip install --python .exl3-runtime/bin/python \
-    -r /home/ray/Projects/exllamav3/requirements.txt
+    -r /path/to/exllamav3/requirements.txt
 
-export PYTHONPATH=/home/ray/Projects/exllamav3
+export PYTHONPATH=/path/to/exllamav3
 export TORCH_EXTENSIONS_DIR="$PWD/.exl3-runtime/torch_extensions"
 export TORCH_CUDA_ARCH_LIST='8.6;12.0'
 export MAX_JOBS=4
@@ -184,7 +184,7 @@ unmet; the measured peak is 26.86 tok/s. MTP is opt-in and measured slower.
 
 ## User-supplied 2.05bpw checkpoint
 
-The requested `/mnt/usb-ssd/Qwen3.8_flash/exl3_2bpw` model passes
+The requested `/path/to/models/Qwen3.8_flash/exl3_2bpw` model passes
 `exl3_tool verify`: five shards, 48 layers, 512 experts, payload smoke passed;
 its actual trellis rates are 75,277 2bpw matrices, two 3bpw, and 472 4bpw.
 This is a real 2.05bpw pack and is distinct from the earlier `exl3_3bpw`
@@ -212,7 +212,7 @@ tokenizer and requested layer count, not CUDA loading or VRAM fit.
 Verify the pack, then run the first profile on an otherwise idle host:
 
 ```bash
-./build_ggmlcuda/exl3_tool verify /mnt/usb-ssd/Qwen3.8_flash/exl3_2bpw
+./build_ggmlcuda/exl3_tool verify /path/to/models/Qwen3.8_flash/exl3_2bpw
 ./build_ggmlcuda/zeromoe --config configs/testing/qwen4exp_exllamav3_2bpw_0_44_4.toml \
     --predict 128
 ```
@@ -334,7 +334,7 @@ capture result predates this segmented test graph and is not comparable. Call
 uploads and route-dependent buffer updates remain outside capture.
 
 `exl3_ggml_cuda_real_bench` exercises the same bridge with a real matrix loaded
-from `/data/sdb/models/qwen3.8-flash-next/exl3_3bpw`. The selected routed expert
+from `/path/to/models/qwen3.8-flash-next/exl3_3bpw`. The selected routed expert
 gate projection is `2560 -> 640`, 4-bit, and 825,728 packed bytes. It measured
 **12.88 us device time** (13.48 us enqueue-to-synchronize time), with a maximum
 absolute GPU-vs-CPU EXL3 result error of `1.23e-7`. This validates real
@@ -348,7 +348,7 @@ Run the real-loader check with:
 ```bash
 cmake --build build_ggmlcuda --target exl3_ggml_cuda_real_bench -j4
 env -u CUDA_VISIBLE_DEVICES ./build_ggmlcuda/exl3_ggml_cuda_real_bench \
-    /data/sdb/models/qwen3.8-flash-next/exl3_3bpw 100 0 --capture
+    /path/to/models/qwen3.8-flash-next/exl3_3bpw 100 0 --capture
 ```
 
 The fused `exl3_ggml_cuda_fused_ffn_bench` reduces gate/up, SwiGLU, and down
@@ -384,7 +384,7 @@ The real routed check is reproducible with:
 ```bash
 cmake --build build_ggmlcuda --target exl3_ggml_cuda_real_routed_ffn_bench -j4
 env -u CUDA_VISIBLE_DEVICES ./build_ggmlcuda/exl3_ggml_cuda_real_routed_ffn_bench \
-    /data/sdb/models/qwen3.8-flash-next/exl3_3bpw 100 0 --capture
+    /path/to/models/qwen3.8-flash-next/exl3_3bpw 100 0 --capture
 ```
 
 Dynamic device-ID validation uses:
@@ -392,7 +392,7 @@ Dynamic device-ID validation uses:
 ```bash
 cmake --build build_ggmlcuda --target exl3_ggml_cuda_real_dynamic_routed_bench -j4
 env -u CUDA_VISIBLE_DEVICES ./build_ggmlcuda/exl3_ggml_cuda_real_dynamic_routed_bench \
-    /data/sdb/models/qwen3.8-flash-next/exl3_3bpw 20 0 --capture
+    /path/to/models/qwen3.8-flash-next/exl3_3bpw 20 0 --capture
 ```
 
 `exl3_ggml_cuda_real_router_ffn_bench` extends this to the real layer-0 router:
@@ -438,7 +438,7 @@ LRU and `Exl3CpuMatrixCache`; the cache-graph benchmark below also tests that
 executor-owned cache path, not the full-graph topology adapter.
 
 ```bash
-export ZEROMOE_EXL3_GGML_BRIDGE_MODEL_PATH=/data/sdb/models/qwen3.8-flash-next/exl3_3bpw
+export ZEROMOE_EXL3_GGML_BRIDGE_MODEL_PATH=/path/to/models/qwen3.8-flash-next/exl3_3bpw
 export ZEROMOE_EXL3_GGML_BRIDGE_LAYER=3
 ```
 
@@ -450,7 +450,7 @@ unavailable; no all-experts EXL3 payload is allocated.
 The same hook can be configured directly in TOML:
 
 ```toml
-exl3_ggml_bridge_model_path = "/data/sdb/models/qwen3.8-flash-next/exl3_3bpw"
+exl3_ggml_bridge_model_path = "/path/to/models/qwen3.8-flash-next/exl3_3bpw"
 exl3_ggml_bridge_layer = 3
 exl3_gpu_cache_gb = 8.0
 # Optional, experimental: capture static GGML spans around dynamic EXL3 FFNs.
@@ -612,7 +612,7 @@ output against its CPU EXL3 reference, and checks the upload count:
 ```bash
 cmake --build build_ggmlcuda --target exl3_ggml_cuda_cache_graph_bench -j4
 env -u CUDA_VISIBLE_DEVICES ./build_ggmlcuda/exl3_ggml_cuda_cache_graph_bench \
-    /data/sdb/models/qwen3.8-flash-next/exl3_3bpw 8 0 2
+    /path/to/models/qwen3.8-flash-next/exl3_3bpw 8 0 2
 ```
 
 The 2026-10-08 direct-device-route rerun (`rows=1`, `topk=2`, two iterations,
@@ -664,7 +664,7 @@ first call's output.
 ```bash
 CUDA_VISIBLE_DEVICES=1 \
   ./build_ggmlcuda/exl3_ggml_cuda_cache_graph_bench \
-  /data/sdb/models/qwen3.8-flash-next/exl3_3bpw 2 0 1 --external 10
+  /path/to/models/qwen3.8-flash-next/exl3_3bpw 2 0 1 --external 10
 ```
 
 An end-to-end smoke used `model_format="exl3"`, the EXL3 Safetensors folder,
@@ -691,7 +691,7 @@ MoE placement.
 ```bash
 cmake --build build_ggmlcuda --target exl3_ggml_cuda_real_exl3_layer_bench -j4
 env -u CUDA_VISIBLE_DEVICES ./build_ggmlcuda/exl3_ggml_cuda_real_exl3_layer_bench \
-    /data/sdb/models/qwen3.8-flash-next/exl3_3bpw 5 0 --capture
+    /path/to/models/qwen3.8-flash-next/exl3_3bpw 5 0 --capture
 ```
 
 Run it with:
@@ -699,7 +699,7 @@ Run it with:
 ```bash
 cmake --build build_ggmlcuda --target exl3_ggml_cuda_real_router_ffn_bench -j4
 env -u CUDA_VISIBLE_DEVICES ./build_ggmlcuda/exl3_ggml_cuda_real_router_ffn_bench \
-    /data/sdb/models/qwen3.8-flash-next/exl3_3bpw 10 0 --capture
+    /path/to/models/qwen3.8-flash-next/exl3_3bpw 10 0 --capture
 ```
 
 The follow-up `exl3_ggml_cuda_moe_bench` exercises 48 chained routed-FFN nodes
@@ -801,7 +801,7 @@ Notation: **GPU / CPU routed experts per layer**, VRAM first. Each layer has 512
 experts, 24,576 in the model. "Split layers / CPU-only layers" counts layers.
 Earlier docs and configs wrote `0/44/4` and `44/4` for whole-layer offload, where
 the first number was the CPU side; those numbers are not comparable to the
-tables here. Pack: `/mnt/usb-ssd/Qwen3.8_flash/exl3_2bpw`. Settings: six CPU
+tables here. Pack: `/path/to/models/Qwen3.8_flash/exl3_2bpw`. Settings: six CPU
 threads, blocking CUDA waits, eight warmup tokens, 42-token prompt, fixed
 128-token output, `context_size = 256`, static placement. Each row is one trial.
 
@@ -900,7 +900,7 @@ matmul kernels. Build with the upstream extension sources:
 
 ```bash
 cmake -S . -B build_ggmlcuda \
-    -DZEROMOE_EXLLAMAV3_SRC=/home/ray/Projects/exllamav3/exllamav3/exllamav3_ext
+    -DZEROMOE_EXLLAMAV3_SRC=/path/to/exllamav3/exllamav3/exllamav3_ext
 ```
 
 - Upstream `exl3_gemm` / `exl3_gemv` / `exl3_moe_coop` are compiled unmodified

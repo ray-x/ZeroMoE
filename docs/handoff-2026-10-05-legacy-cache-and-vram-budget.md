@@ -3,7 +3,7 @@
 Everything done on 2026-10-05. Read together with `docs/option-b-vram-budget-2026-10-05.md` (findings, tables, how to reproduce) and
 `docs/handoff-2026-10-03-option-b-global-pool.md` (global-pool background; its section 8 holds the teacher-forced numerics).
 Hardware: RTX 3090 24 GiB (220 W limit), RTX 5060 Ti, Xeon W-2235 (Gen3 PCIe, 6C/12T), 125 GB RAM. Model for everything below: Q2_0
-(`/data/sdb/models/qwen3.8-flash-next/Q2_0`). Engine: `../moestream-build-upstream-master/moestream`, built from this tree.
+(`/path/to/models/qwen3.8-flash-next/Q2_0`). Engine: `../moestream-build-upstream-master/moestream`, built from this tree.
 
 ## 1. Standing rules (from the user)
 - Commit as `ray-x`, **no Claude co-author trailer**, only when asked. Use the upstream integration ggml.

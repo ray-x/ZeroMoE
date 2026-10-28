@@ -9,7 +9,7 @@ file), two runs per point. Baselines and the update rule are in `configs/bench/p
 |---|---|
 | GPUs | RTX 3090 24 GB (PCIe Gen3 x16), RTX 5060 Ti 16 GB (PCIe Gen3 x8; used by GLM only) |
 | CPU / RAM | Xeon W-2235 (6C/12T), 125 GB, zram swap only, `vm.swappiness=150` |
-| Storage | NVMe (`/data/sdb` models) |
+| Storage | NVMe (`/path/to` models) |
 | Engine | `build_native/zeromoe` (CUDA, native SASS 86;120), ggml fork `~/work/ggml-iq2xxs` with patches 0006-0008 |
 | Isolation | one engine at a time (startup lock), nothing else on the GPU, MemAvailable >= 90 GB before each run |
 
@@ -27,7 +27,7 @@ Free-running decode text differs between runs (GLM assist picks experts by readi
 
 ### GLM-5.3-Flash (AJ IQ2_XXS, dual GPU)
 
-Model `/home/ray/vllm-workspace/GLM-5.3-Flash/GLM-5.3-Flash-AJ-IQ2_XXS-00001-of-00002.gguf`. Config
+Model `/path/to/models/GLM-5.3-Flash/GLM-5.3-Flash-AJ-IQ2_XXS-00001-of-00002.gguf`. Config
 `configs/testing/glm53flash_AJ_IQ2XXS_spread_offload.toml` (`moe_cache_gb = 15.0`, `context_size = 8192`, `prefill_batch_tokens`
 unset = 2048). Command shape (`bench/glm_decode_profile.sh` runs it):
 ```
@@ -58,7 +58,7 @@ the tail is a real batch (2016 + 67: 10.9 s, 191 tok/s).
 
 ### Qwen 3.8 Flash (UD-IQ1_M, single 3090)
 
-Model `/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M/` (3 shards, 69.4 GiB, 1.75 bpw). Config
+Model `/path/to/models/qwen3.8-flash-next/UD-IQ1_M/` (3 shards, 69.4 GiB, 1.75 bpw). Config
 `configs/testing/qwen4exp_3090_only.toml` (`moe_cache_gb = 11.5`, `context_size = 8192`, graph batch = whole prompt). Environment
 (as `bench/qwen_decode_profile.sh`):
 ```

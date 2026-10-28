@@ -6,7 +6,7 @@ if [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]; then e
 sync
 python3 - <<'PY'
 import os,glob
-files=glob.glob('/home/ray/vllm-workspace/GLM-5.3-GGUF-align/*.gguf')+glob.glob('/data/glm53_offload.gguf')+glob.glob('/data/glm53_mirror_*/*.gguf')+glob.glob('/data/glm53_mirror_cold50/*.gguf')
+files=glob.glob('/path/to/models/GLM-5.3-GGUF-align/*.gguf')+glob.glob('/data/glm53_offload.gguf')+glob.glob('/data/glm53_mirror_*/*.gguf')+glob.glob('/data/glm53_mirror_cold50/*.gguf')
 n=0
 for f in files:
     try:

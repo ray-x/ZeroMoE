@@ -6,7 +6,7 @@ The user requested: **when the next job/test finishes, pause the session and wri
 handoff.** The latest Ling test has finished. Do not start new builds, model runs, tuning or refactor work
 until the user resumes. No Python validation, ZeroMoE, or CMake processes remained when checked.
 
-Working tree: `/home/ray/Projects/ZeroMoE/.worktrees/mimo-v26-flash`
+Working tree: `/path/to/ZeroMoE/.worktrees/mimo-v26-flash`
 
 Branch: `feat/mimo-v26-flash`
 
@@ -296,7 +296,7 @@ so the one outlier-driven scale per 256 values rounds the other values coarsely.
 ## Prototype: CPU rounds activations in 32-value blocks (resolves the Ling CPU/GPU drift)
 
 `patches/experimental/ggml-cpu-act32-prototype.diff` (against llama.cpp 8baabd53b; built in a separate git worktree
-`/home/ray/Projects/llama.cpp-act32`, CUDA unchanged, not part of the ZeroMoE ggml series). For IQ1_S, IQ2_XXS and
+`/path/to/llama.cpp-act32`, CUDA unchanged, not part of the ZeroMoE ggml series). For IQ1_S, IQ2_XXS and
 IQ2_S the CPU dot product uses a Q8_0 activation (32-value blocks, like CUDA's Q8_1) and exact dequantized weights; the
 "tiled" CPU kernel is excluded for those types (it assumes a Q8_K activation).
 

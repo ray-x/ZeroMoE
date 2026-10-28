@@ -1,7 +1,7 @@
 # Afternoon change summary — 2026-10-23, Sydney
 
 Scope: work performed by Codex after 12:00 PM AEDT in
-`/home/ray/Projects/ZeroMoE/.worktrees/mimo-v26-flash`, branch `feat/mimo-v26-flash`.
+`/path/to/ZeroMoE/.worktrees/mimo-v26-flash`, branch `feat/mimo-v26-flash`.
 Paused at the user's request after the latest test finished, approximately 16:48 AEDT.
 
 **The refactor is not complete.** MiMo passes the phase-cache correctness/memory test. Ling completes the

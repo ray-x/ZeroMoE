@@ -1,6 +1,6 @@
 # DeepSeek V4.1 Flash graph
 
-Checkpoint: 2026-10-15. Worktree: `/home/ray/work/moestream-deepseek-v41-flash`,
+Checkpoint: 2026-10-15. Worktree: `/path/to/moestream-deepseek-v41-flash`,
 branch `deepseek-v41-flash`, base `1842a5c`.
 
 ## Verified behavior
@@ -129,8 +129,8 @@ were unchanged. The test passed on both the 3090 and 5060 Ti.
 ```sh
 cmake --build /tmp/zeromoe-v41-build --target dsv41_grouped_outproj_test -j4
 /tmp/zeromoe-v41-build/dsv41_grouped_outproj_test
-GGML_SRC_DIR=/home/ray/Projects/llama.cpp-moestream-b11401/ggml/src \
-GGML_LIB_DIR=/home/ray/Projects/ZeroMoE/build_b11401/ggml-build/src \
+GGML_SRC_DIR=/path/to/llama.cpp-moestream-b11401/ggml/src \
+GGML_LIB_DIR=/path/to/ZeroMoE/build_b11401/ggml-build/src \
 BIN=/tmp/zeromoe-v41-build/test_components make test-components
 cmake --build /tmp/zeromoe-v41-build --target zeromoe_tests -j4
 /tmp/zeromoe-v41-build/zeromoe_tests

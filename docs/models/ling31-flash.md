@@ -2,7 +2,7 @@
 
 - **Arch / family:** `bailingmoe3` → `BailingMoE3`. KDA + gated MLA, 72 layers, MoE layers 4+
   (68) routed experts.
-- **Model:** `/home/ray/vllm-workspace/ling-3.1-flash/Ling-3.1-flash-AD-IQ1_S-00001-of-00004.gguf`
+- **Model:** `/path/to/models/ling-3.1-flash/Ling-3.1-flash-AD-IQ1_S-00001-of-00004.gguf`
 - **Placement:** no-copy offload graph; 72 GiB DDR pool, 3.0 + 12.5 GiB GPU caches, 3700 pinned
   VRAM slots, GPU assist 3 + assist2 1.
 

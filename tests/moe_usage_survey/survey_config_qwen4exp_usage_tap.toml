@@ -16,10 +16,10 @@
 #   --graph-device-expert-trailing 1 --graph-device-expert-layers 22
 #   ZEROMOE_BENCH_IGNORE_STOP=1
 
-model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf"
+model_path = "/path/to/models/qwen3.8-flash-next/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf"
 
 cpu_affinity_layers = []
-log_path = "/home/ray/Projects/ZeroMoE/logs/qwen4exp_survey_106prompts_usage_tap.log"
+log_path = "/path/to/ZeroMoE/logs/qwen4exp_survey_106prompts_usage_tap.log"
 log_level = "INFO"
 
 context_size = 2048
@@ -45,8 +45,8 @@ prefetch_worker_threads = 4
 # came out empty -- see qwen4exp_track_router_usage's own comment for why).
 # freeze_usage_stats=false so this 106-prompt run actually accumulates fresh
 # (layer,expert) hit counts.
-pin_file           = "/home/ray/Projects/ZeroMoE/tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_usage_tap"
-prefill_pin_file   = "/home/ray/Projects/ZeroMoE/tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_usage_tap_prefill"
+pin_file           = "/path/to/ZeroMoE/tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_usage_tap"
+prefill_pin_file   = "/path/to/ZeroMoE/tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_usage_tap_prefill"
 freeze_usage_stats = false
 
 qwen4exp_option_b_layer = -1

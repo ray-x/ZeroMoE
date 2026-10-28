@@ -37,7 +37,7 @@ configured with `ZEROMOE_CPU_ONLY=ON`:
 ```bash
 cmake -S /tmp/reverify_wt -B /tmp/reverify_wt/build_ggmlcuda \
   -DCMAKE_BUILD_TYPE=Release \
-  -DZEROMOE_GGML_ROOT=/home/ray/Projects/beellama.cpp/ggml
+  -DZEROMOE_GGML_ROOT=/path/to/beellama.cpp/ggml
 make -j$(nproc) -C /tmp/reverify_wt/build_ggmlcuda
 ```
 
@@ -67,7 +67,7 @@ Everything else about the split lives in the TOML. See
 in the main repo for a complete worked example; the load-bearing keys are:
 
 ```toml
-model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf"
+model_path = "/path/to/models/qwen3.8-flash-next/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf"
 pin_file = "tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_usage_tap"
 prefill_pin_file = "tests/moe_usage_survey/zeromoe_usage_survey_prefill"
 freeze_usage_stats = true
@@ -187,7 +187,7 @@ path can produce a *faster*, not slower, number.
 
 ## 9. Reproduced 2026-10-02 on the upstream integration ggml (and a regression to check first)
 
-Build used: `ZEROMOE_GGML_ROOT=/home/ray/Projects/llama.cpp-moestream-integration/ggml`
+Build used: `ZEROMOE_GGML_ROOT=/path/to/llama.cpp-moestream-integration/ggml`
 (not beellama's ggml as in step 2), `build dir ../moestream-build-upstream-master`.
 Result for `configs/testing/qwen4exp_option_b_rightsize_split44_x0_baseline.toml`, prompt
 "write a python program to print hello world", `--predict 40`: **34.9-35.8 tok/s**
@@ -345,7 +345,7 @@ Config: plain 22/26 + `qwen4exp_cpu_offload = true` for all 26 CPU layers + `ZER
 
 ## 17. Q2_0 (VNNI) measurements and a default-change regression, 2026-10-02 (evening)
 
-Q2_0 (`/data/sdb/models/qwen3.8-flash-next/Q2_0`, 37.6 GB), upstream integration ggml with the Q2_0 VNNI dot kernels (`vpdpbusd` present in `ggml_vec_dot_q2_0_q8_0`),
+Q2_0 (`/path/to/models/qwen3.8-flash-next/Q2_0`, 37.6 GB), upstream integration ggml with the Q2_0 VNNI dot kernels (`vpdpbusd` present in `ggml_vec_dot_q2_0_q8_0`),
 hello-world prompt, `--predict 40`, current tree, `ZEROMOE_QWEN4EXP_DECODE_RECREATE_GRAPH_ARENA=1` (see warning below):
 - All 48 layers' experts on the CPU (scratch config = `qwen4exp_q2_0_fullgraph_22_26.toml` with `cpu_affinity_layers` = 0..47, `PRELOAD_LAYERS=0`): **18.81 tok/s** (53 ms/token), coherent. CPU-only > 10 tok/s confirmed.
 - Plain 22 GPU / 26 CPU (`qwen4exp_q2_0_fullgraph_22_26.toml`): 27.74 tok/s.
