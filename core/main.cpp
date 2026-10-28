@@ -576,8 +576,8 @@ int main(int argc, char *argv[]) {
         std::cerr << "Error: --verbosity must be in [0, 5]\n";
         return 1;
       }
-    else if (arg == "-v" || arg == "--verbose" ||
-             arg == "--log-verbose")
+    } else if (arg == "-v" || arg == "--verbose" ||
+               arg == "--log-verbose")
       log_level_cli = "VERBOSE";
     else if (arg == "--temp" && i + 1 < argc)
       temp_cli = std::stof(argv[++i]);
