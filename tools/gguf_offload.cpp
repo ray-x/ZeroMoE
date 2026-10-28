@@ -168,7 +168,13 @@ int verify_store(const std::string &store_path, const std::string &model, int sa
   for (auto &[k, mask] : have) { if (mask != 7) fail("expert (" + std::to_string(k.first) + "," + std::to_string(k.second) + ") is missing a projection"); else keys.push_back(k); }
   if (keys.size() != st.layer_idx.size()) fail("index has " + std::to_string(st.layer_idx.size()) + " entries but tensors describe " + std::to_string(keys.size()) + " experts");
   if (sample > 0 && (size_t)sample < keys.size()) { std::vector<std::pair<int, int>> s2; for (size_t i = 0; i < keys.size(); i += keys.size() / sample + 1) s2.push_back(keys[i]); keys = s2; }
+#ifdef O_DIRECT
   int dfd = open(store_path.c_str(), O_RDONLY | O_DIRECT);
+#else
+  // O_DIRECT is Linux-specific; other platforms verify with buffered reads.
+  int dfd = -1;
+  errno = EOPNOTSUPP;
+#endif
   bool direct = dfd >= 0; if (!direct) { fprintf(stderr, "[offload-verify] WARNING: O_DIRECT open failed (%s); verifying with buffered reads\n", strerror(errno)); dfd = open(store_path.c_str(), O_RDONLY); }
   uint64_t checked_bytes = 0; size_t n_ok = 0;
   for (auto &[L, E] : keys) {
