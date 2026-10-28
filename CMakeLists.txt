@@ -1371,7 +1371,13 @@ else()
             set_source_files_properties(backends/cpu/kernels_metal.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
             find_library(METAL_FRAMEWORK Metal REQUIRED)
             find_library(MPS_FRAMEWORK MetalPerformanceShaders REQUIRED)
-            target_link_libraries(kernels_cpu PUBLIC ${METAL_FRAMEWORK} ${MPS_FRAMEWORK})
+            # Foundation (and through it libobjc) must be PUBLIC: kernels_metal.mm
+            # is compiled with ARC, so every consumer of this static library --
+            # not just test_components and zeromoe_cpu -- needs the Objective-C
+            # runtime at link time, or it fails with _objc_msgSend undefined.
+            find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
+            target_link_libraries(kernels_cpu PUBLIC ${METAL_FRAMEWORK} ${MPS_FRAMEWORK}
+                                                     ${FOUNDATION_FRAMEWORK})
             target_compile_definitions(kernels_cpu PUBLIC ZEROMOE_METAL=1)
         endif()
     endif()
