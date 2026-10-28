@@ -31,6 +31,9 @@ it does not carry a modified copy of ggml.
 | `0005-ggml-backend-static-weight-copy` | backend-static-weight-copy-count | `ggml-backend.cpp` |
 | `0009-ggml-cpu-iq2-xxs-avx512bwvl` | `36f489d6b` AVX-512BW/VL IQ2_XXS dot kernel | `arch/x86/quants.c` |
 | `0013-ggml-cpu-iq1-s-avx512vnni` | AVX-512 VNNI IQ1_S × Q8_K dot kernel | `arch/x86/quants.c` |
+| `0015-ggml-cuda-zeromoe-hc-fused` | fused Qwen4Exp hyper-connection CUDA kernels | `ggml-cuda/` |
+| `0016-ggml-cpu-q2_0-vnni-cheap-unpack` | cheaper Q2_0 weight unpack in the VNNI dot | `arch/x86/quants.c` |
+| `0017-ggml-cpu-iq3-xxs-avx512vl-dot` | AVX-512BW/VL IQ3_XXS × Q8_K dot (promoted from `experimental/0011`) | `arch/x86/quants.c` |
 | `0014-ggml-build-commit-provenance` | preserve the pinned GGML base revision in copied build trees without `.git` | `CMakeLists.txt` |
 | `0011-ggml-cuda-mestream-bridge-compat` | bridge-only compatibility hunk for newer upstream context | `ggml-cuda/ggml-cuda.cu` |
 | `0012-ggml-impl-export-graph-view` | export graph view from shared ggml | `ggml-impl.h` |

@@ -62,6 +62,7 @@ grep -q zeromoe_mmid_negative_skip "$SRC/ggml/src/ggml-cuda/mmvq.cu" || { echo "
 grep -q zeromoe_ggml_backend_cuda_get_stream "$SRC/ggml/src/ggml-cuda/ggml-cuda.cu" || { echo "bridge patch missing"; exit 1; }
 grep -q ZM_HC_MAGIC "$SRC/ggml/src/ggml-cuda/zm-hc.cuh" || { echo "hyper-connection fusion patch missing"; exit 1; }
 grep -q q2_0_unpack64 "$SRC/ggml/src/ggml-cpu/arch/x86/quants.c" || { echo "Q2_0 cheap-unpack patch missing"; exit 1; }
+grep -q "The 8 sign words of a block are" "$SRC/ggml/src/ggml-cpu/arch/x86/quants.c" || { echo "IQ3_XXS AVX-512VL dot patch missing"; exit 1; }
 
 # ggml's CMakeLists configures ggml.pc.in, which a plain `git archive` of llama.cpp's ggml/ does not contain.
 [[ -f $SRC/ggml/ggml.pc.in ]] || printf 'Name: ggml\nDescription: ggml\nVersion: @GGML_VERSION@\n' > "$SRC/ggml/ggml.pc.in"
