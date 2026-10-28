@@ -1038,10 +1038,6 @@ const bool token_loop_diag_enabled =
                                : 0.0)
                        << "ms\n";
     check_hidden_finite("after prefill", hidden_states.data(), hidden_states.size());
-    if (const char *dump = zeromoe::graphcfg::env("ZEROMOE_DUMP_LAST_HIDDEN"); dump && dump[0] && hidden_states.size() >= (size_t)D) {
-        std::ofstream hf(dump, std::ios::binary | std::ios::trunc);
-        hf.write(reinterpret_cast<const char *>(hidden_states.data() + hidden_states.size() - D), (std::streamsize)D * sizeof(float));
-    }
     // Snapshot the end-of-prompt state for the next request. Saved AFTER
     // prefill and before any decode token, so the cache always corresponds to
     // exactly this prompt -- decode writes dense KV at positions >= N and
