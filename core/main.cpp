@@ -28,6 +28,7 @@
 #include "safetensors_adapter.hpp"
 #include "shutdown.hpp"
 #include "startup_preflight.hpp"
+#include "version.hpp"
 
 #include "ggml.h"
 
@@ -206,7 +207,9 @@ void print_usage(bool all = false) {
         << "  --top-p <number>      Nucleus sampling threshold\n"
         << "  --system-prompt <s>   Conversation instructions\n"
         << "  --verbosity <0..5>   llama.cpp-style log threshold\n"
-        << "  --gen-config [file]   Write a configuration template\n"
+        << "  --gen-config [file]   Write a minimal starter configuration\n"
+        << "  --gen-config-full [file]  Write the annotated full configuration\n"
+        << "  --version             Print version, commit and engine flavor\n"
         << "  --help-all            Advanced tuning, diagnostics and benchmarks\n"
         << "  --help-settings       Canonical graph settings and legacy aliases\n\n"
         << "Model recipes: configs/; configuration guide: docs/configuration.md\n";
@@ -223,7 +226,9 @@ void print_usage(bool all = false) {
       << "  --port <port>    API port (default: 8080)\n"
       << "  --alias <id>     API model name (default: zeromoe)\n"
       << "  --api-key <key>  API key (or ZEROMOE_API_KEY)\n"
-      << "  --gen-config     Generate a sample config file and exit\n"
+      << "  --gen-config     Generate a minimal starter config and exit\n"
+      << "  --gen-config-full  Generate the annotated full config and exit\n"
+      << "  --version        Print version, commit and engine flavor\n"
       << "  --model <path>   Path to GGUF model file or directory\n"
       << "  --ram <GB>       Strict RAM budget in GB (default: auto-detect 88% "
          "free)\n"
@@ -415,6 +420,7 @@ int main(int argc, char *argv[]) {
   std::string prompt_cli;
   std::string model_path = "";
   std::string gen_config_path = "";
+  bool gen_config_full = false;
   double ram_budget_gb = 0.0;
   int promote_threshold_cli = -1;
   int pin_threshold_cli = -1;
@@ -502,6 +508,14 @@ int main(int argc, char *argv[]) {
       gen_config_path = (i + 1 < argc && argv[i + 1][0] != '-')
                             ? argv[++i]
                             : "zeromoe_config.toml";
+    } else if (arg == "--gen-config-full") {
+      gen_config_full = true;
+      gen_config_path = (i + 1 < argc && argv[i + 1][0] != '-')
+                            ? argv[++i]
+                            : "zeromoe_config.toml";
+    } else if (arg == "--version" || arg == "-V") {
+      zeromoe_print_version();
+      return 0;
     } else if (arg == "--model" && i + 1 < argc)
       model_path = argv[++i];
     else if (arg == "--ram" && i + 1 < argc)
@@ -620,7 +634,13 @@ int main(int argc, char *argv[]) {
 
   // Generate sample config and exit
   if (!gen_config_path.empty()) {
-    EngineConfig::write_sample(gen_config_path);
+    if (gen_config_full)
+      EngineConfig::write_sample(gen_config_path);
+    else
+      EngineConfig::write_starter(gen_config_path);
+    std::cout << "Wrote " << gen_config_path
+              << ". Set model_path, then run:\n  " << argv[0] << " --config "
+              << gen_config_path << " --prompt \"Hello\"\n";
     return 0;
   }
 

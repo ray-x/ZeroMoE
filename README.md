@@ -1,20 +1,35 @@
 # ZeroMoE
 
-**A zero-dependency C++ inference engine using NVMe-to-VRAM streaming and CUDA Graphs to run massive MoE models on consumer GPUs.**
+[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 
-"Zero-dependency" means no Python runtime, no PyTorch, and no external model
-server to install: the build vendors ggml, nlohmann/json, and cpp-httplib at
-pinned revisions and produces one native binary.
+**Bare-metal inference for massive Mixture-of-Experts (MoE) models on consumer GPUs.**
 
-ZeroMoE is a native C++23/CUDA inference engine for Mixture-of-Experts (MoE) GGUF models. It keeps dense weights and KV state resident while streaming routed expert matrices from NVMe on demand, so models far larger than VRAM can run on consumer hardware.
+Plain C++23/CUDA implementation with no runtime dependencies. It bypasses VRAM
+limits by streaming expert weights from DDR & NVMe, executed through a whole-model CUDA graph.
 
-It is **not a fork of llama.cpp** and does not link `libllama`. It builds on **ggml**, the tensor library underneath llama.cpp, from a pinned upstream commit, and adds a whole-model execution graph, expert streaming, and graph-level host/device offload on top.
+## Core features
 
-- **GGUF-native loader:** parses binary tensor offsets and the embedded BPE tokenizer straight from the GGUF metadata; no separate JSON or weight config maps.
-- **Lock-free asynchronous prefetching:** an SPSC atomic ring buffer checks layer $L$ activations against layer $L+1$ router parameters to preload upcoming expert matrices via non-blocking DMA.
-- **Fused AVX-512 / VNNI compute core:** dequantizes GGUF blocks directly in CPU registers using hardware integer dot products (`_mm512_dpbusd_epi32`).
-- **RTX 3090 integer acceleration:** an Ampere-native CUDA kernel using `__dp4a` and register warp-shuffles for dense projections.
-- **MLA weight absorption:** calculates Multi-head Latent Attention directly in the lower-dimensional latent space, reducing the attention scanning footprint.
+- **Zero dependencies.** The build vendors ggml, nlohmann/json and cpp-httplib at pinned revisions and produces one
+  native executable.
+- **ggml backend, not a llama.cpp fork.** Built on ggml from a pinned upstream
+  commit, with a custom whole-model CUDA execution graph, device-side conditional
+  subgraphs and graph-level host/device offload.
+- **Dual-mode expert routing.**
+  - **NVMe-to-VRAM streaming:** lock-free asynchronous prefetching for models far
+    larger than VRAM (DeepSeek-V4.1 Flash, GLM-5.3).
+  - **CPU/DDR offload:** expert layers execute from system RAM for models that
+    fare better on CPU compute (Qwen 3.8), with host nodes keeping that work
+    inside the captured graph.
+- **Hardware accelerated.**
+  - **CPU:** fused AVX-512 / VNNI integer dot products
+    (`_mm512_dpbusd_epi32`).
+  - **GPU:** Ampere-native `__dp4a` CUDA kernels for dense projections, plus
+    batched CUDA graph replay.
+- **Native model formats.** Reads GGUF binary tensor offsets and the embedded BPE
+  tokenizer directly from the metadata, and runs EXL3 safetensors checkpoints in
+  place without a GGUF conversion.
+- **MLA optimization.** Absorbs Multi-head Latent Attention directly in the
+  latent space to cut the attention footprint.
 
 ---
 
@@ -22,11 +37,11 @@ It is **not a fork of llama.cpp** and does not link `libllama`. It builds on **g
 
 | Component | Requirement |
 |---|---|
-| OS | Linux x86-64 for the CUDA engine. macOS (Apple Silicon) builds the CPU-only tools and tests. |
+| OS | Linux x86-64 for the CUDA engine. macOS (Apple Silicon) builds the CPU engine (`build-macos/zeromoe_cpu`) and tests. |
 | GPU | NVIDIA GPU supported by the installed CUDA toolkit. Tested on RTX 3090 (`sm_86`) and RTX 5060 Ti (`sm_120a`). |
 | CUDA | CUDA Toolkit and driver. The reference build uses CUDA 13.3.73 with driver 610.57.04. |
 | CPU | x86-64 with AVX-512 F/CD/BW/DQ/VL. AVX-512 VNNI is on by default; disable it with `-DGGML_AVX512_VNNI=OFF` on CPUs without VNNI. |
-| RAM | 64 GB or more recommended. Host RAM is used as the expert cache; test profiles assume 125 GiB. |
+| RAM | Host RAM is the expert cache for models larger than VRAM. 64 GB or more is recommended for the largest checkpoints; a full-fit model like the quick-start example needs little beyond the GGUF's page cache. |
 | Disk | NVMe SSD. Keep the GGUF and any repacked stores outside the repository. |
 | Build tools | CMake ≥ 3.25, GNU Make, `git`, GNU `patch`, Python 3, and a C++23-capable host compiler (tested with GCC 16.2 and nvcc 13.3). |
 
@@ -34,56 +49,88 @@ It is **not a fork of llama.cpp** and does not link `libllama`. It builds on **g
 
 ## Quick start
 
+ZeroMoE's CUDA engine needs an NVIDIA GPU with a matching CUDA toolkit and an
+AVX-512 x86-64 CPU. Check the [Requirements](#requirements) table before starting
+the build.
+
+### 1. Build
+
 ```bash
 git clone https://github.com/ray-x/ZeroMoE.git
 cd ZeroMoE
-./setup.sh
+./setup.sh                 # CUDA engine
+./build/zeromoe --version  # confirms the binary starts; prints commit and engine flavor
 ```
 
-`setup.sh` checks the toolchain, then configures and builds a Release binary at
-`build/zeromoe` (on macOS it builds the CPU-only tools in `build-macos/`). It
-fetches the pinned ggml source on the first run, so that step needs network
-access.
+The first build fetches the pinned ggml source, so it needs network access and
+takes a few minutes. `./setup.sh --cpu-only` builds the CPU engine at
+`build/zeromoe_cpu`; macOS always builds that one. The CPU engine currently
+implements the Qwen families only — the other families need the CUDA engine.
 
-Point a starter profile at your GGUF, then run:
+### 2. Get a model
+
+ZeroMoE does not bundle or download weights. Any model from
+[Supported models](#supported-models) works — GGUF for the families in the
+table, or an EXL3 safetensors checkpoint through the
+[EXL3 path](#qwen-exl3-safetensors-decode). This example is a GGUF, 11.5 GB, and
+fits in 16 GB of VRAM:
 
 ```bash
-$EDITOR configs/qwen38-flash.toml   # set model_path; adjust budgets for your hardware
-./build/zeromoe --config configs/qwen38-flash.toml --prompt "Hello" --predict 32
+hf download unsloth/Qwen3.6-35B-A3B-GGUF \
+  Qwen3.6-35B-A3B-UD-IQ2_M.gguf --local-dir ~/models
 ```
 
-- Supported families and profiles: [docs/models/README.md](docs/models/README.md)
+`hf` comes from `pip install huggingface_hub[cli]` (older installs call it
+`huggingface-cli`); downloading the same file from the repository page in a
+browser works too. Keep weights outside the repository.
+
+### 3. Run
+
+```bash
+./build/zeromoe --model ~/models/Qwen3.6-35B-A3B-UD-IQ2_M.gguf --prompt "Hello"
+```
+
+That is the whole first run. With `--model`, the engine detects the GPU and host
+RAM, keeps what fits, and streams the rest from NVMe. No config file is needed.
+
+For repeatable runs, start from the minimal profile:
+
+```bash
+cp configs/starter.toml my-model.toml
+$EDITOR my-model.toml      # set model_path
+./build/zeromoe --config my-model.toml --prompt "Hello"
+```
+
+Once that works, move to a hardware-tuned profile from
+[docs/models/README.md](docs/models/README.md).
+
+### Where to go next
+
+- Supported families and per-model profiles: [docs/models/README.md](docs/models/README.md)
 - Manual build commands and options: [Build and installation](#build-and-installation)
 - Configuration keys and precedence: [docs/configuration.md](docs/configuration.md)
 - Environment variables: [docs/env-vars.md](docs/env-vars.md)
+- Full flag list: [docs/cli-reference.md](docs/cli-reference.md)
 
-> **Clone with git.** GitHub "Download ZIP" archives contain neither the pinned ggml sources nor a git revision, and the CUDA build stops at its build-provenance check. A normal `git clone` builds.
+> **Clone with git.** GitHub "Download ZIP" archives contain neither the pinned
+> ggml sources nor a git revision, and the CUDA build stops at its
+> build-provenance check. A normal `git clone` builds.
 
-### Getting model weights
+### Model files and repacking
 
-ZeroMoE does not bundle or download weights. Converted GGUFs for the supported
-families are published on Hugging Face by their respective authors; download the
-quantization you want with your preferred client and keep it outside the
-repository:
-
-```bash
-# Replace with the repository and file you have access to.
-hf download <org>/<repo> <model>.gguf --local-dir ~/models
-```
-
-Set `model_path` in the profile to that file, or to a directory containing split
-shards (`*-00001-of-0000N.gguf`). At startup the engine checks the exact
+Set `model_path` to a single GGUF or to a directory of split shards
+(`*-00001-of-0000N.gguf`). At startup the engine checks the exact
 `general.architecture` and tensor topology against its registered
 `FullGraphModel` adapters and refuses an unsupported model.
 
-For `--direct-io`, repack the model into the per-expert layout first, then point
-`model_path` at the output directory:
+Direct I/O needs the per-expert layout. Repack first, then point `model_path` at
+the output directory:
 
 ```bash
 ./build/gguf_tool pack model.gguf ./model-packed --verify-all
 ```
 
-See [tools/README.md](tools/README.md) for packing, verification, and the I/O
+See [tools/README.md](tools/README.md) for packing, verification and the I/O
 benchmark.
 
 ## Supported models
@@ -371,6 +418,17 @@ Check correctness first, then speed. The full sequence - graph-selection gate,
 unit checks, logits against llama.cpp, bisecting a mismatch, the before/after
 regression witness, and where to record results - is in
 [docs/validation.md](docs/validation.md).
+
+## Troubleshooting first runs
+
+| Symptom | Fix |
+|---|---|
+| `nvcc is missing` from `setup.sh` | Install the CUDA Toolkit, or build the CPU engine with `./setup.sh --cpu-only`. |
+| `model_path not set` | Pass `--model /path/to/model.gguf`, or set `model_path` in the profile. |
+| `does not support this model topology` | The GGUF's `general.architecture` has no registered adapter; see [Supported models](#supported-models). |
+| `Insufficient` graph memory | The model does not fit in VRAM as a full graph. A non-graph-only family falls back to layered decode and streams experts from NVMe; a graph-only family fails startup by design. |
+| `Refusing to start` in the preflight check | Another `zeromoe` process is using the budget, or free RAM/VRAM is below the requested plan. Stop the other process or reduce `host_ram_gb`/context. |
+| Build stops at the provenance check | You are building from a ZIP/tarball. Use `git clone`. |
 
 ## License
 

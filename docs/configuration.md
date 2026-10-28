@@ -1,12 +1,14 @@
 # Configuring ZeroMoE
 
-Start with the matching model recipe in `configs/`. Change the paths, memory
-budgets, GPU topology and context size for your machine; keep its measured
-backend choices unless you are benchmarking. No "fast/balanced" preset
-silently changes numerical or memory policy.
+Start with [`configs/starter.toml`](../configs/starter.toml) for a first run: it
+sets only `model_path` and a small context, leaving VRAM and host-RAM sizing to
+the engine. Once a model runs, move to the matching model recipe in `configs/`
+and change the paths, memory budgets, GPU topology and context size for your
+machine; keep its measured backend choices unless you are benchmarking. No
+"fast/balanced" preset silently changes numerical or memory policy.
 
 ```bash
-./build-cuda/zeromoe --config configs/qwen38-flash.toml --prompt "Hello"
+./build/zeromoe --config configs/starter.toml --prompt "Hello"
 ```
 
 ## Choose the right surface

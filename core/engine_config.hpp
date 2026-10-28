@@ -2311,6 +2311,7 @@ struct EngineConfig {
   bool load(const std::string &path);
   bool validate();
   static void write_sample(const std::string &path);
+  static void write_starter(const std::string &path);
   void print() const;
 };
 
@@ -3953,18 +3954,43 @@ inline void EngineConfig::print() const {
       << "[CONFIG] =============================================\n";
 }
 
+inline void EngineConfig::write_starter(const std::string &path) {
+  std::ofstream f(path);
+  f << R"(# ZeroMoE starter configuration.
+#
+# Set model_path, then run:
+#   zeromoe --config zeromoe.toml --prompt "Hello"
+#
+# Every other value is left at the engine default: one GPU, automatic VRAM and
+# host-RAM sizing, and the default sampling settings. Hardware-tuned profiles
+# live in configs/; every key is documented in docs/configuration.md.
+
+model_path = "/path/to/model.gguf"
+
+context_size   = 4096
+max_new_tokens = 256
+temperature    = 0.0    # 0 = greedy; raise for sampling
+
+[[gpus]]
+device_id = 0
+role      = "dense+moe"
+)";
+}
+
 inline void EngineConfig::write_sample(const std::string &path) {
   std::ofstream f(path);
   f << R"(# ZeroMoE Engine Configuration
-# See configs/ for example profiles (single_gpu, dual_gpu, triple_gpu)
+# Full annotated reference. Most runs only need model_path, context_size and
+# max_new_tokens; start from configs/starter.toml or run --gen-config.
+# Hardware-tuned profiles live in configs/.
 
-model_path = "/models/GLM-5.2-UD-IQ2_M/"
+model_path = "/path/to/model.gguf"
 model_format = "gguf"       # "gguf" or "exl3"
 model_load_only = false      # EXL3 metadata/payload load smoke; no inference
-# dense_model_path = "/models/GLM-5.2-Q4_K/"  # optional: separate dense weights
+# dense_model_path = "/path/to/dense-weights"  # optional: separate dense weights
 # spec_type = "none"           # or "draft-mtp"
-# spec_draft_model = "/models/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf"  # optional: a
-#   standalone "shared" MTP/NextN checkpoint (Qwen4Exp convention) -- omits
+# spec_draft_model = "/path/to/mtp-draft.gguf"  # optional: a standalone
+#   "shared" MTP/NextN checkpoint (Qwen4Exp convention) -- omits
 #   token_embd.weight/output.weight, which are reused from model_path.
 # spec_draft_n_max = 3         # llama.cpp-compatible speculative draft length
 

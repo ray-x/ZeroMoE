@@ -106,46 +106,53 @@ cmake "${cmake_args[@]}"
 echo "[3/3] Compiling..."
 cmake --build "$BUILD_DIR" --parallel "$JOBS"
 
+if [[ "$CPU_ONLY" -eq 1 ]]; then
+    BIN="$BUILD_DIR/zeromoe_cpu"
+else
+    BIN="$BUILD_DIR/zeromoe"
+fi
+
 echo "----------------------------------------"
 echo "  ZeroMoE build complete."
+if [[ ! -x "$BIN" ]]; then
+    fail "the build finished but $BIN was not produced"
+fi
+
+# The build is only useful if the binary runs, and checking that must not need
+# a model file. This also prints the commit the binary was built from.
+echo "  -> Verifying the binary starts:"
+"$BIN" --version | sed 's/^/     /'
+
+# Pretty path for the next-steps block; --build-dir may be absolute.
+BIN_DISPLAY="$BIN"
+[[ "$BIN_DISPLAY" != /* ]] && BIN_DISPLAY="./$BIN_DISPLAY"
+
 if [[ "$CPU_ONLY" -eq 1 ]]; then
-    if [[ -x "$BUILD_DIR/zeromoe_cpu" ]]; then
-        echo "  -> CPU engine:      ./$BUILD_DIR/zeromoe_cpu"
-    fi
     echo "  -> Component tests: ./$BUILD_DIR/test_components"
     echo "  -> GGUF tool:       ./$BUILD_DIR/gguf_tool"
+    echo "  -> Note: zeromoe_cpu implements the Qwen families; the other"
+    echo "     supported families need the CUDA engine."
 else
-    echo "  -> Engine:          ./$BUILD_DIR/zeromoe"
     echo "  -> Test harness:    ./$BUILD_DIR/zeromoe_tests"
 fi
-if [[ "$CPU_ONLY" -eq 1 ]]; then
-cat <<EOF
-
-Next steps:
-  1. Pick a CPU-capable starter profile in configs/ and set model_path (and any
-     usage, mirror, or expert-store paths) for your machine. Model weights are
-     not included or downloaded by this script.
-  2. Run a prompt:
-       ./$BUILD_DIR/zeromoe_cpu --config configs/qwen38-flash.toml --prompt "Hello" --predict 32
-  3. Serve the OpenAI/Anthropic APIs:
-       ./$BUILD_DIR/zeromoe_cpu --config configs/qwen38-flash.toml --serve --port 8080
-  4. Supported models: docs/models/README.md
-     Configuration:   docs/configuration.md
-     Validation:      scripts/validate_vs_llama.sh
-EOF
-else
-cat <<EOF
-
-Next steps:
-  1. Pick a starter profile in configs/ and set model_path (and any usage,
-     mirror, or expert-store paths) for your machine. Model weights are not
-     included or downloaded by this script.
-  2. Run a prompt:
-       ./$BUILD_DIR/zeromoe --config configs/qwen38-flash.toml --prompt "Hello" --predict 32
-  3. Serve the OpenAI/Anthropic APIs:
-       ./$BUILD_DIR/zeromoe --config configs/qwen38-flash.toml --serve --port 8080
-  4. Supported models: docs/models/README.md
-     Configuration:   docs/configuration.md
-     Validation:      scripts/validate_vs_llama.sh
-EOF
+if command -v nvidia-smi >/dev/null 2>&1; then
+    echo "  -> GPUs:"
+    nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader 2>/dev/null \
+        | sed 's/^/     /' || true
 fi
+
+cat <<EOF
+
+Next steps:
+  1. Get a GGUF for a supported family (model weights are not bundled or
+     downloaded by this script): docs/models/README.md
+  2. Run a prompt with automatic memory sizing:
+       $BIN_DISPLAY --model /path/to/model.gguf --prompt "Hello"
+  3. For a repeatable setup, copy the starter profile and set model_path:
+       cp configs/starter.toml my-model.toml
+       $BIN_DISPLAY --config my-model.toml --prompt "Hello"
+  4. Serve the OpenAI/Anthropic APIs:
+       $BIN_DISPLAY --config my-model.toml --serve --port 8080
+  5. Configuration: docs/configuration.md
+     Validation:    docs/validation.md
+EOF

@@ -6,6 +6,7 @@
 #include "logger.hpp"
 #include "model_family.hpp"
 #include "cpu_api.hpp"
+#include "version.hpp"
 #include <csignal>
 static volatile std::sig_atomic_t cpu_api_stop = 0;
 static void stop_cpu_api(int) { cpu_api_stop = 1; }
@@ -82,6 +83,12 @@ int main(int argc, char **argv) {
   if (argc == 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
     print_usage(argv[0]);
     return 0;
+  }
+  for (int i = 1; i < argc; ++i) {
+    if (std::string(argv[i]) == "--version" || std::string(argv[i]) == "-V") {
+      zeromoe_print_version();
+      return 0;
+    }
   }
   bool serve = false;
   for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "--serve") serve = true;

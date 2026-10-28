@@ -6,7 +6,9 @@ a built binary.
 | Flag | Description |
 | --- | --- |
 | `--config <file>` | Load engine config from a TOML file (preferred over legacy CLI flags). |
-| `--gen-config [output.toml]` | Generate a sample config file (default `zeromoe_config.toml`) and exit. |
+| `--gen-config [output.toml]` | Write a minimal starter config (default `zeromoe_config.toml`) and exit. |
+| `--gen-config-full [output.toml]` | Write the annotated full config reference and exit. |
+| `--version`, `-V` | Print the version, source commit and engine flavor (CUDA or CPU-only), then exit. |
 | `--model <path>` | Path to a GGUF model file or directory (legacy CLI mode, used without `--config`). |
 | `--ram <GB>` | Strict RAM budget in GB (default: auto-detect 88% of free system memory). |
 | `-c, --ctx-size <N>` | Maximum context size / token window (default: 4096). |
@@ -42,4 +44,4 @@ At DEBUG (`--verbosity 5`), numerical decode comparisons include
 `[TEACHER-FORCE-LOGITS]` fingerprints and Qwen route-hit summaries use the
 `[ROUTE-HIT]`, `[MOE-REQUIRED]`, and `[MOE-PROMPT]` headers. Filter these records from a verbose log by their header.
 
-> Most of these flags have a matching TOML key of the same name (e.g. `raw_prompt`, `system_prompt`, `pin_threshold`) for use with `--config`; a config file's values are used unless the equivalent CLI flag is also passed, in which case the CLI flag wins. Run `--gen-config` to see the full set of TOML-only options (e.g. `unpacked_expert_format`, `pin_strategy`) that have no CLI-flag equivalent.
+> Most of these flags have a matching TOML key of the same name (e.g. `raw_prompt`, `system_prompt`, `pin_threshold`) for use with `--config`; a config file's values are used unless the equivalent CLI flag is also passed, in which case the CLI flag wins. Run `--gen-config-full` to see the full set of TOML-only options (e.g. `unpacked_expert_format`, `pin_strategy`) that have no CLI-flag equivalent.

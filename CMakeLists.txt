@@ -1,5 +1,29 @@
 cmake_minimum_required(VERSION 3.25)
-project(ZeroMoE CXX)
+project(ZeroMoE VERSION 0.1.0 LANGUAGES CXX)
+
+# Version/provenance reported by `zeromoe --version`. Captured at configure
+# time so a rebuild in the same tree reports the source it was compiled from.
+execute_process(
+    COMMAND git rev-parse --short HEAD
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    OUTPUT_VARIABLE ZEROMOE_GIT_COMMIT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+if(NOT ZEROMOE_GIT_COMMIT)
+    set(ZEROMOE_GIT_COMMIT "unknown")
+endif()
+execute_process(
+    COMMAND git status --porcelain
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    OUTPUT_VARIABLE ZEROMOE_GIT_DIRTY
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+if(ZEROMOE_GIT_DIRTY AND NOT ZEROMOE_GIT_COMMIT STREQUAL "unknown")
+    string(APPEND ZEROMOE_GIT_COMMIT "-dirty")
+endif()
+set(ZEROMOE_VERSION_DEFINITIONS
+    ZEROMOE_VERSION="${PROJECT_VERSION}"
+    ZEROMOE_GIT_COMMIT="${ZEROMOE_GIT_COMMIT}")
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -579,7 +603,11 @@ if(NOT ZEROMOE_CPU_ONLY)
         ${CMAKE_CURRENT_SOURCE_DIR}/cuda
     )
     target_compile_options(zeromoe PRIVATE ${ZEROMOE_AVX512_FLAGS})
-    target_compile_definitions(zeromoe PRIVATE ZEROMOE_EXL3_CUDA=1)
+    target_compile_definitions(zeromoe PRIVATE
+        ZEROMOE_EXL3_CUDA=1
+        ZEROMOE_ENGINE_CUDA=1
+        ZEROMOE_BUILD_TYPE="$<CONFIG>"
+        ${ZEROMOE_VERSION_DEFINITIONS})
     set_target_properties(zeromoe PROPERTIES
         CUDA_SEPARABLE_COMPILATION OFF
         CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
@@ -1264,6 +1292,9 @@ else()
     )
     target_link_libraries(zeromoe_cpu_runtime PUBLIC kernels_cpu)
     add_executable(zeromoe_cpu backends/cpu/cpu_main.cpp)
+    target_compile_definitions(zeromoe_cpu PRIVATE
+        ZEROMOE_BUILD_TYPE="$<CONFIG>"
+        ${ZEROMOE_VERSION_DEFINITIONS})
 
     # When the kernel backend contains Objective-C++ (Metal dispatch), the
     # final executable must link the Objective-C runtime / Foundation so the

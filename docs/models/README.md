@@ -19,6 +19,11 @@ decode throughput, peak memory, and the selected strategy**.
 | GLM 5.3 | `GLM_DSA` (`glm-dsa`) | UD-IQ2_M | 1.8 – 2.4 | [`glm53-dsa.toml`](../../configs/glm53-dsa.toml) | [`glm53.md`](glm53.md) |
 | MiMo V2.6 Flash RL | `mimo2` (`mimo2`) | GSQ-RCO 3-bit | Not frozen | [`mimo26-flash.toml`](../../configs/mimo26-flash.toml) (experimental) | [`mimo26-flash.md`](mimo26-flash.md) |
 
+New to the project? [`configs/starter.toml`](../../configs/starter.toml) sets only
+`model_path` and lets the engine size VRAM and host RAM automatically. Use the
+per-model profiles above once that first run works; they carry hardware-specific
+placement and backend choices and are not portable defaults.
+
 ## Baseline provenance
 
 MiMo V2.6 Flash RL is experimental: it has no frozen baseline yet, and
