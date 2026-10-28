@@ -584,9 +584,6 @@ std::expected<void, std::string> EngineRunner::shutdown_and_report() {
   report_moe_bucket_stats(); // [MOE-BUCKET]: real token-sharing rate for MoE
                              // expert dispatch -- the llama.cpp -ub/mul_mat_id
                              // batching investigation
-  report_prefill_lookahead_stats(); // [PREFILL-LOOKAHEAD]:
-                                    // prefill_dispatch_lookahead_tokens real
-                                    // added/skipped counts
   report_pilot_wide_stats();
   report_prefill_window_stats(); // [PREFILL-WINDOW]: prefill sliding-window
                                  // capacity (P1+P2)  // [PILOT-WIDE]:

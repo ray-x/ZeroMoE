@@ -32,7 +32,7 @@ cp tests/moe_usage_survey/zeromoe_usage_survey_prefill /tmp/reverify_wt/tests/mo
 Every CUDA build links ggml-cuda, so the CUDA-graph decode path is present
 whenever the host is not CPU-only. If `Test 34` (GLM5NEXT KDA dense projection
 fusion) reports "Skipped (GGML CUDA backend not compiled)", the build was
-configured with `ZEROMOE_CPU_ONLY=ON`:
+configured with `GGML_CUDA=OFF`:
 
 ```bash
 cmake -S /tmp/reverify_wt -B /tmp/reverify_wt/build_ggmlcuda \
@@ -383,7 +383,7 @@ Host-node mode (CPU MoE as CUDA host callbacks) ran at 22.7 tok/s vs 28.0 for pl
 - End-to-end on host-node mode (3 interleaved reps each, idle machine): env binding `threads/close` 25.37 (+11.5%), default policy + bind 25.30, `cores/spread` 21.73 (-4.5%), spin vs default policy irrelevant.
 - Binding does NOT help the plain modes: 22/26 +4.4% (noise-level), 0/44/4 -4.2% (two of three reps -8%). So it is applied only in host-node mode.
 - Implemented in `src/ggml_qwen4exp_graph.cpp` (`pin_host_node_threads`): in host-node mode the DECODE CPU thread pool (the one the callbacks borrow) uses ggml `strict_cpu` with a mask of the first N allowed CPUs, and the main thread's affinity is restored after pool creation. Pinning the prefill pool too (first attempt) collapsed decode to 4.76 tok/s: ggml pins the creating thread and its workers permanently, so two teams ended up pinned to the same CPUs.
-  Result (2 interleaved reps): in-engine pin **26.25 tok/s (+15.6%)** vs 22.70 opt-out vs 25.57 env binding; output identical. `ZEROMOE_QWEN4EXP_HOST_NODE_PIN=0` disables it. Host-node is now within ~1.75 tok/s of plain splits.
+  Result (2 interleaved reps): in-engine pin **26.25 tok/s (+15.6%)** vs 22.70 opt-out vs 25.57 env binding; output identical. The former `ZEROMOE_QWEN4EXP_HOST_NODE_PIN=0` comparison override was retired after the A/B; host-node is now within ~1.75 tok/s of plain splits.
 - Answer to "wait for all CPU work, then signal once": already the case within a layer (one callback runs gate+up+swiglu+down+reduce, then the H2D copy releases the GPU). Across layers it cannot be batched: layer L+1's GPU attention/router needs layer L's MoE output.
 - Remaining gap (~2.4 ms/token): handoff ~1.6 ms (doorbell -0.4, packing 2.5 D2H copies into one ~-0.4), CPU reduce tail ~0.9 ms (`output_per_expert`), residual placement effect ~1.3 ms. Not implemented.
 

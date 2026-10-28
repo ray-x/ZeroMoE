@@ -621,42 +621,6 @@ inline bool dequant_v_b_row(const QuantizedTensor& t, int row, float* out) {
     return dequant_row(t.meta.type, t.host_ptr + (int64_t)row * rb, out, I);
 }
 
-// cpu_dot_ggml_avx2 (config): switches the CPU-fallback dot product for
-// IQ2_XXS/IQ3_XXS (GLM-5.2's actual routed-expert types, 71-76/78 layers,
-// dispatched from cpu_quant_matmul below) from the existing FMA path
-// (dot_iq2/3_xxs_f32_avx512, F32 dequant + FMA against F32 activations) to
-// a ported upstream llama.cpp/ggml AVX2 kernel (matmul_iq2/3_xxs_ggml_
-// avx2, register-resident int8 dot via _mm256_maddubs_epi16+madd_epi16
-// against Q8_K-quantized activations). Real isolated microbenchmark showed
-// ~1.7-1.9x faster per-call on this hardware (see CLAUDE.md's "CPU-offload
-// feasibility" entries for the full investigation) -- but ALSO a real,
-// not-yet-resolved accuracy caveat for IQ3_XXS specifically (20-row
-// worst-case 1.73% relative error, above this project's own ~1% tolerance
-// convention used elsewhere). This flag exists to A/B the REAL end-to-end
-// effect on decode throughput before deciding whether that tradeoff is
-// worth it -- default off, NOT yet a recommended production setting.
-// Same function-local-static-storage pattern as cpu_only_flag() (dense_
-// dispatch.hpp) -- defined HERE (not there) because dense_dispatch.hpp
-// already #includes this file, and the reverse would be circular.
-inline bool& cpu_dot_ggml_avx2_flag() {
-    static bool v = false;
-    return v;
-}
-inline bool cpu_dot_ggml_avx2_enabled() { return cpu_dot_ggml_avx2_flag(); }
-inline void enable_cpu_dot_ggml_avx2() { cpu_dot_ggml_avx2_flag() = true; }
-
-// Qwen4Exp-only CPU path.  It mirrors llama.cpp's ggml IQ1_M x Q8_K route
-// and is deliberately independent of the GLM IQ2/IQ3 AVX2 experiment above.
-// Note that GGML's IQ1_M kernel is AVX2-width in the current dependency even
-// when the process was built with AVX-512/VNNI enabled; the Qwen-only
-// AVX-512 probe in kernels_cpu.cpp remains opt-in until it wins end-to-end.
-inline bool& cpu_dot_ggml_iq1m_flag() {
-    static bool v = false;
-    return v;
-}
-inline bool cpu_dot_ggml_iq1m_enabled() { return cpu_dot_ggml_iq1m_flag(); }
-inline void enable_cpu_dot_ggml_iq1m() { cpu_dot_ggml_iq1m_flag() = true; }
-
 // CPU reference quantized matmul: y[S,O] = x[S,I] @ W^T, W packed [O,I].
 // Dequantizes each weight row on the fly and dots. Correct for every type
 // dequant_row handles; rows of unsupported types are zeroed (returns false).
@@ -675,10 +639,7 @@ inline bool cpu_quant_matmul(GGUFType type, const uint8_t* W,
     
     if (type == GGUFType::IQ2_XXS) {
         auto t0 = std::chrono::high_resolution_clock::now();
-        // cpu_dot_ggml_avx2: see this flag's own comment above for the
-        // real speedup/accuracy tradeoff this switches between.
-        if (cpu_dot_ggml_avx2_enabled()) matmul_iq2_xxs_ggml_avx2(y, x, W, S, I, O);
-        else matmul_iq2_xxs_fused(y, x, W, S, I, O);
+        matmul_iq2_xxs_fused(y, x, W, S, I, O);
         auto t1 = std::chrono::high_resolution_clock::now();
         PerfCounters::atomic_add(perf().t_cpu_dot, std::chrono::duration<double>(t1 - t0).count());
         return true;
@@ -686,23 +647,10 @@ inline bool cpu_quant_matmul(GGUFType type, const uint8_t* W,
 
     if (type == GGUFType::IQ3_XXS) {
         auto t0 = std::chrono::high_resolution_clock::now();
-        if (cpu_dot_ggml_avx2_enabled()) matmul_iq3_xxs_ggml_avx2(y, x, W, S, I, O);
-        else matmul_iq3_xxs_fused(y, x, W, S, I, O);
+        matmul_iq3_xxs_fused(y, x, W, S, I, O);
         auto t1 = std::chrono::high_resolution_clock::now();
         PerfCounters::atomic_add(perf().t_cpu_dot, std::chrono::duration<double>(t1 - t0).count());
         return true;
-    }
-
-    if (type == GGUFType::IQ1_M && cpu_dot_ggml_iq1m_enabled()) {
-        auto t0 = std::chrono::high_resolution_clock::now();
-        if (matmul_iq1_m_ggml_q8k(y, x, W, S, I, O)) {
-            auto t1 = std::chrono::high_resolution_clock::now();
-            PerfCounters::atomic_add(perf().t_cpu_dot,
-                                     std::chrono::duration<double>(t1 - t0).count());
-            return true;
-        }
-        // Invalid shape or a non-ggml build: preserve the existing
-        // correctness fallback below rather than returning partial output.
     }
 
     if (type == GGUFType::Q5_K) {

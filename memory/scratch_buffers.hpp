@@ -111,16 +111,6 @@ struct LayerScratch {
   std::vector<int> expert_freq;
   std::vector<int> first_needed_by_token;
 
-  struct PendingPrefillPromotion {
-    int layer_idx;
-    int expert_id;
-    int age_layers;
-  };
-  static constexpr int PENDING_PREFILL_CAP = 32;
-  std::array<PendingPrefillPromotion, PENDING_PREFILL_CAP>
-      pending_prefill_promotions{};
-  int pending_prefill_count = 0;
-
   std::array<int, 8> pilot_pred_ids{};
   int pilot_pred_count = 0;
   int pilot_pred_layer = -1;

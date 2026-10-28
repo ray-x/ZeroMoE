@@ -84,76 +84,6 @@ inline bool expert_gpu_activation() { return expert_gpu_activation_flag(); }
 inline bool moe_prefill_batched() { return moe_prefill_batched_flag(); }
 inline void set_moe_prefill_batched(bool v) { moe_prefill_batched_flag() = v; }
 
-// --- moe_decode_batched (EngineConfig, default OFF) -----------------------
-// Decode-time (S==1) counterpart to moe_prefill_batched, from the
-// ZeroMoE-vs-llama.cpp decode-gap investigation (2026-09-10). A live
-// measurement found the `expert` dispatch bucket at ~77% of decode wall
-// time, with the actual GPU matmul inside it only ~7% of that bucket --
-// the rest is dispatch_expert_k's per-expert VRAM-cache bookkeeping
-// (find_expert's index lookup, expert_ffn_resolve_gpu_loc's
-// hold_for_compute lock, the gpu_pool issue/finish machinery), paid fresh
-// for EVERY one of topk x n_layers expert lookups, every decode token --
-// even when the whole expert set is already 100% RAM-resident
-// (ram_preload_all_experts) and no miss is possible for the session's
-// lifetime. llama.cpp instead decide weight placement ONCE at
-// load time (`-ncmoe`) and never revisit it per token (see this
-// project's own [[llamacpp-op-offload-is-the-lever]] /
-// [[moe-expert-dispatch-not-batched]] memory).
-//
-// When on, dispatch_expert_k (execution_layer.cpp) skips straight to its
-// OWN existing CPU-fallback branch (ram_pin -> expert_ffn_cpu ->
-// ram_unpin -> accumulate, the exact same call already used whenever GPU
-// dispatch fails today) for S==1, instead of attempting the VRAM path
-// first. The RAM-tier pin/claim discipline (get_experts_batch, ram_pin)
-// is NOT touched or weakened -- that machinery protects against genuinely
-// concurrent mutation from prefetch-worker threads, not just this
-// function's own redundant work, and stays exactly as today.
-//
-// REAL TRADE-OFF, not a free win: this also means a decode-time expert
-// dispatched this way never goes through expert_ffn_resolve_gpu_loc's own
-// cold-miss VRAM promotion path, so it can no longer newly promote an
-// expert into VRAM residency from a decode-time hit while this is
-// enabled. Acceptable when the model is already fully RAM-resident
-// up front (this project's current tuned qwen4exp configs); a real
-// regression risk for a config that relies on decode-time promotion to
-// build VRAM residency over a session. Never engages for a vram_shadow
-// block (VRAM-only, no host bytes without a synchronous reload) --
-// dispatch_expert_k falls through to its existing path unchanged there.
-//
-// VERIFIED ON REAL HARDWARE, 2026-09-10, qwen4exp (Qwen3.8-Flash-Next,
-// UD-IQ1_M) -- MUST STAY FALSE FOR THIS MODEL. Position-controlled A/B
-// (baseline / batched / baseline, same build, same 1-token prompt):
-//   baseline (GPU dispatch)      5.03, 4.97 tok/s decode  (~1% spread)
-//   moe_decode_batched=true      2.93 tok/s decode         (-41%)
-// A real, reproducible REGRESSION, not a wash and not a win.
-// `expert_calls` flips from 480GPU/0CPU (baseline) to 418GPU/2462CPU
-// (batched): this model's real quant type (IQ1_M) has a fast, working GPU
-// kernel, so forcing CPU dequant-then-matmul (cpu_quant_matmul) instead
-// is strictly worse -- it reconfirms an earlier, under-weighted project
-// measurement (CPU-only decode 0.80 tok/s vs GPU-routed 1.55 tok/s,
-// qwen4exp-gpu-path-state.md) that this same investigation had initially
-// discounted. See memory: moe-decode-batched-regression.md for the full
-// writeup, including the root-cause lesson (the `dispatch_k`/
-// `phase3_loop` sub-timers this flag was built to eliminate are
-// explicitly commented "upper-bound, overlaps gpu/cpu" -- they measure a
-// window that OVERLAPS async GPU dispatch, not pure serial overhead
-// sitting on top of it, so removing the GPU path traded a cheap async GPU
-// op for an expensive synchronous CPU one, not free time back).
-//
-// This flag is only a plausible win when GPU dispatch was NEVER going to
-// be used anyway -- i.e. the routed expert's quant type has NO GPU
-// kernel at all (CLAUDE.md's CPU AVX-512 fallback list: IQ2_XXS,
-// IQ3_XXS, IQ2_S) or the layer is `cpu_affinity_layers`-pinned. Qwen4Exp
-// UD-IQ1_M is neither -- every one of its routed experts already has a
-// fast GPU kernel (confirmed by the 480GPU/0CPU baseline above), so this
-// flag has NO valid use case for that model/quant combination. Left in
-// the tree, default false, as a documented negative result -- do not
-// re-enable for qwen4exp without re-measuring, and do not assume this
-// generalizes to a model/quant where the GPU kernel is missing or slow.
-inline bool &moe_decode_batched_flag() { static bool v = false; return v; }
-inline bool moe_decode_batched() { return moe_decode_batched_flag(); }
-inline void set_moe_decode_batched(bool v) { moe_decode_batched_flag() = v; }
-
 // --- moe_prefill_stream (EngineConfig, default OFF) ----------------------
 // Optional legacy path that streams prefill expert weights straight from a
 // whole-shard mmap into a pinned, double-buffered chunk on the GPU, bypassing
@@ -367,7 +297,6 @@ inline void set_moe_prefill_stream_chunk(int v) {
 // dense_bf16_prefill_gemm's accessors live in kquant_dequant.hpp, NOT here:
 // cuda_manager.hpp needs them and cannot include this header (dense_dispatch.hpp
 // includes cuda_manager.hpp, so the dependency only goes one way). Same reason
-// cpu_dot_ggml_avx2_enabled() lives over there.
 
 // SwiGLU clamp SEMANTICS switch (GLM5Next / GLM 5.3 Flash). Off (default):
 // this project's long-standing order -- silu(gate), multiply by up, then
@@ -422,14 +351,6 @@ inline bool& dsv4_score_gpu_flag() {
 }
 inline bool dsv4_score_gpu_enabled() { return dsv4_score_gpu_flag(); }
 inline void enable_dsv4_score_gpu() { dsv4_score_gpu_flag() = true; }
-
-// cpu_dot_ggml_avx2_flag()/_enabled()/enable_cpu_dot_ggml_avx2(): defined
-// in kquant_dequant.hpp, not here -- that header is cpu_quant_matmul's own
-// home, and this file already #includes it above (kquant_dequant.hpp
-// includes engine.hpp/kernels_cpu.hpp only, never this file, so no
-// circular-include risk) -- so the real definitions are already reachable
-// here by the time any code below this point calls them. See that
-// header's own comment for the full flag semantics.
 
 // Per-layer version of the same idea: `cpu_affinity_layers` (config) names
 // specific MoE layers whose routed experts should NEVER be dispatched on
@@ -1232,16 +1153,12 @@ inline void dense_proj(StreamingEngine& engine, const std::string& wname,
       wname == "blk.1.ple_value.weight";
   const bool ple_path_diag = ple_projection &&
       Logger::instance().would_log(LogLevel::DEBUG);
-  const char* ple_cpu_env =
-      zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PLE_FORCE_CPU");
-  const bool ple_force_cpu = ple_path_diag && ple_cpu_env &&
-                             ple_cpu_env[0] == '1';
   if (ple_path_diag) {
       LOG_INFO("[QWEN4EXP-PLE-PATH] name=%s S=%d I=%d O=%d type=%u "
-               "bytes=%zu gpu_fast=%d device=%d force_cpu=%d\n",
+               "bytes=%zu gpu_fast=%d device=%d\n",
                wname.c_str(), S, I, O, static_cast<unsigned>(W.meta.type),
                W.meta.size_bytes, W.gpu_fast_ptr ? 1 : 0,
-               W.device_ptr ? 1 : 0, ple_force_cpu ? 1 : 0);
+               W.device_ptr ? 1 : 0);
   }
     // 1) GPU dispatch. Prefer the BF16-matched fast-path buffer
     //    (upload_dequantized_bf16, cuda_manager.hpp) when present — cuBLAS
@@ -1266,14 +1183,14 @@ inline void dense_proj(StreamingEngine& engine, const std::string& wname,
     //    BF16 activation, dense_matmul_bf16_matched_host), verified correct
     //    in isolation via Test 10 (real hardware) before being wired in
     //    here.
-    if (!ple_force_cpu && !force_original_quant && !cpu_only_mode() &&
+    if (!force_original_quant && !cpu_only_mode() &&
         engine.gpu && W.gpu_fast_ptr &&
         engine.gpu->dense_matmul_bf16_matched_host(W.gpu_fast_ptr, x, y, S, I, O)) {
         if (ple_path_diag)
             LOG_INFO("[QWEN4EXP-PLE-PATH] selected=BF16-fast\n");
         return;
     }
-    if (!ple_force_cpu && !cpu_only_mode() && engine.gpu && W.device_ptr &&
+    if (!cpu_only_mode() && engine.gpu && W.device_ptr &&
         engine.gpu->dense_matmul_host(W.meta.type, W.device_ptr, x, y, S, I, O)) {
         if (ple_path_diag)
             LOG_INFO("[QWEN4EXP-PLE-PATH] selected=original-weight-GPU\n");

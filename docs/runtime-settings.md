@@ -35,18 +35,12 @@ single backend split (`splits=1`, `transitions=0` in the `[GGML-QWEN-FULL]` log)
 nodes: **22.6 tok/s** (81%) with the blocking schedule, 18.2 tok/s with the old spinning schedule. Use it when you need a
 single captured graph (the Phase 2 master-graph gate requires it), not for speed.
 
-### `ZEROMOE_QWEN4EXP_HOST_NODE_PIN`
+### Host-node CPU thread placement
 
-| | |
-|---|---|
-| Values | `0` disables; anything else / unset = enabled |
-| Default | on, but only takes effect when `ZEROMOE_QWEN4EXP_HOST_NODE=1` |
-| Effect | Pins the host-node CPU thread pool's N workers to the first N CPUs of the process's allowed set (ggml `strict_cpu`), and restores the main thread's affinity afterwards. Does nothing if fewer distinct CPUs than threads are available. |
-
-Why: the callback runs on a CUDA driver thread that leads the OpenMP team, and unpinned workers land on arbitrary logical CPUs: the same graph computes ~33% slower
-than from the main thread. Pinning gave host-node mode 22.70 -> 26.25 tok/s (+15.6%, identical output). It is deliberately not applied to plain scheduler-split modes
-(0/44/4 got ~4% slower with binding, 22/26 ~4% faster, both within noise-to-negative). Do not combine host-node mode with `OMP_WAIT_POLICY=active`:
-spinning workers plus a busy main thread can starve the callback thread (measured 7x slower in isolation).
+Host-node mode pins its CPU worker threads to distinct CPUs in the process's
+allowed affinity set. The matched A/B showed 26.25 tok/s with pinning versus
+22.70 tok/s without it (+15.6%, identical output). Pinning is fixed on for
+host-node mode; it is not applied to scheduler-split execution.
 
 ### Host-node GPU weighted reduce (fixed on)
 

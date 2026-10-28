@@ -113,8 +113,6 @@ inline std::vector<int> find_other_zeromoe_pids(pid_t own_pid) {
 // admission decision: two instances can both scan an empty /proc and then
 // allocate at the same time. Hold one small process-lifetime flock so the
 // multi-session freeze incident cannot recur through that TOCTOU window.
-// --force-start remains an explicit operator escape hatch for deliberately
-// disjoint workloads.
 inline int host_admission_lock_fd = -1;
 
 inline bool acquire_host_admission_lock() {
@@ -132,8 +130,8 @@ inline bool acquire_host_admission_lock() {
     fprintf(stderr,
             "[PREFLIGHT] FATAL: another ZeroMoE process currently holds "
             "the host admission lock; refusing concurrent startup. Stop it "
-            "first, or pass --force-start only when the workloads are known "
-            "to be safe and disjoint (%s).\n",
+            "first, or pass --force-start only when workloads are known "
+            "safe and disjoint (%s).\n",
             std::strerror(errno));
     close(fd);
     return false;
@@ -157,15 +155,12 @@ inline void release_host_admission_lock() {
 // 5% of the budget), expressed in decimal GB -- see CLAUDE.md's "host_ram_gb swap-thrashing
 // regression" entry: exactly-the-budget was already once a real,
 // measured, reboot-surviving regression on this box, not a hypothetical).
-// gpu_device_ids is this run's own resolved config.gpus[*].device_id
-// list. `force` (wired to a new --force-start CLI flag, main.cpp-local,
-// not a TOML config field) lets an operator proceed anyway when they are
-// certain it's safe -- e.g. two zeromoe instances deliberately using
-// disjoint GPU sets -- but always after seeing every real number that
-// would otherwise have blocked the start.
+// gpu_device_ids is this run's own resolved config.gpus[*].device_id list.
+// `force` lets an operator proceed when certain the concurrent workload is
+// safe, for example when instances use disjoint GPU sets.
 inline bool run(double required_host_ram_gb,
-                 const std::vector<int> &gpu_device_ids, bool force,
-                 double margin_gb = -1.0) {
+                const std::vector<int> &gpu_device_ids, bool force,
+                double margin_gb = -1.0) {
   // Preserve 20 GiB for the kernel, drivers, graph scratch, and desktop
   // services. The previous 10 GiB floor did not protect the host during the
   // full-DDR-page-pinned DeepSeek graph run.
@@ -178,19 +173,14 @@ inline bool run(double required_host_ram_gb,
   auto others = find_other_zeromoe_pids(self);
   if (!others.empty()) {
     fprintf(stderr,
-            "[PREFLIGHT] FATAL: %zu other zeromoe process(es) already "
-            "running (pid",
+            "[PREFLIGHT] FATAL: %zu other ZeroMoE process(es) are running; "
+            "the configured host RAM and VRAM budgets are process-wide. "
+            "Stop the other process, or pass --force-start only if safe "
+            "and disjoint (pid",
             others.size());
     for (int p : others)
       fprintf(stderr, " %d", p);
-    fprintf(stderr,
-            ") -- each instance assumes it owns the FULL configured "
-            "host_ram_gb/VRAM budget; running two together is a real, "
-            "previously-confirmed way to drive this box into swap "
-            "thrashing or a hard crash requiring a reboot. Stop the "
-            "other instance first, or pass --force-start if you are "
-            "certain this is safe (e.g. deliberately disjoint GPU "
-            "sets).\n");
+    fprintf(stderr, ").\n");
     ok = false;
   }
 
@@ -213,10 +203,8 @@ inline bool run(double required_host_ram_gb,
               "this box's own zram swap is already confirmed pathological "
               "for this workload (real CPU cost, ~1.0x compression on "
               "already-quantized expert weights -- zero real capacity "
-              "gained). Free memory (check for another zeromoe or "
-              "otherwise heavy process), or lower host_ram_gb, and "
-              "retry -- or pass --force-start if you are certain this is "
-              "safe.\n",
+              "gained). Free memory or lower host_ram_gb, then retry -- "
+              "or pass --force-start if certain this is safe.\n",
               avail, required_host_ram_gb, margin_gb, need);
       ok = false;
     } else {
@@ -259,8 +247,7 @@ inline bool run(double required_host_ram_gb,
               "-- looks already substantially claimed by another process "
               "(this box's own GPUs should be near-empty before this "
               "engine's own pools allocate). Check `nvidia-smi`, free the "
-              "GPU, or pass --force-start if you are certain this is "
-              "safe.\n",
+              "GPU, or pass --force-start if certain this is safe.\n",
               dev, free_gb, total_gb);
       ok = false;
     } else {
@@ -271,10 +258,8 @@ inline bool run(double required_host_ram_gb,
 
   if (!ok && force) {
     fprintf(stderr,
-            "[PREFLIGHT] --force-start given: proceeding DESPITE the "
-            "failure(s) above. This is exactly the condition that "
-            "previously caused a real crash on this box -- only do this "
-            "if you are certain it's safe.\n");
+            "[PREFLIGHT] --force-start given: proceeding despite the "
+            "preflight failure(s) above.\n");
     return true;
   }
   if (!ok && admission_lock_held) release_host_admission_lock();

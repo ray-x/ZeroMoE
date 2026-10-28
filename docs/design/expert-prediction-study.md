@@ -71,7 +71,7 @@ activations of the token being processed).
 
 **Ridge correction** (`bench/qwen_ridge_export.py`, learned `(x - mu) R + c` added to the pilot scores). Fitted on
 router activation dumps of six prompts (`~/Projects/ZeroMoE-results/promotion-study/ridge/`; 300 decode tokens
-each, router taps only via `ZEROMOE_QWEN4EXP_PROBE_ROUTER_ONLY=1`):
+each, using the historical router-only probe capture mode (that selector was removed 2026-10-28; current probe dumps also include graph-construction taps):
 * held-out top-3 hit rate, mean over layers: 90.7% -> 92.8% (story held out); 84.9% -> 89.5% (leetcode held
   out, fit on five prompts). Gains concentrate in a few layers (1, 5, 9, 12, 25, 42, 47: +5 to +16 points).
 * In the engine on the never-seen story prompt (fit on five other prompts), cold-expert prediction got

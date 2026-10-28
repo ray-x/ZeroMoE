@@ -237,7 +237,7 @@ Same config as above (K=8, 54 GiB pool, 426-token prompt, 35 steady steps), run 
 ## GLM-5.3 (glm-dsa) decode route survey: ranking refit does not help (2026-10-19)
 
 Hypothesis: the DSA usage file (`.zeromoe_usage_glm53_ud_iq2m`, 35,400 counts) is thin, so a decode-only route survey
-(`ZEROMOE_GLM5NEXT_ROUTE_TRACE`, 4 prompts x 47 decode tokens x 75 MoE layers, `obsolete/glm53-logs-scripts/survey_dsa_all.sh`) could raise the
+(the tagged `[MOE-ROUTE-TRACE]` debug records (captured via the historical `ZEROMOE_GLM5NEXT_ROUTE_TRACE` file selector), 4 prompts x 47 decode tokens x 75 MoE layers, `obsolete/glm53-logs-scripts/survey_dsa_all.sh`) could raise the
 resident-set hit rate and cut SSD bytes/token (needed: ~-40% for 1.7 tok/s).
 
 Leave-one-prompt-out, fraction of routed experts inside the top-N ranked set (base = existing file; refit = base + 3 training prompts):
@@ -647,7 +647,7 @@ At decode with a 64 GiB pool the process held 84.5 GiB anonymous memory plus a 3
 
 ### Trial 43: prompt-adaptive resident set, oracle upper bound (negative)
 
-25-token computing-history prompt, recipe, 64 GiB pool, 22 GiB hot set, swap-free, NGEN=80. Baseline run with `ZEROMOE_GLM5NEXT_ROUTE_TRACE` (80 tokens x 75 layers; 9270 distinct (layer, expert) pairs routed, more than the ~7900 resident): 1.44 tok/s (Rates), 1.50 first-to-last, loads 5752/64 tok, split stall 206 ms/tok. Then a usage file built from that same trace (base counts + 3x trace counts, in-sample = best case for any adaptive scheme): 1.55 (Rates), 1.63 first-to-last, loads 4206 (-27%), but split stall 216 ms/tok (unchanged). Result: a 27% cut in SSD loads is worth +7.6% decode; split stall tracks the number of layers with a pending miss times single-miss latency, not the load count. A real prompt-adaptive scheme would gain less than +7.6%, so with the 78 GiB pool (1.37 long) it cannot reach 1.5. Dynamic VRAM promotion not built.
+25-token computing-history prompt, recipe, 64 GiB pool, 22 GiB hot set, swap-free, NGEN=80. Historical baseline run with `ZEROMOE_GLM5NEXT_ROUTE_TRACE` (80 tokens x 75 layers; now captured with tagged `[MOE-ROUTE-TRACE]` DEBUG records; 9270 distinct (layer, expert) pairs routed, more than the ~7900 resident): 1.44 tok/s (Rates), 1.50 first-to-last, loads 5752/64 tok, split stall 206 ms/tok. Then a usage file built from that same trace (base counts + 3x trace counts, in-sample = best case for any adaptive scheme): 1.55 (Rates), 1.63 first-to-last, loads 4206 (-27%), but split stall 216 ms/tok (unchanged). Result: a 27% cut in SSD loads is worth +7.6% decode; split stall tracks the number of layers with a pending miss times single-miss latency, not the load count. A real prompt-adaptive scheme would gain less than +7.6%, so with the 78 GiB pool (1.37 long) it cannot reach 1.5. Dynamic VRAM promotion not built.
 
 ### Trial 44: confidence-based pilot prefetch width (negative, removed)
 

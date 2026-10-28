@@ -1982,61 +1982,6 @@ float dot_iq2_xxs_avx2_prototype(const uint8_t *block,
   return 0.125f * hsum_f32_avx2(accumf);
 }
 
-// OpenMP wrapper for dot_iq2_xxs_avx2_prototype -- EngineConfig::
-// cpu_dot_ggml_avx2's own matmul entry point (kquant_dequant.hpp's
-// cpu_quant_matmul, gated behind cpu_dot_ggml_avx2_enabled()), mirroring
-// matmul_iq2_xxs_fused's own structure exactly but quantizing activations
-// to Q8_K ONCE per token (not per output row) before the parallel O-loop --
-// same "plain static, not thread_local" reasoning as matmul_q8_0_fused's
-// own g_xq_q8 buffer above (single decode-thread-only caller, fully
-// written before the parallel region reads it).
-void matmul_iq2_xxs_ggml_avx2(float *y, const float *x,
-                              const uint8_t *W_quantized, int S, int I, int O) {
-  constexpr int QK_K = 256;
-  constexpr size_t BLOCK_BYTES = 66;
-  const size_t row_bytes = (size_t)(I / QK_K) * BLOCK_BYTES;
-  const int num_superblocks = I / QK_K;
-
-  static std::vector<block_q8_K_local> g_xq_k;
-  if (g_xq_k.size() < (size_t)(S * num_superblocks))
-    g_xq_k.resize((size_t)S * num_superblocks);
-
-  // Gated on S>1 -- an OMP team-spawn for a single S=1 (decode, the
-  // dominant call volume for this dispatch path) serial iteration is pure
-  // overhead with zero parallelism gained, the exact same "OMP-spawn cost
-  // exceeds a tiny workload" regression this project has hit and fixed
-  // multiple times before (see CLAUDE.md's qabsorb q_nope_gather_all entry
-  // for the canonical writeup) -- copied uncritically from matmul_q8_0_
-  // fused's own identical pattern above, which never got the same fix
-  // because Q8_0 isn't a real routed-expert type for this model (never
-  // exercised at S=1 in production, so the inefficiency was never
-  // surfaced). Real hardware run caught this: wiring this function in
-  // showed ZERO decode improvement over the existing FMA path despite a
-  // genuine ~1.8x isolated per-call win -- this is the fix for that gap.
-  if (S > 1) {
-#pragma omp parallel for schedule(static)
-    for (int s = 0; s < S; ++s) {
-      quantize_row_q8_K_ref(x + (int64_t)s * I,
-                            g_xq_k.data() + (int64_t)s * num_superblocks, I);
-    }
-  } else if (S == 1) {
-    quantize_row_q8_K_ref(x, g_xq_k.data(), I);
-  }
-
-  for (int s = 0; s < S; ++s) {
-    const block_q8_K_local *xq = g_xq_k.data() + (int64_t)s * num_superblocks;
-    float *ys = y + (int64_t)s * O;
-#pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; ++o) {
-      const uint8_t *row_w = W_quantized + (size_t)o * row_bytes;
-      if (o + 1 < O) {
-        _mm_prefetch((const char *)(W_quantized + (size_t)(o + 1) * row_bytes),
-                     _MM_HINT_T0);
-      }
-      ys[o] = dot_iq2_xxs_avx2_prototype(row_w, xq, I);
-    }
-  }
-}
 // ============================================================
 
 // Llama.cpp/ggml's Qwen CPU route uses IQ1_M weights against one Q8_K-
@@ -2556,57 +2501,6 @@ float dot_iq3_xxs_avx2_prototype(const uint8_t *block,
   return 0.25f * hsum_f32_avx2(accumf);
 }
 
-// OpenMP wrapper for dot_iq3_xxs_avx2_prototype -- IQ3_XXS sibling of
-// matmul_iq2_xxs_ggml_avx2 above, same design (see that function's own
-// comment).
-void matmul_iq3_xxs_ggml_avx2(float *y, const float *x,
-                              const uint8_t *W_quantized, int S, int I, int O) {
-  constexpr int QK_K = 256;
-  constexpr size_t BLOCK_BYTES = 98;
-  const size_t row_bytes = (size_t)(I / QK_K) * BLOCK_BYTES;
-  const int num_superblocks = I / QK_K;
-
-  static std::vector<block_q8_K_local> g_xq_k;
-  if (g_xq_k.size() < (size_t)(S * num_superblocks))
-    g_xq_k.resize((size_t)S * num_superblocks);
-
-  // Gated on S>1 -- an OMP team-spawn for a single S=1 (decode, the
-  // dominant call volume for this dispatch path) serial iteration is pure
-  // overhead with zero parallelism gained, the exact same "OMP-spawn cost
-  // exceeds a tiny workload" regression this project has hit and fixed
-  // multiple times before (see CLAUDE.md's qabsorb q_nope_gather_all entry
-  // for the canonical writeup) -- copied uncritically from matmul_q8_0_
-  // fused's own identical pattern above, which never got the same fix
-  // because Q8_0 isn't a real routed-expert type for this model (never
-  // exercised at S=1 in production, so the inefficiency was never
-  // surfaced). Real hardware run caught this: wiring this function in
-  // showed ZERO decode improvement over the existing FMA path despite a
-  // genuine ~1.8x isolated per-call win -- this is the fix for that gap.
-  if (S > 1) {
-#pragma omp parallel for schedule(static)
-    for (int s = 0; s < S; ++s) {
-      quantize_row_q8_K_ref(x + (int64_t)s * I,
-                            g_xq_k.data() + (int64_t)s * num_superblocks, I);
-    }
-  } else if (S == 1) {
-    quantize_row_q8_K_ref(x, g_xq_k.data(), I);
-  }
-
-  for (int s = 0; s < S; ++s) {
-    const block_q8_K_local *xq = g_xq_k.data() + (int64_t)s * num_superblocks;
-    float *ys = y + (int64_t)s * O;
-#pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; ++o) {
-      const uint8_t *row_w = W_quantized + (size_t)o * row_bytes;
-      if (o + 1 < O) {
-        _mm_prefetch((const char *)(W_quantized + (size_t)(o + 1) * row_bytes),
-                     _MM_HINT_T0);
-      }
-      ys[o] = dot_iq3_xxs_avx2_prototype(row_w, xq, I);
-    }
-  }
-}
-
 namespace {
 
 using q8k_dot_fn = float (*)(const uint8_t *, const block_q8_K_local *,
@@ -2630,7 +2524,7 @@ static float dot_iq3_xxs_ggml_q8k_exact(const uint8_t *w,
   return out;
 }
 
-bool matmul_iqxxs_ggml_avx2_grouped_impl(float *const *y, const float *x,
+bool matmul_iqxxs_ggml_grouped_impl(float *const *y, const float *x,
                                          const uint8_t *const *W_quantized,
                                          int n_matrices, int S, int I, int O,
                                          size_t block_bytes, q8k_dot_fn dot) {
@@ -3376,31 +3270,17 @@ bool matmul_qwen_q2_0_q2_0_fused(
   return true;
 }
 
-bool matmul_iq2_xxs_ggml_avx2_grouped(float *const *y, const float *x,
-                                      const uint8_t *const *W_quantized,
-                                      int n_matrices, int S, int I, int O) {
-  return matmul_iqxxs_ggml_avx2_grouped_impl(
-      y, x, W_quantized, n_matrices, S, I, O, 66, dot_iq2_xxs_avx2_prototype);
-}
-
-bool matmul_iq3_xxs_ggml_avx2_grouped(float *const *y, const float *x,
-                                      const uint8_t *const *W_quantized,
-                                      int n_matrices, int S, int I, int O) {
-  return matmul_iqxxs_ggml_avx2_grouped_impl(
-      y, x, W_quantized, n_matrices, S, I, O, 98, dot_iq3_xxs_avx2_prototype);
-}
-
 bool matmul_iq2_xxs_ggml_q8k_grouped(float *const *y, const float *x,
                                      const uint8_t *const *W_quantized,
                                      int n_matrices, int S, int I, int O) {
-  return matmul_iqxxs_ggml_avx2_grouped_impl(
+  return matmul_iqxxs_ggml_grouped_impl(
       y, x, W_quantized, n_matrices, S, I, O, 66, dot_iq2_xxs_ggml_q8k_exact);
 }
 
 bool matmul_iq3_xxs_ggml_q8k_grouped(float *const *y, const float *x,
                                      const uint8_t *const *W_quantized,
                                      int n_matrices, int S, int I, int O) {
-  return matmul_iqxxs_ggml_avx2_grouped_impl(
+  return matmul_iqxxs_ggml_grouped_impl(
       y, x, W_quantized, n_matrices, S, I, O, 98, dot_iq3_xxs_ggml_q8k_exact);
 }
 

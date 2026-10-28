@@ -46,7 +46,7 @@ Config: `configs/bench/qwen4exp_tg400_iq1m_22_26.toml`, with three lines changed
 | `context_size` | `416` | 16-token prompt + 400 generated. Longer pushes the last token onto the legacy path (+1.5 s, fakes an 11% gap) |
 | `ram_preload_all_experts`, `host_ram_gb`, `ram_pinned_budget_gb` | `true`, `100`, `45.0` | CPU-layer experts live in pinned DDR (21.2 GiB aliased) |
 | `omp_max_threads` | **`10`** (config ships 12) | see "Why 10 threads" |
-| `[[gpus]]` | `dense_gb = 4.1`, `kv_cache_gb = 2.0`, `moe_cache_gb = 11.5`, `kv_bits = 4` | legacy cache is disabled under full graph; dense arena actually 3.26 GiB |
+| `[[gpus]]` | `dense_gb = 4.1`, `kv_cache_gb = 2.0`, `moe_cache_gb = 11.5` | legacy cache is disabled under full graph; dense arena actually 3.26 GiB |
 
 Environment (all set by the script):
 

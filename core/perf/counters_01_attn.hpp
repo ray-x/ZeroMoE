@@ -318,26 +318,6 @@ struct PerfCountersPart01 {
     std::atomic<double> t_score_gpu_down{0};
     std::atomic<uint64_t> n_score_gpu_calls{0};
 
-    // qwen4exp dense full-attention GPU path (EngineConfig::qwen4exp_attn_gpu).
-    // Kept separate from t_score_gpu_* above: that is GLM's MLA score phase, a
-    // structurally different call site, and sharing buckets would hide which
-    // one dominates -- the same discipline upload_expert_active's own counters
-    // follow. t_attn_qwen_dense remains the WHOLE dense-layer cost (projections
-    // + norms + RoPE + attention + gate + wo), so these three are a strict
-    // subset of it and the difference is what stays on the CPU.
-    std::atomic<double> t_qwen4exp_attn_gpu_up{0};
-    std::atomic<double> t_qwen4exp_attn_gpu_cmp{0};
-    std::atomic<double> t_qwen4exp_attn_gpu_dn{0};
-    std::atomic<uint64_t> n_qwen4exp_attn_gpu_calls{0};
-    std::atomic<uint64_t> n_qwen4exp_attn_gpu_fallback_cpu{0};
-
-    // qwen4exp chunkwise GDN GPU path (EngineConfig::qwen4exp_gdn_gpu).
-    std::atomic<double> t_qwen4exp_gdn_gpu_up{0};
-    std::atomic<double> t_qwen4exp_gdn_gpu_cmp{0};
-    std::atomic<double> t_qwen4exp_gdn_gpu_dn{0};
-    std::atomic<uint64_t> n_qwen4exp_gdn_gpu_calls{0};
-    std::atomic<uint64_t> n_qwen4exp_gdn_gpu_fallback_cpu{0};
-
     // GDN causal conv1d+SiLU GPU path (EngineConfig::qwen4exp_gdn_conv_gpu).
     std::atomic<double> t_gdn_conv1d_gpu_up{0};
     std::atomic<double> t_gdn_conv1d_gpu_cmp{0};

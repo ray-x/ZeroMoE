@@ -130,8 +130,6 @@ bool env_device_expert_trailing();
 bool env_layer_timing_enabled();
 bool env_qwen4exp_host_node_enabled();
 bool env_layer_timing_verbose();
-int env_host_node_diag_layer();
-bool env_host_node_transport_diag_enabled(int layer);
 int env_partial_layer();
 int env_partial_layer_top_n();
 float env_partial_layer_min_coverage();

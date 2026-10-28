@@ -89,7 +89,7 @@ How to read it:
 - Same graph, different placement: run once with everything on one GPU and once with the hot/cold split. If only
   one differs, the bug is in placement or the cold path, not the math (the MiMo NaN from a repeated placeholder id
   was found this way).
-- `--graph-node-trace 2` (MiMo) reports the first non-finite node. Use `--verbosity 4` for tensor traces;
+- `--verbosity 5` enables MiMo node and non-finite reports; `--verbosity 4` enables tensor traces;
   capture to a file and filter the resulting log after the run.
 - Check tensor sizes first: `./quant_table_test` and the `[PREFLIGHT]` lines at startup flag a tensor type that is
   missing from `memory/quant_table.hpp`.

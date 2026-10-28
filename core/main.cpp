@@ -190,6 +190,23 @@ static void zeromoe_ggml_log_callback(enum ggml_log_level level,
   std::fflush(stderr);
 }
 
+void print_bench_usage() {
+  std::cout
+      << "Usage: zeromoe bench --config <model.toml> [benchmark options]\n\n"
+      << "  --config <file>             Model recipe\n"
+      << "  --bench-prompt <file>       Repeatable real-text prompt input\n"
+      << "  --bench-ngen <N>            Generated tokens per prompt\n"
+      << "  --bench-reps <N>            Repetitions per prompt\n"
+      << "  --bench-warmup <N>          Warmup repetitions\n"
+      << "  --bench-long <N>            Long decode token count\n"
+      << "  --bench-long-reps <N>       Long decode repetitions\n"
+      << "  --bench-random-pp <N>       Random-token prompt lengths\n"
+      << "  --bench-random-tg <N>       Random-token decode lengths\n"
+      << "  --bench-seed <N>            Random-token seed\n"
+      << "  --bench-out <file>          Append benchmark JSON output\n"
+      << "  --stats-file <file>         Request stats JSONL output\n";
+}
+
 void print_usage(bool all = false) {
   if (!all) {
     std::cout
@@ -206,11 +223,13 @@ void print_usage(bool all = false) {
         << "  --temp <number>       Temperature; 0 selects greedy sampling\n"
         << "  --top-p <number>      Nucleus sampling threshold\n"
         << "  --system-prompt <s>   Conversation instructions\n"
-        << "  --verbosity <0..5>   llama.cpp-style log threshold\n"
+        << "  bench                  Run developer benchmarks; see zeromoe bench --help\n"
+        << "  -v, --verbose, --log-verbose Enable all log messages\n"
+        << "  -lv, --verbosity, --log-verbosity <0..5> llama.cpp log threshold\n"
         << "  --gen-config [file]   Write a minimal starter configuration\n"
         << "  --gen-config-full [file]  Write the annotated full configuration\n"
         << "  --version             Print version, commit and engine flavor\n"
-        << "  --help-all            Advanced tuning, diagnostics and benchmarks\n"
+        << "  --help-all            Advanced inference tuning and diagnostics\n"
         << "  --help-settings       Canonical graph settings and legacy aliases\n\n"
         << "Model recipes: configs/; configuration guide: docs/configuration.md\n";
     return;
@@ -220,6 +239,7 @@ void print_usage(bool all = false) {
       << "       ./zeromoe --model <path_to_gguf> [options]\n"
       << "       ./zeromoe --gen-config [output.toml]\n\n"
       << "Options:\n"
+      << "  zeromoe bench --help   Developer benchmark options\n"
       << "  --config <file>  Load engine config from TOML file\n"
       << "  --serve          Serve OpenAI and Anthropic APIs (optional server build)\n"
       << "  --host <host>    API bind address (default: 127.0.0.1)\n"
@@ -288,24 +308,9 @@ void print_usage(bool all = false) {
       << "                   (default: max; enable_thinking=false selects "
          "direct answer).\n"
       << "  --log-file <file>  Redirect logging to a file instead of stderr\n"
-      << "  --verbosity <0..5> llama.cpp-style log threshold\n"
-      << "  --verbose          Enable all ZeroMoE log and trace messages\n"
-      << "  --freeze-usage-stats  Don't overwrite pin_file/prefill_pin_file at "
-         "shutdown\n"
-      << "                   (still read at startup) -- for controlled A/B "
-         "testing\n"
-      << "  --collect-usage-stats  Override freeze_usage_stats and write the "
-         "usage files at shutdown\n"
-      << "  --bench          Benchmark: run --bench-prompt files in one process, report per-request speeds\n"
-      << "                   (--bench-prompt <file> repeatable, --bench-ngen N, --bench-reps N, --bench-warmup N,\n"
-      << "                    --bench-long N, --bench-out <file>; see core/bench_mode.hpp)\n"
-      << "                   llama-bench style random tokens: --bench-random-pp N, --bench-random-tg N, --bench-seed S\n"
-      << "  --stats-file <path>  Append one JSON line per finished request\n"
-      << "  --force-start    Bypass the startup safety checks (concurrent "
-         "zeromoe\n"
-      << "                   instance, real RAM headroom, free VRAM) -- only "
-         "use when\n"
-      << "                   certain it's safe; see startup_preflight.hpp\n"
+        << "  -v, --verbose, --log-verbose Enable all log messages\n"
+        << "  -lv, --verbosity, --log-verbosity <0..5> llama.cpp log threshold\n"
+      << "  --force-start    Bypass startup safety checks for deliberate, known-safe runs\n"
       << "  --help           Show this help interface\n";
 }
 
@@ -415,6 +420,9 @@ int main(int argc, char *argv[]) {
   mallopt(M_TRIM_THRESHOLD, 128 << 20);
   install_shutdown_handlers(); // Ctrl-C/SIGTERM -> graceful teardown (see
                                // shutdown.hpp)
+  const bool benchmark_subcommand = argc > 1 && std::string(argv[1]) == "bench";
+  if (benchmark_subcommand)
+    zeromoe::bench::plan().enabled = true;
 
   std::string config_path = "";
   std::string prompt_cli;
@@ -443,19 +451,10 @@ int main(int argc, char *argv[]) {
   std::string reasoning_effort_cli;
   std::string log_path_cli;
   std::string log_level_cli;
-  bool freeze_usage_stats_cli = false;
-  bool collect_usage_stats_cli = false;
   float temp_cli = -1.0f, top_p_cli = -1.0f; // -1 sentinel = "not given" (0.0
                                              // is a valid greedy-decode value)
   float repeat_penalty_cli = 1.0f;
   bool repeat_penalty_cli_given = false;
-  // 2026-09: real incident -- a second zeromoe instance (a separate
-  // one-off smoke test) was started while this box already had another
-  // zeromoe benchmark running; the two together drove the box into
-  // swap thrashing hard enough to force a reboot. See
-  // startup_preflight.hpp's own header comment. --force-start bypasses
-  // the resulting startup checks for a deliberate, known-safe case
-  // (e.g. two instances on disjoint GPU sets).
   bool force_start_cli = false;
   bool serve_api_cli = false;
   std::string api_host_cli = "127.0.0.1";
@@ -467,7 +466,7 @@ int main(int argc, char *argv[]) {
   int spec_draft_n_max_cli = -1;
   zeromoe::graphsettings::CliValues graph_cli_settings;
 
-  for (int i = 1; i < argc; ++i) {
+  for (int i = benchmark_subcommand ? 2 : 1; i < argc; ++i) {
     std::string arg = argv[i];
     std::string graph_setting;
     if (zeromoe::graphsettings::cli_setting_name(arg, graph_setting)) {
@@ -513,7 +512,7 @@ int main(int argc, char *argv[]) {
       gen_config_path = (i + 1 < argc && argv[i + 1][0] != '-')
                             ? argv[++i]
                             : "zeromoe_config.toml";
-    } else if (arg == "--version" || arg == "-V") {
+    } else if (arg == "--version") {
       zeromoe_print_version();
       return 0;
     } else if (arg == "--model" && i + 1 < argc)
@@ -562,8 +561,8 @@ int main(int argc, char *argv[]) {
       prefetch_worker_threads_cli = std::stoi(argv[++i]);
     else if (arg == "--log-file" && i + 1 < argc)
       log_path_cli = argv[++i];
-    else if ((arg == "--verbosity" || arg == "--log-verbosity") &&
-             i + 1 < argc) {
+    else if ((arg == "-lv" || arg == "--verbosity" ||
+              arg == "--log-verbosity") && i + 1 < argc) {
       try {
         size_t end = 0;
         const std::string value = argv[++i];
@@ -577,12 +576,9 @@ int main(int argc, char *argv[]) {
         std::cerr << "Error: --verbosity must be in [0, 5]\n";
         return 1;
       }
-    } else if (arg == "--verbose")
+    else if (arg == "-v" || arg == "--verbose" ||
+             arg == "--log-verbose")
       log_level_cli = "VERBOSE";
-    else if (arg == "--freeze-usage-stats")
-      freeze_usage_stats_cli = true;
-    else if (arg == "--collect-usage-stats")
-      collect_usage_stats_cli = true;
     else if (arg == "--temp" && i + 1 < argc)
       temp_cli = std::stof(argv[++i]);
     else if (arg == "--top-p" && i + 1 < argc)
@@ -591,29 +587,27 @@ int main(int argc, char *argv[]) {
       repeat_penalty_cli = std::stof(argv[++i]);
       repeat_penalty_cli_given = true;
     }
-    else if (arg == "--bench")
-      zeromoe::bench::plan().enabled = true;
-    else if (arg == "--bench-prompt" && i + 1 < argc)
+    else if (benchmark_subcommand && arg == "--bench-prompt" && i + 1 < argc)
       zeromoe::bench::plan().prompt_files.push_back(argv[++i]);
-    else if (arg == "--bench-ngen" && i + 1 < argc)
+    else if (benchmark_subcommand && arg == "--bench-ngen" && i + 1 < argc)
       zeromoe::bench::plan().ngen = std::stoi(argv[++i]);
-    else if (arg == "--bench-reps" && i + 1 < argc)
+    else if (benchmark_subcommand && arg == "--bench-reps" && i + 1 < argc)
       zeromoe::bench::plan().reps = std::stoi(argv[++i]);
-    else if (arg == "--bench-warmup" && i + 1 < argc)
+    else if (benchmark_subcommand && arg == "--bench-warmup" && i + 1 < argc)
       zeromoe::bench::plan().warmup = std::stoi(argv[++i]);
-    else if (arg == "--bench-long" && i + 1 < argc)
+    else if (benchmark_subcommand && arg == "--bench-long" && i + 1 < argc)
       zeromoe::bench::plan().long_ngen = std::stoi(argv[++i]);
-    else if (arg == "--bench-long-reps" && i + 1 < argc)
+    else if (benchmark_subcommand && arg == "--bench-long-reps" && i + 1 < argc)
       zeromoe::bench::plan().long_reps = std::stoi(argv[++i]);
-    else if (arg == "--bench-random-pp" && i + 1 < argc)
+    else if (benchmark_subcommand && arg == "--bench-random-pp" && i + 1 < argc)
       zeromoe::bench::plan().random_pp.push_back(std::stoi(argv[++i]));
-    else if (arg == "--bench-random-tg" && i + 1 < argc)
+    else if (benchmark_subcommand && arg == "--bench-random-tg" && i + 1 < argc)
       zeromoe::bench::plan().random_tg.push_back(std::stoi(argv[++i]));
-    else if (arg == "--bench-seed" && i + 1 < argc)
+    else if (benchmark_subcommand && arg == "--bench-seed" && i + 1 < argc)
       zeromoe::bench::plan().seed = static_cast<unsigned>(std::stoul(argv[++i]));
-    else if (arg == "--bench-out" && i + 1 < argc)
+    else if (benchmark_subcommand && arg == "--bench-out" && i + 1 < argc)
       zeromoe::bench::plan().out = argv[++i];
-    else if (arg == "--stats-file" && i + 1 < argc)
+    else if (benchmark_subcommand && arg == "--stats-file" && i + 1 < argc)
       zeromoe::stats::Sink::instance().set_file(argv[++i]);
     else if (arg == "--force-start")
       force_start_cli = true;
@@ -621,10 +615,16 @@ int main(int argc, char *argv[]) {
       std::cout << zeromoe::graphsettings::settings_reference();
       return 0;
     } else if (arg == "--help-all") {
-      print_usage(true);
+      if (benchmark_subcommand)
+        print_bench_usage();
+      else
+        print_usage(true);
       return 0;
     } else if (arg == "--help" || arg == "-h") {
-      print_usage();
+      if (benchmark_subcommand)
+        print_bench_usage();
+      else
+        print_usage();
       return 0;
     } else if (!arg.empty() && arg[0] == '-') {
       std::cerr << "Error: unknown option " << arg << "\n";
@@ -795,10 +795,6 @@ int main(int argc, char *argv[]) {
     config.log_path = log_path_cli;
   if (!log_level_cli.empty())
     config.log_level = log_level_cli;
-  if (freeze_usage_stats_cli)
-    config.freeze_usage_stats = true;
-  if (collect_usage_stats_cli)
-    config.freeze_usage_stats = false;
   if (temp_cli >= 0.0f)
     config.temperature = temp_cli;
   if (top_p_cli >= 0.0f)
@@ -830,8 +826,8 @@ int main(int argc, char *argv[]) {
     if (!preflight::run(config.host_ram_gb, gpu_ids, force_start_cli)) {
       LOG_STREAM_ERROR()
           << "  Startup pre-flight check(s) failed -- see [PREFLIGHT] "
-             "lines above. Refusing to start (pass --force-start to "
-             "override once you're certain it's safe).\n";
+             "lines above. Refusing to start (pass --force-start only when "
+             "you are certain it is safe).\n";
       return 1;
     }
   }
@@ -867,12 +863,7 @@ int main(int argc, char *argv[]) {
     enable_dsv4_outproj_gpu();
   if (config.dsv4_score_gpu)
     enable_dsv4_score_gpu();
-  if (config.cpu_dot_ggml_avx2)
-    enable_cpu_dot_ggml_avx2();
-  if (config.cpu_dot_ggml_iq1m)
-    enable_cpu_dot_ggml_iq1m();
   set_moe_prefill_batched(config.moe_prefill_batched);
-  set_moe_decode_batched(config.moe_decode_batched);
   set_moe_prefill_stream(config.moe_prefill_stream);
   set_moe_prefill_stream_chunk(config.moe_prefill_stream_chunk);
   set_moe_expert_bf16_gemm(config.moe_expert_bf16_gemm);
@@ -898,16 +889,9 @@ int main(int argc, char *argv[]) {
   LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp decode batch RAM staging: "
                     << (config.qwen4exp_decode_batch_stage ? "ON" : "off")
                     << " (Qwen S=1 only; direct pinned-slab path otherwise)\n";
-  LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp custom exact-Q8 HC decode: "
-                    << (config.qwen4exp_decode_custom_hc_q8 ? "ON" : "off")
-                    << " (requires device HC; Qwen-only)\n";
   LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp async HC readback: "
                     << (config.qwen4exp_hc_async_readback ? "ON" : "off")
                     << " (pinned D2H staging; Qwen CPU-affinity path only)\n";
-  LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp GPU router during S==1 decode: "
-                    << (config.qwen4exp_decode_gpu_router ? "ON" : "off")
-                    << " (batched prefill still follows moe_ggml_gpu_router; "
-                       "Qwen pilot is independent)\n";
   set_hc_ggml(config.hc_ggml);
   set_gdn_proj_ggml(config.gdn_proj_ggml);
   set_gdn_full_ggml(config.gdn_full_ggml);
@@ -985,31 +969,6 @@ int main(int argc, char *argv[]) {
       << "[CONFIG] MoE prefill token-batching (group tokens by expert): "
       << (config.moe_prefill_batched ? "ON" : "off")
       << " -- shared path, see dense_dispatch.hpp's blast-radius note\n";
-  LOG_STREAM_INFO()
-      << "[CONFIG] MoE decode batched dispatch (skip VRAM-cache "
-         "lock/residency machinery, CPU-direct for RAM-resident experts): "
-      << (config.moe_decode_batched ? "ON" : "off")
-      << " -- see dense_dispatch.hpp's own accessor for the real "
-         "measured numbers\n";
-  // VERIFIED regression on real hardware (dense_dispatch.hpp's own
-  // moe_decode_batched() comment / memory: moe-decode-batched-
-  // regression.md): 5.03/4.97 tok/s baseline decode -> 2.93 tok/s with
-  // this on for qwen4exp (Qwen3.8-Flash-Next, UD-IQ1_M), ~41% SLOWER,
-  // because that model's routed experts already have a fast GPU kernel
-  // and forcing CPU dequant instead is strictly worse. `engine` isn't
-  // constructed yet at this point in main() (this block only has
-  // `config`), so this can't be gated on model family the way the
-  // header comments are -- warns unconditionally whenever the flag is
-  // on. Loud, not just a comment, so a config drift or copy-paste from
-  // another model's tuning doesn't silently reintroduce this.
-  if (config.moe_decode_batched) {
-    LOG_WARN("[CONFIG] moe_decode_batched=true -- VERIFIED ~41%% DECODE "
-             "REGRESSION on qwen4exp/qwen3.8-flash-next UD-IQ1_M (5.0 -> "
-             "2.9 tok/s), not a win. Only a plausible win when the routed "
-             "experts have NO GPU kernel at all -- most checkpoints' quant "
-             "types ARE GPU-capable. Re-measure before trusting this on "
-             "for any model/quant combination.\n");
-  }
   LOG_STREAM_INFO()
       << "[CONFIG] GLM5NEXT grouped GPU prefill: "
       << (config.glm5next_moe_prefill_gpu ? "ON" : "off")

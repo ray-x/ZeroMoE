@@ -46,12 +46,12 @@ Per token the scheduler runs 34 CPU splits and 35 GPU splits. The GPU is idle ab
 cmake -S . -B build_b11401 -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=75 \
   -DGGML_CUDA=ON -DGGML_NATIVE=ON -DGGML_OPENMP=ON \
   -DGGML_CUDA_FA_QUANTS="q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16" \
-  -DZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES=OFF -DGGML_AVX512_VNNI=OFF \
+  -DGGML_AVX512_VNNI=OFF \
   -DZEROMOE_GGML_ROOT=/path/to/llama.cpp-moestream-b11401/ggml
 cmake --build build_b11401 --target zeromoe -j12
 ```
 
-- `HOST_NODE_PATCHES` must be OFF (the host-node scheduler-gate patch does not apply to b11401).
+- Historical b11401 build: this fork does not accept the required host-node scheduler patch. Current ZeroMoE CMake always applies that patch and rejects incompatible GGML source trees, so b11401 is no longer a supported build base.
 - Do NOT point `ZEROMOE_GGML_ROOT` at another project's tree (neurall): CMake applies patches to it in place.
 - Compile flags match neurall's: `-O3 -DNDEBUG -march=native`, Release, LTO off, OpenMP on. `GGML_LLAMAFILE` is OFF
   (tested ON: 0-1% slower, no benefit).

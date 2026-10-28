@@ -224,10 +224,6 @@ std::expected<void, std::string> EngineRunner::init_ram_tier() {
   // fixed-stride graph tensors. The remaining layers use the graph's
   // source-backed fallback and retain normal lazy cache behavior.
   if (ram_graph_cache) {
-    const char *layer0_diag_env =
-        zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_DIAG_LAYER0_RESIDUAL");
-    const bool narrow_layer0_diag =
-        layer0_diag_env && layer0_diag_env[0] == '1';
     std::vector<int> graph_ram_full_layers;
     std::vector<int> graph_ram_projection_compact_layers;
     const int n_experts = engine.model_file.architecture_config.n_experts;
@@ -248,12 +244,8 @@ std::expected<void, std::string> EngineRunner::init_ram_tier() {
       // populated by the preload block below, never by GGUF mmap at
       // decode time.
       const bool full_graph_ram_layer =
-          graph_mode && graph_ram_cache && !narrow_layer0_diag;
-      const bool narrow_layer0_ram_layer =
-          narrow_layer0_diag && layer == 0 &&
-          engine.qwen4exp_cpu_offload_layer_enabled(layer);
-      if (!full_graph_ram_layer && !qwen_cpu_layer &&
-          !narrow_layer0_ram_layer)
+          graph_mode && graph_ram_cache;
+      if (!full_graph_ram_layer && !qwen_cpu_layer)
         continue;
       if (n_experts <= 0 || engine.compute_expert_slab_bytes(layer) == 0 ||
           (int)engine.layers_experts[(size_t)layer].size() < n_experts ||

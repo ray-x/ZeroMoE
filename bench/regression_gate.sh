@@ -27,8 +27,8 @@
 #
 # Preconditions (enforced by the individual run scripts where they exist):
 #   * no other zeromoe / llama.cpp process, GPUs idle
-#   * enough free RAM (some recipes need host_ram_gb + 21.5 GiB margin; the gate uses
-#     --force-start under scripts/run_capped.sh where the conservative margin would refuse)
+#   * enough free RAM; some recipes use --force-start under run_capped.sh
+#     because the cgroup cap prevents swap thrashing during bounded regressions.
 #   * set MIMO26_MODEL when selecting the mimo26 recipe
 #
 # Coherence is NOT auto-checked: these models are non-deterministic under near-tie
@@ -352,7 +352,7 @@ PY
         --config "$config" \
         --graph-offload-ddr-gib 100 \
         --graph-offload-usage-file "$PWD/bench/profiles/mimo26_combined.usage" \
-        --log-file "$eng" --temp 0 --predict 64 > "$log" 2>&1 || rc=$?
+        --log-file "$eng" --temp 0 --predict 64 --force-start > "$log" 2>&1 || rc=$?
   local before=$FAIL
   report mimo26 "$(grab_rate "$eng")" "$rc" "$log" "$(grab_tokens "$eng")" 64
   (( FAIL > before )) && return
@@ -385,7 +385,7 @@ run_dsv41() {
         scripts/run_capped.sh -- "$BIN" --verbosity 5 \
         --config configs/bench/deepseek_v41_100gib_ddr_17gib_vram_dual_gpu.toml \
         --log-file "$eng" \
-        --temp 0 --predict 64 --force-start > "$log" 2>&1 || rc=$?
+        --temp 0 --predict 64 > "$log" 2>&1 || rc=$?
   report dsv41 "$(grab_rate "$eng")" "$rc" "$log" "$(grab_tokens "$eng")" 64
 }
 

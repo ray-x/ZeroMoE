@@ -1,7 +1,7 @@
-// `zeromoe --bench`: run a fixed set of prompts through the normal request path in ONE process and summarise the
+// `zeromoe bench`: run a fixed set of prompts through the normal request path in ONE process and summarise the
 // per-request records (core/request_stats.hpp).
 //
-//   zeromoe --config C --bench --bench-prompt bench/prompts/short.txt --bench-prompt bench/prompts/mid.txt
+//   zeromoe bench --config C --bench-prompt bench/prompts/short.txt --bench-prompt bench/prompts/mid.txt
 //           --bench-prompt bench/prompts/long.txt [--bench-ngen 200] [--bench-reps 3] [--bench-warmup 1]
 //           [--bench-long 1500] [--bench-out result.json]
 //
@@ -74,9 +74,9 @@ class Session {
   // Reads the prompt files and builds the queue. Returns an empty string on success, an error message otherwise.
   std::string prepare(bool &prompt_cache_flag, int vocab) {
     random_ = !plan_.random_pp.empty() || !plan_.random_tg.empty();
-    if (random_ && !plan_.prompt_files.empty()) return "--bench-random-* cannot be combined with --bench-prompt";
+    if (random_ && !plan_.prompt_files.empty()) return "benchmark random options cannot be combined with --bench-prompt";
     if (!random_ && plan_.prompt_files.empty())
-      return "--bench needs --bench-prompt FILE (real text) or --bench-random-pp/-tg N (random tokens)";
+      return "bench needs --bench-prompt FILE (real text) or --bench-random-pp/-tg N (random tokens)";
     if (plan_.ngen < 8 || plan_.reps < 1) return "--bench-ngen must be at least 8 and --bench-reps at least 1";
     if (random_) {
       if (vocab < 2) return "the model vocabulary size is unknown; cannot draw random tokens";

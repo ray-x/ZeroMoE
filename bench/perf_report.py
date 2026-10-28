@@ -6,7 +6,7 @@
       --set omp_max_threads=10 --note ram="DDR4-2666 4ch"
   bench/perf_report.py render bench/results/*.json
 
-The measurements come from the engine itself: this script starts `zeromoe --bench` (core/bench_mode.hpp), which loads
+The measurements come from the engine itself: this script starts `zeromoe bench` (core/bench_mode.hpp), which loads
 the model once and runs every request through the normal request path, and reads the per-request records the engine
 writes (core/request_stats.hpp). It does not parse log lines. What it adds is what only an outside observer can do:
 describe the machine and the build, and decide whether the machine was quiet while each request ran.
@@ -166,7 +166,7 @@ def wait_quiet(seconds=10, limit=1500):
 
 # ---------------------------------------------------------------- one bench process
 def run_bench(args, tag, bench_args, cfg_text, env_extra):
-    """Starts `zeromoe --bench ...`, samples the machine every second while it runs, returns (bench json, samples, events)."""
+    """Starts `zeromoe bench ...`, samples the machine every second while it runs, returns (bench json, samples, events)."""
     logdir = os.path.join(args.out, f"{args.name}.logs")
     os.makedirs(logdir, exist_ok=True)
     cfg = re.sub(r"(?m)^model_path\s*=.*$", f'model_path = "{args.model}"', cfg_text)
@@ -181,7 +181,7 @@ def run_bench(args, tag, bench_args, cfg_text, env_extra):
         if os.path.exists(f):
             os.remove(f)
     env = dict(os.environ, **env_extra)
-    cmd = [args.binary, "--config", cfg_file, "--bench", "--bench-out", result_file, "--stats-file", stats_file] + bench_args
+    cmd = [args.binary, "bench", "--config", cfg_file, "--bench-out", result_file, "--stats-file", stats_file] + bench_args
     out = open(f"{logdir}/{tag}.out", "w")
     p = subprocess.Popen(cmd, cwd=ROOT, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT)
     samples, events = [], []
@@ -362,7 +362,7 @@ def finalize(args, cfg_path, cfg_text, env_extra, accepted, rejected_f):
         "environment": {**{k: v for k, v in os.environ.items() if re.match(r"(ZEROMOE_|CUDA_VISIBLE|OMP_|GGML_)", k)}, **env_extra},
         "notes": dict(kv.split("=", 1) for kv in args.note), "engine_log_lines": engine_lines,
         "protocol": {
-            "source": "zeromoe --bench per-request records (core/request_stats.hpp)", "standard_ngen": STD_NGEN, "reps": args.reps,
+            "source": "zeromoe bench per-request records (core/request_stats.hpp)", "standard_ngen": STD_NGEN, "reps": args.reps,
             "prompts": PROMPTS, "random_seed": args.seed, "random_tests": [] if args.no_random else
             [f"pp{n}" for n in args.random_pp] + [f"tg{n}" for n in args.random_tg],
             "decode_definition": "1000 / mean(step ms) over steps >= 3", "peak_definition": "best 32-step window",
@@ -466,7 +466,7 @@ def cmd_render(args):
     print("\nLong decode: greedy output is identical on every run, so variation between parts reflects what is generated (which "
           "experts it routes to) as well as the growing context; read the spread, not a trend line. Prefill average is the mean "
           "over the three prompt lengths; compare models by the per-length numbers.")
-    print("\nMethod: `zeromoe --bench` (one process, requests through the normal request path); median of accepted requests, "
+    print("\nMethod: `zeromoe bench` (one process, requests through the normal request path); median of accepted requests, "
           "a request counts only if it produced all its tokens and the machine was quiet during it; decode = 1000 / mean(step ms) over "
           "steps >= 3; peak = best 32-step window; second-request setup = decode-graph setup paid by a request after its prefill.")
 

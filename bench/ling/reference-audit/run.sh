@@ -152,7 +152,6 @@ fi
 unset ZEROMOE_LING_NATIVE_GRAPH ZEROMOE_LING_HYBRID_CUDA_GRAPH ZEROMOE_LING_CPU_COLD_MISSES ZEROMOE_GLM5NEXT_GPU1_HOT_GIB ZEROMOE_GLM5NEXT_GPU1_HOT_USAGE ZEROMOE_FULL_GRAPH_RESIDENT_GB ZEROMOE_FULL_GRAPH_USE_RAM_CACHE ZEROMOE_LING_FULL_GRAPH_DDR_PREFETCH_GIB
 prompt_sha256=$(sha256sum -- "$prompt_file" | awk '{print $1}')
 printf '[RUN] prompt_file=%s; prompt_sha256=%s; context=%s; ngen=32; temp=0; config=%s; usage=%s; DDR=%s GiB OffloadStore; GPU cache=%s+%s GiB; pinned VRAM slots=%s; pinned DDR fraction=%s; GPU assist slots=%s+%s; early-ready=%s; batched-negative-skip=%s; MoE tensors alias cache; CPU threads=%s\n' "$prompt_file" "$prompt_sha256" "$context_size" "$config" "$profile" "${LING_DDR_GIB:-64}" "${LING_GPU0_CACHE_GIB:-3.0}" "${LING_GPU1_CACHE_GIB:-12.5}" "${LING_PINNED_VRAM_CAPACITY:-3700}" "${LING_OFFLOAD_PINNED:-0.5}" "${LING_GPU_ASSIST:-3}" "${LING_ASSIST2_SLOTS:-1}" "${LING_EARLY_READY:-1}" "${ZEROMOE_GLM5NEXT_BATCHED_NEGATIVE_SKIP}" "${LING_CPU_THREADS:-10}"
-export ZEROMOE_GLM5NEXT_ROUTE_TRACE="${log%.log}.routes"
 export ZEROMOE_GENERATED_TOKEN_FILE="${log%.log}.tokens"
 unset ZEROMOE_TEACHER_FORCE_TOKEN_FILE GGML_OP_OFFLOAD_MIN_BATCH
 if [[ -n "${LING_TOKEN_FILE:-}" ]]; then export ZEROMOE_TEACHER_FORCE_TOKEN_FILE="$LING_TOKEN_FILE"; fi
@@ -161,5 +160,6 @@ if [[ "$freeze_usage_stats" =~ ^(0|false|no)$ ]]; then
 else
   unset ZEROMOE_GLM5NEXT_PREFILL_ROUTE_CAPTURE
 fi
-exec "$worktree/scripts/run_capped.sh" --limit-gb "${LING_CAP_GIB:-95}" "$bin" \
-  --config "$config" --predict 32 --temp 0 "${graph_args[@]}" < "$prompt_file"
+"$worktree/scripts/run_capped.sh" --limit-gb "${LING_CAP_GIB:-95}" "$bin" \
+  --verbosity 5 --config "$config" --predict 32 --temp 0 "${graph_args[@]}" < "$prompt_file"
+sed -n 's/.*\[MOE-ROUTE-TRACE\] //p' "$log" > "${log%.log}.routes"

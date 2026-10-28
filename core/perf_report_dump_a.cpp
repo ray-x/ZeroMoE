@@ -387,26 +387,6 @@ void PerfCounters::dump_report_part2(double session_elapsed_s) const {
                      (unsigned long)pw_att, (unsigned long)pw_ok, (unsigned long)pw_fail,
                      t_prefill_warm_time.load(), (unsigned long)pw_hint);
         }
-        uint64_t pp_promo = n_prefill_pending_promoted.load();
-        uint64_t pp_load = n_prefill_pending_still_loading.load();
-        uint64_t pp_age = n_prefill_pending_aged_out.load();
-        uint64_t pp_slot = n_prefill_pending_no_free_slot.load();
-        uint64_t pp_res = n_prefill_pending_already_resident.load();
-        uint64_t pp_cap = n_prefill_pending_cap_dropped.load();
-        if (pp_promo || pp_load || pp_age || pp_slot || pp_res || pp_cap) {
-            LOG_INFO("Prefill opportunistic VRAM promotion: %lu promoted / %lu already resident by the "
-                     "time checked (something else, e.g. Phase 3's own dispatch, beat this pass to it) "
-                     "/ %lu still loading (checked again next layer) / %lu aged out (never landed in "
-                     "time, Phase 3's own synchronous dispatch handled it as usual) / %lu found no free "
-                     "VRAM slot left / %lu never tracked at all (pending_prefill_promotions' 32-entry "
-                     "cap was already full at push time -- high here means the cap, not fetch speed, "
-                     "is the binding constraint) -- cross-layer follow-up for prefill_warm_via_"
-                     "prefetcher's own pushed hints, not a speculative bet (every entry here is a "
-                     "confirmed real router pick for this exact prefill batch). Should sum to "
-                     "~n_prefill_hint_pushed above.\n",
-                     (unsigned long)pp_promo, (unsigned long)pp_res, (unsigned long)pp_load,
-                     (unsigned long)pp_age, (unsigned long)pp_slot, (unsigned long)pp_cap);
-        }
     }
     {
         uint64_t rhits = n_pilot_recall_hits.load(), rchecks = n_pilot_recall_checks.load();

@@ -1230,8 +1230,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "CMakeLists.txt execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: use upstream GGML_CUDA as the sole public CUDA build switch; ZeroMoE derives its internal capability from that setting.",
+      "removal_status": "REMOVED 2026-10-28",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0010"
     },
@@ -1902,8 +1902,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "CMakeLists.txt execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: use upstream GGML_CUDA as the sole public CUDA build switch; ZeroMoE derives its internal capability from that setting.",
+      "removal_status": "REMOVED 2026-10-28",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0018"
     },
@@ -2145,8 +2145,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "patched ggml CUDA host-node execution and graph capture compatibility. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: source builds always apply the required host-node patch series; incompatible GGML trees fail configuration. CMake verifies the scheduler and CUDA bridge symbols in prebuilt libraries before linking.",
+      "removal_status": "REMOVED 2026-10-28",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0021"
     },
@@ -2430,8 +2430,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "native HTTP protocol/scheduling test build. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: removed the dedicated test-only CMake toggle; both API test targets now follow the root build policy and are always included.",
+      "removal_status": "REMOVED 2026-10-28",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0025"
     },
@@ -3189,7 +3189,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "EXL3: backends/core/models execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "KEEP 2026-10-28: EXL3-specific compile guard used only on the CUDA engine and EXL3 adapter benchmarks; GGML-CUDA test targets intentionally omit it, so it is distinct from ZEROMOE_USE_GGML_CUDA.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0030"
@@ -3282,7 +3282,7 @@
       "member_name_occurrences": [],
       "affected_if_removed": "EXL3: backends execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "KEEP 2026-10-28: internal compile capability guard set only when ZEROMOE_EXLLAMAV3_SRC supplies the optional upstream sources; not a standalone user or runtime A/B switch.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0031"
@@ -6944,8 +6944,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "KEEP OPERATOR OVERRIDE 2026-10-28: needed for deliberate disjoint-device runs and cgroup-capped regression runs; do not remove before resource-aware admission replaces the bypass.",
+      "removal_status": "RETAINED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0056"
     },
@@ -9925,8 +9925,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "REMOVED 2026-10-28: configurable debug abort removed; non-finite diagnostics remain logged.",
-      "removal_status": "REMOVED",
+      "review_decision": "REMOVED 2026-10-28: no active CLI parser/reader; finite-value diagnostics log errors without configurable abort behavior.",
+      "removal_status": "REMOVED 2026-10-28",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0089"
     },
@@ -9995,8 +9995,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "REMOVED 2026-10-28: tensor trace tags are all emitted at verbose level and can be filtered in the captured log.",
-      "removal_status": "REMOVED",
+      "review_decision": "REMOVED 2026-10-28: no active CLI parser/reader; verbose tensor traces retain tags for post-processing instead of a runtime regex filter.",
+      "removal_status": "REMOVED 2026-10-28",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0090"
     },
@@ -13464,8 +13464,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "backends execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: test-only environment override removed; typed dense_async_copies TOML setting remains authoritative.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0123"
     },
@@ -16374,8 +16374,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "model graph equations/operator implementation and routing. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: no maintained consumer for Layer-0 GDN dump output; diagnostic graph roots and synchronization removed.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0156"
     },
@@ -16437,8 +16437,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "model graph equations/operator implementation and routing. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28 with the GDN diagnostic dump path.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0157"
     },
@@ -16500,8 +16500,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "model graph equations/operator implementation and routing. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28 with the GDN diagnostic dump path.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0158"
     },
@@ -18691,8 +18691,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "model graph equations/operator implementation and routing. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: no maintained consumer for HC internal dump files; diagnostic snapshots and synchronous readbacks removed.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0186"
     },
@@ -19756,8 +19756,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: only an unused S=1 shared-expert A/B override; no maintained caller or profile. Normal capability fallback remains.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0201"
     },
@@ -19849,8 +19849,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: A/B-only force-host-upload selector; same-device external binding is the validated path, with existing safe fallbacks for missing/mismatched device buffers.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0202"
     },
@@ -28373,8 +28373,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "GLM: prompt batching/prefill execution. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: dense beyond top_k was a non-model-exact historical A/B; sparse pooled attention is fixed beyond top_k.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0269"
     },
@@ -28436,8 +28436,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "GLM: prompt batching/prefill execution. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: test hook forcing sparse attention below top_k removed; normal selection follows model semantics.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0270"
     },
@@ -28562,8 +28562,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "GLM: prompt batching/prefill execution. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: A/B switch disabling valid chunk continuation removed; state/alignment guards remain.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0272"
     },
@@ -29654,8 +29654,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "GLM: diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: no maintained consumer for GLM next-layer probe dump; removed graph taps and per-token readback.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0284"
     },
@@ -29840,8 +29840,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "GLM: model graph equations/operator implementation and routing. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: route records now use DEBUG header [MOE-ROUTE-TRACE]; maintained survey scripts filter them from engine logs.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0286"
     },
@@ -40065,8 +40065,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: layer-0-only RAM residency was a diagnostic branch; normal eligible-layer selection remains.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0371"
     },
@@ -44425,8 +44425,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: single-layer host-node transport diagnostic selector had no maintained caller; normal dispatch/timing remain.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0394"
     },
@@ -44636,8 +44636,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: A/B validated CPU pinning (+15.6%); host-node mode now always pins allowed CPUs.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0397"
     },
@@ -45614,8 +45614,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: model graph equations/operator implementation and routing. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: debug-only CPU force path removed; DEBUG path reporting and normal fallback remain.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0409"
     },
@@ -63201,8 +63201,8 @@
       ],
       "affected_if_removed": "core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/main.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: legacy CPU fallback A/B selector removed; grouped Qwen GGML Q8_K kernel remains.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0551"
     },
@@ -74410,8 +74410,8 @@
       ],
       "affected_if_removed": "core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_config.hpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change. Check maintained scripts/tool arguments and benchmark outputs.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: per-GPU TOML field was parsed and printed but had no reader in any KV-cache implementation; kv_cache_gb is the actual budget control.",
+      "removal_status": "REMOVED 2026-10-28",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0608"
     },
@@ -90549,8 +90549,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: deprecated no-op TOML field removed after its layered Qwen4Exp CUDA implementation was deleted; parser entry and dead report counters removed.",
+      "removal_status": "REMOVED 2026-10-28",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0684"
     },
@@ -93009,8 +93009,8 @@
       ],
       "affected_if_removed": "Qwen: prompt batching/prefill execution. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/batched_dispatch_pipeline.cpp, core/engine_runner.cpp, core/main.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "KEEP CONFIG FOR REVIEW 2026-10-28: retain this ZeroMoE-only RAM-to-VRAM offload path, default off; survey-only and no controlled full-request evidence found.",
+      "removal_status": "KEEP FOR REVIEW",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0697"
     },
@@ -93169,8 +93169,8 @@
       ],
       "affected_if_removed": "Qwen: model graph equations/operator implementation and routing. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner.cpp, core/hyper_connections.cpp, core/main.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: unvalidated custom HC Q8 selector was false in its only survey profile and absent from shipped profiles; removed field, parser, engine wiring, startup log, and survey entry.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0698"
     },
@@ -93909,8 +93909,8 @@
       ],
       "affected_if_removed": "Qwen: CPU worker pools, affinity and scheduling. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner.cpp, core/engine_runner_dense.cpp, core/main.cpp, core/moe_router_service.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "KEEP CONFIG FOR REVIEW 2026-10-28: retain this ZeroMoE-only offload/scheduling path, default off; no accepted end-to-end result found.",
+      "removal_status": "KEEP FOR REVIEW",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0702"
     },
@@ -94408,8 +94408,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "Qwen: model graph equations/operator implementation and routing. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-28: deprecated no-op TOML field removed after its layered Qwen4Exp CUDA implementation was deleted; parser entry and dead report counters removed.",
+      "removal_status": "REMOVED 2026-10-28",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0706"
     },
@@ -94628,7 +94628,7 @@
       ],
       "affected_if_removed": "Qwen: core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner.cpp, core/engine_runner_cache.cpp, models/qwen/ggml_qwen4exp_graph.cpp, models/qwen/ggml_qwen4exp_graph_arena.cpp (+2 other files).",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "KEEP for user review; this enables ZeroMoE-specific GPU staging of selected CPU-offloaded experts. Off by default and only enabled in the survey test profile.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0707"
@@ -95108,7 +95108,7 @@
       ],
       "affected_if_removed": "Qwen: core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner.cpp, core/engine_runner_cache.cpp, models/qwen/ggml_qwen4exp_graph.cpp, models/qwen/ggml_qwen4exp_graph_arena.cpp (+4 other files).",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "KEEP for user review; this selects the ZeroMoE-specific CPU-offload layers staged through the GPU. Off by default and only enabled in the survey test profile.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0708"
@@ -95648,7 +95648,7 @@
       ],
       "affected_if_removed": "Qwen: core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner.cpp, core/engine_runner_preload.cpp, models/qwen/ggml_qwen4exp_graph.cpp, models/qwen/ggml_qwen4exp_graph_placement.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "KEEP for user review; selects the per-layer concentrated-only Option B placement variant.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0711"
@@ -95768,7 +95768,7 @@
       ],
       "affected_if_removed": "Qwen: host/VRAM accounting, residency, expert cache and transfer lifetime. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner_cache.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
+      "review_decision": "KEEP for user review; selects the legacy-cache interaction for Option B placement.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0712"
@@ -95948,7 +95948,7 @@
       ],
       "affected_if_removed": "Qwen: host/VRAM accounting, residency, expert cache and transfer lifetime. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner.cpp, models/qwen/ggml_qwen4exp_graph_arena.cpp, models/qwen/ggml_qwen4exp_graph_placement.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
+      "review_decision": "KEEP for user review; controls Option B VRAM fill behavior.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0713"
@@ -95995,7 +95995,7 @@
           "file_sha256": "92ecfe716e0ced05c8561cc0786c086a89b8edb1c4cea1000aea076385cb534c"
         }
       ],
-      "action": "INTERNALIZE validated implementation choice; retain DEV experiment only with active evidence",
+      "action": "FINALIZED 2026-10-28: the shipped global-pool Qwen profile uses a one-hot-expert minimum per selected layer.",
       "proposed_owner": "model adapter/backend policy",
       "rationale": "Users should not assemble correct operator/backend combinations; settle the supported path before deleting its selector.",
       "risk": "MEDIUM",
@@ -96168,7 +96168,7 @@
       ],
       "affected_if_removed": "Qwen: core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner.cpp, core/engine_runner_cache.cpp, core/engine_runner_preload.cpp, models/qwen/ggml_qwen4exp_graph_placement.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "FINALIZED 2026-10-28: the shipped global-pool Qwen profile uses a one-hot-expert minimum per selected layer.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0714"
@@ -96215,7 +96215,7 @@
           "file_sha256": "92ecfe716e0ced05c8561cc0786c086a89b8edb1c4cea1000aea076385cb534c"
         }
       ],
-      "action": "INTERNALIZE startup/runtime policy; remove external tuning input after replacement exists",
+      "action": "FINALIZED 2026-10-28: Option B global pool is enabled in configs/qwen38-flash.toml at K=14000 across all 48 layers; K is hardware and usage-file specific, not a universal engine default.",
       "proposed_owner": "resource planner/adaptive controller",
       "rationale": "Planner output, not user intent; preserve validated initial policy before adding measured adaptation.",
       "risk": "MEDIUM",
@@ -96508,7 +96508,7 @@
       ],
       "affected_if_removed": "Qwen: core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner.cpp, core/engine_runner_cache.cpp, core/engine_runner_preload.cpp, models/qwen/ggml_qwen4exp_graph_arena.cpp (+1 other files).",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "FINALIZED 2026-10-28: Option B global pool is enabled in configs/qwen38-flash.toml at K=14000 across all 48 layers; K is hardware and usage-file specific, not a universal engine default.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0715"
@@ -96888,7 +96888,7 @@
       ],
       "affected_if_removed": "Qwen: core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner.cpp, core/engine_runner_cache.cpp, core/engine_runner_preload.cpp, models/qwen/ggml_qwen4exp_graph.cpp (+3 other files).",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "KEEP for user review; selects a layer for per-layer Option B placement.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0716"
@@ -97088,7 +97088,7 @@
       ],
       "affected_if_removed": "Qwen: core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner.cpp, core/engine_runner_preload.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "KEEP for user review; limits the selected layer count for concentrated Option B placement.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0717"
@@ -97408,7 +97408,7 @@
       ],
       "affected_if_removed": "Qwen: core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner.cpp, core/engine_runner_cache.cpp, core/engine_runner_preload.cpp, models/qwen/ggml_qwen4exp_graph_placement.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "KEEP for user review; controls coverage-based Option B sizing.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0718"
@@ -97588,7 +97588,7 @@
       ],
       "affected_if_removed": "Qwen: core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner.cpp, core/engine_runner_cache.cpp, models/qwen/ggml_qwen4exp_graph_placement.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "KEEP for user review; controls right-sized per-layer Option B placement.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0719"
@@ -97635,7 +97635,7 @@
           "file_sha256": "92ecfe716e0ced05c8561cc0786c086a89b8edb1c4cea1000aea076385cb534c"
         }
       ],
-      "action": "INTERNALIZE adapter/topology/placement decision; remove redundant public switches",
+      "action": "FINALIZED 2026-10-28: the shipped Qwen global-pool profile selects all 48 layers.",
       "proposed_owner": "family adapter and resource planner",
       "rationale": "Select a supported graph path and placement from metadata, capabilities and budgets; preserve explicit device restrictions.",
       "risk": "MEDIUM",
@@ -97788,7 +97788,7 @@
       ],
       "affected_if_removed": "Qwen: core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner_cache.cpp, core/engine_runner_preload.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "FINALIZED 2026-10-28: the shipped Qwen global-pool profile selects all 48 layers.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0720"
@@ -97968,7 +97968,7 @@
       ],
       "affected_if_removed": "Qwen: core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner.cpp, core/engine_runner_cache.cpp, models/qwen/ggml_qwen4exp_graph_placement.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "KEEP for user review; controls Option B staging count.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0721"
@@ -98148,7 +98148,7 @@
       ],
       "affected_if_removed": "Qwen: core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner.cpp, core/engine_runner_cache.cpp, models/qwen/ggml_qwen4exp_graph_placement.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "KEEP for user review; selects the expert for Option B staging.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0722"
@@ -98508,7 +98508,7 @@
       ],
       "affected_if_removed": "Qwen: core execution/configuration. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner.cpp, core/engine_runner_cache.cpp, core/engine_runner_preload.cpp, models/qwen/ggml_qwen4exp_graph_arena.cpp (+1 other files).",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
+      "review_decision": "KEEP for user review; controls the per-layer Option B hot count.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0723"
@@ -98628,7 +98628,7 @@
       ],
       "affected_if_removed": "Qwen: full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
+      "review_decision": "KEEP for user review; controls Qwen prefill state handoff, a ZeroMoE-specific prompt/prefill path.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0724"
@@ -98808,7 +98808,7 @@
       ],
       "affected_if_removed": "Qwen: model graph equations/operator implementation and routing. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner.cpp, core/execution_layer.cpp, core/main.cpp, core/moe_router_service.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
+      "review_decision": "KEEP for user review; ZeroMoE-specific next-layer route prediction from Qwen host/device state. Off by default; survey-only caller.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0725"
@@ -99048,7 +99048,7 @@
       ],
       "affected_if_removed": "Qwen: model graph equations/operator implementation and routing. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner.cpp, core/execution_layer.cpp, core/main.cpp, core/moe_router_service.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
+      "review_decision": "KEEP for user review; sets the prediction candidate count for the ZeroMoE Qwen router pilot. Off by default; survey-only caller.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0726"
@@ -99328,7 +99328,7 @@
       ],
       "affected_if_removed": "Qwen: model graph equations/operator implementation and routing. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner.cpp, core/main.cpp, core/moe_router_service.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
+      "review_decision": "KEEP for user review; selects layers evaluated by the ZeroMoE Qwen router pilot. Off by default; survey-only caller.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0727"
@@ -99648,7 +99648,7 @@
       ],
       "affected_if_removed": "Qwen: model graph equations/operator implementation and routing. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner.cpp, core/execution_layer.cpp, core/main.cpp, core/moe_router_service.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
+      "review_decision": "KEEP for user review; enables the ZeroMoE-specific Qwen prediction prefetch path. Off by default; survey-only caller.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0728"
@@ -100028,7 +100028,7 @@
       ],
       "affected_if_removed": "Qwen: model graph equations/operator implementation and routing. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner.cpp, core/execution_layer.cpp, core/main.cpp, core/moe_router_service.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
+      "review_decision": "KEEP for user review; scopes ZeroMoE Qwen prediction prefetch exclusions. Off by default; survey-only caller.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0729"
@@ -100288,7 +100288,7 @@
       ],
       "affected_if_removed": "Qwen: model graph equations/operator implementation and routing. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner.cpp, core/execution_layer.cpp, core/main.cpp, core/moe_router_service.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
+      "review_decision": "KEEP for user review; controls the candidate count for ZeroMoE Qwen prediction prefetch. Off by default; survey-only caller.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0730"
@@ -100488,7 +100488,7 @@
       ],
       "affected_if_removed": "Qwen: model graph equations/operator implementation and routing. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner.cpp, core/execution_layer.cpp, core/main.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
+      "review_decision": "KEEP for user review; avoids router-pilot work when the target layer is already fully cached. Off by default; survey-only caller.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0731"
@@ -100668,7 +100668,7 @@
       ],
       "affected_if_removed": "Qwen: model graph equations/operator implementation and routing. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_runner.cpp, core/execution_layer.cpp, core/main.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Run teacher-forced per-decode-frame reference checks and kernel checks when numerical paths change.",
-      "review_decision": "",
+      "review_decision": "KEEP for user review; skips pilot prediction for layers excluded from prediction prefetch. Off by default; survey-only caller.",
       "removal_status": "NOT STARTED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0732"
@@ -108196,8 +108196,8 @@
       ],
       "affected_if_removed": "diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default. Member-name references to inspect include core/engine_config.hpp, core/main.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "REMOVED 2026-10-28: configurable debug abort removed; non-finite diagnostics remain logged.",
-      "removal_status": "REMOVED",
+      "review_decision": "REMOVED 2026-10-28: no active TOML parser/reader; finite-value diagnostics log errors without configurable abort behavior.",
+      "removal_status": "REMOVED 2026-10-28",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0773"
     },
@@ -108356,8 +108356,8 @@
       ],
       "affected_if_removed": "diagnostics, numerical inspection and performance reporting. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement. Member-name references to inspect include core/engine_config.hpp, core/main.cpp.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "REMOVED 2026-10-28: tensor trace tags are all emitted at verbose level and can be filtered in the captured log.",
-      "removal_status": "REMOVED",
+      "review_decision": "REMOVED 2026-10-28: no active TOML parser/reader; verbose tensor traces retain tags for post-processing instead of a runtime regex filter.",
+      "removal_status": "REMOVED 2026-10-28",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0774"
     },
@@ -132456,5 +132456,4283 @@
       ],
       "id": "K1157"
     }
-  ]
+  ],
+  "current_inventory": {
+    "generated_at": "2026-10-28",
+    "source": {
+      "branch": "master",
+      "head": "f689ae2b04e608bde4d68615197dc942fb6803a5",
+      "working_tree": "dirty; includes the active settings-cleanup changes"
+    },
+    "counts": {
+      "build_cache": 4,
+      "build_option": 1,
+      "cli": 96,
+      "environment": 196,
+      "graph_setting": 36,
+      "macro": 7,
+      "toml": 232
+    },
+    "items": [
+      {
+        "kind": "build_cache",
+        "name": "ZEROMOE_EXLLAMAV3_SRC",
+        "locations": [
+          "cmake/ZeroMoEExl3Upstream.cmake:12"
+        ]
+      },
+      {
+        "kind": "build_cache",
+        "name": "ZEROMOE_GGML_COMMIT",
+        "locations": [
+          "CMakeLists.txt:330"
+        ]
+      },
+      {
+        "kind": "build_cache",
+        "name": "ZEROMOE_GGML_PREBUILT_DIR",
+        "locations": [
+          "CMakeLists.txt:423"
+        ]
+      },
+      {
+        "kind": "build_cache",
+        "name": "ZEROMOE_GGML_ROOT",
+        "locations": [
+          "CMakeLists.txt:331"
+        ]
+      },
+      {
+        "kind": "build_option",
+        "name": "ZEROMOE_METAL",
+        "locations": [
+          "CMakeLists.txt:85"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--alias",
+        "locations": [
+          "backends/cpu/cpu_main.cpp:119",
+          "core/main.cpp:500"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--api-cache-mib",
+        "locations": [
+          "backends/cpu/cpu_main.cpp:120"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--api-key",
+        "locations": [
+          "backends/cpu/cpu_main.cpp:124",
+          "core/main.cpp:502"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--bench-long",
+        "locations": [
+          "core/main.cpp:598"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--bench-long-reps",
+        "locations": [
+          "core/main.cpp:600"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--bench-ngen",
+        "locations": [
+          "core/main.cpp:592"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--bench-out",
+        "locations": [
+          "core/main.cpp:608"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--bench-prompt",
+        "locations": [
+          "core/main.cpp:590"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--bench-random-pp",
+        "locations": [
+          "core/main.cpp:602"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--bench-random-tg",
+        "locations": [
+          "core/main.cpp:604"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--bench-reps",
+        "locations": [
+          "core/main.cpp:594"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--bench-seed",
+        "locations": [
+          "core/main.cpp:606"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--bench-warmup",
+        "locations": [
+          "core/main.cpp:596"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--config",
+        "locations": [
+          "backends/cpu/cpu_main.cpp:133",
+          "backends/exl3/exllamav3_backend.hpp:25",
+          "core/main.cpp:483"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--ctx-size",
+        "locations": [
+          "backends/cpu/cpu_main.cpp:144",
+          "backends/cpu/cpu_main.cpp:164",
+          "core/main.cpp:522",
+          "core/main.cpp:841"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--cuda-schedule",
+        "locations": [
+          "backends/cpu/cpu_main.cpp:166",
+          "core/main.cpp:843"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--direct-io",
+        "locations": [
+          "core/main.cpp:542"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--drop-pages",
+        "locations": [
+          "core/main.cpp:540"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--expert-fetch-threads",
+        "locations": [
+          "core/main.cpp:558"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--force-start",
+        "locations": [
+          "core/main.cpp:612"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--gen-config",
+        "locations": [
+          "core/main.cpp:506"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--gen-config-full",
+        "locations": [
+          "core/main.cpp:510"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-",
+        "locations": [
+          "core/main.cpp:479",
+          "models/graph/graph_settings.hpp:144"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-cpu-threads-decode",
+        "locations": [
+          "models/graph/graph_settings.hpp:176"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-device-expert-layers",
+        "locations": [
+          "models/graph/graph_settings.hpp:166"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-device-expert-trailing",
+        "locations": [
+          "models/graph/graph_settings.hpp:169"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-dynamic-cache",
+        "locations": [
+          "models/graph/graph_settings.hpp:219"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-early-ready",
+        "locations": [
+          "models/graph/graph_settings.hpp:211"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-gpu-assist-slots",
+        "locations": [
+          "models/graph/graph_settings.hpp:196"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-gpu-assist2-slots",
+        "locations": [
+          "models/graph/graph_settings.hpp:221"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-lane-with-gpu1",
+        "locations": [
+          "models/graph/graph_settings.hpp:215"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-offload-async",
+        "locations": [
+          "models/graph/graph_settings.hpp:192"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-offload-byte-cap",
+        "locations": [
+          "models/graph/graph_settings.hpp:205"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-offload-ddr-gib",
+        "locations": [
+          "models/graph/graph_settings.hpp:232"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-offload-first-layer",
+        "locations": [
+          "models/graph/graph_settings.hpp:194"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-offload-mirror",
+        "locations": [
+          "models/graph/graph_settings.hpp:252"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-offload-model",
+        "locations": [
+          "models/graph/graph_settings.hpp:256"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-offload-pin",
+        "locations": [
+          "models/graph/graph_settings.hpp:190"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-offload-pin-dma",
+        "locations": [
+          "models/graph/graph_settings.hpp:207"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-offload-pinned-fraction",
+        "locations": [
+          "models/graph/graph_settings.hpp:235"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-offload-pinned-pct",
+        "locations": [
+          "models/graph/graph_settings.hpp:188"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-offload-policy",
+        "locations": [
+          "models/graph/graph_settings.hpp:250"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-offload-probation-fraction",
+        "locations": [
+          "models/graph/graph_settings.hpp:237"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-offload-seed-gpu1-hot",
+        "locations": [
+          "models/graph/graph_settings.hpp:209"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-offload-split-reads",
+        "locations": [
+          "models/graph/graph_settings.hpp:203"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-offload-store",
+        "locations": [
+          "models/graph/graph_settings.hpp:254"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-offload-thp",
+        "locations": [
+          "models/graph/graph_settings.hpp:201"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-offload-usage-file",
+        "locations": [
+          "models/graph/graph_settings.hpp:245"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-phase-cache-mib",
+        "locations": [
+          "models/graph/graph_settings.hpp:172"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-phase-cache-reserve-mib",
+        "locations": [
+          "models/graph/graph_settings.hpp:174"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-pilot-copy",
+        "locations": [
+          "models/graph/graph_settings.hpp:217"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-prefill-chunk",
+        "locations": [
+          "models/graph/graph_settings.hpp:179"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-prefill-min-batch",
+        "locations": [
+          "models/graph/graph_settings.hpp:181"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-prefill-offload-min-tokens",
+        "locations": [
+          "models/graph/graph_settings.hpp:186"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-prefill-op-offload",
+        "locations": [
+          "models/graph/graph_settings.hpp:183"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-preflight-strict",
+        "locations": [
+          "models/graph/graph_settings.hpp:224"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-split-load",
+        "locations": [
+          "models/graph/graph_settings.hpp:213"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-usage-record-file",
+        "locations": [
+          "models/graph/graph_settings.hpp:248"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--graph-use-gpu1",
+        "locations": [
+          "models/graph/graph_settings.hpp:199"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--help",
+        "locations": [
+          "backends/cpu/cpu_main.cpp:83",
+          "core/main.cpp:623"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--help-all",
+        "locations": [
+          "core/main.cpp:617"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--help-settings",
+        "locations": [
+          "core/main.cpp:614"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--host",
+        "locations": [
+          "backends/cpu/cpu_main.cpp:117",
+          "core/main.cpp:487"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--io-uring",
+        "locations": [
+          "core/main.cpp:544"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--log-file",
+        "locations": [
+          "core/main.cpp:562"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--log-verbose",
+        "locations": [
+          "core/main.cpp:580"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--log-verbosity",
+        "locations": [
+          "core/main.cpp:565"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--main-gpu",
+        "locations": [
+          "core/main.cpp:529"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--model",
+        "locations": [
+          "core/main.cpp:518"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--n-predict",
+        "locations": [
+          "backends/cpu/cpu_main.cpp:147",
+          "core/main.cpp:525"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--no-raw-prompt",
+        "locations": [
+          "backends/cpu/cpu_main.cpp:169",
+          "core/main.cpp:847"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--no-thinking",
+        "locations": [
+          "backends/cpu/cpu_main.cpp:170",
+          "core/main.cpp:848"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--pin-file",
+        "locations": [
+          "core/main.cpp:556"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--pin-threshold",
+        "locations": [
+          "core/main.cpp:554"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--port",
+        "locations": [
+          "backends/cpu/cpu_main.cpp:118",
+          "core/main.cpp:489"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--predict",
+        "locations": [
+          "backends/cpu/cpu_main.cpp:147",
+          "backends/cpu/cpu_main.cpp:163",
+          "core/main.cpp:525",
+          "core/main.cpp:840"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--prefetch-threads",
+        "locations": [
+          "core/main.cpp:560"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--promote-threshold",
+        "locations": [
+          "core/main.cpp:552"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--prompt",
+        "locations": [
+          "backends/cpu/cpu_main.cpp:171",
+          "backends/cpu/cpu_main.cpp:173",
+          "backends/cpu/cpu_main.cpp:185",
+          "backends/cpu/cpu_main.cpp:247",
+          "core/main.cpp:504",
+          "core/main.cpp:850"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--ram",
+        "locations": [
+          "core/main.cpp:520"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--raw-prompt",
+        "locations": [
+          "backends/cpu/cpu_main.cpp:169",
+          "core/main.cpp:546",
+          "core/main.cpp:847"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--reasoning-effort",
+        "locations": [
+          "backends/cpu/cpu_main.cpp:256",
+          "core/main.cpp:550"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--repeat-penalty",
+        "locations": [
+          "core/main.cpp:586",
+          "core/main.cpp:846"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--serve",
+        "locations": [
+          "backends/cpu/cpu_main.cpp:94",
+          "core/main.cpp:485"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--spec-draft-model",
+        "locations": [
+          "core/main.cpp:536"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--spec-draft-n-max",
+        "locations": [
+          "core/main.cpp:538"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--spec-type",
+        "locations": [
+          "core/main.cpp:534"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--stats-file",
+        "locations": [
+          "core/main.cpp:610"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--system-prompt",
+        "locations": [
+          "backends/cpu/cpu_main.cpp:252",
+          "core/main.cpp:548"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--temp",
+        "locations": [
+          "backends/cpu/cpu_main.cpp:150",
+          "backends/cpu/cpu_main.cpp:167",
+          "core/main.cpp:582",
+          "core/main.cpp:844"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--thinking",
+        "locations": [
+          "backends/cpu/cpu_main.cpp:170",
+          "core/main.cpp:848"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--threads",
+        "locations": [
+          "backends/cpu/cpu_main.cpp:148",
+          "backends/cpu/cpu_main.cpp:165",
+          "core/main.cpp:532",
+          "core/main.cpp:842"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--top-p",
+        "locations": [
+          "backends/cpu/cpu_main.cpp:151",
+          "backends/cpu/cpu_main.cpp:168",
+          "core/main.cpp:584",
+          "core/main.cpp:845"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--verbose",
+        "locations": [
+          "core/main.cpp:579"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--verbosity",
+        "locations": [
+          "core/main.cpp:564"
+        ]
+      },
+      {
+        "kind": "cli",
+        "name": "--version",
+        "locations": [
+          "backends/cpu/cpu_main.cpp:88",
+          "core/main.cpp:515"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_API_KEY",
+        "locations": [
+          "backends/cpu/cpu_main.cpp:123",
+          "core/engine_runner_api.cpp:123",
+          "core/main.cpp:753"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_BENCH_IGNORE_STOP",
+        "locations": [
+          "core/bench_mode.hpp:115",
+          "core/bench_mode.hpp:134",
+          "core/generation_loop.hpp:491"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_BENCH_SILENT",
+        "locations": [
+          "core/bench_mode.hpp:116",
+          "core/bench_mode.hpp:135",
+          "core/generation_loop.hpp:499"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_CUDA_SCHEDULE",
+        "locations": [
+          "backends/exl3/exl3_gpu.cpp:146",
+          "core/gpu_topology.hpp:932"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DECODE_LOGITS_DUMP",
+        "locations": [
+          "core/generation_loop.hpp:62"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DEEPSEEK_V41_CACHE_MOE_ASYNC_UPLOAD",
+        "locations": [
+          "models/deepseek/ggml_deepseek_v41_graph.cpp:786"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DEEPSEEK_V41_CACHE_MOE_CPU_COLD",
+        "locations": [
+          "models/deepseek/ggml_deepseek_v41_graph.cpp:1200"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DEEPSEEK_V41_CACHE_MOE_DECODE",
+        "locations": [
+          "core/engine_runner_cache.cpp:68",
+          "models/deepseek/ggml_deepseek_v41_graph_decode.cpp:902"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DEEPSEEK_V41_CACHE_MOE_GRAPH",
+        "locations": [
+          "core/engine_runner_cache.cpp:311",
+          "core/engine_runner_cache.cpp:67",
+          "models/deepseek/ggml_deepseek_v41_graph.cpp:1430",
+          "models/deepseek/ggml_deepseek_v41_graph.cpp:1593",
+          "models/deepseek/ggml_deepseek_v41_graph.cpp:1700"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DEEPSEEK_V41_CPU_THREADS",
+        "locations": [
+          "models/deepseek/ggml_deepseek_v41_graph.cpp:1684"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DEEPSEEK_V41_DECODE_GPU_HC",
+        "locations": [
+          "models/deepseek/ggml_deepseek_v41_graph_decode.cpp:645",
+          "models/deepseek/ggml_deepseek_v41_graph_decode.cpp:646"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DEEPSEEK_V41_FULL_GRAPH_DECODE",
+        "locations": [
+          "models/deepseek/ggml_deepseek_v41_graph_decode.cpp:822",
+          "models/deepseek/ggml_deepseek_v41_graph_decode.cpp:823"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DEEPSEEK_V41_GPU_PREFILL",
+        "locations": [
+          "core/moe_router_service.cpp:1356",
+          "models/deepseek/ggml_deepseek_v41_graph.cpp:189"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DEEPSEEK_V41_GRAPH_PRELOAD_LAYERS",
+        "locations": [
+          "models/deepseek/ggml_deepseek_v41_graph.cpp:220"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DEEPSEEK_V41_NATIVE_F32_GRAPH",
+        "locations": [
+          "models/deepseek/ggml_deepseek_v41_graph.cpp:234",
+          "models/glm/ggml_glm5next_graph_build_blocks.cpp:49"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DEEPSEEK_V41_OUTPROJ_GPU",
+        "locations": [
+          "models/deepseek/ggml_deepseek_v41_graph_decode.cpp:74"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DEEPSEEK_V41_PREFILL_CHUNK",
+        "locations": [
+          "models/graph/full_graph_models.cpp:647"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DEEPSEEK_V41_PREFILL_F32",
+        "locations": [
+          "models/deepseek/ggml_deepseek_v41_graph.cpp:237"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DEEPSEEK_V41_TRACE_DIR",
+        "locations": [
+          "models/deepseek/dsv41_trace.hpp:12"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DEEPSEEK_V41_TRACE_LAYER",
+        "locations": [
+          "models/deepseek/dsv41_trace.hpp:17"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DEEPSEEK_V41_TRACE_POS",
+        "locations": [
+          "models/deepseek/dsv41_trace.hpp:24"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DENSE_SCRATCH_RESERVE_MB",
+        "locations": [
+          "core/attention_layer.cpp:449"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DISABLE_PRELOAD_BATCH",
+        "locations": [
+          "core/engine_runner_preload.cpp:1235"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DISABLE_ROUTER_BF16",
+        "locations": [
+          "core/engine_runner_dense.cpp:205"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DSV41_CACHE_BONUS_RAM",
+        "locations": [
+          "core/moe_router_service.cpp:1531"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DSV41_CACHE_BONUS_VRAM",
+        "locations": [
+          "core/moe_router_service.cpp:1527"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DSV41_PILOT_COLD_K",
+        "locations": [
+          "core/moe_router_service.cpp:1656"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DSV41_PILOT_DDR_THRESHOLD",
+        "locations": [
+          "core/moe_router_service.cpp:1771"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DSV41_PILOT_GATE",
+        "locations": [
+          "core/moe_router_service.cpp:1767"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DSV41_PILOT_GATE_MIN_SAMPLES",
+        "locations": [
+          "core/moe_router_service.cpp:1779"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DSV41_PILOT_K",
+        "locations": [
+          "core/moe_router_service.cpp:1647"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DSV41_PILOT_PROMOTE_MODE",
+        "locations": [
+          "core/moe_router_service.cpp:1788"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DSV41_PILOT_VRAM_THRESHOLD",
+        "locations": [
+          "core/moe_router_service.cpp:1775"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DUMP_ACTIVATION_EXPERT",
+        "locations": [
+          "core/gpu_expert_executor.cpp:321"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DUMP_ACTIVATION_LAYER",
+        "locations": [
+          "core/gpu_expert_executor.cpp:320"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DUMP_ACTIVATION_OUT",
+        "locations": [
+          "core/gpu_expert_executor.cpp:327"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DUMP_LAST_HIDDEN",
+        "locations": [
+          "core/generation_loop.hpp:1041"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_DUMP_PROMPT_TOKENS",
+        "locations": [
+          "core/generation_loop.hpp:815"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_EXL3_GGML_BRIDGE_LAYER",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph_build_moe.cpp:615"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_EXL3_GGML_BRIDGE_MODEL_PATH",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph_build_moe.cpp:614"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_EXL3_GGML_CPU_REFERENCE_OUTPUT",
+        "locations": [
+          "backends/exl3/exl3_ggml_ffn.cpp:601"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_EXL3_GGML_VERIFY_CPU_LAYER",
+        "locations": [
+          "backends/exl3/exl3_ggml_model.cpp:263"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_EXL3_MOE_COOP",
+        "locations": [
+          "backends/exl3/exl3_upstream_ops.cu:130"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_EXPERT_BF16_GEMM",
+        "locations": [
+          "core/dense_dispatch.hpp:286"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_FULL_GRAPH_PIN_GB",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_weights.cpp:1083"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_FULL_GRAPH_READ_THREADS",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_weights.cpp:991"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_FULL_GRAPH_RESIDENT_GB",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_partial.cpp:273"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_FULL_GRAPH_USAGE_FILE",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_weights.cpp:219"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_FULL_GRAPH_USE_RAM_CACHE",
+        "locations": [
+          "core/engine_runner_cache.cpp:174"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GDN_CHUNKED",
+        "locations": [
+          "core/attention_layer.cpp:1986"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GDN_FULL_GGML",
+        "locations": [
+          "core/dense_dispatch.hpp:253"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GDN_PROJ_GGML",
+        "locations": [
+          "core/dense_dispatch.hpp:237"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GENERATED_TOKEN_FILE",
+        "locations": [
+          "core/generation_loop.hpp:143"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GGML_CHUNK_PIPELINE",
+        "locations": [
+          "core/batched_dispatch_pipeline.cpp:525"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GGML_FIXED_EXPERT_SLOTS",
+        "locations": [
+          "core/batched_dispatch_pipeline.cpp:91"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GGML_FIXED_PAIR_CAPACITY",
+        "locations": [
+          "core/batched_dispatch_pipeline.cpp:71"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GGML_GPU_ROUTER",
+        "locations": [
+          "core/dense_dispatch.hpp:172"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GGML_HC_COMPARE",
+        "locations": [
+          "core/hyper_connections.cpp:714",
+          "core/hyper_connections.cpp:957"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GGML_HC_COMPARE_DUMP",
+        "locations": [
+          "core/hyper_connections.cpp:1002",
+          "core/shared_expert_executor.cpp:248",
+          "models/qwen/ggml_qwen_shared_runner.cpp:551",
+          "models/qwen/ggml_qwen_shared_runner.cpp:709",
+          "models/qwen/ggml_qwen_shared_runner.cpp:858"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GGML_MOE_DEVICE",
+        "locations": [
+          "core/batched_dispatch_pipeline.cpp:489"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GGML_MOE_DUMP",
+        "locations": [
+          "backends/ggml/ggml_moe_runner.cpp:1384"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GGML_MUL_MAT_ID",
+        "locations": [
+          "core/dense_dispatch.hpp:132"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GGML_SHARED_EXPERT",
+        "locations": [
+          "core/dense_dispatch.hpp:148"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_offload.cpp:433",
+          "models/graph/ggml_graph_vram_headroom.cpp:33"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_ASSIST2_DEVICE",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_settings.cpp:183"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_ASSIST2_KEEP",
+        "locations": [
+          "models/graph/early_ready_lane.hpp:618"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_ASSIST_DEVICE",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_build.cpp:61"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_BATCHED_NEGATIVE_SKIP",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_partial.cpp:861"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_CPU_LM_HEAD",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_build.cpp:1099",
+          "models/glm/ggml_glm5next_graph_build.cpp:1114"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_CPU_THREADS",
+        "locations": [
+          "models/glm/ggml_glm5next_graph.cpp:277",
+          "models/glm/ggml_glm5next_graph_decode.cpp:209"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_DYNAMIC_HEAT",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_partial.cpp:1264"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_DYNAMIC_HEAT_HALFLIFE",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_partial.cpp:1271"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_EARLY_STATE_EXPORT",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_build_blocks.cpp:172"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL",
+        "locations": [
+          "models/graph/full_graph_models.cpp:427"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_GPU1_HOT_GIB",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_partial.cpp:436",
+          "models/glm/ggml_glm5next_graph_settings.cpp:187"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_GPU1_HOT_ON_GPU0",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_partial.cpp:583"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_GPU1_HOT_PRELOAD",
+        "locations": [
+          "models/glm/ggml_glm5next_graph.cpp:84"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_GPU1_HOT_USAGE",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_partial.cpp:710"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_GPU1_LAYERS",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_decode.cpp:242"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_GPU1_MIN_LAYER",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_partial.cpp:734"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_GRAPH_PRELOAD_LAYERS",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_settings.cpp:120"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_GRAPH_STRICT",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_decode.cpp:193"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_MODEL_DIRECT",
+        "locations": [
+          "memory/offload_store.hpp:414"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_PILOT_LOOKAHEAD",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_settings.cpp:88"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_PILOT_MIN_SCORE",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_settings.cpp:102"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_PILOT_PREFETCH",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_settings.cpp:62",
+          "models/glm/ggml_glm5next_graph_settings.cpp:78"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_PILOT_RIDGE",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_stage.cpp:377"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_PILOT_STAGE",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_settings.cpp:52"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_PIN_BRANCH_SUM",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_build.cpp:296",
+          "models/glm/ggml_glm5next_graph_build.cpp:408"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_PREFILL_AHEAD",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_offload.cpp:626"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_PREFILL_AHEAD_MIN_TOKENS",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_offload.cpp:644"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_PREFILL_CHUNK",
+        "locations": [
+          "models/graph/full_graph_models.cpp:447",
+          "models/graph/full_graph_models.cpp:510"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_PREFILL_CPU_THREADS",
+        "locations": [
+          "models/glm/ggml_glm5next_graph.cpp:275"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_PREFILL_GPU1",
+        "locations": [
+          "models/glm/ggml_glm5next_graph.cpp:330"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_PREFILL_PREFETCH",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_offload.cpp:350",
+          "models/glm/ggml_glm5next_graph_offload.cpp:526"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_PREFILL_PREFETCH_CHUNK",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_offload.cpp:223"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_PREFILL_PREFETCH_DELAY_US",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_offload.cpp:227"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_PREFILL_PREFETCH_DRAIN",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_offload.cpp:230"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_PREFILL_PREFETCH_EARLY",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_offload.cpp:507"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_PREFILL_PREFETCH_SETS",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_offload.cpp:355"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_PREFILL_ROUTE_CAPTURE",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_build.cpp:202",
+          "models/glm/ggml_glm5next_graph_run.cpp:151"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_PREFILL_SCHED_EVENTS",
+        "locations": [
+          "models/glm/ggml_glm5next_graph.cpp:345"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_PREFILL_SCHED_PARALLEL",
+        "locations": [
+          "models/glm/ggml_glm5next_graph.cpp:347"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_PREFILL_SPLIT",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_build.cpp:261",
+          "models/glm/ggml_glm5next_graph_offload.cpp:361"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_ROUTE_TAP",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_partial.cpp:1241"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM5NEXT_SPARSE_DECODE_RESERVE",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_decode.cpp:140"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_GLM_DSA_CPU_LANE",
+        "locations": [
+          "models/graph/full_graph_models.cpp:505"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_HC_GGML",
+        "locations": [
+          "core/dense_dispatch.hpp:213"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_KQUANT_LEGACY",
+        "locations": [
+          "kernels/quant/kquant_matmul.cu:488"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_LING_HYBRID_CUDA_GRAPH",
+        "locations": [
+          "models/glm/ggml_bailingmoe3_graph.cpp:197"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_LING_NATIVE_GRAPH",
+        "locations": [
+          "models/glm/ggml_bailingmoe3_graph.cpp:188"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_LING_NO_GPU1_CACHE_ALIAS",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_partial.cpp:42"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_LING_NO_VRAM_CACHE_ALIAS",
+        "locations": [
+          "models/glm/ggml_glm5next_graph_partial.cpp:40"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_MEM_GUARD_FLOOR_MB",
+        "locations": [
+          "memory/memory_guard.hpp:151"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_MIMO2_INGRAPH_MOE",
+        "locations": [
+          "models/mimo/ggml_mimo2_graph.cpp:138",
+          "models/mimo/ggml_mimo2_graph.cpp:728"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_MTP_GREEDY_FAST_PATH",
+        "locations": [
+          "core/generation_loop.hpp:1189"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_MTP_PREFILL_OVERLAP",
+        "locations": [
+          "core/qwen4exp_graph_mtp.cpp:268"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_OFFLOAD_EVICT",
+        "locations": [
+          "memory/offload_store.hpp:659"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_OFFLOAD_PIN_TRANSIENT",
+        "locations": [
+          "memory/expert_store.hpp:282"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_OFFLOAD_RETARGET",
+        "locations": [
+          "memory/offload_store.hpp:745"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_OFFLOAD_SEED_PAR",
+        "locations": [
+          "memory/offload_store.hpp:974"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_OFFLOAD_TRANSIENT_PAR",
+        "locations": [
+          "memory/offload_store.hpp:929"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_PREFILL_BOUNDARY_DUMP",
+        "locations": [
+          "core/execution_layer.cpp:762",
+          "core/moe_router_service.cpp:1017",
+          "core/moe_router_service.cpp:77",
+          "models/qwen/ggml_qwen_shared_runner.cpp:909",
+          "models/qwen/ggml_qwen_shared_runner.cpp:925",
+          "models/qwen/ple_ngram.cpp:65",
+          "models/qwen/ple_ngram.cpp:86"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_PREFILL_BOUNDARY_FIRST_POS",
+        "locations": [
+          "core/execution_layer.cpp:776",
+          "models/qwen/ple_ngram.cpp:71"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_PREFILL_BOUNDARY_LAST_POS",
+        "locations": [
+          "core/execution_layer.cpp:768",
+          "models/qwen/ple_ngram.cpp:75"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_PREFILL_BOUNDARY_LAYER",
+        "locations": [
+          "core/execution_layer.cpp:784",
+          "core/moe_router_service.cpp:78",
+          "models/qwen/ple_ngram.cpp:67"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_PREFILL_FINAL_HIDDEN_DUMP",
+        "locations": [
+          "core/generation_loop.hpp:84"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_PREFILL_UNBATCHED",
+        "locations": [
+          "core/generation_loop.hpp:123"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_PROBE_DUMP",
+        "locations": [
+          "core/execution_layer.cpp:1505"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_PROMO_BURST",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph_promote.cpp:49"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_PROMO_CAP",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph_promote.cpp:48"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_PROMO_DECAY_EVERY",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph_promote.cpp:52"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_PROMO_FREQ_WEIGHT",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph_promote.cpp:51"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_PROMO_MIN_MISSES",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph_promote.cpp:50"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_PROMPT_TOKEN_FILE",
+        "locations": [
+          "core/engine_runner_session.cpp:441"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_PROMPT_TOKEN_INPUT_FILE",
+        "locations": [
+          "core/bench_mode.hpp:158",
+          "core/engine_runner_session.cpp:409"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_Q2_0_DISABLE_VNNI",
+        "locations": [
+          "backends/cpu/kernels_cpu.cpp:3055"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN4EXP_ADAPTIVE_POLICY",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph_settings.cpp:180"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN4EXP_DEVICE_ROUTE",
+        "locations": [
+          "core/moe_router_service.cpp:153"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN4EXP_DIAG_DUMP_DIR",
+        "locations": [
+          "models/qwen/ggml_qwen_cpu_moe.cpp:106"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN4EXP_EXPERT_PROMOTION",
+        "locations": [
+          "core/engine_runner.cpp:330"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE_KV_CAPACITY",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph_settings.cpp:184"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN4EXP_GRAPH_ALLOC_FLOOR_MIB",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph_build.cpp:1146"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_PARTIAL_GATE_UP",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph.cpp:488",
+          "models/qwen/ggml_qwen4exp_graph_decode_prepare.cpp:383"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN4EXP_HOST_NODE",
+        "locations": [
+          "core/engine_runner_ram.cpp:258",
+          "core/gpu_topology.hpp:938",
+          "models/qwen/ggml_qwen4exp_graph_host_node.cpp:298",
+          "models/qwen/ggml_qwen4exp_graph_settings.cpp:74"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN4EXP_MTP_WINDOW",
+        "locations": [
+          "core/qwen4exp_graph_mtp.cpp:350"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN4EXP_PARTIAL_LAYER",
+        "locations": [
+          "core/moe_router_service.cpp:436",
+          "models/qwen/ggml_qwen4exp_graph_settings.cpp:92"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN4EXP_PARTIAL_LAYER_MIN_COVERAGE",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph_settings.cpp:122"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN4EXP_PARTIAL_LAYER_PHASE2",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph_settings.cpp:139",
+          "models/qwen/ggml_qwen4exp_graph_settings.cpp:27"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN4EXP_PARTIAL_LAYER_PREFILL_CAPTURE",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph_settings.cpp:154"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN4EXP_PARTIAL_LAYER_TOP_N",
+        "locations": [
+          "core/moe_router_service.cpp:458",
+          "models/qwen/ggml_qwen4exp_graph_settings.cpp:103"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN4EXP_PHASE2_ALLOW_RISKY_ALLOC",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph_decode_prepare.cpp:445"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN4EXP_PLE_ROW_CACHE",
+        "locations": [
+          "models/qwen/ple_ngram.cpp:121"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN4EXP_PREFILL_CHUNK",
+        "locations": [
+          "models/graph/full_graph_models.cpp:63"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN4EXP_PREFILL_DEVICE_STATE",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph_settings.cpp:25"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN4EXP_PREFILL_OP_OFFLOAD",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph.cpp:638"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN4EXP_PREFILL_STATE_HANDOFF",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph_settings.cpp:18"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN4EXP_PROBE_DUMP",
+        "locations": [
+          "core/generation_loop.hpp:1543",
+          "models/qwen/ggml_qwen4exp_graph_build.cpp:161",
+          "models/qwen/ggml_qwen4exp_graph_build.cpp:183",
+          "models/qwen/ggml_qwen4exp_graph_build.cpp:226",
+          "models/qwen/ggml_qwen4exp_graph_build.cpp:31",
+          "models/qwen/ggml_qwen4exp_graph_build.cpp:435",
+          "models/qwen/ggml_qwen4exp_graph_build.cpp:712",
+          "models/qwen/ggml_qwen4exp_graph_build_blocks.cpp:243",
+          "models/qwen/ggml_qwen4exp_graph_build_blocks.cpp:396",
+          "models/qwen/ggml_qwen4exp_graph_build_blocks.cpp:72",
+          "models/qwen/ggml_qwen4exp_graph_build_moe.cpp:1107",
+          "models/qwen/ggml_qwen4exp_graph_diag.cpp:395",
+          "models/qwen/ggml_qwen4exp_graph_run.cpp:368"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN4EXP_PROBE_LAYER",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph_build_moe.cpp:1109"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN4EXP_RING_SPIN_US",
+        "locations": [
+          "models/qwen/qwen_cpu_offload_ring.cpp:27"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN4EXP_ROUTE_IDS_DUMP",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph_host_node.cpp:224"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN4EXP_STORAGE_TIMEOUT_MS",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph_settings.cpp:169"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN_BATCH_D2D_UNPACK",
+        "locations": [
+          "core/batched_dispatch_pipeline.cpp:124"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN_CPU_DIRECT_FUSED",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph_build_moe.cpp:199",
+          "models/qwen/ggml_qwen4exp_graph_host_node.cpp:610",
+          "models/qwen/ggml_qwen_cpu_moe.cpp:197"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN_CPU_DIRECT_POOL",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph_build_moe.cpp:197",
+          "models/qwen/ggml_qwen4exp_graph_host_node.cpp:608",
+          "models/qwen/ggml_qwen_cpu_moe.cpp:189"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN_CPU_THREADS",
+        "locations": [
+          "backends/cpu/kernels_cpu.cpp:72",
+          "models/graph/graph_settings.hpp:178"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph_build_moe.cpp:900"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN_EARLY_READY_ASYNC_OUTPUT",
+        "locations": [
+          "models/graph/early_ready_lane.hpp:245"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN_EARLY_READY_LAYER13",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph_build_moe.cpp:899"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN_EARLY_READY_PREDICT",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph_build_moe.cpp:992"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN_EARLY_READY_PREDICT_LAYER",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph_build_moe.cpp:993"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN_EARLY_READY_RESIDENT_TABLES",
+        "locations": [
+          "models/graph/early_ready_lane.hpp:249"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN_EARLY_READY_RIDGE",
+        "locations": [
+          "models/graph/early_ready_lane.hpp:44"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN_EARLY_READY_ROUTE_TRACE",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph_run.cpp:112"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN_EARLY_READY_SKIP_ALL_HOT",
+        "locations": [
+          "models/graph/early_ready_lane.hpp:243"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN_EARLY_READY_STAGE_LAYER",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph_build_moe.cpp:923",
+          "models/qwen/ggml_qwen4exp_graph_build_moe.cpp:994"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN_EARLY_READY_STAGE_VERIFY",
+        "locations": [
+          "models/qwen/qwen4exp_stage_pool.hpp:231"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN_GRAPH_HOST_OFFSET",
+        "locations": [
+          "core/engine.hpp:2875"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN_GRAPH_MLOCK",
+        "locations": [
+          "core/engine.hpp:2916"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN_GRAPH_NO_REGISTER",
+        "locations": [
+          "core/engine.hpp:2939"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN_GRAPH_REGISTER",
+        "locations": [
+          "core/engine.hpp:2937"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN_HC_ASYNC_READBACK",
+        "locations": [
+          "backends/ggml/ggml_hc_backend.cpp:97"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN_HC_DISABLE_FUSED_POST",
+        "locations": [
+          "core/hyper_connections.cpp:923"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN_HOST_NODE_THREADS",
+        "locations": [
+          "models/qwen/ggml_qwen_cpu_moe.cpp:162"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN_ROUTER_COMPARE",
+        "locations": [
+          "backends/ggml/ggml_router_runner.cpp:203",
+          "core/moe_router_service.cpp:1134"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN_SHARED_CPU_ORACLE",
+        "locations": [
+          "core/shared_expert_executor.cpp:293"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_QWEN_SOFT_PIN_GIB",
+        "locations": [
+          "models/qwen/ggml_qwen4exp_graph_arena.cpp:625"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_ROUTER_IN_LOG",
+        "locations": [
+          "core/moe_router_service.cpp:1618"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_ROUTE_LOG",
+        "locations": [
+          "core/moe_router_service.cpp:1601"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_SCHED_EVENTS",
+        "locations": [
+          "models/glm/ggml_glm5next_graph.cpp:346",
+          "models/mimo/ggml_mimo2_graph.cpp:589"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_SCORE_PREFILL_LEGACY",
+        "locations": [
+          "core/attention_layer.cpp:131"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_TEACHER_FORCE_NLL",
+        "locations": [
+          "core/generation_loop.hpp:1384"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_TEACHER_FORCE_REQUEST_DIR",
+        "locations": [
+          "core/bench_mode.hpp:113",
+          "core/generation_loop.hpp:157"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_TEACHER_FORCE_SKIP_SAMPLING",
+        "locations": [
+          "core/bench_mode.hpp:114",
+          "core/generation_loop.hpp:192"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_TEACHER_FORCE_TOKEN_FILE",
+        "locations": [
+          "core/generation_loop.hpp:174"
+        ]
+      },
+      {
+        "kind": "environment",
+        "name": "ZEROMOE_WUV_INT8",
+        "locations": [
+          "core/attention_layer.cpp:123"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "cpu_threads_decode",
+        "locations": [
+          "models/graph/graph_settings.hpp:176"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "device_expert_layers",
+        "locations": [
+          "models/graph/graph_settings.hpp:166"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "device_expert_trailing",
+        "locations": [
+          "models/graph/graph_settings.hpp:169"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "dynamic_cache",
+        "locations": [
+          "models/graph/graph_settings.hpp:219"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "early_ready",
+        "locations": [
+          "models/graph/graph_settings.hpp:211"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "gpu_assist2_slots",
+        "locations": [
+          "models/graph/graph_settings.hpp:221"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "gpu_assist_slots",
+        "locations": [
+          "models/graph/graph_settings.hpp:196"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "lane_with_gpu1",
+        "locations": [
+          "models/graph/graph_settings.hpp:215"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "offload_async",
+        "locations": [
+          "models/graph/graph_settings.hpp:192"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "offload_byte_cap",
+        "locations": [
+          "models/graph/graph_settings.hpp:205"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "offload_ddr_gib",
+        "locations": [
+          "models/graph/graph_settings.hpp:232"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "offload_first_layer",
+        "locations": [
+          "models/graph/graph_settings.hpp:194"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "offload_mirror",
+        "locations": [
+          "models/graph/graph_settings.hpp:252"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "offload_model",
+        "locations": [
+          "models/graph/graph_settings.hpp:256"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "offload_pin",
+        "locations": [
+          "models/graph/graph_settings.hpp:190"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "offload_pin_dma",
+        "locations": [
+          "models/graph/graph_settings.hpp:207"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "offload_pinned_fraction",
+        "locations": [
+          "models/graph/graph_settings.hpp:235"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "offload_pinned_pct",
+        "locations": [
+          "models/graph/graph_settings.hpp:188"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "offload_policy",
+        "locations": [
+          "models/graph/graph_settings.hpp:250"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "offload_probation_fraction",
+        "locations": [
+          "models/graph/graph_settings.hpp:237"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "offload_seed_gpu1_hot",
+        "locations": [
+          "models/graph/graph_settings.hpp:209"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "offload_split_reads",
+        "locations": [
+          "models/graph/graph_settings.hpp:203"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "offload_store",
+        "locations": [
+          "models/graph/graph_settings.hpp:254"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "offload_thp",
+        "locations": [
+          "models/graph/graph_settings.hpp:201"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "offload_usage_file",
+        "locations": [
+          "models/graph/graph_settings.hpp:245"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "phase_cache_mib",
+        "locations": [
+          "models/graph/graph_settings.hpp:172"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "phase_cache_reserve_mib",
+        "locations": [
+          "models/graph/graph_settings.hpp:174"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "pilot_copy",
+        "locations": [
+          "models/graph/graph_settings.hpp:217"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "prefill_chunk",
+        "locations": [
+          "models/graph/graph_settings.hpp:179"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "prefill_min_batch",
+        "locations": [
+          "models/graph/graph_settings.hpp:181"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "prefill_offload_min_tokens",
+        "locations": [
+          "models/graph/graph_settings.hpp:186"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "prefill_op_offload",
+        "locations": [
+          "models/graph/graph_settings.hpp:183"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "preflight_strict",
+        "locations": [
+          "models/graph/graph_settings.hpp:224"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "split_load",
+        "locations": [
+          "models/graph/graph_settings.hpp:213"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "usage_record_file",
+        "locations": [
+          "models/graph/graph_settings.hpp:248"
+        ]
+      },
+      {
+        "kind": "graph_setting",
+        "name": "use_gpu1",
+        "locations": [
+          "models/graph/graph_settings.hpp:199"
+        ]
+      },
+      {
+        "kind": "macro",
+        "name": "ZEROMOE_BUILD_TYPE",
+        "locations": [
+          "core/version.hpp:15"
+        ]
+      },
+      {
+        "kind": "macro",
+        "name": "ZEROMOE_EXL3_CUDA",
+        "locations": [
+          "backends/cpu/cpu_engine.cpp:642",
+          "backends/cpu/cpu_engine.cpp:677",
+          "backends/cpu/cpu_engine.cpp:7",
+          "backends/cpu/cpu_engine.cpp:702",
+          "backends/exl3/exl3_decode.cpp:197",
+          "backends/exl3/exl3_decode.cpp:247",
+          "backends/exl3/exl3_decode.cpp:256",
+          "backends/exl3/exl3_decode.cpp:318",
+          "backends/exl3/exl3_decode.cpp:37",
+          "backends/exl3/exl3_decode.cpp:5",
+          "backends/exl3/exl3_decode.cpp:74",
+          "backends/exl3/exl3_decode.cpp:81",
+          "core/engine_runner.hpp:15",
+          "core/engine_runner_model.cpp:16",
+          "core/main.cpp:12",
+          "models/qwen/cpu_qwen4exp.cpp:164",
+          "models/qwen/cpu_qwen4exp.cpp:42",
+          "models/qwen/cpu_qwen4exp.cpp:8"
+        ]
+      },
+      {
+        "kind": "macro",
+        "name": "ZEROMOE_EXL3_UPSTREAM",
+        "locations": [
+          "backends/exl3/exl3_aux.cu:112",
+          "backends/exl3/exl3_cuda.hpp:62",
+          "backends/exl3/exl3_ggml_ffn.cpp:798",
+          "backends/exl3/exl3_gpu.cpp:990"
+        ]
+      },
+      {
+        "kind": "macro",
+        "name": "ZEROMOE_GIT_COMMIT",
+        "locations": [
+          "core/version.hpp:12"
+        ]
+      },
+      {
+        "kind": "macro",
+        "name": "ZEROMOE_METAL",
+        "locations": [
+          "backends/cpu/kernels_cpu_neon.cpp:132",
+          "backends/cpu/kernels_cpu_neon.cpp:20"
+        ]
+      },
+      {
+        "kind": "macro",
+        "name": "ZEROMOE_USE_GGML_CUDA",
+        "locations": [
+          "backends/cpu/cpu_engine.cpp:10",
+          "backends/cpu/cpu_engine.cpp:737",
+          "backends/cpu/cpu_engine.cpp:920",
+          "backends/cpu/cpu_engine.hpp:211",
+          "backends/exl3/exl3_ggml_backend.cpp:3",
+          "backends/exl3/exl3_ggml_backend.hpp:3",
+          "backends/exl3/exl3_ggml_ffn.cpp:6",
+          "backends/exl3/exl3_ggml_ffn.hpp:3",
+          "backends/exl3/exl3_ggml_model.cpp:3",
+          "backends/exl3/exl3_ggml_model.hpp:3",
+          "backends/ggml/ggml_f32_quant_backend.hpp:3",
+          "backends/ggml/ggml_gdn_proj_backend.cpp:12",
+          "backends/ggml/ggml_hc_backend.cpp:16",
+          "backends/ggml/ggml_moe_backend.cpp:26",
+          "backends/ggml/ggml_moe_internal.hpp:6",
+          "backends/ggml/ggml_moe_runner.cpp:24",
+          "backends/ggml/ggml_moe_transfer_manager.cpp:26",
+          "backends/ggml/ggml_resource_guards.hpp:111",
+          "backends/ggml/ggml_resource_guards.hpp:9",
+          "backends/ggml/ggml_router_runner.cpp:24",
+          "core/engine_runner.cpp:194",
+          "core/engine_runner_model.cpp:16",
+          "core/nvtx_range.hpp:6",
+          "core/qwen4exp_graph_mtp.cpp:6",
+          "core/version.hpp:41",
+          "kernels/quant/kquant_matmul.cu:596",
+          "models/deepseek/ggml_deepseek_v41_graph.cpp:22",
+          "models/deepseek/ggml_deepseek_v41_graph_decode.cpp:19",
+          "models/glm/ggml_bailingmoe3_graph.cpp:185",
+          "models/glm/ggml_bailingmoe3_graph.cpp:195",
+          "models/glm/ggml_bailingmoe3_graph.cpp:207",
+          "models/glm/ggml_bailingmoe3_graph.cpp:221",
+          "models/glm/ggml_bailingmoe3_graph.cpp:252",
+          "models/glm/ggml_bailingmoe3_graph.cpp:275",
+          "models/glm/ggml_bailingmoe3_graph.cpp:299",
+          "models/glm/ggml_bailingmoe3_graph.cpp:31",
+          "models/glm/ggml_glm5next_graph.cpp:12",
+          "models/glm/ggml_glm5next_graph_arena.cpp:9",
+          "models/glm/ggml_glm5next_graph_build.cpp:20",
+          "models/glm/ggml_glm5next_graph_build_blocks.cpp:10",
+          "models/glm/ggml_glm5next_graph_decode.cpp:9",
+          "models/glm/ggml_glm5next_graph_impl.hpp:57",
+          "models/glm/ggml_glm5next_graph_offload.cpp:19",
+          "models/glm/ggml_glm5next_graph_partial.cpp:11",
+          "models/glm/ggml_glm5next_graph_run.cpp:8",
+          "models/glm/ggml_glm5next_graph_settings.cpp:9",
+          "models/glm/ggml_glm5next_graph_stage.cpp:9",
+          "models/glm/ggml_glm5next_graph_weights.cpp:9",
+          "models/glm/ggml_glm5next_proj_backend.cpp:10",
+          "models/glm/glm5next_graph_internal.hpp:53",
+          "models/graph/full_graph_models.cpp:229",
+          "models/graph/full_graph_models.cpp:26",
+          "models/graph/full_graph_models.cpp:317",
+          "models/graph/ggml_graph_vram_headroom.cpp:6",
+          "models/graph/ggml_moe_graph_builder.cpp:4",
+          "models/graph/ggml_moe_graph_builder.hpp:3",
+          "models/graph/mtp_graph_draft.hpp:10",
+          "models/graph/mtp_graph_runtime.cpp:4",
+          "models/graph/mtp_graph_runtime.hpp:5",
+          "models/mimo/ggml_mimo2_graph.cpp:34",
+          "models/mimo/ggml_mimo2_graph.cpp:736",
+          "models/mimo/ggml_mimo2_graph.cpp:744",
+          "models/mimo/ggml_mimo2_graph.cpp:754",
+          "models/mimo/ggml_mimo2_graph.cpp:803",
+          "models/mimo/ggml_mimo2_graph.cpp:879",
+          "models/qwen/cpu_qwen4exp.cpp:11",
+          "models/qwen/cpu_qwen4exp.cpp:166",
+          "models/qwen/ggml_qwen4exp_graph.cpp:10",
+          "models/qwen/ggml_qwen4exp_graph_arena.cpp:9",
+          "models/qwen/ggml_qwen4exp_graph_build.cpp:9",
+          "models/qwen/ggml_qwen4exp_graph_build_blocks.cpp:9",
+          "models/qwen/ggml_qwen4exp_graph_build_moe.cpp:11",
+          "models/qwen/ggml_qwen4exp_graph_checkpoint.cpp:16",
+          "models/qwen/ggml_qwen4exp_graph_decode_prepare.cpp:8",
+          "models/qwen/ggml_qwen4exp_graph_diag.cpp:9",
+          "models/qwen/ggml_qwen4exp_graph_expert_bind.cpp:9",
+          "models/qwen/ggml_qwen4exp_graph_host_node.cpp:10",
+          "models/qwen/ggml_qwen4exp_graph_internal.hpp:56",
+          "models/qwen/ggml_qwen4exp_graph_placement.cpp:9",
+          "models/qwen/ggml_qwen4exp_graph_promote.cpp:15",
+          "models/qwen/ggml_qwen4exp_graph_run.cpp:10",
+          "models/qwen/ggml_qwen4exp_graph_settings.cpp:10",
+          "models/qwen/ggml_qwen4exp_graph_window.cpp:13",
+          "models/qwen/ggml_qwen_decode_scheduler.cpp:21",
+          "models/qwen/ggml_qwen_shared_runner.cpp:25",
+          "models/qwen/qwen4exp_mtp_graph.cpp:3",
+          "models/qwen/qwen4exp_mtp_graph.hpp:5"
+        ]
+      },
+      {
+        "kind": "macro",
+        "name": "ZEROMOE_VERSION",
+        "locations": [
+          "core/version.hpp:9"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "active_layer_capacity",
+        "locations": [
+          "core/engine_config.hpp:2917"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "active_layer_capacity_slots",
+        "locations": [
+          "core/engine_config.hpp:2962"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "active_layer_promote_hit_threshold",
+        "locations": [
+          "core/engine_config.hpp:2920"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "active_layer_routing_policy",
+        "locations": [
+          "core/engine_config.hpp:2932"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "active_layer_upload_worker_threads",
+        "locations": [
+          "core/engine_config.hpp:2934"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "active_layer_weight",
+        "locations": [
+          "core/engine_config.hpp:2960"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "attn_pilot_vram_promote_dynamic",
+        "locations": [
+          "core/engine_config.hpp:2593"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "attn_pilot_vram_promote_top_k",
+        "locations": [
+          "core/engine_config.hpp:2591"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "attn_qabsorb_gpu",
+        "locations": [
+          "core/engine_config.hpp:2610"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "attn_qabsorb_gpu_max_vram_gb",
+        "locations": [
+          "core/engine_config.hpp:2611"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "attn_score_gpu",
+        "locations": [
+          "core/engine_config.hpp:2619"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "attn_score_gpu_max_context",
+        "locations": [
+          "core/engine_config.hpp:2753"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "attn_score_gpu_max_vram_gb",
+        "locations": [
+          "core/engine_config.hpp:2745"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "attn_score_threads",
+        "locations": [
+          "core/engine_config.hpp:2903"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "context_size",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:284",
+          "core/engine_config.hpp:2408"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "cpu_affinity_layers",
+        "locations": [
+          "core/engine_config.hpp:2415"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "cpu_offload_max_experts",
+        "locations": [
+          "core/engine_config.hpp:2495"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "cpu_only",
+        "locations": [
+          "core/engine_config.hpp:2414"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "decode_async_prewarm",
+        "locations": [
+          "core/engine_config.hpp:2599"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "decode_async_prewarm_max_batch",
+        "locations": [
+          "core/engine_config.hpp:2600"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "decode_async_prewarm_nonblocking",
+        "locations": [
+          "core/engine_config.hpp:2602"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "decode_promote_all_misses",
+        "locations": [
+          "core/engine_config.hpp:2923"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "dense_async_copies",
+        "locations": [
+          "core/engine_config.hpp:2838"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "dense_bf16_kquant",
+        "locations": [
+          "core/engine_config.hpp:2738"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "dense_bf16_prefill_gemm",
+        "locations": [
+          "core/engine_config.hpp:2837"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "dense_gb",
+        "locations": [
+          "core/engine_config.hpp:2956"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "dense_model_path",
+        "locations": [
+          "core/engine_config.hpp:2406"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "device_id",
+        "locations": [
+          "core/engine_config.hpp:2951"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "direct_io",
+        "locations": [
+          "core/engine_config.hpp:2595"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "disk_batch_padding",
+        "locations": [
+          "core/engine_config.hpp:2775"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "disk_batch_padding_evict_dup",
+        "locations": [
+          "core/engine_config.hpp:2778"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "disk_batch_padding_target",
+        "locations": [
+          "core/engine_config.hpp:2777"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "drop_pages",
+        "locations": [
+          "core/engine_config.hpp:2413"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "dsv4_outproj_gpu",
+        "locations": [
+          "core/engine_config.hpp:2822"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "dsv4_score_gpu",
+        "locations": [
+          "core/engine_config.hpp:2761"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "dsv4_score_gpu_max_vram_gb",
+        "locations": [
+          "core/engine_config.hpp:2762"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "embedding_device",
+        "locations": [
+          "core/engine_config.hpp:2804"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "enable_thinking",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:300",
+          "core/engine_config.hpp:2944"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "exl3_backend",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:250",
+          "core/engine_config.hpp:2373"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "exl3_cpu_expert_cache_gb",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:281",
+          "core/engine_config.hpp:2403"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "exl3_cpu_expert_int8_vnni",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:283",
+          "core/engine_config.hpp:2405"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "exl3_ggml_bridge_layer",
+        "locations": [
+          "core/engine_config.hpp:2378"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "exl3_ggml_bridge_layers",
+        "locations": [
+          "core/engine_config.hpp:2380"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "exl3_ggml_bridge_model_path",
+        "locations": [
+          "core/engine_config.hpp:2375"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "exl3_ggml_graph_capture",
+        "locations": [
+          "core/engine_config.hpp:2382"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "exl3_ggml_routed_graph_capture",
+        "locations": [
+          "core/engine_config.hpp:2383"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "exl3_gpu",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:269",
+          "core/engine_config.hpp:2391"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "exl3_gpu_cache_gb",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:272",
+          "core/engine_config.hpp:2394"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "exl3_gpu_device",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:271",
+          "core/engine_config.hpp:2393"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "exl3_gpu_expert_layer_begin",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:274",
+          "core/engine_config.hpp:2396"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "exl3_gpu_expert_split_layer",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:276",
+          "core/engine_config.hpp:2398"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "exl3_gpu_hc",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:270",
+          "core/engine_config.hpp:2392"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "exl3_gpu_split_cache_gb",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:279",
+          "core/engine_config.hpp:2401"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "exl3_gpu_split_device",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:277",
+          "core/engine_config.hpp:2399"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "exllamav3_cuda_schedule",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:253",
+          "core/engine_config.hpp:2387"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "exllamav3_python",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:251",
+          "core/engine_config.hpp:2385"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "exllamav3_runner_path",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:252",
+          "core/engine_config.hpp:2386"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "expert_fetch_threads",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:296",
+          "core/engine_config.hpp:2900"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "expert_gpu_activation",
+        "locations": [
+          "core/engine_config.hpp:2739"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "freeze_usage_stats",
+        "locations": [
+          "core/engine_config.hpp:2803"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "gdn_full_ggml",
+        "locations": [
+          "core/engine_config.hpp:2835"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "gdn_proj_ggml",
+        "locations": [
+          "core/engine_config.hpp:2834"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "glm5next_dense_prefill_fusion",
+        "locations": [
+          "core/engine_config.hpp:2624"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "glm5next_kda_gpu",
+        "locations": [
+          "core/engine_config.hpp:2620"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "glm5next_moe_prefill_gpu",
+        "locations": [
+          "core/engine_config.hpp:2622"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "glm5next_router_gpu",
+        "locations": [
+          "core/engine_config.hpp:2621"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "hc_ggml",
+        "locations": [
+          "core/engine_config.hpp:2833"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "host_ram_gb",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:288",
+          "core/engine_config.hpp:2782"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "io_uring",
+        "locations": [
+          "core/engine_config.hpp:2772"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "io_uring_workers",
+        "locations": [
+          "core/engine_config.hpp:2773"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "kv_cache_gb",
+        "locations": [
+          "core/engine_config.hpp:2957"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "log_level",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:302",
+          "core/engine_config.hpp:2947"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "log_path",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:303",
+          "core/engine_config.hpp:2946"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "max_new_tokens",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:285",
+          "core/engine_config.hpp:2409"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "mem_guard",
+        "locations": [
+          "core/engine_config.hpp:2741"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "mem_guard_poll_ms",
+        "locations": [
+          "core/engine_config.hpp:2744"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "mem_guard_stop_mb",
+        "locations": [
+          "core/engine_config.hpp:2743"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "mem_guard_warn_mb",
+        "locations": [
+          "core/engine_config.hpp:2742"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "metadata_model_path",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:268",
+          "core/engine_config.hpp:2389"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "mirror_coverage_file",
+        "locations": [
+          "core/engine_config.hpp:2791"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "mirror_model_path",
+        "locations": [
+          "core/engine_config.hpp:2789"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "model_format",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:249",
+          "core/engine_config.hpp:2372"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "model_load_only",
+        "locations": [
+          "core/engine_config.hpp:2388"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "model_path",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:248",
+          "core/engine_config.hpp:2371",
+          "core/engine_config.hpp:2954"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "moe_cache_gb",
+        "locations": [
+          "core/engine_config.hpp:2958"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "moe_cache_reserve_gb",
+        "locations": [
+          "core/engine_config.hpp:2959"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "moe_expert_bf16_gemm",
+        "locations": [
+          "core/engine_config.hpp:2836"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "moe_ggml_device",
+        "locations": [
+          "core/engine_config.hpp:2832"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "moe_ggml_gpu_router",
+        "locations": [
+          "core/engine_config.hpp:2831"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "moe_ggml_mul_mat_id",
+        "locations": [
+          "core/engine_config.hpp:2826"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "moe_ggml_planar_copies",
+        "locations": [
+          "core/engine_config.hpp:2829"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "moe_ggml_shared_expert",
+        "locations": [
+          "core/engine_config.hpp:2827"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "moe_gpu_accum",
+        "locations": [
+          "core/engine_config.hpp:2737"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "moe_prefill_batched",
+        "locations": [
+          "core/engine_config.hpp:2823"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "moe_prefill_stream",
+        "locations": [
+          "core/engine_config.hpp:2824"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "moe_prefill_stream_chunk",
+        "locations": [
+          "core/engine_config.hpp:2825"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "move_on_promotion",
+        "locations": [
+          "core/engine_config.hpp:2913"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "mtp_graph",
+        "locations": [
+          "core/engine_config.hpp:2728"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "name",
+        "locations": [
+          "core/engine_config.hpp:2952"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "omp_max_threads",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:297",
+          "core/engine_config.hpp:2901"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "pilot_widen_all_tokens",
+        "locations": [
+          "core/engine_config.hpp:2506"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "pin_core_gpu_top_n",
+        "locations": [
+          "core/engine_config.hpp:2814"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "pin_file",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:291",
+          "core/engine_config.hpp:2800"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "pin_global_floor_per_layer",
+        "locations": [
+          "core/engine_config.hpp:2808"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "pin_global_tiers",
+        "locations": [
+          "core/engine_config.hpp:2819"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "pin_ram_fraction",
+        "locations": [
+          "core/engine_config.hpp:2817"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "pin_strategy",
+        "locations": [
+          "core/engine_config.hpp:2807"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "pin_threshold",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:292",
+          "core/engine_config.hpp:2799"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "pin_topk_per_layer",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:294",
+          "core/engine_config.hpp:2806"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "pin_vram_lru_fraction",
+        "locations": [
+          "core/engine_config.hpp:2816"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "pinned_vram_capacity",
+        "locations": [
+          "core/engine_config.hpp:2912"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "predict_gpu1_cap_per_layer",
+        "locations": [
+          "core/engine_config.hpp:2893"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "predict_gpu1_rank_end",
+        "locations": [
+          "core/engine_config.hpp:2892"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "predict_gpu1_rank_start",
+        "locations": [
+          "core/engine_config.hpp:2890"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "prefetch_attn_pilot",
+        "locations": [
+          "core/engine_config.hpp:2588"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "prefetch_attn_pilot_k",
+        "locations": [
+          "core/engine_config.hpp:2590"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "prefetch_pilot_depth",
+        "locations": [
+          "core/engine_config.hpp:2569",
+          "core/engine_config.hpp:2578"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "prefetch_pilot_k",
+        "locations": [
+          "core/engine_config.hpp:2547"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "prefetch_pilot_k_adaptive",
+        "locations": [
+          "core/engine_config.hpp:2550"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "prefetch_pilot_k_adaptive_min_samples",
+        "locations": [
+          "core/engine_config.hpp:2556"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "prefetch_pilot_k_adaptive_threshold",
+        "locations": [
+          "core/engine_config.hpp:2553"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "prefetch_pilot_k_depth2",
+        "locations": [
+          "core/engine_config.hpp:2586"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "prefetch_pilot_k_per_layer",
+        "locations": [
+          "core/engine_config.hpp:2549"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "prefetch_widen_all_tokens",
+        "locations": [
+          "core/engine_config.hpp:2508"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "prefetch_worker_threads",
+        "locations": [
+          "core/engine_config.hpp:2781"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "prefill_batch_tokens",
+        "locations": [
+          "core/engine_config.hpp:2512"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "prefill_hint_order_by_earliest_token",
+        "locations": [
+          "core/engine_config.hpp:2503"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "prefill_pin_file",
+        "locations": [
+          "core/engine_config.hpp:2801"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "prefill_retention_decay",
+        "locations": [
+          "core/engine_config.hpp:2525"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "prefill_retention_flat_cut",
+        "locations": [
+          "core/engine_config.hpp:2521"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "prefill_retention_min_demand",
+        "locations": [
+          "core/engine_config.hpp:2519"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "prefill_retention_peaky_cut",
+        "locations": [
+          "core/engine_config.hpp:2523"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "prefill_retention_top_n",
+        "locations": [
+          "core/engine_config.hpp:2517"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "prefill_retention_weight",
+        "locations": [
+          "core/engine_config.hpp:2516"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "prefill_warm_via_prefetcher",
+        "locations": [
+          "core/engine_config.hpp:2596"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "prefill_window_cap",
+        "locations": [
+          "core/engine_config.hpp:2510"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "prefill_window_extra_gb",
+        "locations": [
+          "core/engine_config.hpp:2514"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "promote_hit_threshold",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:290",
+          "core/engine_config.hpp:2798"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "prompt",
+        "locations": [
+          "core/engine_config.hpp:2390"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "prompt_cache",
+        "locations": [
+          "core/engine_config.hpp:2716"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_cpu_fused_grouped",
+        "locations": [
+          "core/engine_config.hpp:2681"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_cpu_ggml_moe",
+        "locations": [
+          "core/engine_config.hpp:2678"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_cpu_gpu_overlap",
+        "locations": [
+          "core/engine_config.hpp:2683"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_cpu_gpu_overlap_max_layers",
+        "locations": [
+          "core/engine_config.hpp:2685"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_cpu_offload",
+        "locations": [
+          "core/engine_config.hpp:2697"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_cpu_offload_event_fence",
+        "locations": [
+          "core/engine_config.hpp:2700"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_cpu_offload_layers",
+        "locations": [
+          "core/engine_config.hpp:2699"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_cpu_offload_ring_slots",
+        "locations": [
+          "core/engine_config.hpp:2710"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_cpu_shared_device",
+        "locations": [
+          "core/engine_config.hpp:2694"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_cpu_strided_grouped",
+        "locations": [
+          "core/engine_config.hpp:2679"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_decode_batch_stage",
+        "locations": [
+          "core/engine_config.hpp:2673"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_decode_device_hc",
+        "locations": [
+          "core/engine_config.hpp:2671"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_decode_ggml_moe",
+        "locations": [
+          "core/engine_config.hpp:2668"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_decode_scheduler",
+        "locations": [
+          "core/engine_config.hpp:2669"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_expert_promotion",
+        "locations": [
+          "core/engine_config.hpp:2708"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_full_graph",
+        "locations": [
+          "core/engine_config.hpp:2454"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_full_graph_decode",
+        "locations": [
+          "core/engine_config.hpp:2455"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_gdn_conv_gpu",
+        "locations": [
+          "core/engine_config.hpp:2626"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_gpu_stage_enabled",
+        "locations": [
+          "core/engine_config.hpp:2702"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_gpu_stage_layers",
+        "locations": [
+          "core/engine_config.hpp:2705"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_graph_expert_vram_budget_gb",
+        "locations": [
+          "core/engine_config.hpp:2416"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_hc_async_readback",
+        "locations": [
+          "core/engine_config.hpp:2675"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_option_b_concentrated_only",
+        "locations": [
+          "core/engine_config.hpp:2446"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_option_b_disable_legacy_cache",
+        "locations": [
+          "core/engine_config.hpp:2443"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_option_b_fill_vram",
+        "locations": [
+          "core/engine_config.hpp:2441"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_option_b_global_floor_per_layer",
+        "locations": [
+          "core/engine_config.hpp:2430"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_option_b_global_top_k",
+        "locations": [
+          "core/engine_config.hpp:2428"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_option_b_layer",
+        "locations": [
+          "core/engine_config.hpp:2419"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_option_b_max_layers",
+        "locations": [
+          "core/engine_config.hpp:2439"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_option_b_min_coverage",
+        "locations": [
+          "core/engine_config.hpp:2423"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_option_b_right_size_top_n",
+        "locations": [
+          "core/engine_config.hpp:2425"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_option_b_selected_layers",
+        "locations": [
+          "core/engine_config.hpp:2437"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_option_b_stage_count",
+        "locations": [
+          "core/engine_config.hpp:2451"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_option_b_stage_expert",
+        "locations": [
+          "core/engine_config.hpp:2449"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_option_b_top_n",
+        "locations": [
+          "core/engine_config.hpp:2421"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_prefill_state_handoff",
+        "locations": [
+          "core/engine_config.hpp:2457"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_router_pilot",
+        "locations": [
+          "core/engine_config.hpp:2628"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_router_pilot_k",
+        "locations": [
+          "core/engine_config.hpp:2629"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_router_pilot_predict_layers",
+        "locations": [
+          "core/engine_config.hpp:2660"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_router_pilot_prefetch",
+        "locations": [
+          "core/engine_config.hpp:2641"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_router_pilot_prefetch_exclude_layers",
+        "locations": [
+          "core/engine_config.hpp:2658"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_router_pilot_prefetch_k",
+        "locations": [
+          "core/engine_config.hpp:2643"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_router_pilot_skip_fully_cached",
+        "locations": [
+          "core/engine_config.hpp:2661"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_router_pilot_skip_prefetch_excluded_layers",
+        "locations": [
+          "core/engine_config.hpp:2664"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "qwen4exp_track_router_usage",
+        "locations": [
+          "core/engine_config.hpp:2706"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "ram_cache_layer_adaptive",
+        "locations": [
+          "core/engine_config.hpp:2898"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "ram_cache_total_experts",
+        "locations": [
+          "core/engine_config.hpp:2783"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "ram_copy_reclaim_threshold",
+        "locations": [
+          "core/engine_config.hpp:2914"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "ram_pin_eager_preregister",
+        "locations": [
+          "core/engine_config.hpp:2796"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "ram_pinned_budget_gb",
+        "locations": [
+          "core/engine_config.hpp:2793"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "ram_preload_all_experts",
+        "locations": [
+          "core/engine_config.hpp:2785"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "ram_vram_promote_adaptive",
+        "locations": [
+          "core/engine_config.hpp:2842"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "ram_vram_promote_adaptive_threshold",
+        "locations": [
+          "core/engine_config.hpp:2844"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "ram_vram_promote_dynamic_cold_start_k",
+        "locations": [
+          "core/engine_config.hpp:2884"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "ram_vram_promote_dynamic_k_floor",
+        "locations": [
+          "core/engine_config.hpp:2881"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "ram_vram_promote_dynamic_k_tier1",
+        "locations": [
+          "core/engine_config.hpp:2879"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "ram_vram_promote_dynamic_k_tier2",
+        "locations": [
+          "core/engine_config.hpp:2877"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "ram_vram_promote_dynamic_k_tier3",
+        "locations": [
+          "core/engine_config.hpp:2875"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "ram_vram_promote_dynamic_k_tier4",
+        "locations": [
+          "core/engine_config.hpp:2873"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "ram_vram_promote_dynamic_layer",
+        "locations": [
+          "core/engine_config.hpp:2859"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "ram_vram_promote_dynamic_min_samples",
+        "locations": [
+          "core/engine_config.hpp:2887"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "ram_vram_promote_dynamic_threshold_1",
+        "locations": [
+          "core/engine_config.hpp:2871"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "ram_vram_promote_dynamic_threshold_2",
+        "locations": [
+          "core/engine_config.hpp:2868"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "ram_vram_promote_dynamic_threshold_3",
+        "locations": [
+          "core/engine_config.hpp:2865"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "ram_vram_promote_dynamic_threshold_4",
+        "locations": [
+          "core/engine_config.hpp:2862"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "ram_vram_promote_layer_gate",
+        "locations": [
+          "core/engine_config.hpp:2848"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "ram_vram_promote_layer_gate_min_samples",
+        "locations": [
+          "core/engine_config.hpp:2854"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "ram_vram_promote_layer_gate_threshold",
+        "locations": [
+          "core/engine_config.hpp:2851"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "ram_vram_promote_layer_gate_top_fraction",
+        "locations": [
+          "core/engine_config.hpp:2857"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "ram_vram_promote_min_samples",
+        "locations": [
+          "core/engine_config.hpp:2846"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "ram_vram_promote_top_k",
+        "locations": [
+          "core/engine_config.hpp:2840"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "raw_prompt",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:298",
+          "core/engine_config.hpp:2942"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "reactive_promote_gpu1_every_n",
+        "locations": [
+          "core/engine_config.hpp:2895"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "reasoning_effort",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:301",
+          "core/engine_config.hpp:2945"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "repeat_penalty",
+        "locations": [
+          "core/engine_config.hpp:2412"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "role",
+        "locations": [
+          "core/engine_config.hpp:2953"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "spec_draft_model",
+        "locations": [
+          "core/engine_config.hpp:2407"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "spec_draft_n_max",
+        "locations": [
+          "core/engine_config.hpp:2730"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "spec_type",
+        "locations": [
+          "core/engine_config.hpp:2718"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "speculative_active_layer_max_k",
+        "locations": [
+          "core/engine_config.hpp:2927"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "speculative_active_layer_promote_on_confirm",
+        "locations": [
+          "core/engine_config.hpp:2930"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "speculative_promote_to_active_layer",
+        "locations": [
+          "core/engine_config.hpp:2925"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "system_prompt",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:299",
+          "core/engine_config.hpp:2943"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "temperature",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:286",
+          "core/engine_config.hpp:2410"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "top_p",
+        "locations": [
+          "backends/cpu/cpu_config.hpp:287",
+          "core/engine_config.hpp:2411"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "unpacked_expert_format",
+        "locations": [
+          "core/engine_config.hpp:2771"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "use_active_layer_area",
+        "locations": [
+          "core/engine_config.hpp:2919"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "vram_cache_full_layer_prefix",
+        "locations": [
+          "core/engine_config.hpp:2812"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "vram_evict_demote_to_ram",
+        "locations": [
+          "core/engine_config.hpp:2821"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "vram_gb",
+        "locations": [
+          "core/engine_config.hpp:2955"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "vram_min_free_mb",
+        "locations": [
+          "core/engine_config.hpp:2740"
+        ]
+      },
+      {
+        "kind": "toml",
+        "name": "vram_preload_prefix_layers",
+        "locations": [
+          "core/engine_config.hpp:2810"
+        ]
+      }
+    ]
+  }
 }

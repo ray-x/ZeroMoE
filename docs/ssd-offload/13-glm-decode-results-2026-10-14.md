@@ -339,7 +339,7 @@ tokens), halves the batch if the graph declines for memory, and falls back to S=
 The default chunk is now 2048 (= the sparse top-k): every chunk streams all cold experts again, so a bigger chunk is faster
 (1998 tokens as 1024 + 974: 11.8 s). Chunks that continue beyond top_k would need the indexer's per-query selection; the dense
 attention used by the prefill graph is the model's attention only while the context fits top_k, so that is opt-in
-(`ZEROMOE_GLM5NEXT_PREFILL_DENSE_BEYOND_TOPK=1`, not the model's exact semantics).
+(historical A/B override, removed 2026-10-28; current code always uses sparse pooled attention beyond `top_k`).
 
 Correctness: the hidden state of a graph prefill differs from another batch shape by relL2 ~0.1 even inside the first chunk
 (rows 100..500 of 512+293 vs 805: 0.08-0.19), so tokens of a chunked prompt can legitimately differ from the single-graph

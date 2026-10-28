@@ -37,11 +37,17 @@ recompiled by the top-level setting; it must already contain a native cubin
 for the target GPU. An `sm_86`-only build is not a valid 5060 Ti performance
 measurement, even if it happens to execute through a fallback path.
 
-## The series
+## GGML patch series
 
-`patches/ggml` then `patches/ggml-host-node`, in filename order, rooted at the ggml directory
-(`a/src/...`), applied by `scripts/build_ggml.sh` (and by `cmake/ZeroMoEGgmlPatches.cmake` when CMake
-builds ggml itself) with `git apply --directory=ggml`. A patch that does not apply stops the build.
+`patches/ggml` followed by `patches/ggml-host-node` is always applied, in
+filename order, for source builds. `scripts/build_ggml.sh` and CMake's
+`cmake/ZeroMoEGgmlPatches.cmake` both stop when a required patch cannot apply;
+beellama-only scheduler helpers remain best effort. The host-node runtime mode
+is a separate opt-in and does not control whether the GGML patch is applied.
+
+A prebuilt GGML directory must come from the patched source. CMake cannot modify
+prebuilt libraries; it verifies both host-node hook symbols before linking them.
+Use `scripts/build_ggml.sh` to produce a matched patched source/library pair.
 
 Ported to 0.27 (same intent, rebased hunks): 0001 (Q2_0 VNNI; its `arch-fallback.h` hunk is gone because
 upstream no longer defines the generic alias on x86), 0002 (negative-id skip; the new

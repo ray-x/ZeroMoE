@@ -214,46 +214,6 @@ struct PerfCountersPart07 : PerfCountersPart06 {
     // still a valid diagnostic peek at the SPSC queue, just no longer fed
     // into a dedicated counter.)
     std::atomic<uint64_t> n_prefill_hint_pushed{0};
-    // LayerScratch::pending_prefill_promotions' own opportunistic-promotion
-    // outcomes (execution_layer.cpp): a pushed hint that later landed in
-    // RAM (checked cross-layer, decode-thread-only) gets promoted to VRAM
-    // right there via upload_expert_async, same as the legacy synchronous
-    // Phase-2 path always did inline -- these are NOT speculative bets
-    // (every entry is a confirmed real router pick for this exact prefill
-    // batch), so "promoted" here has no accuracy/wrong-guess dimension the
-    // way decode's own ram_vram_promote_top_k does; it's purely a timing
-    // question. n_prefill_pending_still_loading is expected to dominate
-    // early (most checks land before the read finishes) -- only a genuine
-    // problem if n_prefill_pending_aged_out stays high too (both is a
-    // signal the check cadence/cap is too tight to ever catch up).
-    std::atomic<uint64_t> n_prefill_pending_promoted{0};
-    std::atomic<uint64_t> n_prefill_pending_still_loading{0};
-    std::atomic<uint64_t> n_prefill_pending_aged_out{0};
-    std::atomic<uint64_t> n_prefill_pending_no_free_slot{0};
-    // Found already VRAM-resident by the time this follow-up pass checked
-    // it -- something ELSE (most likely Phase 3's own synchronous dispatch
-    // for that entry's layer, possibly a reactive hit-count promotion)
-    // beat this opportunistic pass to it. Not a failure -- the expert IS
-    // VRAM-resident either way -- but a real accounting gap without this:
-    // n_prefill_hint_pushed should equal the sum of promoted+still_loading+
-    // aged_out+no_free_slot+already_resident (modulo whatever's still
-    // legitimately pending when the process exits); without this counter
-    // a large silent remainder was unexplained.
-    std::atomic<uint64_t> n_prefill_pending_already_resident{0};
-    // A pushed hint whose (layer,expert) never even got a tracking slot --
-    // LayerScratch::pending_prefill_promotions' 32-entry cap was already
-    // full at push time. This is the OTHER real gap the first version of
-    // this accounting missed (already_resident above was the first): a
-    // real run showed 146 promoted + 96 already_resident + 0 still_loading
-    // + 0 aged_out + 14 no_free_slot = 256 accounted of 420 hints pushed --
-    // 164 (39%) unexplained until this counter existed. High values here
-    // mean the cap itself, not fetch speed or free-slot availability, is
-    // the binding constraint -- the fetches ARE landing fast (0 aged_out/
-    // still_loading in that same run says so), there just isn't room to
-    // track more than 32 at once given how many hints one layer's Phase 2
-    // can push before the next layer's follow-up pass drains any.
-    std::atomic<uint64_t> n_prefill_pending_cap_dropped{0};
-
     // io_uring batch outcome, per active_prefetch() call that attempted it
     // (io_uring=true AND Ring::available()). Added because the fallback-on-
     // any-failure design (io_uring_backend.hpp) is deliberately silent at

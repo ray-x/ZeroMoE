@@ -10,7 +10,6 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <string>
 #include <vector>
 
@@ -597,19 +596,6 @@ bool GgmlHcRunner::ensure_pre_graph(int S, const Bracket &b, int layer,
       ggml_free(ctx);
       return false;
     }
-    static const bool keep_internal_dump_outputs = [] {
-      return zeromoe::graphcfg::path("ZEROMOE_GGML_HC_INTERNAL_DUMP") != nullptr;
-    }();
-    if (keep_internal_dump_outputs && S == 1 && layer < 2) {
-      // The allocator normally reuses these temporaries immediately after
-      // their last consumer. Preserve them through graph completion only in
-      // the diagnostic run so the subsequent readback sees the real values.
-      ggml_set_output(xn2);
-      ggml_set_output(lo);
-      ggml_set_output(gate);
-      ggml_set_output(mixed);
-      ggml_set_output(inj);
-    }
     ggml_build_forward_expand(gf, mixed_store);
     ggml_build_forward_expand(gf, inj_store);
     if (!ggml_gallocr_alloc_graph((ggml_gallocr_t)galloc_pre_, gf)) {
@@ -627,11 +613,6 @@ bool GgmlHcRunner::ensure_pre_graph(int S, const Bracket &b, int layer,
     }
     slot.ctx = ctx;
     slot.graph = gf;
-    slot.diag_normed = xn2;
-    slot.diag_lowrank_silu = lo;
-    slot.diag_gate = gate;
-    slot.diag_mixed = mixed;
-    slot.diag_inject = inj;
     slot.norm = b.norm;
     slot.down = b.down;
     slot.up = b.up;
@@ -1172,37 +1153,6 @@ bool GgmlHcRunner::pre_mix(int layer, int sub_block, int S, float *out_hidden,
   // Diagnostic-only snapshots to find which HC projection first magnifies an
   // upstream state delta. They intentionally synchronize and are restricted
   // to S=1 / Layers 0-1; the normal path is unchanged when the env var is unset.
-  static const char *internal_dump_base = [] {
-    return zeromoe::graphcfg::env("ZEROMOE_GGML_HC_INTERNAL_DUMP");
-  }();
-  if (internal_dump_base && S == 1 && layer < 2 && !b.custom_q8 &&
-      active_pre_graph_) {
-      static int call_index[2][kPreGraphLayerCount] = {};
-      const int call = call_index[sub_block][layer]++;
-      ggml_backend_event_synchronize(
-          (ggml_backend_event_t)active_pre_done_event_);
-      auto dump = [&](const char *label, void *opaque) {
-        auto *tensor = (ggml_tensor *)opaque;
-        if (!tensor || tensor->type != GGML_TYPE_F32 || !tensor->data)
-          return;
-        const size_t n = (size_t)ggml_nelements(tensor);
-        std::vector<float> host(n);
-        ggml_backend_tensor_get(tensor, host.data(), 0, n * sizeof(float));
-        std::string path = std::string(internal_dump_base) + ".l" +
-                           (layer < 10 ? "0" : "") + std::to_string(layer) +
-                           ".s" + std::to_string(sub_block) + ".call" +
-                           std::to_string(call) + "." + label + ".f32";
-        std::ofstream out(path, std::ios::binary | std::ios::trunc);
-        if (out)
-          out.write(reinterpret_cast<const char *>(host.data()),
-                    (std::streamsize)(host.size() * sizeof(float)));
-      };
-      dump("normed", active_pre_graph_->diag_normed);
-      dump("lowrank_silu", active_pre_graph_->diag_lowrank_silu);
-      dump("gate", active_pre_graph_->diag_gate);
-      dump("mixed", active_pre_graph_->diag_mixed);
-      dump("inject", active_pre_graph_->diag_inject);
-  }
   if (debug_sync_hc())
     ggml_backend_synchronize((ggml_backend_t)backend_);
 

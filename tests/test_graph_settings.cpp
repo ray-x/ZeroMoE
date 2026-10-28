@@ -188,7 +188,6 @@ int main(int argc, char **argv) {
     CHECK(m.tun.gpu_assist_slots.value == 0);
     CHECK(m.tun.offload_ddr_gib.value < 0);
     CHECK(m.tun.offload_usage_file.value.empty());
-    CHECK(m.diag.verify_alias.value == 1 && m.diag.node_trace.value == 0);
     auto l = resolve_settings(Family::Ling, env_of({}), &err);
     CHECK(l.tun.prefill_min_batch.value == 2);
     CHECK(l.tun.prefill_chunk.value == 0);       // engine decides

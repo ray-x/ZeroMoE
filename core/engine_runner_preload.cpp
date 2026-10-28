@@ -1718,21 +1718,8 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
               // lookup would look like a genuine index miss
               // (indistinguishable from "really not resident"),
               // see that function's own comment.
-              uint32_t ram_seed_hit_count = 0;
-              if (config.ram_preload_seed_hit_count) {
-                // Clamp below promote_hit_threshold so this only
-                // biases RAM-tier retention, never fires a
-                // reactive VRAM promotion before the slot has
-                // actually been touched this session -- see
-                // ram_preload_seed_hit_count's own comment.
-                uint32_t cap = ram_mgr.promote_hit_threshold > 0
-                                   ? ram_mgr.promote_hit_threshold - 1
-                                   : 0;
-                ram_seed_hit_count =
-                    (uint32_t)std::min<uint64_t>(v[i].count, cap);
-              }
               ram_mgr.preload_ram_slot(engine, v[i].layer, v[i].expert,
-                                       (size_t)slot_idx, ram_seed_hit_count);
+                                       (size_t)slot_idx);
             }
           }
           off += chunk_n;

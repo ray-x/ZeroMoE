@@ -86,7 +86,7 @@ layer split (`configs/bench/qwen4exp_tg400_iq1m_22_26.toml`) is only the CPU/GPU
 The full record, with the hardware, build, model files, config and environment it was taken with, is
 `bench/results/qwen38-flash.json`. How it is measured and how to reproduce it: `docs/performance-measurement.md`
 (`bench/perf_report.py run ...`, `bench/perf_report.py render ...`). The figures are medians of 3 accepted requests per
-prompt from one `zeromoe --bench` process (a request counts only if it produced all its tokens and nothing else used the CPU
+prompt from one `zeromoe bench` process (a request counts only if it produced all its tokens and nothing else used the CPU
 while it ran; 1 of 18 were rejected and rerun), 200 generated tokens, fixed prompts in `bench/prompts/`. Decode is
 1000 / mean(step ms) over steps >= 3; peak is the best 32-step window.
 
@@ -105,7 +105,7 @@ the decode-style path, not the batched prefill).
 is 20% slower than the first. Greedy output is the same on every run, so the spread comes from what is generated (which experts
 it routes to) as well as from the growing context. Read it as a spread of 35-46 tok/s, not as a steady trend.
 
-**Random tokens** (llama-bench style: `llama-bench -p 512 -n 128` equivalent, seed 1; `zeromoe --bench-random-pp 512 --bench-random-tg 128`)
+**Random tokens** (llama-bench style: `llama-bench -p 512 -n 128` equivalent, seed 1; `zeromoe bench --bench-random-pp 512 --bench-random-tg 128`)
 
 | Test | Tokens/s (range) | Peak tok/s |
 | --- | ---: | ---: |
@@ -119,7 +119,7 @@ Setup: Xeon W-2235 (6 cores / 12 threads, AVX-512 with VNNI, no VBMI), 125 GiB D
 CachyOS, CUDA 13.3, ggml `8baabd53b` with the patch series, binary from commit `ca0c144`. The RTX 5060 Ti was hidden
 (`CUDA_VISIBLE_DEVICES=0`).
 
-*Method change:* the first version of this record (taken before `zeromoe --bench` existed) started a new process per request
+*Method change:* the first version of this record (taken before `zeromoe bench` existed) started a new process per request
 and scraped log lines. It measured prefill 23.8 / 211.5 / 425.4 tok/s and decode 45.3 / 42.1 / 43.8 tok/s. The engine's own
 records, from a warm process, give higher prefill (+3 to +15%, the first request of a fresh process pays one-off costs) and decode within
 1 to 5%; second-request setup is unchanged (0.11 / 0.39 / 0.69 s before, 0.10 / 0.38 / 0.67 s now).
@@ -317,7 +317,7 @@ Same config as above (K=8, 54 GiB pool, 426-token prompt, 35 steady steps), run 
 ## GLM-5.3 (glm-dsa) decode route survey: ranking refit does not help (2026-10-19)
 
 Hypothesis: the DSA usage file (`.zeromoe_usage_glm53_ud_iq2m`, 35,400 counts) is thin, so a decode-only route survey
-(`ZEROMOE_GLM5NEXT_ROUTE_TRACE`, 4 prompts x 47 decode tokens x 75 MoE layers, `obsolete/glm53-logs-scripts/survey_dsa_all.sh`) could raise the
+(historical `ZEROMOE_GLM5NEXT_ROUTE_TRACE` capture; the maintained survey now filters `[MOE-ROUTE-TRACE]` DEBUG records, 4 prompts x 47 decode tokens x 75 MoE layers, `obsolete/glm53-logs-scripts/survey_dsa_all.sh`) could raise the
 resident-set hit rate and cut SSD bytes/token (needed: ~-40% for 1.7 tok/s).
 
 Leave-one-prompt-out, fraction of routed experts inside the top-N ranked set (base = existing file; refit = base + 3 training prompts):
@@ -704,7 +704,7 @@ At decode with a 64 GiB pool the process held 84.5 GiB anonymous memory plus a 3
 
 ### Trial 43: prompt-adaptive resident set, oracle upper bound (negative)
 
-25-token computing-history prompt, recipe, 64 GiB pool, 22 GiB hot set, swap-free, NGEN=80. Baseline run with `ZEROMOE_GLM5NEXT_ROUTE_TRACE` (80 tokens x 75 layers; 9270 distinct (layer, expert) pairs routed, more than the ~7900 resident): 1.44 tok/s (Rates), 1.50 first-to-last, loads 5752/64 tok, split stall 206 ms/tok. Then a usage file built from that same trace (base counts + 3x trace counts, in-sample = best case for any adaptive scheme): 1.55 (Rates), 1.63 first-to-last, loads 4206 (-27%), but split stall 216 ms/tok (unchanged). Result: a 27% cut in SSD loads is worth +7.6% decode; split stall tracks the number of layers with a pending miss times single-miss latency, not the load count. A real prompt-adaptive scheme would gain less than +7.6%, so with the 78 GiB pool (1.37 long) it cannot reach 1.5. Dynamic VRAM promotion not built.
+25-token computing-history prompt, recipe, 64 GiB pool, 22 GiB hot set, swap-free, NGEN=80. Historical baseline run with `ZEROMOE_GLM5NEXT_ROUTE_TRACE` (now tagged `[MOE-ROUTE-TRACE]` DEBUG records; 80 tokens x 75 layers; 9270 distinct (layer, expert) pairs routed, more than the ~7900 resident): 1.44 tok/s (Rates), 1.50 first-to-last, loads 5752/64 tok, split stall 206 ms/tok. Then a usage file built from that same trace (base counts + 3x trace counts, in-sample = best case for any adaptive scheme): 1.55 (Rates), 1.63 first-to-last, loads 4206 (-27%), but split stall 216 ms/tok (unchanged). Result: a 27% cut in SSD loads is worth +7.6% decode; split stall tracks the number of layers with a pending miss times single-miss latency, not the load count. A real prompt-adaptive scheme would gain less than +7.6%, so with the 78 GiB pool (1.37 long) it cannot reach 1.5. Dynamic VRAM promotion not built.
 
 ### Trial 44: confidence-based pilot prefetch width (negative, removed)
 

@@ -183,8 +183,9 @@ Pitfalls found while bringing it up:
 - The offload store's row-size table needed MXFP4 (ggml type 39).
 - Aliased cache slots need row-aligned strides (engine pads them when MiMo's in-graph
   MoE is enabled); the engine RAM tier must not preload on top of the offload tier.
-- `--graph-node-trace 1|2|3|4` is a debug aid; trace modes install an eval
-  callback that disables the early-ready bridge, so never use them for timing.
+- `--verbosity 5` enables MiMo node, route-ID, route-grid and non-finite
+  diagnostics. The eval callback disables the early-ready bridge, so DEBUG
+  traces are for diagnosis and must not be used for timing.
 
 Next: run the dual-GPU config, freeze a surveyed usage profile, A/B the GPU-assist ring.
 

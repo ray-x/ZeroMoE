@@ -9,7 +9,7 @@
       "binaryDir": "${sourceDir}/build-cpu",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "ZEROMOE_CPU_ONLY": "ON"
+        "GGML_CUDA": "OFF"
       }
     },
     {
@@ -20,7 +20,7 @@
       "condition": {"type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux"},
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "ZEROMOE_CPU_ONLY": "OFF"
+        "GGML_CUDA": "ON"
       }
     }
   ],

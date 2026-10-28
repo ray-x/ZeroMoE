@@ -264,22 +264,13 @@ std::expected<void, std::string> EngineRunner::apply_engine_config() {
            "see "
            "ram_pin_eager_preregister's own comment): "
         << (config.ram_pin_eager_preregister ? "ON" : "off") << "\n";
-    LOG_STREAM_INFO()
-        << "[CONFIG] RAM preload hit_count seeding (Tier 3 slots start "
-           "'known warm' from their real pin_file count, clamped below "
-           "promote_hit_threshold -- see ram_preload_seed_hit_count's own "
-           "comment): "
-        << (config.ram_preload_seed_hit_count ? "ON" : "off") << "\n";
   }
-  engine.prefill_opportunistic_promote = config.prefill_opportunistic_promote;
   engine.decode_async_prewarm = config.decode_async_prewarm;
   engine.decode_async_prewarm_max_batch = config.decode_async_prewarm_max_batch;
   engine.decode_async_prewarm_nonblocking =
       config.decode_async_prewarm_nonblocking;
   engine.cpu_offload_max_experts = config.cpu_offload_max_experts;
   engine.prefill_retention_decay = config.prefill_retention_decay;
-  engine.prefill_dispatch_lookahead_tokens =
-      config.prefill_dispatch_lookahead_tokens;
   engine.prefill_hint_order_by_earliest_token =
       config.prefill_hint_order_by_earliest_token;
   engine.pilot_widen_all_tokens = config.pilot_widen_all_tokens;
@@ -305,9 +296,7 @@ std::expected<void, std::string> EngineRunner::apply_engine_config() {
   engine.qwen4exp_decode_scheduler = config.qwen4exp_decode_scheduler;
   engine.qwen4exp_decode_device_hc = config.qwen4exp_decode_device_hc;
   engine.qwen4exp_decode_batch_stage = config.qwen4exp_decode_batch_stage;
-  engine.qwen4exp_decode_custom_hc_q8 = config.qwen4exp_decode_custom_hc_q8;
-  engine.qwen4exp_decode_gpu_router = config.qwen4exp_decode_gpu_router;
-  engine.qwen4exp_cpu_ggml_moe = config.qwen4exp_cpu_ggml_moe;
+    engine.qwen4exp_cpu_ggml_moe = config.qwen4exp_cpu_ggml_moe;
   engine.qwen4exp_cpu_strided_grouped =
       config.qwen4exp_cpu_strided_grouped;
   engine.qwen4exp_cpu_fused_grouped = config.qwen4exp_cpu_fused_grouped;
@@ -323,10 +312,6 @@ std::expected<void, std::string> EngineRunner::apply_engine_config() {
       std::unique(engine.qwen4exp_cpu_offload_layers.begin(),
                   engine.qwen4exp_cpu_offload_layers.end()),
       engine.qwen4exp_cpu_offload_layers.end());
-  engine.qwen4exp_cpu_offload_force_cold_count =
-      config.qwen4exp_cpu_offload_force_cold_count;
-  engine.qwen4exp_cpu_offload_force_expert =
-      config.qwen4exp_cpu_offload_force_expert;
   engine.qwen4exp_cpu_offload_event_fence =
       config.qwen4exp_cpu_offload_event_fence;
   engine.qwen4exp_cpu_offload_ring_slots =

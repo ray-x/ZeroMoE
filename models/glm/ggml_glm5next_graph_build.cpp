@@ -828,10 +828,6 @@ struct GlmFfn final : zeromoe::graph::FfnBlock {
     const auto &c = g.engine->model_file.architecture_config;
     const std::string p = "blk." + std::to_string(l) + ".";
     ggml_tensor *cur_pre = cur;
-    if (g.decode_mode && zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PROBE_DUMP")) {
-      ggml_set_output(cur_pre);
-      g.probe_x.push_back({l, cur_pre});
-    }
     ggml_tensor *fn = resident_tensor(g, g.ctx, p + "ffn_norm.weight");
     if (!fn) {
       if (g.native_moe_cache)

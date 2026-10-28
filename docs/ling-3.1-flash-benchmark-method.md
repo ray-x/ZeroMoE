@@ -67,7 +67,7 @@ bench/ling/reference-audit/run.sh
 
 The runner writes the effective TOML to `/tmp/ling-reference-config.*.toml`,
 logs the prompt SHA-256, creates `/tmp/ling-short.tokens` and
-`/tmp/ling-short.routes`, and runs under `run_capped.sh` with
+`/tmp/ling-short.routes` filtered from the verbose engine log, and runs under `run_capped.sh` with
 `MemoryMax=95G` and `MemorySwapMax=0`. The runner preflight rejects a run if a
 model/build process is present or host `MemAvailable` is below 120.5e6 KiB.
 
@@ -100,7 +100,7 @@ For every reported number, preserve all of:
 
 1. The full `LING_LOG` (stdout plus timestamped engine lines).
 2. The effective config path printed in `[RUN]`.
-3. The token and route sidecars `*.tokens` and `*.routes`, with SHA-256.
+3. The token and route sidecars `*.tokens` and `*.routes`, with SHA-256; route sidecars are filtered from `[MOE-ROUTE-TRACE]` records in the verbose engine log.
 4. The exact prompt path and SHA-256 from `[RUN]`.
 5. The usage profile path and SHA-256. A profile is collected once with
    `LING_FREEZE_USAGE_STATS=0` on the same prompt, then reused frozen for the

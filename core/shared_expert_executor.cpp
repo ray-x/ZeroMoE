@@ -29,13 +29,13 @@
 #include <climits>
 #include <cmath>
 #include <cstdlib>
+#include <fstream>
 #include <cstring>
 #include <cuda_runtime.h>
-#include <fstream>
 #include <immintrin.h>
 #include <limits>
-#include <sstream>
 #include <string>
+#include <sstream>
 #include <thread>
 #include <vector>
 
@@ -98,12 +98,6 @@ bool run_qwen4exp_shared_device(StreamingEngine &engine, int layer_idx,
   static const bool debug = shared_debug_enabled();
   if (combined_output)
     *combined_output = nullptr;
-  static const bool force_host_decode = [] {
-    const char *e = zeromoe::graphcfg::env("ZEROMOE_GGML_SHARED_FORCE_HOST_DECODE");
-    return e && e[0] == '1';
-  }();
-  if (force_host_decode && S == 1)
-    return false;
   if (!device_input ||
       (!routed_output && !host_routed && !shared_only) ||
       (shared_add && (!host_routed || routed_output)) ||
@@ -118,10 +112,6 @@ bool run_qwen4exp_shared_device(StreamingEngine &engine, int layer_idx,
 
   const std::string prefix = "blk." + std::to_string(layer_idx) + ".";
   const int shared_device = moe_ggml_device() >= 0 ? moe_ggml_device() : 0;
-  static const bool no_external_weights = [] {
-    const char *e = zeromoe::graphcfg::env("ZEROMOE_GGML_SHARED_NO_EXTERNAL");
-    return e && e[0] == '1';
-  }();
   auto make_ref = [&](const std::string &name, int64_t ne0,
                       int64_t ne1) -> std::optional<GgmlSharedWeightRef> {
     auto it = engine.resident_layers.find(name);
@@ -140,7 +130,7 @@ bool run_qwen4exp_shared_device(StreamingEngine &engine, int layer_idx,
     // The dense pool is allocated on the core GPU. Borrow it only when the
     // shared GGML backend is configured for that same device; otherwise the
     // runner's host upload path remains the safe fallback.
-    if (!no_external_weights && engine.gpu &&
+    if (engine.gpu &&
         engine.gpu->get_core_device() == shared_device && w.device_ptr) {
       ref.device_data = w.device_ptr;
       ref.device_bytes = w.meta.size_bytes;
@@ -167,7 +157,7 @@ bool run_qwen4exp_shared_device(StreamingEngine &engine, int layer_idx,
                   ? (int64_t)gate_inp_it->second.meta.shape[1]
                   : 1;
     ref.nbytes = gate_inp_it->second.meta.size_bytes;
-    if (!no_external_weights && engine.gpu &&
+    if (engine.gpu &&
         engine.gpu->get_core_device() == shared_device &&
         gate_inp_it->second.device_ptr) {
       ref.device_data = gate_inp_it->second.device_ptr;

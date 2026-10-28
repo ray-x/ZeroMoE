@@ -1029,22 +1029,13 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
     int cpu_offload_cold_count = 0;
     auto cpu_offload_start = std::chrono::steady_clock::now();
     if (cpu_offload_target) {
-      const int forced_count = std::min(
-          std::max(0, engine.qwen4exp_cpu_offload_force_cold_count), topk);
       for (int k = 0; k < topk; ++k) {
         const int expert_id = scratch.tok_topk_ids[s * topk + k];
         bool cold = false;
-        // If Option B has already built a usage-ranked mask for this layer,
-        // reuse it as the hot/cold policy.  The dedicated CPUOffload switch
-        // remains independent: with no mask, only the deterministic forced
-        // slots below are cold.
+        // Option B supplies the usage-ranked hot/cold mask for this layer.
+        // With no Option B mask, no experts are assigned to CPU offload.
         if (engine.qwen4exp_option_b_layer_enabled(layer_idx) &&
             !engine.qwen4exp_option_b_hot_expert(layer_idx, expert_id))
-          cold = true;
-        if (k < forced_count)
-          cold = true;
-        if (engine.qwen4exp_cpu_offload_force_expert >= 0 &&
-            expert_id == engine.qwen4exp_cpu_offload_force_expert)
           cold = true;
         scratch.qwen_cpu_offload_cold_slots[(size_t)k] = cold ? 1 : 0;
         if (cold) {
@@ -1223,32 +1214,7 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
         return;
       }
 
-      // EngineConfig::moe_decode_batched (default OFF, PROTOTYPE) --
-      // decode-time (S==1) fast path. Skips the VRAM-cache resolve/lock/
-      // GPU-pool machinery below entirely and goes straight to the same
-      // CPU dequant-matmul call this lambda's own GPU-dispatch-failure
-      // branch already uses further down (ram_pin -> expert_ffn_cpu ->
-      // ram_unpin -> accumulate) -- see dense_dispatch.hpp's
-      // moe_decode_batched() for the full writeup, including the real
-      // trade-off (this expert can no longer be newly promoted into VRAM
-      // from a decode-time hit while this path is taken for it). Never
-      // engages for a vram_shadow block -- it has no host bytes to read
-      // without the synchronous reload the code below already handles;
-      // falls through unchanged for that case.
-      if (S == 1 && !exp->vram_shadow && moe_decode_batched()) {
-        ram_mgr.ram_pin(*exp);
-        expert_ffn_cpu(
-            token_hidden, scratch.down_buf.data(), exp->gate_proj.host_ptr,
-            exp->gate_proj.meta, exp->up_proj.host_ptr, exp->up_proj.meta,
-            exp->down_proj.host_ptr, exp->down_proj.meta,
-            scratch.gate_buf.data(), scratch.up_buf.data(), 1, D, moe_inter,
-            clamp_exp, layer_idx, routed_expert_id);
-        ram_mgr.ram_unpin(*exp);
-        accumulate(k, exp, scratch.down_buf.data());
-        return;
-      }
-
-      ExpertGpuContext gpu_ctx;
+ExpertGpuContext gpu_ctx;
       gpu_ctx.topo = ram_mgr.vram_cache;
       gpu_ctx.layer_idx = layer_idx;
       gpu_ctx.expert_id = routed_expert_id;
@@ -1597,57 +1563,6 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
         }
       }
 
-      // EngineConfig::prefill_dispatch_lookahead_tokens (prefill-only,
-      // additive) -- see that field's own comment (engine_config.hpp)
-      // for the full motivation. Widens the combined get_experts_batch
-      // call below to also opportunistically RAM-warm upcoming tokens'
-      // not-yet-resident picks. A sentinel k of -1 marks a "lookahead
-      // only" entry in ram_needed_k -- it has no (token,k) slot of its
-      // own to write into or dispatch, so every one of the 4 real
-      // consumers of ram_needed_k below (expert_ptrs write-back, the
-      // cpu_offload_max_experts forcing loop, decode_async_prewarm's
-      // candidate collection, and the final dispatch loop) must skip
-      // it. Real risk this deliberately avoids: NOT promoting a
-      // lookahead entry into the active-layer VRAM pool via decode_
-      // async_prewarm -- only warming the RAM tier -- since this
-      // codebase's own history (CLAUDE.md) has repeatedly found
-      // over-eager speculative VRAM promotion to be a real regression
-      // (churn/eviction), while RAM-tier warming alone has no such
-      // downside (a claim_or_wait slot that's never consumed just sits
-      // resident, exactly like an ordinary background prefetch hit).
-      if (S > 1 && engine.prefill_dispatch_lookahead_tokens > 0 &&
-          layer_gpu_capable) {
-        int lookahead_end =
-            std::min(S, s + 1 + engine.prefill_dispatch_lookahead_tokens);
-        for (int s2 = s + 1; s2 < lookahead_end; ++s2) {
-          for (int k2 = 0; k2 < topk; ++k2) {
-            int expert_id2 = scratch.tok_topk_ids[s2 * topk + k2];
-            if (ram_mgr.vram_cache->find_expert(layer_idx, expert_id2)) {
-              perf().n_prefill_lookahead_skipped_vram.fetch_add(
-                  1, std::memory_order_relaxed);
-              continue;
-            }
-            if (ram_mgr.is_ram_resident(layer_idx, expert_id2)) {
-              perf().n_prefill_lookahead_skipped_ram.fetch_add(
-                  1, std::memory_order_relaxed);
-              continue;
-            }
-            bool dup = std::find(ram_needed_ids.begin(), ram_needed_ids.end(),
-                                 expert_id2) != ram_needed_ids.end();
-            if (dup) {
-              perf().n_prefill_lookahead_skipped_dup.fetch_add(
-                  1, std::memory_order_relaxed);
-              continue;
-            }
-            ram_needed_ids.push_back(expert_id2);
-            ram_needed_k.push_back(
-                -1); // sentinel: lookahead-only, no (token,k) to fill
-            perf().n_prefill_lookahead_added.fetch_add(
-                1, std::memory_order_relaxed);
-          }
-        }
-      }
-
       if (!ram_needed_ids.empty()) {
         ram_needed_ptrs.resize(ram_needed_ids.size());
         // nullptr (rather than overflow the fixed-size array) on the
@@ -1659,54 +1574,17 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
         // populates is unaffected.
         bool real_fetch_overflow =
             ram_needed_ids.size() > ram_was_real_fetch.size();
-        // ram_needed_k.data() doubles as the caller_k parameter --
-        // its own -1 sentinel (prefill_dispatch_lookahead_tokens
-        // additions) is exactly what get_experts_batch needs to tag
-        // MoEExpertBlock::loaded_by_lookahead correctly, no separate
-        // array required.
         if (S == 1 && engine.family_ops.family == ModelFamily::Qwen4Exp)
           moe_pipeline_internal::qwen4exp_record_pilot_fetch_start(layer_idx);
         ram_mgr.get_experts_batch(
             engine, layer_idx, ram_needed_ids.data(),
             (int)ram_needed_ids.size(), ram_needed_ptrs.data(),
-            real_fetch_overflow ? nullptr : ram_was_real_fetch.data(),
-            ram_needed_k.data());
-        // 2026-08-30: real, hardware-confirmed bug found while
-        // debugging a S=100 crash/NaN-corruption with speculative_
-        // promote_to_active_layer + active_layer_upload_worker_
-        // threads both enabled -- see dispatch_expert_k's own
-        // RAM-IDENTITY diagnostic for the full investigation.
-        // get_experts_batch's Phase A (ram_manager.hpp) now pins
-        // every out[k] it resolves (Hit and Claimed) at the MOMENT
-        // of resolution -- see that function's own comment for why
-        // "pin right before use" (the 2026-08-29 fix, dispatch_
-        // expert_k's own CPU-path pin below) is insufficient: the
-        // slot can already be reclaimed before that later pin ever
-        // runs, including DURING get_experts_batch's own Phase B/C
-        // execution (real blocking I/O, real time for another
-        // thread's victim-selection scan to run). This loop is
-        // that pin's matching release:
-        //   - a REAL entry (ram_needed_k[i]>=0) is held through
-        //     THIS token's own full dispatch instead -- released
-        //     right after dispatch_expert_k(k) returns, in the
-        //     ram_needed_k dispatch loop below (covers both the CPU
-        //     path's synchronous compute and the GPU path's
-        //     synchronous upload_expert/upload_expert_active call).
-        //   - a LOOKAHEAD-only entry (ram_needed_k[i]<0,
-        //     prefill_dispatch_lookahead_tokens) belongs to a
-        //     LATER token, never dispatched by this one -- once
-        //     get_experts_batch returns it's fully published
-        //     (Ready, not just Loading), safe to treat exactly like
-        //     any other resident expert from here on (a later
-        //     token's own Phase A will find+use it normally); held
-        //     no longer than necessary, released right here.
-        for (size_t i = 0; i < ram_needed_ids.size(); ++i) {
-          if (ram_needed_k[i] < 0) {
-            ram_mgr.ram_unpin(*ram_needed_ptrs[i]);
-            continue;
-          }
+            real_fetch_overflow ? nullptr : ram_was_real_fetch.data());
+        // Phase A pins every resolved RAM slot and keeps it pinned through
+        // this token's dispatch. ram_needed_k maps each miss back to the
+        // token's top-k position for dispatch and release.
+        for (size_t i = 0; i < ram_needed_ids.size(); ++i)
           scratch.expert_ptrs[ram_needed_k[i]] = ram_needed_ptrs[i];
-        }
 
         // Qwen-only CPU-affinity grouping. At this point every selected
         // expert has a published RAM block and get_experts_batch has already
@@ -1772,14 +1650,9 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
       engine.family_ops.family == ModelFamily::DeepSeek_V41;
           int budget = engine.cpu_offload_max_experts;
           for (size_t i = 0; i < ram_needed_ids.size(); ++i) {
-            // A lookahead-only entry (ram_needed_k[i]==-1) isn't
-            // this token's own real fetch to force to CPU or
-            // not -- skip before any k-indexed access.
-            if (ram_needed_k[i] < 0)
-              continue;
-    // DeepSeek's GLM-style split sends any selected expert outside the
-    // persistent VRAM cache to the CPU DDR lane. Other families retain the
-    // established policy of CPU-offloading only genuine disk-cold misses.
+            // DeepSeek's GLM-style split sends any selected expert outside the
+            // persistent VRAM cache to the CPU DDR lane. Other families retain the
+            // established policy of CPU-offloading only genuine disk-cold misses.
     if (!ram_was_real_fetch[i] && !deepseek_cpu_cold)
       continue;
     if (deepseek_cpu_cold && ram_mgr.vram_cache &&
@@ -1869,17 +1742,6 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
           static thread_local std::vector<size_t> decode_async_candidates;
           decode_async_candidates.clear();
           for (size_t i = 0; i < ram_needed_ids.size(); ++i) {
-            // A lookahead-only entry (ram_needed_k[i]==-1,
-            // prefill_dispatch_lookahead_tokens) is deliberately
-            // NEVER a candidate for active-layer VRAM pre-warm --
-            // only for RAM-tier warming above. Promoting a not-
-            // yet-needed expert into the scarce active-layer pool
-            // this early is exactly the over-eager speculative-
-            // promotion regression this codebase has repeatedly
-            // found and reverted (see CLAUDE.md) -- and reading
-            // force_cpu_offload_k[-1] just below would be OOB.
-            if (ram_needed_k[i] < 0)
-              continue;
             MoEExpertBlock *blk = ram_needed_ptrs[i];
             // Cheap pre-filter only, NOT the safety-critical check
             // (that one is re-done immediately adjacent to
@@ -2173,15 +2035,6 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
           // the genuinely still-unexplained residual.
           PERF_SCOPE(t_ram_needed_dispatch_total);
           for (size_t i = 0; i < ram_needed_k.size(); ++i) {
-            // A lookahead-only entry (-1) belongs to a later
-            // token -- never dispatched by this one; it's now
-            // sitting RAM-resident, ready for a cheap resolve
-            // when its own token's turn comes up. (Its own pin
-            // was already released right after get_experts_
-            // batch returned -- see that call site's own
-            // comment.)
-            if (ram_needed_k[i] < 0)
-              continue;
             dispatch_expert_k(ram_needed_k[i]);
             // 2026-08-30: matching release for get_experts_
             // batch's pin-at-resolution fix (ram_manager.hpp) --

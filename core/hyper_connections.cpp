@@ -436,31 +436,6 @@ void qwen4exp_hc_mix_impl(StreamingEngine &engine,
   const float *const streams_base =
       in_streams ? in_streams : engine.hc_stream_buf.data();
 
-  // Diagnostic-only: mirror ggml_hc_backend.cpp's internal-dump instrument
-  // (same env var, same file-naming scheme) for this CPU path, so a run with
-  // hc_ggml=false is directly diffable against the GPU path's dumps and
-  // against llama.cpp's own captures. Restricted to S=1 / layers 0-1,
-  // like the GPU path; a no-op cost (one getenv + string compares) when the
-  // env var is unset.
-  const bool sub0 = norm_name.find("hc_attn_") != std::string::npos;
-  const bool sub1 = norm_name.find("hc_ffn_") != std::string::npos;
-  const char *internal_dump_base = zeromoe::graphcfg::env("ZEROMOE_GGML_HC_INTERNAL_DUMP");
-  const bool dump_this_call = internal_dump_base && S == 1 && trace_layer >= 0 &&
-                              trace_layer < 2 && (sub0 || sub1);
-  const int dump_sub = sub0 ? 0 : 1;
-  static int dump_call_index[2][2] = {};
-  const int dump_call = dump_this_call ? dump_call_index[dump_sub][trace_layer]++ : -1;
-  auto dump_hc_internal = [&](const char *label, const float *data, size_t n) {
-    if (!dump_this_call) return;
-    std::string path = std::string(internal_dump_base) + ".l" +
-                       (trace_layer < 10 ? "0" : "") + std::to_string(trace_layer) +
-                       ".s" + std::to_string(dump_sub) + ".call" +
-                       std::to_string(dump_call) + "." + label + ".f32";
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    if (out) out.write(reinterpret_cast<const char *>(data),
-                       (std::streamsize)(n * sizeof(float)));
-  };
-
   // 1. grouped RMS norm: ggml_rms_norm over x [n_embd, hc, T] normalizes
   // over ne0 = n_embd PER (stream, token) with NO learned gain (the gain is
   // the separate w_norm multiply after the flatten). Engine layout of
@@ -519,8 +494,6 @@ void qwen4exp_hc_mix_impl(StreamingEngine &engine,
     LOG_ERROR("[HC-Q4E] missing %s -- HC gate/norm silently unweighted.\n",
               norm_name.c_str());
   }
-  dump_hc_internal("normed", xn, (size_t)S * hc_dim);
-
   // 3. low-rank gate: lo = silu(down(xn) / hc); gate = sigmoid(up(lo)).
   float *const lo = grow(lo_buf, (size_t)S * hc_lr);
   dense_proj(engine, down_name, xn, lo, S, hc_dim, hc_lr,
@@ -532,7 +505,6 @@ void qwen4exp_hc_mix_impl(StreamingEngine &engine,
     float x = lo[i] * inv_hc;
     lo[i] = x / (1.0f + std::exp(-x)); // silu
   }
-  dump_hc_internal("lowrank_silu", lo, lo_n);
   float *const gate = grow(gate_buf, (size_t)S * hc_dim);
   dense_proj(engine, up_name, lo, gate, S, hc_lr, hc_dim,
              force_original_quant);
@@ -542,8 +514,6 @@ void qwen4exp_hc_mix_impl(StreamingEngine &engine,
 #pragma omp parallel for if (S > 1) schedule(static)
   for (size_t i = 0; i < gate_n; ++i)
     gate[i] = 1.0f / (1.0f + std::exp(-gate[i]));
-  dump_hc_internal("gate", gate, gate_n);
-
   // 4. gated = xn * gate; mixed = mean over the HC streams.
 #pragma omp parallel for if (S > 1) schedule(static)
   for (int s = 0; s < S; ++s) {
@@ -556,14 +526,11 @@ void qwen4exp_hc_mix_impl(StreamingEngine &engine,
         out[d] += xs[(size_t)h * D + d] * gs[(size_t)h * D + d];
     for (int d = 0; d < D; ++d) out[d] *= inv_hc;
   }
-  dump_hc_internal("mixed", out_hidden, (size_t)S * D);
-
   // 5. inject = w_inject(xn) -> [S, HC], consumed by the matching
   // hc_post_combine (per-layer hooks only).
   if (out_inject) {
     dense_proj(engine, inject_name, xn, out_inject, S, hc_dim, HC,
                force_original_quant);
-    dump_hc_internal("inject", out_inject, (size_t)S * HC);
     if (trace_gate("HC")) {
       const float *row = out_inject + (size_t)(S - 1) * HC;
       auto &&os = LOG_STREAM_VERBOSE();
@@ -702,13 +669,6 @@ static bool hc_ggml_register(StreamingEngine &engine, int layer, int sub,
   if (!ref(p + pre + "down.weight", dref) || !ref(p + pre + "up.weight", uref) ||
       !ref(p + pre + "inject.weight", iref))
     return false;
-  const bool custom_q8 = engine.qwen4exp_decode_custom_hc_q8 &&
-                         engine.qwen4exp_decode_device_hc && S == 1 &&
-                         dref.type == (uint32_t)GGUFType::Q8_0 &&
-                         uref.type == (uint32_t)GGUFType::Q8_0 &&
-                         (iref.type == (uint32_t)GGUFType::Q8_0 ||
-                          iref.type == (uint32_t)GGUFType::F32);
-  dref.custom_q8 = uref.custom_q8 = iref.custom_q8 = custom_q8;
   return r.ensure_weights(layer, sub, nref, dref, uref, iref);
 }
 
@@ -813,17 +773,10 @@ void qwen4exp_hc_pre_mix(StreamingEngine &engine, int layer_idx,
         gdn_full_ggml() && gdn_proj_ggml() && sub_block == 0 &&
         qwen4exp_is_gdn_layer(c, layer_idx) &&
       GgmlGdnProjRunner::instance().full_weights_ready(layer_idx);
-    // Keep the Qwen decode MoE input on the device independently of where
-    // routing is performed.  The host-router A/B path still needs a host
-    // copy of the mixed [D] row for the AVX-512 projection, but the grouped
-    // expert graph and HC post-combine must continue to consume the exact
-    // device-authoritative activation.  Previously this gate was tied to
-    // qwen_decode_gpu_router, so disabling only the GPU router also disabled
-    // the device MoE handoff and silently switched the whole routed FFN to a
-    // numerically different host path (including a different quantized
-    // expert execution/accumulation path).  Keep this Qwen-specific; other
-    // families never enter this branch.
-    const bool decode_device_moe_input =
+// Keep the device expert/HC handoff independent of router placement.
+// The host router uses host-facing hidden state; the grouped device expert
+// graph can still consume device_input separately.
+const bool decode_device_moe_input =
         S == 1 && engine.qwen4exp_decode_ggml_moe &&
         engine.qwen4exp_decode_device_hc;
     const bool device_moe_input =
@@ -831,27 +784,10 @@ void qwen4exp_hc_pre_mix(StreamingEngine &engine, int layer_idx,
         layer_idx >= c.first_dense && (S > 1 || decode_device_moe_input);
     const bool need_device_input =
         device_gdn_input || device_moe_input;
-    const bool qwen_decode_gpu_layer =
-        engine.family_ops.family == ModelFamily::Qwen4Exp &&
-        engine.family_ops.uses_hyper_connections &&
-        !is_cpu_affinity_layer(layer_idx) &&
-        engine.qwen4exp_decode_gpu_router;
-    const bool keep_moe_input_on_device =
-        // GPU routing consumes the mixed activation directly and returns only
-        // the compact route table to the host.  The shared-expert flag used
-        // to be included here, which accidentally forced a full [S,D] D2H
-        // copy for the ordinary GPU-router path as well.  That copy is one
-        // of the per-layer boundaries this path is intended to remove.
-        // Without GPU routing the host router still needs hidden_states, so
-        // its copy remains mandatory.
-        device_moe_input && moe_ggml_gpu_router() && qwen_decode_gpu_layer;
     const void *device_input = nullptr;
     if (hc_ggml_register(engine, layer_idx, sub_block, D, S) &&
         GgmlHcRunner::instance().pre_mix(layer_idx, sub_block, S,
-                                       (device_gdn_input ||
-                                        keep_moe_input_on_device)
-                                           ? nullptr
-                                           : hidden_states,
+                                       device_gdn_input ? nullptr : hidden_states,
                                          need_device_input ? &device_input
                                                             : nullptr)) {
       GgmlHcRunner::instance().queue_pre_mix_dependency();

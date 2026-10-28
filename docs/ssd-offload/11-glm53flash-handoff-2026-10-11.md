@@ -271,7 +271,7 @@ alone (`ASSIST_DEVICE=1`) 78.9 ms (-7.5 ms), against assist=3 on the 3090 at ~68
 a second assist ring on it should add on top of the 3090's (not built: the lane supports one assist backend today).
 
 **Ranking refit** (`bench/make_survey_batches.py`, `bench/glm_route_survey.sh`, `bench/ranking_holdout_eval.py`; per-token route
-trace via `ZEROMOE_GLM5NEXT_ROUTE_TRACE=<file>`): 40 corpus prompts (not among the 5 already in the ranking), 96 decode tokens each,
+trace via the historical `ZEROMOE_GLM5NEXT_ROUTE_TRACE=<file>` selector; current survey script filters `[MOE-ROUTE-TRACE]` DEBUG records): 40 corpus prompts (not among the 5 already in the ranking), 96 decode tokens each,
 graph prefill. Held-out 10 prompts, top-4700 resident, share of routes that are cold: current ranking 44.5%, + the 30 training
 prompts (weight 10) 35.9%, training prompts alone 35.8%, oracle 28.0%. On the benchmark prompt (outside all 40) it is neutral: 35.4% old vs
 36.0% new cold routes, and end-to-end 68.8 / 69.3 ms vs 69.9 / 69.0 ms (logits 91.7% top-1, KL 0.056 = placement noise). So the refit
@@ -331,9 +331,9 @@ tokens: benchmark sequence 15.43 tok/s; held-out 046 css 13.27 tok/s (old rankin
 ### The default binary with the kernel: `build_gk` (2026-10-14)
 
 `cmake -S . -B build_gk -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=75 -DZEROMOE_GGML_ROOT=<fork ggml> -DZEROMOE_GGML_PREBUILT_DIR=
--DZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES=ON -DGGML_AVX512=ON -DGGML_AVX512_VNNI=ON` builds ggml in-tree, so the
+-DGGML_AVX512=ON -DGGML_AVX512_VNNI=ON` builds ggml in-tree, so the
 binary links the kernel (`36f489d6b`) and patch 0006 without any `LD_LIBRARY_PATH`. `llama.cpp-moestream-integration` is already at
-`7bd457fa1` (kernel included) with the host-node edits uncommitted in its working tree, so rebuilding
+`7bd457fa1` (kernel included) with the host-node edits uncommitted in its working tree. At the time, the removed patch toggle was ON; current builds apply it unconditionally. Rebuilding
 `~/Projects/moestream-build-upstream-master` (the engine's prebuilt ggml) is all that is needed on the main tree. A clean fork
 checkout is NOT enough: `ggml-backend.cpp` / `ggml-cuda.cu` need those uncommitted host-node edits (applied here from
 `git diff` of the integration tree). Measured with that binary, no overrides, recipe env, auto pool 76 GiB: benchmark sequence
