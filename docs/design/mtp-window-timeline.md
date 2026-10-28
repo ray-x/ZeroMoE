@@ -171,3 +171,18 @@ btree 73.6 / 70.5 / 74.3, math 74.9 / 78.6 / 79.5, leet 69.2 / 71.5 / 71.9, stor
 below mode 0, so it is the only behaviour. Committed-state re-measure, two passes (tok/s, acceptance): palindrome 80.2 / 80.3
 (79.3%), review 75.7 / 76.0 (70.9%), btree 77.2 / 76.8 (68.1%), math 78.5 / 78.9 (84.0%), leet 72.2 / 71.5 (86.8%),
 story 63.0 / 62.9 (52.4%). tests/mtp_speculation_test passes.
+
+## Host profile, VRAM headroom and a rejected fusion (2026-10-28)
+
+* **Host CPU profile of a cycle** (perf, palindrome, 75 tok/s under perf): the main thread spends 62% in the CUDA driver
+  (graph launches, sync polling), 18% in ggml CPU kernels (its share of the cold op), 6% in ZeroMoE code. The only
+  surprise, the greedy selector, is fixed (a2b7cfa). `gdn_state_transpose_host` is one-time prefill handoff, not per cycle.
+* **More hot experts:** K=13,500 still dies during the expert preload with the admission floor lowered to 512 MiB
+  (`ZEROMOE_QWEN4EXP_GRAPH_ALLOC_FLOOR_MIB`), so the floor is not the limit; the gain from the few hundred experts that
+  might fit is below 1 tok/s. Closed.
+* **Fusing the routed-expert reduction** (`sum_k((hot_k*w_k)+cold_k)` as one kernel instead of MUL + ADD + 7 chained ADDs
+  per layer, 480 fewer compute nodes per window, 6,765 -> 5,805 graph nodes): bit-identical logits (S=1 and S=4, math and
+  story) but no measurable speed change (two passes, tok/s vs the unfused state: palindrome 83.3/78.3 vs 83.2, review
+  79.7/79.3 vs 79.1/78.4, btree 80.8/80.5 vs 80.1/80.3, math 81.5/81.8 vs 81.1/82.0, leet 71.5/73.2 vs 74.0, story
+  65.3/64.6 vs 65.3). Not committed. Launch count inside the captured CUDA graphs is no longer a bottleneck; further
+  elementwise fusion is not worth building. The GDN CONT/CONCAT pair costs about 0.4 ms per window and was not built.
