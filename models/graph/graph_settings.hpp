@@ -561,8 +561,8 @@ inline ResolvedSettings resolve_settings(Family fam, const EnvView &env, std::st
     if (!err) throw std::invalid_argument("graph_prefill_chunk must be between 0 and 512 for MiMo");
     note("graph_prefill_chunk must be between 0 and 512 for MiMo");
   }
-  for (const auto &[name, value] : config) {
-    (void)value;
+  for (const auto &entry : config) {
+    const std::string &name = entry.first;
     bool known = false;
     each_field([&](const auto &f) { known |= name == f.name; });
     if (!known) {
@@ -631,8 +631,8 @@ inline bool validate_config(const ConfigValues &values, const std::vector<Family
   for (const auto &[name, value] : cli) merged[name] = value;
   // The list is the model's active adapters (plus Other for shared knobs), not
   // its alias namespace: Ling's shared-graph runs list Glm, native runs do not.
-  for (const auto &[name, value] : merged) {
-    (void)value;
+  for (const auto &entry : merged) {
+    const std::string &name = entry.first;
     bool known = false, supported = false;
     each_field([&](const auto &f) {
       if (name != f.name) return;

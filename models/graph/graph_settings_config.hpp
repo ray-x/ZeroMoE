@@ -10,12 +10,14 @@ template<class Document>
 bool collect_config(const Document &doc, ConfigValues &values, std::string &error) {
   values.clear();
   for (const auto &table : doc.gpu_tables)
-    for (const auto &[key, value] : table.values) {
-      (void)value;
+    for (const auto &entry : table.values) {
+      const std::string &key = entry.first;
       if (key.starts_with("graph_"))
         error += key + " must be a root setting before [[gpus]]\n";
     }
-  for (const auto &[key, value] : doc.root.values) {
+  for (const auto &entry : doc.root.values) {
+    const std::string &key = entry.first;
+    const auto &value = entry.second;
     if (!key.starts_with("graph_")) continue;
     const auto name = key.substr(6);
     bool known = false;
