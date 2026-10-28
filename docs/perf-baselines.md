@@ -419,6 +419,15 @@ Kernel: `patches/experimental/0011-ggml-cpu-iq3_xxs-avx512vl-dot.patch` (applied
 
 Compute fell 1.2% (440.8 -> 435.6), against about 6% predicted from the 1.23x microbenchmark. One valid run, so the difference is inside run-to-run noise. Output text is coherent (the answer starts "How a Transformer Language Model Generates Text ... Let me walk through the complete process"). Correction of the first explanation: I guessed decode was bound by memory traffic. `bench/iq3k/iq3_cold_bench.c` (2 GB of weights, 6 or 12 threads, each row read once) shows the dot product, not DRAM, is the limit on this CPU: stock 18.5 GB/s at 6 threads and 19.9 at 12 against a 58-64 GB/s raw read, and the AVX-512VL kernel is 1.15x (6 threads) to 1.25x (12 threads) faster, so the kernel gain survives cold memory. So the 1.2% end-to-end compute change is not explained by memory traffic. Cause unknown: the IQ3_XXS share of the lane compute may be smaller than the 152 ms I attributed, the 6 lane threads may not be running the new branch (verified afterwards: the loaded libggml-cpu.so contains the masked vpsubb, so the branch is in the binary), or the run was within noise. The 64 GiB pool is marginal against the MEM-GUARD stop threshold: it failed 1 of 2 runs here and 1 of 1 at 426 tokens.
 
+### Trial 25 follow-up (2026-10-28): the IQ3_XXS AVX-512VL dot, promoted to patches/ggml/0017
+
+Trial 25 found no end-to-end gain because GLM-5.3-Flash decode was disk/miss-bandwidth-bound; the kernel was never judged on a CPU-compute-bound
+workload. `bench/expert_cost_by_quant_bench.cpp` (ggml `MUL_MAT_ID` on the CPU backend, gate+up, SwiGLU, down) at Qwen3.6-35B-A3B's expert
+shape (`BENCH_D=2048 BENCH_F=512 BENCH_NE=256 BENCH_TOPK=8`), 6 threads pinned to cores 0-5, 3 alternating runs of stock vs patched ggml:
+IQ3_XXS 69/69/68 -> 55/56/56 us per expert (-19%; one valid expert 135/136/132 -> 121/118/121 us, ten 691/693/678 -> 550/559/563 us); the
+IQ2_XXS control is unchanged (41/41/42 vs 41/41/42 us). The dot is bit-identical (`bench/iq3k/iq3_dot_bench.c`: 0 mismatching rows).
+End to end on Qwen3.6-35B-A3B is not measurable here: the validated recipe keeps every expert on the GPU, so the CPU dot never runs.
+
 ### Trial 26: decode CPU profile and lane thread count
 
 Config as trial 25: 22-token prompt, NGEN=80, 22 GiB 3090 hot set, 64 GiB pool, swap-free, new IQ3_XXS kernel. `perf record -F 199` over the whole run, `logs/perf/perf1.data` (decode run 1.45 tok/s).
