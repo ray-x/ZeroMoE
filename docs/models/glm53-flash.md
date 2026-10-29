@@ -113,5 +113,12 @@ Gotchas:
 - Open: at pool 80 (3090 only) some runs hit a non-finite hidden state at decode start, `invalid argument` on dense-weight
   uploads, or runaway memory during seeding. Not reproduced at pool 88; cause not found. Ruled out: lane (messenger only), pool
   pinning, deferred host unregisters, registered upload sources, CUDA API errors (driver log). Notes in the handoff doc.
-- 20 tok/s has no measured path yet: per token 39 ms CPU expert compute + 21 ms graph. The next lever is a wider Q2_K CPU dot
-  (the patch series has fast dots for IQ2_XXS/IQ1_S/IQ3_XXS/Q2_0 but not Q2_K/Q3_K/Q4_K).
+- Intermittent: 1 of 6 launcher runs at pool 88 (dual GPU, neighbour compiling) aborted right after prefill with
+  `cudaMemcpyAsync ... invalid argument` in `ggml_backend_cuda_buffer_set_tensor` (same family as the pool-80 failures above).
+  Not explained.
+- 20 tok/s has no measured path yet: per token 40 ms CPU expert compute + 21 ms graph. A 512-bit Q2_K dot was tried
+  (`bench/q2k_dot_bench.cpp`): bit-exact with ggml's stock AVX2 kernel but not faster (1 thread 8.2 vs 8.3 GB/s, 10 threads
+  38.1 vs 37.5 GB/s). The raw DRAM read rate is ~60 GB/s and the dot reaches ~63% of it, in both 256- and 512-bit form, so the
+  limit is per-block instruction work (scale/min handling, scalar setup, one row at a time), not vector width or DRAM. A
+  restructured kernel could gain up to ~1.6x on the CPU part (71 -> ~55 ms/token); untried, and a changed float summation order needs a
+  same-input trace.

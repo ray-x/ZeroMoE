@@ -34,9 +34,11 @@ tokens 21-99 `FULL-DECODE-TIME`. Box load 12-14 from other jobs during the runs 
 | metric | baseline | date | notes |
 |---|---|---|---|
 | decode, 3090 + 5060 Ti (14.2 GiB hot), 10 decode threads | **70.5-71.1 ms/token = 14.1-14.2 tok/s** | 2026-10-29 | lane wait 21 + compute 39 ms; 3 runs |
+| decode, same, via `bench/glm_gsqrco_pool.sh` (6 attempts) | **70.8 ms = 14.12-14.13 tok/s** (2 runs); 72.3 / 76.4 ms = 13.8 / 13.1 (neighbour compile + python at the same time); 85.7 ms = 11.7 (heavy compile); 1 crash | 2026-10-29 | the shared host makes single runs noisy: quote the best clean run and the spread. Crash: `cudaMemcpyAsync ... invalid argument` in `ggml_backend_cuda_buffer_set_tensor` right after prefill (open, see docs/models/glm53-flash.md) |
 | decode, same, 6 threads | 76.9 ms = 13.0 tok/s | 2026-10-29 | |
 | decode, same + K-quant GPU assist | 90.7 ms = 11.0 tok/s | 2026-10-29 | worse, assist off |
 | decode, 3090 only, 6 threads | 93.8 ms = 10.7 tok/s | 2026-10-29 | 15.7 GiB MemAvailable minimum |
+| Q2_K x Q8_K CPU dot, stock AVX2 vs 512-bit (`bench/q2k_dot_bench.cpp`) | 8.3 vs 8.2 GB/s (1 thread), 30.0 vs 29.9 (6), 37.5 vs 38.1 (10); bit-exact | 2026-10-29 | no gain from a wider kernel; DRAM read limit on this box is ~60 GB/s (6-12 threads), the dot reaches ~63% of it |
 | decode, 3090 only, pool 80 | 190 ms = 5.3 tok/s (5.8 with assist) | 2026-10-29 | ~2 SSD misses/token |
 
 ## Qwen 3.8 Flash Next (GSQ-RCO Q2_0), single 3090, plain decode and MTP (v0.0.1 baseline)
