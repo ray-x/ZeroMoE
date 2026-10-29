@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # GLM-5.3-Flash GSQ-RCO offload-pool run (the config behind the 14.1-14.2 tok/s dual-GPU baseline).
 #   usage: bench/glm_gsqrco_pool.sh TAG [POOL_GIB=88] [prompt-file]     run from the repo root
-#   env:   CVD=0,1 (default; 0 = 3090 only)   GPU1_HOT_GIB=14.2   CPUT (decode CPU threads, default 10)   PREFILL_THREADS=6
+#   env:   GLM_MODEL=/path/to/GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf (required)   CVD=0,1 (default; 0 = 3090 only)   GPU1_HOT_GIB=14.2   CPUT (decode CPU threads, default 10)   PREFILL_THREADS=6
 # Refuses to start unless the GPUs are idle, no other model run is active, the load average is under 3 and 100 GiB are free:
 # a loaded box gives invalid numbers (0.89 vs 5.8 tok/s) and the 88 GiB pool leaves only ~16-30 GiB of headroom. A 1 Hz watchdog
 # stops the engine below 6 GiB MemAvailable. Writes TAG.log, TAG.out and TAG.mem.csv (memory, load) next to TAG.
 set -u
 TAG=$(realpath -m "${1:?tag}"); POOL=${2:-88}; PROMPT=${3:-}
-CVD=${CVD:-0,1}; HOT=${GPU1_HOT_GIB:-14.2}; LOW_GIB=6
+GLM_MODEL=${GLM_MODEL:?set GLM_MODEL to the GSQ-RCO .gguf}; CVD=${CVD:-0,1}; HOT=${GPU1_HOT_GIB:-14.2}; LOW_GIB=6
 CFG=configs/bench/glm53flash_gsqrco_offload_pool.toml
 RANK=${GLM_RANKING:-docs/ssd-offload/data/glm53flash_usage_combined_old_plus_survey5.txt}
 [ -n "$PROMPT" ] || { PROMPT=$(mktemp); echo "Write a Python function that checks whether a string is a palindrome, and explain it." > "$PROMPT"; }
@@ -19,7 +19,7 @@ quiet() {
 }
 for _ in $(seq 1 1440); do quiet && { sleep 30; quiet && break; }; sleep 10; done
 quiet || { echo "box never became quiet"; exit 2; }
-sed -e "s#^log_path.*#log_path = \"$TAG.log\"#" -e "s/^graph_offload_ddr_gib = .*/graph_offload_ddr_gib = $POOL/" "$CFG" > "$TAG.toml"
+sed -e "s#^log_path.*#log_path = \"$TAG.log\"#" -e "s#/path/to/models/GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf#$GLM_MODEL#" -e "s/^graph_offload_ddr_gib = .*/graph_offload_ddr_gib = $POOL/" "$CFG" > "$TAG.toml"
 { cat "$PROMPT"; printf '\n:q\n'; } > "$TAG.in"
 rm -f "$TAG.out" "$TAG.mem.csv"
 ENVV="CUDA_VISIBLE_DEVICES=$CVD ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512 ZEROMOE_GLM5NEXT_PREFILL_CPU_THREADS=${PREFILL_THREADS:-6}"
