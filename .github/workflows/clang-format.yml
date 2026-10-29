@@ -1,0 +1,56 @@
+name: C++ formatting
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  changed-files:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install clang-format 18
+        run: sudo apt-get update && sudo apt-get install -y clang-format-18
+      - name: Check changed first-party C++ and CUDA files
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import subprocess
+          import sys
+
+          base = os.environ["BASE_SHA"]
+          if not base or set(base) == {"0"}:
+              base = subprocess.check_output(
+                  ["git", "rev-parse", "HEAD^"], text=True
+              ).strip()
+          changed = subprocess.check_output(
+              ["git", "diff", "--name-only", "-z", "--diff-filter=ACMR", base, "HEAD"],
+          ).decode().split("\0")
+          suffixes = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".cu", ".cuh"}
+          files = [
+              path for path in changed
+              if path and pathlib.Path(path).suffix in suffixes
+              and not path.startswith(("third_party/", "build/", "build-macos/"))
+          ]
+          if not files:
+              print("No changed first-party C++ or CUDA files")
+              sys.exit(0)
+          result = subprocess.run(
+              ["git-clang-format-18", "--binary", "clang-format-18", "--diff",
+               base, "HEAD", "--", *files],
+              text=True, capture_output=True,
+          )
+          print(result.stdout, end="")
+          print(result.stderr, end="", file=sys.stderr)
+          if result.returncode or "diff --git " in result.stdout:
+              sys.exit(1)
+          PY
