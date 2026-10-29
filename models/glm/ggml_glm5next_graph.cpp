@@ -272,9 +272,10 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   g->cpu = ggml_backend_cpu_init();
   if (g->cpu) {
     // Prefill runs the cold-expert matmuls on the CPU for a whole batch: it has its own thread count.
+    // Not tied to ZEROMOE_GLM5NEXT_CPU_THREADS (the decode thread count): 10
+    // prefill threads grew anonymous memory by ~16 GiB right after pool seeding
+    // and tripped the memory watchdog, while decode at 10 is fine.
     const char *e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PREFILL_CPU_THREADS");
-    if (!e || !e[0])
-      e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_CPU_THREADS");
     ggml_backend_cpu_set_n_threads(g->cpu, e ? std::max(1, std::atoi(e)) : 6);
   }
   if (!g->cuda || !g->cpu)

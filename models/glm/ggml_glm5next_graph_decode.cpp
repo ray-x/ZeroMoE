@@ -207,7 +207,9 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   g->cpu = ggml_backend_cpu_init();
   if (g->cpu) {
     const char *e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_CPU_THREADS");
-    ggml_backend_cpu_set_n_threads(g->cpu, e ? std::max(1, std::atoi(e)) : 6);
+    // 10 threads cut the lane's cold-expert compute from 45.7 to 39.9 ms/token
+    // on the 12-core box (dual GPU, 14.2 tok/s); 6 was the old default.
+    ggml_backend_cpu_set_n_threads(g->cpu, e ? std::max(1, std::atoi(e)) : 10);
   }
   if (!g->cuda || !g->cpu)
     return decline_decode_graph();
@@ -359,6 +361,12 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   const double prepare_ms = std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() - prepare_start)
                                 .count();
+  if (offload_first_layer() >= 0) {
+    const size_t freed = release_uploaded_dense_host(*g);
+    LOG_INFO("[GGML-GLM5NEXT-FULL-DECODE] released %.2f GiB of dense host "
+             "copies now resident on the device\n",
+             (double)freed / (1024.0 * 1024.0 * 1024.0));
+  }
   g->ready = true;
   g_graph = std::move(g);
   LOG_INFO("[GGML-GLM5NEXT-FULL-DECODE] reusable graph prepared: "

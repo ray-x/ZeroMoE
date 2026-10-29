@@ -26,6 +26,19 @@ Prefetch ring on (2 sets, drain, chunk 2), DDR pool 60-76 GiB, batch default 204
 | decode, tokens 16-32 | 70.1 ms/token | 2026-10-15 | `moe_cache_gb` 15.8 -> 15.0: 70.7 (+0.9%) |
 | prefill, before this work | 159 tok/s (5.05 s) | 2026-10-14 | for the record |
 
+## GLM-5.3-Flash (GSQ-RCO 3.0-bit, Q2_K/Q3_K/Q4_K), offload pool 88 GiB, 0 SSD misses
+
+Config and recipe: `docs/models/glm53-flash.md` (GSQ-RCO section). 100 tokens, `--temp 0`, palindrome prompt; steady decode =
+tokens 21-99 `FULL-DECODE-TIME`. Box load 12-14 from other jobs during the runs (slight underestimate). Branch commit `58c1ab9`.
+
+| metric | baseline | date | notes |
+|---|---|---|---|
+| decode, 3090 + 5060 Ti (14.2 GiB hot), 10 decode threads | **70.5-71.1 ms/token = 14.1-14.2 tok/s** | 2026-10-29 | lane wait 21 + compute 39 ms; 3 runs |
+| decode, same, 6 threads | 76.9 ms = 13.0 tok/s | 2026-10-29 | |
+| decode, same + K-quant GPU assist | 90.7 ms = 11.0 tok/s | 2026-10-29 | worse, assist off |
+| decode, 3090 only, 6 threads | 93.8 ms = 10.7 tok/s | 2026-10-29 | 15.7 GiB MemAvailable minimum |
+| decode, 3090 only, pool 80 | 190 ms = 5.3 tok/s (5.8 with assist) | 2026-10-29 | ~2 SSD misses/token |
+
 ## Qwen 3.8 Flash Next (GSQ-RCO Q2_0), single 3090, plain decode and MTP (v0.0.1 baseline)
 
 Config: `configs/bench/qwen38-flash-q2_0-mtp.toml` (global Option-B hot set of 13,000 experts, `expert_promotion = "on"`, context 1536; the plain rows set `spec_type = "none"`

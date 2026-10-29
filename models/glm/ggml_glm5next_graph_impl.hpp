@@ -143,6 +143,7 @@ bool graph_dense_weight_name(const std::string &name);
 bool arena_alloc(ggml_backend_buffer_t buffer, void *base, size_t capacity, size_t &used, ggml_tensor *t, const void *src, size_t src_bytes);
 ggml_tensor *resident_tensor(FullGraph &g, ggml_context *ctx, const std::string &name);
 ggml_tensor *resident_tensor_uncached(FullGraph &g, ggml_context *ctx, const std::string &name);
+size_t release_uploaded_dense_host(FullGraph &g);
 // Binds a dense-weight descriptor to the shared owner's address for `name`.
 // With src == nullptr only an existing cached address is accepted.
 bool dense_weight_bind(FullGraph &g, ggml_tensor *t, const std::string &name,
