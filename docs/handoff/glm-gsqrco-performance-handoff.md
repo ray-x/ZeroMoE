@@ -54,7 +54,7 @@ neighbour compiled: **never quote a number without the contamination report** (t
 | pool 88 GiB (the cold set is ~88 GiB) instead of 80 / auto 67.9 | removes ~70 ms/token of SSD waits: 5.3 -> 10.7 tok/s on the 3090 | `graph_offload_ddr_gib` |
 | 10 CPU threads for the **decode** lane (was 6) | lane compute 45.7 -> 39.9 ms: 13.0 -> 14.2 tok/s dual | `ggml_glm5next_graph_decode.cpp` |
 | prefill threads independent of the decode setting (6) | 10 prefill threads grew host memory ~16 GiB after seeding and tripped the watchdog | `ggml_glm5next_graph.cpp`, `ZEROMOE_GLM5NEXT_PREFILL_CPU_THREADS` |
-| dense host copies freed once the decode graph holds them on the device | ~8.6 GiB of DDR back after graph prepare | `release_uploaded_dense_host` |
+| ~~dense host copies freed once the decode graph holds them~~ | **removed 2026-10-30**: it zeroed attention/logits for every request after the first (found with a 6-prompt session) | see the warning in `docs/models/glm53-flash.md` |
 | 5060 Ti holds 14.2 GiB of hot experts | 10.7 -> 13.0-14.2 tok/s | `ZEROMOE_GLM5NEXT_GPU1_HOT_GIB=14.2` |
 
 ### 1.4 Levers tried and rejected (do not repeat without a new idea)

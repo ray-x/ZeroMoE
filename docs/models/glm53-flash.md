@@ -74,8 +74,8 @@ files is not equivalent (teacher-forced top-1 agreement 77%, mean KL 0.35, see t
   (the same file is the pin ranking in the toml; prefill ranking `glm53flash_survey5_usage_prefill.txt`).
 - Measurement: steady decode = mean of the engine's `FULL-DECODE-TIME` for tokens 21-99 (the first tokens include graph build);
   the lane's `wait`/`compute` come from the `[GLM5NEXT-LANE] tokens=96` line; `misses=0` confirms the pool holds the cold set.
-- Code: master `3679787` (GLM decode lane 10 threads, prefill threads independent, dense host copies freed after the graph
-  upload). Built from a clean tree with ggml patches 0001-0017 (+ host-node 0001-0003) on llama.cpp `8baabd53b`.
+- Code: master after `e205935` (GLM decode lane 10 threads, prefill threads independent; the dense host copies are kept, see the
+  warning below). Built from a clean tree with ggml patches 0001-0017 (+ host-node 0001-0003) on llama.cpp `8baabd53b`.
 - Seeding the pool takes ~4 min from the SATA SSD and prefill of 23 tokens ~65 s on the first request (cold experts read
   from the pool through the layered prefill); both are excluded from the decode figures.
 
@@ -100,11 +100,17 @@ other jobs), so these are slight underestimates.
 
 Changes behind these numbers: decode CPU lane defaults to 10 threads (was 6); the prefill graph's thread count no longer
 follows `ZEROMOE_GLM5NEXT_CPU_THREADS` (10 prefill threads grew host memory by ~16 GiB right after pool seeding and tripped the
-memory watchdog; prefill stays at 6, override with `ZEROMOE_GLM5NEXT_PREFILL_CPU_THREADS`); in offload mode the engine's host
-copies of the dense weights (~8.6 GiB) are freed once the decode graph holds them on the device; the early-ready lane names
+memory watchdog; prefill stays at 6, override with `ZEROMOE_GLM5NEXT_PREFILL_CPU_THREADS`); the early-ready lane names
 the cause (layer, call, input hidden state, weights) before aborting on a non-finite router weight.
 
 Gotchas:
+- **Memory figures below were measured with a feature that has since been removed (2026-10-30).** Until then the engine freed its
+  8.7 GiB of dense host copies once the first decode graph held them on the device. That broke every later request in a session
+  (the layered prefill and the legacy logits path read `attn_k_b`/`attn_v_b`/`output.weight` from host memory: zeroed attention, zero
+  logits, output `!`); the benchmarks sent one prompt per session, so it went unnoticed until a 6-prompt session failed on prompt 2.
+  With the copies kept, expect about 8.7 GiB lower MemAvailable than the figures below: dual GPU pool 88 about 17-21 GiB (above the
+  10 GiB guard), 3090 only pool 88 about 7 GiB (**below the guard: the 10.7 tok/s 3090-only figure needs a smaller pool or a graph-only
+  prefill; not re-measured**). Any change that frees host memory must be validated with a session of at least two prompts.
 - Pool 88 peaks at ~104 GiB anonymous memory on the 3090-only run (15.7 GiB available, guard 10 GiB) and ~89-92 GiB with the
   5060 Ti holding 14.2 GiB of experts (29 GiB available). Run it only on a quiet box: another job using ~10 GiB trips the
   watchdog. Skipping the dense host copies at startup does NOT work: the layer-by-layer prefill builds its MLA caches from

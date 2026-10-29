@@ -361,12 +361,6 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   const double prepare_ms = std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() - prepare_start)
                                 .count();
-  if (offload_first_layer() >= 0) {
-    const size_t freed = release_uploaded_dense_host(*g);
-    LOG_INFO("[GGML-GLM5NEXT-FULL-DECODE] released %.2f GiB of dense host "
-             "copies now resident on the device\n",
-             (double)freed / (1024.0 * 1024.0 * 1024.0));
-  }
   g->ready = true;
   g_graph = std::move(g);
   LOG_INFO("[GGML-GLM5NEXT-FULL-DECODE] reusable graph prepared: "

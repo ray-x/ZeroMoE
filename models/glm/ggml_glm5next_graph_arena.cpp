@@ -184,27 +184,6 @@ ggml_tensor *resident_tensor(FullGraph &g, ggml_context *ctx,
   return r;
 }
 
-// Offload-pool mode keeps ~10 GiB of dense weights in DDR twice: once in the
-// engine's resident table and once on the device.  Once a graph holds them on
-// the device the host copy only takes pool space, so release it; a later graph
-// rebuild reads the weight from the model file again.
-size_t release_uploaded_dense_host(FullGraph &g) {
-  if (!g.dense_owner || !g.engine)
-    return 0;
-  size_t freed = 0;
-  for (auto &[name, q] : g.engine->resident_layers) {
-    if (!q.host_ptr || q.meta.size_bytes < (1u << 20) ||
-        name.find("token_embd") != std::string::npos ||
-        !graph_dense_weight_name(name) || !g.dense_owner->addrs.count(name))
-      continue;
-    std::free(q.host_ptr);
-    q.host_ptr = nullptr;
-    g.engine->release_host_memory(q.meta.size_bytes);
-    freed += q.meta.size_bytes;
-  }
-  return freed;
-}
-
 ggml_tensor *resident_tensor_uncached(FullGraph &g, ggml_context *ctx,
                                       const std::string &name) {
   const QuantizedTensor *q = resident(*g.engine, name);
