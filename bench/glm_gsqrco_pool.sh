@@ -22,7 +22,8 @@ quiet || { echo "box never became quiet"; exit 2; }
 sed -e "s#^log_path.*#log_path = \"$TAG.log\"#" -e "s#/path/to/models/GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf#$GLM_MODEL#" -e "s/^graph_offload_ddr_gib = .*/graph_offload_ddr_gib = $POOL/" "$CFG" > "$TAG.toml"
 { cat "$PROMPT"; printf '\n:q\n'; } > "$TAG.in"
 rm -f "$TAG.out" "$TAG.mem.csv"
-ENVV="CUDA_VISIBLE_DEVICES=$CVD ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512 ZEROMOE_GLM5NEXT_PREFILL_CPU_THREADS=${PREFILL_THREADS:-6}"
+gcc -shared -fPIC -O1 "$(dirname "$0")/abort_backtrace.c" -o "$TAG.abort_bt.so" 2> /dev/null || true
+ENVV="LD_PRELOAD=$TAG.abort_bt.so CUDA_LOG_FILE=$TAG.cudalog CUDA_VISIBLE_DEVICES=$CVD ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512 ZEROMOE_GLM5NEXT_PREFILL_CPU_THREADS=${PREFILL_THREADS:-6}"
 [ "$CVD" = "0" ] || ENVV="$ENVV ZEROMOE_GLM5NEXT_GPU1_HOT_GIB=$HOT"
 [ -z "${CPUT:-}" ] || ENVV="$ENVV ZEROMOE_GLM5NEXT_CPU_THREADS=$CPUT"
 nohup bash -c "$ENVV timeout 2400 scripts/run_capped.sh --limit-gb 118 -- ./build/zeromoe --config $TAG.toml --temp 0 --predict 100 \
