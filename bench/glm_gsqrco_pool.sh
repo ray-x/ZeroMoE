@@ -27,10 +27,10 @@ ENVV="CUDA_VISIBLE_DEVICES=$CVD ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512 ZEROMOE_GLM
 [ -z "${CPUT:-}" ] || ENVV="$ENVV ZEROMOE_GLM5NEXT_CPU_THREADS=$CPUT"
 nohup bash -c "$ENVV timeout 2400 scripts/run_capped.sh --limit-gb 118 -- ./build/zeromoe --config $TAG.toml --temp 0 --predict 100 \
   --force-start --graph-offload-usage-file $RANK < $TAG.in > $TAG.out 2>&1; echo rc=\$? >> $TAG.out" > /dev/null 2>&1 &
-echo "t_s,avail_gib,used_gib,load" > "$TAG.mem.csv"; T0=$(date +%s)
+echo "t_s,avail_gib,used_gib,load,other_cpu_hogs" > "$TAG.mem.csv"; T0=$(date +%s)
 while true; do
   av=$(awk '/MemAvailable/{printf "%.1f", $2/1048576}' /proc/meminfo)
-  echo "$(( $(date +%s) - T0 )),$av,$(free -g | awk 'NR==2{print $3}'),$(cut -d' ' -f1 /proc/loadavg)" >> "$TAG.mem.csv"
+  echo "$(( $(date +%s) - T0 )),$av,$(free -g | awk 'NR==2{print $3}'),$(cut -d' ' -f1 /proc/loadavg),$(ps -eo pcpu,comm --sort=-pcpu | awk 'NR>1 && $2!="zeromoe" && $1>=20 {printf "%s:%s ", $2, $1}')" >> "$TAG.mem.csv"
   if awk -v a="$av" -v l="$LOW_GIB" 'BEGIN{exit !(a<l)}'; then
     echo "WATCHDOG: MemAvailable $av GiB < $LOW_GIB GiB - stopping the engine" | tee -a "$TAG.mem.csv"
     pkill -TERM -x zeromoe; sleep 3; pkill -KILL -x zeromoe; echo "rc=killed-by-watchdog" >> "$TAG.out"; break
@@ -42,3 +42,4 @@ done
 grep "FULL-DECODE-TIME" "$TAG.log" | sed 's/.*total=//; s/ ms//' | awk '{v[NR]=$1} END{for(i=21;i<=NR;i++){s+=v[i];n++} if(n) printf "steady %.1f ms/token = %.2f tok/s (n=%d)\n", s/n, 1000/(s/n), n}'
 grep "GLM5NEXT-LANE\] tokens" "$TAG.log" | tail -1 | cut -c1-260
 echo "min MemAvailable $(awk -F, 'NR>1{if(m==""||$2<m)m=$2}END{print m}' "$TAG.mem.csv") GiB, mean load $(awk -F, 'NR>1{s+=$4;n++}END{printf "%.1f", s/n}' "$TAG.mem.csv")"
+echo "other processes >=20% CPU during the run: $(awk -F, 'NR>1 && $5!=""{print $5}' "$TAG.mem.csv" | tr ' ' '\n' | cut -d: -f1 | sort | uniq -c | sort -rn | head -5 | tr '\n' ' ')"
