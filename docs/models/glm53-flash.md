@@ -111,7 +111,7 @@ Gotchas:
   host `attn_k_b`/`attn_v_b` and the dense arena size is derived from the host copies (a try gave zeroed weights and a 0.65 s fake prefill).
 - Benchmarks are invalid under CPU load: the same run gave 0.89 tok/s while a neighbour compiled (lane compute 323-2123 ms/token).
 - Open: at pool 80 (3090 only) some runs hit a non-finite hidden state at decode start, `invalid argument` on dense-weight
-  uploads, or runaway memory during seeding. Not reproduced at pool 88; cause not found. Ruled out: lane (messenger only), pool
+  uploads, or runaway memory during seeding. Seen once at pool 88 (next bullet); cause not found. Ruled out: lane (messenger only), pool
   pinning, deferred host unregisters, registered upload sources, CUDA API errors (driver log). Notes in the handoff doc.
 - Intermittent: 1 of 6 launcher runs at pool 88 (dual GPU, neighbour compiling) aborted right after prefill with
   `cudaMemcpyAsync ... invalid argument` in `ggml_backend_cuda_buffer_set_tensor` (same family as the pool-80 failures above).
