@@ -43,18 +43,48 @@ The registered GLM5Next graph is the default CUDA path; there is no layered-path
 `GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf` does not fit the whole-layer placement (91 GiB of experts), so it runs in offload-pool
 mode: experts live in a DDR pool read from the model file, hot ones in VRAM, the CPU lane computes the cold ones.
 
-Recipe (dual GPU, zero SSD misses; box 125 GB DDR, 3090 + 5060 Ti):
+### Which model file the numbers are for
+
+The GSQ-RCO file is larger and heavier per token than the AJ IQ2_XXS file used by the older baselines on this page:
+
+| | AJ IQ2_XXS (older baselines) | GSQ-RCO 3.0-bit (this section) |
+|---|---|---|
+| file size | 81.3 GiB (87.3 GB, 2 shards) | 109.4 GiB (117 GB, 1 file) |
+| routed experts | IQ2_XXS (8 layers: down IQ2_S), 2.06 bpw, ~6.6 MB/expert | Q2_K layers 9-44 (2.625 bpw), Q3_K layers 6-8, Q4_K layers 3-5 |
+| dense tensors (attention, shared experts, head) | smaller; dense arena ~6.8 GiB | Q8_0; dense arena ~9.0 GiB (8.6 GiB uploaded) |
+| expert bytes read per token | baseline | ~27% more for Q2_K layers, more still for layers 3-8 |
+| fits whole-layer on the 3090 + CPU | yes | no, offload pool needed (cold set ~88 GiB) |
+| dual-GPU decode (this box) | 70.1 ms/token = 14.3 tok/s (2026-10-15, perf-baselines.md) | 70.5-71.1 ms/token = 14.1-14.2 tok/s |
+
+So the larger quant reaches the same speed as the AJ file: the CPU kernels for IQ2_XXS are the AVX-512 ones from the patch series
+(0009), while Q2_K runs ggml's stock AVX2 dot, so a Q2_K-specific kernel is the remaining headroom. Output quality of the two
+files is not equivalent (teacher-forced top-1 agreement 77%, mean KL 0.35, see the handoff doc): they are different models.
+
+### Performance test: config and procedure
+
+- Config: `configs/bench/glm53flash_gsqrco_offload_pool.toml` (copy of the run config; `graph_offload_first_layer = 3`,
+  `graph_offload_ddr_gib = 88`, `host_ram_gb = 16`, one `[[gpus]]` entry for the 3090 with `moe_cache_gb = 12.4` so the dense arena
+  fits, `vram_cache_full_layer_prefix = 0`, no GPU assist, `ram_pinned_budget_gb = 16`).
+- Launcher: `bench/glm_gsqrco_pool.sh TAG [POOL_GIB] [prompt]` from the repo root. It waits for a quiet box, sets
+  `CUDA_VISIBLE_DEVICES`, `ZEROMOE_GLM5NEXT_GPU1_HOT_GIB=14.2` (dual), `ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512`,
+  `ZEROMOE_GLM5NEXT_PREFILL_CPU_THREADS=6`, runs under `scripts/run_capped.sh --limit-gb 118`, watches MemAvailable at 1 Hz
+  (stops the engine below 6 GiB) and prints the steady decode rate and the lane breakdown. `CVD=0` runs the 3090 alone.
+- Run: `--temp 0 --predict 100 --force-start`, prompt "Write a Python function that checks whether a string is a palindrome,
+  and explain it.", `--graph-offload-usage-file docs/ssd-offload/data/glm53flash_usage_combined_old_plus_survey5.txt`
+  (the same file is the pin ranking in the toml; prefill ranking `glm53flash_survey5_usage_prefill.txt`).
+- Measurement: steady decode = mean of the engine's `FULL-DECODE-TIME` for tokens 21-99 (the first tokens include graph build);
+  the lane's `wait`/`compute` come from the `[GLM5NEXT-LANE] tokens=96` line; `misses=0` confirms the pool holds the cold set.
+- Code: master `3679787` (GLM decode lane 10 threads, prefill threads independent, dense host copies freed after the graph
+  upload). Built from a clean tree with ggml patches 0001-0017 (+ host-node 0001-0003) on llama.cpp `8baabd53b`.
+- Seeding the pool takes ~4 min from the SATA SSD and prefill of 23 tokens ~65 s on the first request (cold experts read
+  from the pool through the layered prefill); both are excluded from the decode figures.
+
+Recipe summary:
 
 ```toml
 graph_offload_first_layer = 3
 graph_offload_model = "/path/to/GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf"
 graph_offload_ddr_gib = 88      # the cold set is ~88 GiB; 80 leaves ~2 SSD misses/token (190 ms/token)
-```
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 ZEROMOE_GLM5NEXT_GPU1_HOT_GIB=14.2 ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512 \
-  scripts/run_capped.sh --limit-gb 118 -- ./build/zeromoe --config <toml from bench/glm_gsq_rco_dual.toml + the keys above> \
-  --temp 0 --predict 100 --force-start --graph-offload-usage-file docs/ssd-offload/data/glm53flash_usage_combined_old_plus_survey5.txt
 ```
 
 | Config (pool 88 GiB, 0 misses) | ms/token | tok/s |
