@@ -28,7 +28,7 @@ Facts that bound what is possible:
   CPU part cannot go below ~30 ms; the whole token has a floor of ~61 ms (~16 tok/s) **unless fewer bytes are read per token**.
 - 3090 VRAM: 51% used during startup/prefill (12.9 GB, only the expert cache), **92% during decode** (22.7 GB, the dense arena
   8.96 GiB is uploaded when the decode graph is built). 5060 Ti holds 14.2 GiB of hot experts.
-- The AJ IQ2_XXS file (81 GiB) gave 70.1 ms dual-GPU on 2026-10-15; GSQ-RCO (109 GiB, ~27% more expert bytes) gives 70.5-71.1 ms.
+- The AJ IQ2_XXS file (81.35 GiB = 87.35 GB, 2.230 bpw) gave 70.1 ms dual-GPU on 2026-10-15; GSQ-RCO (109.41 GiB, 3.000 bpw vs AJ 2.230 bpw, 1.345x the expert bytes) gives 70.5-71.1 ms.
   Same speed with more bytes: the CPU kernels for the two quants have different efficiency (IQ2_XXS has the AVX-512 patch 0009;
   Q2_K runs ggml's stock AVX2 dot).
 

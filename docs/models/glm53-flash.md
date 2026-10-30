@@ -49,10 +49,10 @@ The GSQ-RCO file is larger and heavier per token than the AJ IQ2_XXS file used b
 
 | | AJ IQ2_XXS (older baselines) | GSQ-RCO 3.0-bit (this section) |
 |---|---|---|
-| file size | 81.3 GiB (87.3 GB, 2 shards) | 109.4 GiB (117 GB, 1 file) |
-| routed experts | IQ2_XXS (8 layers: down IQ2_S), 2.06 bpw, ~6.6 MB/expert | Q2_K layers 9-44 (2.625 bpw), Q3_K layers 6-8, Q4_K layers 3-5 |
-| dense tensors (attention, shared experts, head) | smaller; dense arena ~6.8 GiB | Q8_0; dense arena ~9.0 GiB (8.6 GiB uploaded) |
-| expert bytes read per token | baseline | ~27% more for Q2_K layers, more still for layers 3-8 |
+| file size | 81.35 GiB (87.35 GB, 2 shards), **2.230 bpw** | 109.41 GiB (117.48 GB, 1 file), **3.000 bpw** |
+| routed experts | IQ2_XXS 91.0% of params + IQ2_S 6.2% (8 layers: down IQ2_S), ~6.6 MB/expert | Q2_K 83.3% (layers 9-44, 2.625 bpw), Q3_K 6.9% (layers 6-8), Q4_K 6.9% (layers 3-5) |
+| non-expert tensors (attention, shared experts, embedding, head) | Q6_K 8.63 B params; dense arena ~6.8 GiB | Q8_0 8.43 B params; dense arena ~9.0 GiB (8.6 GiB uploaded) |
+| expert bytes | 79.7 GB | 107.2 GB (1.345x; the whole file is also 1.345x) |
 | fits whole-layer on the 3090 + CPU | yes | no, offload pool needed (cold set ~88 GiB) |
 | dual-GPU decode (this box) | 70.1 ms/token = 14.3 tok/s (2026-10-15, perf-baselines.md) | 70.5-71.1 ms/token = 14.1-14.2 tok/s |
 

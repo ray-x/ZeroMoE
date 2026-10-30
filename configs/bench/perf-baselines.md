@@ -7,6 +7,29 @@ produced it. Any measurement more than 5% below its baseline is reported to the 
 Hardware: RTX 3090 (24 GB, PCIe Gen3 x16) + RTX 5060 Ti (16 GB, PCIe Gen3 x8), Xeon W-2235, 125 GB RAM, zram swap only.
 Tokens are the engine's own tokenizer counts; prefill figures are the engine's `[PREFILL-DONE]` line.
 
+## GLM-5.3-Flash model files compared (verified from the GGUF headers, 2026-10-30)
+
+Both files hold the same model: 313.327 B parameters, 1383 tensors, 45 layers (34 KDA + 11 DSA), 288 experts per MoE layer. Size and
+bits per weight were computed from the files themselves (`bytes * 8 / parameters` from the tensor shapes).
+
+| | AJ IQ2_XXS | GSQ-RCO 3.0-bit |
+|---|---|---|
+| file | `GLM-5.3-Flash-AJ-IQ2_XXS-0000{1,2}-of-00002.gguf` | `GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf` |
+| size | **87.35 GB = 81.35 GiB** (2 shards, 87,346,006,560 B) | **117.48 GB = 109.41 GiB** (1 file, 117,481,680,096 B) |
+| average bits per weight | **2.230** | **3.000** |
+| routed experts | IQ2_XXS 285.1 B params (91.0%) + IQ2_S 19.3 B (6.2%) | Q2_K 260.9 B (83.3%) + Q3_K 21.7 B (6.9%) + Q4_K 21.7 B (6.9%) |
+| non-expert tensors | Q6_K 8.63 B (embedding + head), Q8_0 0.20 B | Q8_0 8.43 B, BF16 0.32 B |
+| expert bytes | 79.7 GB | 107.2 GB (**1.345x**, same ratio as the whole file) |
+| placement on this box | whole-layer (3090 + CPU), no offload pool | offload pool of 88 GiB (cold set), 14.2 GiB of hot experts on the 5060 Ti |
+| CPU expert kernel | AVX-512 IQ2_XXS dot (patch 0009) | ggml stock AVX2 Q2_K dot |
+| decode, dual GPU | **70.1 ms/token = 14.3 tok/s** (2026-10-15, below) | **70.8 ms/token = 14.1 tok/s** (2026-10-30, section after next) |
+| decode, 3090 only | 6.5-8.5 tok/s whole-layer (7.26 documented, `docs/GLM5.3-Flash-baseline.md`) | 10.7 tok/s at pool 88 (2026-10-29, measured with the since-removed host-copy release; **needs re-measuring**, see `docs/models/glm53-flash.md`) |
+| prefill | 243-272 tok/s on 800-5100 token prompts (batched graph prefill, 2026-10-15/16) | 20-31 tok/s on 20-104 token prompts (2026-10-30; short prompts, not comparable) |
+| the two are not the same model | | teacher-forced top-1 agreement with AJ 77%, mean KL 0.35 (handoff doc of 2026-10-11) |
+
+The GSQ-RCO file reads 34.5% more expert bytes per token and still decodes at the same dual-GPU speed, because its experts are a different
+quant with a different CPU kernel (IQ2_XXS has the AVX-512 patch, Q2_K runs ggml's stock path), so per-byte efficiency differs.
+
 ## GLM-5.3-Flash (AJ IQ2_XXS), dual GPU
 
 Config: `configs/testing/glm53flash_AJ_IQ2XXS_spread_offload.toml` (`moe_cache_gb = 15.0`, `context_size = 8192`), recipe env
