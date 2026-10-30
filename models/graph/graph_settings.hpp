@@ -162,6 +162,7 @@ struct GraphSettings {
 // Diagnostics: never hashed, never drift-checked.
 struct DiagnosticSettings {
   Resolved<std::string> usage_record_file;  // survey mode: write per-expert route counts here at shutdown
+  Resolved<std::string> diag_dump_dir;     // CPU graph boundary snapshot directory
   Resolved<long> preflight_strict;         // bool: a preflight finding aborts instead of warning
 };
 
@@ -372,6 +373,8 @@ inline const std::vector<Field<std::string>> &text_fields() {
        {}, false},
       {"usage_record_file", ZEROMOE_SETTINGS_REF(diag.usage_record_file), std::string(), Parse::Text,
        claims_for(Family::MiMo2, Family::Glm), {}, true},
+      {"diag_dump_dir", ZEROMOE_SETTINGS_REF(diag.diag_dump_dir), std::string(), Parse::Text,
+       claims_for(Family::Qwen), {}, true},
       {"offload_policy", ZEROMOE_SETTINGS_REF(tun.offload_policy), std::string("lru"), Parse::Text,
        claims_for(Family::Glm), {}, false},
       {"offload_mirror", ZEROMOE_SETTINGS_REF(tun.offload_mirror), std::string(), Parse::Text,
@@ -525,6 +528,7 @@ inline const char *meaning(const std::string &name) {
       {"promo_decay_every", "Qwen4Exp adaptive expert promotion: halve all hit counts after this many hits; the default effectively disables decay within a session."},
       {"mtp_prefill_overlap", "Qwen4Exp graph-native MTP: overlap draft setup with prompt prefill when free VRAM allows. Off by default."},
       {"usage_record_file", "Diagnostic route-survey output path; empty disables recording. Excluded from default hashes."},
+      {"diag_dump_dir", "Diagnostic CPU graph boundary snapshot directory; empty disables snapshots."},
       {"preflight_strict", "Fail on graph health/performance findings rather than only warning. Does not weaken safety checks."},
   };
   const auto it = descriptions.find(name);

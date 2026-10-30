@@ -103,7 +103,7 @@ void dump_qwen_cpu_diag_tensor(const char *role, const ggml_tensor *tensor) {
   // comparable with llama.cpp's per-expert dumps.  Keep this opt-in and write only
   // the first instance of each role: a diagnostic prefill may execute many
   // S=1 positions, but position 0 is the parity boundary we are auditing.
-  const char *dump_dir = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_DIAG_DUMP_DIR");
+  const char *dump_dir = zeromoe::graphsettings::active_settings().diag.diag_dump_dir.value.c_str();
   if (dump_dir && dump_dir[0]) {
     static std::atomic<bool> dumped_down_input{false};
     static std::atomic<bool> dumped_down_output{false};
