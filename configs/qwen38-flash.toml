@@ -111,4 +111,4 @@ role = "dense+moe"
 dense_gb = 4.1
 kv_cache_gb = 2.0
 moe_cache_gb = 11.5
-kv_bits = 4
+# kv_bits = 4 # historical experiment note; runtime currently budgets KV through kv_cache_gb. llama.cpp uses separate K/V cache-type settings; this historical scalar is not wired.

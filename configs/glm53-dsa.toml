@@ -1463,7 +1463,7 @@ name         = "NVIDIA GeForce RTX 3090"
 role         = "moe"
 vram_gb      = 24.0
 kv_cache_gb  = 0.0
-kv_bits      = 4
+# kv_bits = 4 # historical experiment note; runtime currently budgets KV through kv_cache_gb. llama.cpp uses separate K/V cache-type settings; this historical scalar is not wired.
 dense_gb     = 0.0
 # STALE COMMENT, corrected 2026-08-28: this used to claim "~4.7GB free" --
 # a real nvidia-smi check the same day found only ~1.97GB genuinely free
@@ -1503,7 +1503,7 @@ name         = "NVIDIA GeForce RTX 5060 Ti"
 role         = "dense+moe"
 vram_gb      = 16.0
 kv_cache_gb  = 0.0
-kv_bits      = 4
+# kv_bits = 4 # historical experiment note; runtime currently budgets KV through kv_cache_gb. llama.cpp uses separate K/V cache-type settings; this historical scalar is not wired.
 # 2026-08-16: was 12.0, stale -- this model's real dense-tensor requirement
 # (native quant, gate_inp excluded since it's converted/budgeted
 # separately) is 12.9315 GB, confirmed both by the live engine's own new
