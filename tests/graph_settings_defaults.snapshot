@@ -5,6 +5,7 @@ cache_moe_async_upload=0
 cache_moe_cpu_cold=0
 cache_moe_decode=0
 cache_moe_graph=0
+cpu_lm_head=0
 decode_gpu_hc=1
 device_expert_layers=2
 device_expert_trailing=0

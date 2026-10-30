@@ -1094,7 +1094,7 @@ bool build_graph(FullGraph &g) {
   ggml_build_forward_expand(g.graph, g.final_streams);
   ggml_set_output(g.output);
   ggml_build_forward_expand(g.graph, g.output);
-  if (g.decode_mode && !zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_CPU_LM_HEAD")) {
+  if (g.decode_mode && zeromoe::graphsettings::active_settings().tun.cpu_lm_head.value == 0) {
     ggml_tensor *out_norm = resident_tensor(g, g.ctx, "output_norm.weight");
     ggml_tensor *out_w = resident_tensor(g, g.ctx, "output.weight");
     if (out_norm && out_w) {
@@ -1109,7 +1109,7 @@ bool build_graph(FullGraph &g) {
     }
   }
   if (!g.decode_mode && !g.native_moe_cache && g.dense_owner &&
-      !zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_CPU_LM_HEAD")) {
+      zeromoe::graphsettings::active_settings().tun.cpu_lm_head.value == 0) {
     // Prefill does not need the LM head, but the decode graph built right
     // after it does.  Materialize those two weights into the shared owner
     // before the first output so the prompt->decode transition does not pay
