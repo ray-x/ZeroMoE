@@ -1289,11 +1289,9 @@ if (moe_ggml_gpu_router() && qwen_prefill_gpu_router &&
       std::fill(scratch.expert_freq.begin(), scratch.expert_freq.end(), 0);
       std::fill(scratch.first_needed_by_token.begin(),
                 scratch.first_needed_by_token.end(), INT_MAX);
-      const char *dsv41_gpu_prefill_env =
-          zeromoe::graphcfg::env("ZEROMOE_DEEPSEEK_V41_GPU_PREFILL");
       const bool stable_dsv41_boundary =
           engine.family_ops.family == ModelFamily::DeepSeek_V41 && S > 1 &&
-          dsv41_gpu_prefill_env && std::atoi(dsv41_gpu_prefill_env) != 0;
+          zeromoe::graphsettings::active_settings().tun.gpu_prefill.value != 0;
       constexpr float kDsv41BoundaryEpsilon = 2.0e-5f;
       std::vector<Dsv41RouterScore> dsv41_router_scores;
       std::vector<int> dsv41_selected_ids;

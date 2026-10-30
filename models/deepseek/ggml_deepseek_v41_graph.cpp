@@ -187,7 +187,7 @@ void v41_hc_post_node(ggml_tensor *dst, int ith, int, void *ud) {
 }
 
 bool v41_gpu_prefill_enabled() {
-  return zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_GPU_PREFILL");
+  return zeromoe::graphsettings::active_settings().tun.gpu_prefill.value != 0;
 }
 
 // Dense tensors already uploaded by the engine are non-owning graph views.

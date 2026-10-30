@@ -9,6 +9,7 @@ dynamic_cache=0
 early_ready=-1
 gpu_assist2_slots=1
 gpu_assist_slots=0
+gpu_prefill=0
 lane_with_gpu1=1
 mtp_prefill_overlap=0
 native_f32_graph=0
