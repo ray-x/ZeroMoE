@@ -1,6 +1,7 @@
 adaptive_policy=0
 alloc_floor_mib=1024
 batch_d2d_unpack=0
+decode_gpu_hc=1
 device_expert_layers=2
 device_expert_trailing=0
 device_route=0

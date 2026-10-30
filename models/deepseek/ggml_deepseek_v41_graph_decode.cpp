@@ -5,6 +5,7 @@
 #include "ggml_deepseek_v41_graph.hpp"
 #include "graph_config.hpp"
 #include "graph_settings_global.hpp"
+#include "graph_settings_global.hpp"
 #include "dsv41_attention.hpp"
 #include "glm5next_graph_internal.hpp"
 #include "cache_backed_moe.hpp"
@@ -641,8 +642,7 @@ bool build(DecodeGraph &g) {
   }
   // Default on; ZEROMOE_DEEPSEEK_V41_DECODE_GPU_HC=0 selects the host nodes.
   const bool gpu_hc_decode =
-      !zeromoe::graphcfg::env("ZEROMOE_DEEPSEEK_V41_DECODE_GPU_HC") ||
-      zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_DECODE_GPU_HC");
+      zeromoe::graphsettings::active_settings().tun.decode_gpu_hc.value != 0;
   ggml_tensor *carry = nullptr;
   if (gpu_hc_decode) {
     g.hc_carry_in = host_input(g, g.ctx, GGML_TYPE_F32, {g.HC, 1},
