@@ -30,10 +30,14 @@ Both files hold the same model: 313.327 B parameters, 1383 tensors, 45 layers (3
 | decode, 3090 + 5060 Ti | **70.1 ms = 14.3 tok/s** | **70.8 ms = 14.1 tok/s** |
 | decode, 3090 only | 6.5-8.5 tok/s (whole-layer) | 10.7 tok/s, needs re-measuring |
 | code the decode number was measured on | 2026-10-15/16: record commit `04994e5` (the 70.1 ms row is dated 10-15, just before it; the exact binary commit was not recorded), `build_native`, ggml fork `~/work/ggml-iq2xxs` + patches 0006-0008, 15.0 GiB hot on the 5060 Ti, `GPU1_MIN_LAYER=31`, AJ-fitted ranking | 2026-10-30: master `b7d6bd1e027c` (binary stamped clean, source snapshot `f3ef9739`), ggml llama.cpp `8baabd53b` + patches 0001-0017 + host-node 0001-0003 (manifest `bc15a892`), 14.2 GiB hot, shipped ranking |
+| **same-binary decode, 3090 + 5060 Ti** (master `b7d6bd1e027c`, same flags, same 6 prompts, 550 decode tokens, 14.2 GiB hot on the 5060 Ti, offload pool 88 GiB, shipped ranking, 2026-10-30) | **75.4 ms = 13.26 tok/s** (mean load 4.8, min 56.2 GiB available) | **70.8 ms = 14.13 tok/s** (mean load 13.1, min 30.8 GiB available) |
 | prefill | 243-272 tok/s (800-5100 token prompts, batched graph prefill) | 20-31 tok/s (20-104 token prompts; not comparable) |
 
-**The two decode columns were measured on different code**, so 70.1 vs 70.8 ms is not a controlled comparison (code, ggml, hot-set size and
-ranking all differ). A same-binary AJ run is recorded below when it finishes. The files are also different models (teacher-forced top-1
+**The "decode, 3090 + 5060 Ti" row was measured on different code for the two files**, so 70.1 vs 70.8 ms is not a controlled comparison (code, ggml,
+hot-set size, placement, prompt and ranking all differ). The controlled row is the "same-binary decode" row: on identical code, flags and prompts AJ
+is **4.6 ms slower** (75.4 vs 70.8 ms, one run each, within about 3 ms run-to-run noise of a tie) although it reads 26% fewer expert bytes; the 70.1 ms
+record is not reproduced on the current code with these prompts (it used one prompt, tokens 16-32, whole-layer placement, a ranking fitted to that
+prompt). The AJ run used the offload pool too (pool 88 holds all of AJ's experts), not the whole-layer placement of the old record. The files are also different models (teacher-forced top-1
 agreement 77%, mean KL 0.35). The GSQ-RCO file reads 34.5% more expert bytes per token; its CPU kernel is a different, less optimised one.
 
 ## GLM-5.3-Flash (AJ IQ2_XXS), 3090 + 5060 Ti
