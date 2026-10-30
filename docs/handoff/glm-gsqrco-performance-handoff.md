@@ -2,11 +2,12 @@
 
 ## Latest status (2026-10-30)
 
-**Merge status (read first):** the full-graph prefill default for GLM, the 1 GiB prefill-planner margin (`618d454`) and the docs below were merged to master at the owner's request **before the
-validation of the planner margin had finished**. At the time of the merge: a 2,313-token prompt on GSQ-RCO failed with a GPU out of memory without the margin and completed (7.6 tok/s prefill) with
-the 3090 cache reduced by 1.5 GB; **it has not yet been shown to pass with the margin at the default cache**. Short prompts (13-104 tokens) are validated (6 of 6 on the graph path, 14.13 tok/s, logits
-bitwise identical). The validated binary was built before the other agent's environment-cleanup commit `613d9fe`; the merged tree has not been rebuilt and re-run. Treat long prompts (above ~1,000 tokens)
-on this file as unverified until the results are recorded here.
+**Merge status (read first):** the full-graph prefill default for GLM and the 1 GiB prefill-planner margin (`618d454`) are on master. Validated on a binary stamped clean at `618d454` (3090 + 5060 Ti, GSQ-RCO,
+pool 88, default settings, no graph-prefill variable): **(1)** a 2,313-token prompt completes (it ran out of memory with the old 0.15 GiB margin): the planner declines the 2048-token batch (1.90 GiB needed, 1.55 GiB free),
+retries at 408 tokens, 3090 peak 23,446 of 24,576 MiB; prefill takes **408 s = 5.7 tok/s** (the cold experts run on the CPU; `graph_prefill_op_offload = true` ran the 3090 out of memory again, so it is not enabled),
+so long-prompt prefill is correct but slow and remains open; **(2)** the 6 pilot prompts decode at **70.2 ms = 14.25 tok/s**, 6 of 6 on the graph path; **(3)** teacher-forced logits are **bitwise identical** on all 8 steps to the
+earlier runs. Not yet re-run: the merged tree itself, which also contains the other agent's later commit `613d9fe` (environment cleanup, 71 lines of `models/` and `core/`), and the Qwen family, which shares the RAM-tier slab
+code fixed here. Chunking and memory margins are tuned on this one file and card; other GLM files or GPUs may need their own check.
 
 Code: master `b7d6bd1e027c` and later (clean stamp; ggml llama.cpp `8baabd53b` + patches 0001-0017 + host-node 0001-0003). Model file:
 `GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf`, 117.48 GB (109.41 GiB), 3.000 bpw (Q2_K 83.3% / Q3_K 6.9% / Q4_K 6.9% of 313.327 B parameters). Full model-file
