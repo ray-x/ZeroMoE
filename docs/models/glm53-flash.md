@@ -103,6 +103,29 @@ follows `ZEROMOE_GLM5NEXT_CPU_THREADS` (10 prefill threads grew host memory by ~
 memory watchdog; prefill stays at 6, override with `ZEROMOE_GLM5NEXT_PREFILL_CPU_THREADS`); the early-ready lane names
 the cause (layer, call, input hidden state, weights) before aborting on a non-finite router weight.
 
+### Ranking matched to this model file (2026-10-30, in-sample)
+
+The shipped usage ranking was collected on the AJ IQ2_XXS file; GSQ-RCO routes differently (77% top-1 agreement), so the hot sets
+(3090: `pin_file`; 5060 Ti: `--graph-offload-usage-file`) are mismatched. A 6-prompt pilot survey on this file
+(`docs/ssd-offload/data/glm53flash_gsqrco_pilot6_usage_decode.txt`, prompts `bench/data_glm_gsqrco_pilot6_prompts.txt`, recorded with
+`graph_usage_record_file`) shows the effect on **those same prompts** (dual GPU, 3122 hot experts, pool 88, 550 decode tokens):
+
+| ranking | cold routes (offline) | steady decode (engine) |
+|---|---|---|
+| shipped (AJ-derived) | 54.1% (engine measured 52%) | 70.8 ms = 14.13 tok/s |
+| shipped + pilot counts (`bench/make_mix_ranking.py`) | 41.0% | **63.1 ms = 15.84 tok/s** (+11%) |
+| pilot only (offline only, not run) | 37.1% | predicted ~58 ms |
+
+**This is in-sample and must not be quoted as a general gain**: the ranking comes from the prompts it is tested on. Offline,
+3090-alone cold routes go 74.2% -> 63.2% the same way. The real gain on unseen prompts needs a held-out survey (the 2026-10-14
+AJ refit gave +2-3 tok/s on held-out prompts); `bench/make_survey_sets.py` builds a stratified train/test split of the 100
+survey prompts for that. Output text changes slightly with the ranking (different experts run on GPU vs CPU), as with any
+placement change. Run: `GLM_RANKING=<file> GLM_EXTRA_ENV=ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL=1 bench/glm_gsqrco_pool.sh ...`.
+
+**Full-graph prefill** (`ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL=1`) works on this file at pool 88 now: 20-104 token prompts prefill in
+0.7-3.6 s (20-31 tok/s) instead of ~46 s for 20 tokens on the layered path; 6 consecutive prompts in one session all decode on the
+graph path (`graph_prefill_runs=6`). It is opt-in and was validated only on those 6 prompts.
+
 Gotchas:
 - **Memory figures below were measured with a feature that has since been removed (2026-10-30).** Until then the engine freed its
   8.7 GiB of dense host copies once the first decode graph held them on the device. That broke every later request in a session

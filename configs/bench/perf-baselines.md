@@ -38,6 +38,8 @@ tokens 21-99 `FULL-DECODE-TIME`. Box load 12-14 from other jobs during the runs 
 | decode, same, 6 threads | 76.9 ms = 13.0 tok/s | 2026-10-29 | |
 | decode, same + K-quant GPU assist | 90.7 ms = 11.0 tok/s | 2026-10-29 | worse, assist off |
 | decode, 3090 only, 6 threads | 93.8 ms = 10.7 tok/s | 2026-10-29 | 15.7 GiB MemAvailable minimum |
+| decode, dual GPU, 6 pilot prompts, current ranking (A) | 70.8 ms = 14.13 tok/s (550 tokens) | 2026-10-30 | fixed binary (master `b7d6bd1`), full-graph prefill on, box otherwise quiet (`python` only) |
+| decode, same prompts, ranking = base + the GSQ-RCO pilot counts (B) | **63.1 ms = 15.84 tok/s** (+11%) | 2026-10-30 | **IN-SAMPLE**: the ranking was built from these same 6 prompts, so this is an upper bound for unseen prompts, not a general result. Cold routes 54% -> ~41% (offline model predicted ~61 ms). `GLM_RANKING=<mix file>` in the launcher; file built by `bench/make_mix_ranking.py` from `docs/ssd-offload/data/glm53flash_gsqrco_pilot6_usage_decode.txt` |
 | Q2_K x Q8_K CPU dot, stock AVX2 vs 512-bit (`bench/q2k_dot_bench.cpp`) | 8.3 vs 8.2 GB/s (1 thread), 30.0 vs 29.9 (6), 37.5 vs 38.1 (10); bit-exact | 2026-10-29 | no gain from a wider kernel; DRAM read limit on this box is ~60 GB/s (6-12 threads), the dot reaches ~63% of it |
 | decode, 3090 only, pool 80 | 190 ms = 5.3 tok/s (5.8 with assist) | 2026-10-29 | ~2 SSD misses/token |
 

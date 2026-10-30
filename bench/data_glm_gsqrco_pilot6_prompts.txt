@@ -1,0 +1,6 @@
+Explain the time and space complexity of merge sort vs quicksort.
+Write a bash script that finds all files larger than 100MB in a directory tree and lists them sorted by size.
+Write a C function implementing quicksort on an integer array.
+What is the meaning of life?
+I'm getting this error, what's wrong and how do I fix it? ``` Traceback (most recent call last): File "app.py", line 12, in <module> result = process(data) File "app.py", line 7, in process return data['value'] / count KeyError: 'value' ``` Here's the relevant code: ```python def process(items): count = len(items) data = items[0] return data['value'] / count ```
+Explain the Observer pattern with a short code example.
