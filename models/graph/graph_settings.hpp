@@ -130,6 +130,7 @@ struct GraphSettings {
   Resolved<long> batch_d2d_unpack;
   Resolved<long> shared_cpu_oracle;
   Resolved<long> device_route;
+  Resolved<long> adaptive_policy;
 };
 
 // Diagnostics: never hashed, never drift-checked.
@@ -262,6 +263,8 @@ inline const std::vector<Field<long>> &long_fields() {
       {"shared_cpu_oracle", ZEROMOE_SETTINGS_REF(tun.shared_cpu_oracle), 0, Parse::FlagOn,
        claims_for(F::Qwen), {}, false},
       {"device_route", ZEROMOE_SETTINGS_REF(tun.device_route), 0, Parse::FlagOn,
+       claims_for(F::Qwen), {}, false},
+      {"adaptive_policy", ZEROMOE_SETTINGS_REF(tun.adaptive_policy), 0, Parse::FlagOn,
        claims_for(F::Qwen), {}, false},
       {"preflight_strict", ZEROMOE_SETTINGS_REF(diag.preflight_strict), 0, Parse::FlagOn,
        kClaimAll, {}, true},
@@ -402,6 +405,7 @@ inline const char *meaning(const std::string &name) {
       {"batch_d2d_unpack", "Qwen decode fast path: batch VRAM-cache D2D copies and unpack with one scatter kernel."},
       {"shared_cpu_oracle", "Force Qwen shared experts to run on the CPU oracle for validation (default off)."},
       {"device_route", "Qwen device-side routing experiment (default off)."},
+      {"adaptive_policy", "Qwen adaptive completion policy (default off)."},
       {"soft_pin_gib", "GiB of split expert arenas kept in separately freeable soft-pin buffers so prefill can reclaim them; 0 disables. Currently Qwen full-graph decode; intended to generalize to other families."},
       {"promo_cap", "Qwen4Exp adaptive expert promotion: promotions per committed token. Higher values react faster but copy more."},
       {"promo_burst", "Qwen4Exp adaptive expert promotion: extra promotions per step during the burst window at the start of a request."},

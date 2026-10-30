@@ -100,7 +100,7 @@ std::chrono::milliseconds env_storage_wait_timeout() {
 }
 
 bool env_adaptive_completion_policy_enabled() {
-  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_ADAPTIVE_POLICY");
+  return zeromoe::graphsettings::active_settings().tun.adaptive_policy.value != 0;
 }
 
 int env_decode_kv_capacity(int max_t, int required) {
