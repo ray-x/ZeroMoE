@@ -54,12 +54,18 @@
 void attn_causal_conv1d_silu(const float* x, const float* w, float* out,
                              int S, int channels, int kernel, float* history);
 
-// Real-model checks locate their fixture directory from the environment so a
-// checkout does not carry machine-specific absolute paths. Without the
-// variable the tests skip, which is the same outcome as a missing source.
-inline std::string test_model_dir(const char *env_name) {
-    const char *dir = std::getenv(env_name);
-    return dir ? std::string(dir) : std::string("/nonexistent/zeromoe-test-models");
+// Real-model checks locate their GLM-5.3 fixture directory from the
+// --glm53-dir command-line option so a checkout does not carry
+// machine-specific absolute paths. Without the option the tests skip, which
+// is the same outcome as a missing source.
+inline std::string &test_glm53_dir() {
+    static std::string dir;
+    return dir;
+}
+
+inline std::string test_model_dir() {
+    const std::string &dir = test_glm53_dir();
+    return dir.empty() ? std::string("/nonexistent/zeromoe-test-models") : dir;
 }
 
 // ------------------------------------------------------------------

@@ -784,9 +784,18 @@ int main(int argc, char **argv) {
         const std::string arg = argv[i];
         if (arg == "--bench") {
             run_bench = true;
+        } else if (arg == "--glm53-dir") {
+            if (i + 1 >= argc) {
+                std::cerr << "--glm53-dir requires a path\n";
+                return 2;
+            }
+            test_glm53_dir() = argv[++i];
+        } else if (arg.rfind("--glm53-dir=", 0) == 0) {
+            test_glm53_dir() = arg.substr(sizeof("--glm53-dir=") - 1);
         } else if (arg == "--help" || arg == "-h") {
-            std::cout << "Usage: zeromoe_tests [--bench]\n"
-                         "  --bench  Run optional CPU throughput and THP benchmarks\n";
+            std::cout << "Usage: zeromoe_tests [--bench] [--glm53-dir <path>]\n"
+                         "  --bench            Run optional CPU throughput and THP benchmarks\n"
+                         "  --glm53-dir <path> Directory holding the GLM-5.3 real-model fixtures\n";
             return 0;
         } else {
             std::cerr << "Unknown option: " << arg

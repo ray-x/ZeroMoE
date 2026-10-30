@@ -2,6 +2,12 @@
 
 ## Latest status (2026-10-30)
 
+**Merge status (read first):** the full-graph prefill default for GLM, the 1 GiB prefill-planner margin (`618d454`) and the docs below were merged to master at the owner's request **before the
+validation of the planner margin had finished**. At the time of the merge: a 2,313-token prompt on GSQ-RCO failed with a GPU out of memory without the margin and completed (7.6 tok/s prefill) with
+the 3090 cache reduced by 1.5 GB; **it has not yet been shown to pass with the margin at the default cache**. Short prompts (13-104 tokens) are validated (6 of 6 on the graph path, 14.13 tok/s, logits
+bitwise identical). The validated binary was built before the other agent's environment-cleanup commit `613d9fe`; the merged tree has not been rebuilt and re-run. Treat long prompts (above ~1,000 tokens)
+on this file as unverified until the results are recorded here.
+
 Code: master `b7d6bd1e027c` and later (clean stamp; ggml llama.cpp `8baabd53b` + patches 0001-0017 + host-node 0001-0003). Model file:
 `GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf`, 117.48 GB (109.41 GiB), 3.000 bpw (Q2_K 83.3% / Q3_K 6.9% / Q4_K 6.9% of 313.327 B parameters). Full model-file
 comparison with the AJ IQ2_XXS file (87.35 GB, 2.230 bpw): `configs/bench/perf-baselines.md`.

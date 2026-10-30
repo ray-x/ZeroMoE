@@ -3,7 +3,7 @@
 #   usage: bench/glm_gsqrco_pool.sh TAG [POOL_GIB=88] [prompt-file]     run from the repo root
 #   extra: GLM_PRELOAD (more LD_PRELOAD libraries, e.g. bench/hostreg_trace.c built as .so)  GLM_EXTRA_ARGS (more engine arguments, e.g. --raw-prompt)  MOE_CACHE_GB (3090 expert cache GB)  GLM_RANKING (usage file for every hot-set/seeding decision)  ZEROMOE_BIN (engine binary, default ./build/zeromoe)  NGEN (tokens per prompt, default 100)  GLM_EXTRA_TOML (lines added to the
 #          root of the config)  GLM_EXTRA_ENV (VAR=val ... for the engine)  a prompt file may hold several lines (one prompt each)
-#   env:   GLM_MODEL=/path/to/GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf (required)   CVD=0,1 (default; 0 = 3090 only)   GPU1_HOT_GIB=14.2   CPUT (engine threads = omp_max_threads, default 10: decode uses all of them, prefill min(that, 6))
+#   env:   GLM_MODEL=/path/to/GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf (required)   CVD=0,1 (default; 0 = 3090 only)   GPU1_HOT_GIB=14.2   CPUT (CPU threads, default 10; GLM prefill uses min(CPUT, 6))
 # Refuses to start unless the GPUs are idle, no other model run is active, the load average is under 3 and 100 GiB are free:
 # a loaded box gives invalid numbers (0.89 vs 5.8 tok/s) and the 88 GiB pool leaves only ~16-30 GiB of headroom. A 1 Hz watchdog
 # stops the engine below 6 GiB MemAvailable. Writes TAG.log, TAG.out and TAG.mem.csv (memory, load) next to TAG.
@@ -40,10 +40,8 @@ rm -f "$TAG.out" "$TAG.mem.csv"
 gcc -shared -fPIC -O1 "$(dirname "$0")/abort_backtrace.c" -o "$TAG.abort_bt.so" 2> /dev/null || true
 ENVV="LD_PRELOAD=$TAG.abort_bt.so${GLM_PRELOAD:+:$GLM_PRELOAD} CUDA_LOG_FILE=$TAG.cudalog CUDA_VISIBLE_DEVICES=$CVD ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512"
 [ "$CVD" = "0" ] || ENVV="$ENVV ZEROMOE_GLM5NEXT_GPU1_HOT_GIB=$HOT"
-# thread counts come from omp_max_threads in the config (the ZEROMOE_GLM5NEXT_*_CPU_THREADS env vars were removed from the engine)
-[ -z "${CPUT:-}" ] || sed -i "s/^omp_max_threads = .*/omp_max_threads = $CPUT/" "$TAG.toml"
 [ -z "${GLM_EXTRA_ENV:-}" ] || ENVV="$ENVV $GLM_EXTRA_ENV"
-nohup bash -c "$ENVV timeout 2400 scripts/run_capped.sh --limit-gb 118 -- $BIN --config $TAG.toml --temp 0 --predict $NGEN ${GLM_EXTRA_ARGS:-} \
+nohup bash -c "$ENVV timeout 2400 scripts/run_capped.sh --limit-gb 118 -- $BIN --config $TAG.toml --threads ${CPUT:-10} --temp 0 --predict $NGEN ${GLM_EXTRA_ARGS:-} \
   --force-start --graph-offload-usage-file $RANK < $TAG.in > $TAG.out 2>&1; echo rc=\$? >> $TAG.out" > /dev/null 2>&1 &
 echo "t_s,avail_gib,used_gib,load,other_cpu_hogs" > "$TAG.mem.csv"; T0=$(date +%s)
 while true; do

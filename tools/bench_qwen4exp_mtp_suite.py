@@ -175,10 +175,8 @@ def main() -> int:
     p.add_argument("--expected-prompts", type=int, default=6)
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--drafts", type=int, default=3)
-    p.add_argument("--greedy-fast-path", choices=("on", "off"), default="on",
-                   help="use direct argmax at temperature 0, or the probability-vector path")
     p.add_argument("--prefill-overlap", choices=("on", "off"), default="off",
-                   help="request overlap when the VRAM headroom guard allows it")
+                   help="request MTP draft setup overlap with prompt prefill when the VRAM headroom guard allows it")
     p.add_argument("--context", type=int, default=None)
     p.add_argument("--threads", type=int, default=10)
     p.add_argument("--gpu", default="0")
@@ -222,7 +220,7 @@ def main() -> int:
             "context_override": args.context, "threads": args.threads, "gpu": args.gpu,
             "prompt_hashes": {x.name: hashlib.sha256(prompt_text[x.name].encode()).hexdigest() for x in prompts},
             "bench_ignore_stop": True,
-        "greedy_fast_path": args.greedy_fast_path,
+        "greedy_fast_path": "always (temperature 0)",
         "prefill_overlap": args.prefill_overlap,
         }
         (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
@@ -231,8 +229,6 @@ def main() -> int:
         base_env.update({
             "CUDA_VISIBLE_DEVICES": args.gpu,
             "ZEROMOE_BENCH_SILENT": "1",
-        "ZEROMOE_MTP_GREEDY_FAST_PATH": "1" if args.greedy_fast_path == "on" else "0",
-        "ZEROMOE_MTP_PREFILL_OVERLAP": "1" if args.prefill_overlap == "on" else "0",
         })
         results = {}
         for prompt_file in prompts:
@@ -257,7 +253,7 @@ def main() -> int:
                     wait_for_idle(args.gpu, args.idle_timeout)
                     print(f"{prompt_file.name} rep={rep+1} mode={mode}", flush=True)
                     with stdout.open("w") as out:
-                        subprocess.run([str(engine), "--ignore-eos", "--threads", str(args.threads), "--graph-device-expert-layers", "0", "--graph-device-expert-trailing", "1", "--config", str(run_dir / "config.toml")],
+                        subprocess.run([str(engine), "--ignore-eos", "--threads", str(args.threads), "--graph-device-expert-layers", "0", "--graph-device-expert-trailing", "1", "--graph-mtp-prefill-overlap", "1" if args.prefill_overlap == "on" else "0", "--config", str(run_dir / "config.toml")],
                                        input=prompt + "\n:q\n", text=True,
                                        stdout=out, stderr=subprocess.STDOUT,
                                        cwd=ROOT, env=env, timeout=args.timeout, check=True)

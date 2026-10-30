@@ -69,6 +69,11 @@ decode default to the graph; placement uses TOML `graph_device_expert_layers` /
 | `ZEROMOE_QWEN4EXP_HOST_NODE` | off | Use the host-node CPU/GPU schedule (`flag_on`). Measured in [runtime-settings.md](runtime-settings.md). |
 | `ZEROMOE_QWEN_HOST_NODE_THREADS` | Removed 2026-10-29 | Host-node CPU workers now share the global `-t/--threads` limit. |
 | `ZEROMOE_CUDA_SCHEDULE` | `auto` (`blocking` when `ZEROMOE_QWEN4EXP_HOST_NODE=1`) | CUDA synchronisation: `auto`, `blocking` or `spin`. Other values select the default. |
+| `ZEROMOE_QWEN4EXP_EXPERT_PROMOTION` | Removed 2026-10-30 | Use TOML `expert_promotion` (`off`/`observe`/`on`); graph-native MTP enables promotion automatically. |
+| `ZEROMOE_PROMO_CAP`, `ZEROMOE_PROMO_BURST`, `ZEROMOE_PROMO_MIN_MISSES`, `ZEROMOE_PROMO_FREQ_WEIGHT`, `ZEROMOE_PROMO_DECAY_EVERY` | Removed 2026-10-30 | Use TOML `graph_promo_cap`, `graph_promo_burst`, `graph_promo_min_misses`, `graph_promo_freq_weight`, `graph_promo_decay_every` or the matching `--graph-promo-*` flags. Defaults 12, 20, 2, 4096, 16000000. |
+| `ZEROMOE_MTP_PREFILL_OVERLAP` | Removed 2026-10-30 | Use TOML `graph_mtp_prefill_overlap` or `--graph-mtp-prefill-overlap`; default off. |
+| `ZEROMOE_MTP_GREEDY_FAST_PATH` | Removed 2026-10-30 | The direct argmax fast path is always used at temperature 0. |
+| `ZEROMOE_QWEN4EXP_ROUTE_IDS_DUMP` | Removed 2026-10-30 | Route-ID capture was removed; existing dumps remain usable offline. |
 
 ### Qwen memory policy
 
@@ -148,3 +153,5 @@ These are model-specific. The model's own document (`docs/models/<model>.md`) is
 | `--verbosity 5` | Emits Qwen layer-0 CPU graph diagnostics (`[QWEN4EXP-LAYER0-DIAG]`); the separate dump-directory variable controls binary snapshots. |
 | `ZEROMOE_WUV_INT8` | Attention value-projection int8 path (`1` enables). Diagnostic; read in `core/attention_layer.cpp`. |
 | `ZEROMOE_TEST_EXL3_CPU_ONLY`, `ZEROMOE_TEST_EXL3_ONLY` | Stop the native test harness early: after the CPU/EXL3 checks with `_CPU_ONLY`, after the CUDA kernel checks with `_ONLY` (the form `README.md` uses for the short CUDA check). |
+| `ZEROMOE_TEST_GLM53_DIR` | Removed 2026-10-30 | Use `zeromoe_tests --glm53-dir <path>` (or `--glm53-dir=<path>`). |
+| `ZEROMOE_QWEN4EXP_PROBE_LAYER` | Tool-local | With `ZEROMOE_QWEN4EXP_PROBE_DUMP` set, selects the layer whose detailed gate/up/activation/down taps are retained; documented in the full-graph onboarding guide. |
