@@ -244,10 +244,10 @@ Two runs of the unchanged build (master `b7d6bd1`, 3090 + 5060 Ti, pool 88, prom
 
 | prefill | run 1 vs run 2 |
 |---|---|
-| layered (default) | **not reproducible**: cosine 0.992 at step 0, 0.92-0.95 at steps 1-7, max abs 1.8-7.8, top-1 flips at step 1 (13 vs 624) |
-| full-graph (`ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL=1`) | **bitwise identical on all 8 steps** |
+| layered prefill (the **fallback** path, used whenever the full-graph prefill is not enabled) | **not reproducible**: cosine 0.992 at step 0, 0.92-0.95 at steps 1-7, max abs 1.8-7.8, top-1 flips at step 1 (13 vs 624) |
+| full-graph prefill (`ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL=1`; the path that should run when the memory plan fits, project rule: no silent layered/legacy execution) | **bitwise identical on all 8 steps** |
 
-So a parity test of the overlap change must use the full-graph prefill and then requires bitwise-equal logits (any difference is a real change). With the layered prefill
+The layered prefill is a fallback path for all models, so its run-to-run noise is not a defect of the intended path. For GLM the full-graph prefill is still opt-in; making it the default when the plan fits is an open decision (it is validated on 6 prompts, deterministic and 20-100x faster). A parity test of the overlap change must use the full-graph prefill and then requires bitwise-equal logits (any difference is a real change). With the layered prefill
 the unchanged build differs from itself by as much as the earlier overlap attempt `e45e92d` differed from its parent (cosine 0.86-0.98), so that attempt's recorded
 "parity failure" cannot be attributed to the reorder (probable cause of the layered noise: experts placed on the GPU or CPU depending on upload timing; the two kernels quantize
 activations differently). The earlier revert was based on evidence that could not distinguish a bug from noise; the NaN diagnostic seen once in that attempt was a separate symptom.
