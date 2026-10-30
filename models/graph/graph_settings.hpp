@@ -140,6 +140,7 @@ struct GraphSettings {
   Resolved<long> prefill_device_state;
   Resolved<long> host_node;
   Resolved<long> mtp_window;
+  Resolved<long> partial_gate_up;
   Resolved<long> decode_kv_capacity;
   Resolved<long> outproj_gpu;
   Resolved<long> native_f32_graph;
@@ -308,6 +309,8 @@ inline const std::vector<Field<long>> &long_fields() {
       {"host_node", ZEROMOE_SETTINGS_REF(tun.host_node), 0, Parse::FlagOn,
        claims_for(F::Qwen), {}, false},
       {"mtp_window", ZEROMOE_SETTINGS_REF(tun.mtp_window), 1, Parse::FlagUnlessOff,
+       claims_for(F::Qwen), {}, false},
+      {"partial_gate_up", ZEROMOE_SETTINGS_REF(tun.partial_gate_up), 0, Parse::FlagOn,
        claims_for(F::Qwen), {}, false},
       {"decode_kv_capacity", ZEROMOE_SETTINGS_REF(tun.decode_kv_capacity), 2048, Parse::IntStrict,
        claims_for(F::Qwen), {}, false},
@@ -513,6 +516,7 @@ inline const char *meaning(const std::string &name) {
       {"prefill_device_state", "Qwen prefill device-state inputs (on unless set to 0)."},
       {"host_node", "Qwen host-node mode (default off)."},
       {"mtp_window", "Qwen graph-native MTP multi-token window (on unless set to 0)."},
+      {"partial_gate_up", "Qwen partial gate-up preload (default off)."},
       {"decode_kv_capacity", "Qwen full-graph decode KV capacity hint (default 2048)."},
       {"outproj_gpu", "DeepSeek V4.1 grouped out-projection on GPU (on unless set to 0)."},
       {"native_f32_graph", "DeepSeek V4.1 native F32 graph precision mode (default off)."},

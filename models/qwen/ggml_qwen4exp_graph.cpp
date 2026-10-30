@@ -5,6 +5,7 @@
 // declarations live in ggml_qwen4exp_graph_internal.hpp.
 
 #include "ggml_qwen4exp_graph_internal.hpp"
+#include "graph_settings_global.hpp"
 #include "request_stats.hpp"
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
@@ -481,16 +482,13 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
         std::min(qwen4exp_full_graph_device_expert_layers(), c.n_layers);
     g->device_expert_trailing = env_device_expert_trailing();
   }
-  const char *partial_gate_up =
-      zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_PARTIAL_GATE_UP");
   // partial_gate_up's boundary math (layer==device_expert_layers, the
   // first CPU layer just past a LEADING block) has no trailing-mode
   // equivalent yet -- force it off rather than apply leading-only math
   // to a trailing block. See device_expert_trailing's own comment.
   g->device_expert_partial_gate_up = g->device_expert_layers > 0 &&
                                      !g->device_expert_trailing &&
-                                     partial_gate_up &&
-                                     partial_gate_up[0] == '1';
+                                     zeromoe::graphsettings::active_settings().tun.partial_gate_up.value != 0;
   plan_expert_vram_split(*g); // must run before init_device_expert_arena
   // Keep the immutable model-weight arenas across requests.  The old
   // prefill's scheduler owns a large activation workspace, so release that

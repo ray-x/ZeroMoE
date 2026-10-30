@@ -41,6 +41,7 @@ offload_store=
 offload_thp=0
 offload_usage_file=
 outproj_gpu=1
+partial_gate_up=0
 phase_cache_mib=0
 phase_cache_reserve_mib=512
 pilot_cold_k=0
