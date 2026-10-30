@@ -121,6 +121,9 @@ struct GraphSettings {
   Resolved<long> promo_decay_every;  // halve all hit counts after this many hits
   // Qwen4Exp graph-native MTP: overlap the draft setup with prompt prefill.
   Resolved<long> mtp_prefill_overlap;
+  // Graph allocator admission floor in MiB. 0 leaves the built-in default
+  // (family-specific). Replaces the family-specific alloc-floor env knobs.
+  Resolved<long> alloc_floor_mib;
 };
 
 // Diagnostics: never hashed, never drift-checked.
@@ -240,6 +243,8 @@ inline const std::vector<Field<long>> &long_fields() {
        claims_for(F::Qwen), {}, false},
       {"mtp_prefill_overlap", ZEROMOE_SETTINGS_REF(tun.mtp_prefill_overlap), 0, Parse::FlagOn,
        claims_for(F::Qwen), {}, false},
+      {"alloc_floor_mib", ZEROMOE_SETTINGS_REF(tun.alloc_floor_mib), 1024, Parse::IntStrict,
+       claims_for(F::Qwen, F::Glm), {}, false},
       {"preflight_strict", ZEROMOE_SETTINGS_REF(diag.preflight_strict), 0, Parse::FlagOn,
        kClaimAll, {}, true},
   };
@@ -304,6 +309,7 @@ inline bool valid_integer(const std::string &name, long n) {
   if (name == "prefill_min_batch") return n > 0 && n <= 1000000;
   if (name == "offload_pinned_pct") return n >= 0 && n <= 100;
   if (name == "gpu_assist2_slots") return n >= 0 && n <= 8;
+  if (name == "alloc_floor_mib") return n >= 0 && n <= 4096;
   // Default is 16,000,000: "effectively never" for a session, but still a uint32 knob.
   if (name == "promo_decay_every") return n >= 0 && n <= 4294967295L;
   return n >= 0 && n <= 1048576;
@@ -369,6 +375,7 @@ inline const char *meaning(const std::string &name) {
       {"offload_model", "GLM/Ling model source used by expert offload."},
       {"offload_ddr_gib", "Host expert offload budget in GiB, or \"auto\". Separate from VRAM and pinned fractions."},
       {"offload_usage_file", "Historical expert-routing counts used to choose the hot set."},
+      {"alloc_floor_mib", "Graph allocator admission floor in MiB (0 keeps the family default: 1024 for Qwen, 2048 for GLM)."},
       {"soft_pin_gib", "GiB of split expert arenas kept in separately freeable soft-pin buffers so prefill can reclaim them; 0 disables. Currently Qwen full-graph decode; intended to generalize to other families."},
       {"promo_cap", "Qwen4Exp adaptive expert promotion: promotions per committed token. Higher values react faster but copy more."},
       {"promo_burst", "Qwen4Exp adaptive expert promotion: extra promotions per step during the burst window at the start of a request."},
@@ -448,6 +455,8 @@ inline const std::vector<Override> &family_overrides() {
        "GPU assist of 3 slots is the measured setting for the GLM graph (docs/GLM5.3-Flash-baseline.md)"},
       {Family::Ling, "prefill_min_batch", 2,
        "value used by Ling31FlashGraphModel before the resolver existed"},
+      {Family::Glm, "alloc_floor_mib", 2048,
+       "GLM keeps a 2 GiB graph allocator admission floor by default"},
   };
   return t;
 }

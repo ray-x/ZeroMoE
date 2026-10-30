@@ -1,3 +1,4 @@
+alloc_floor_mib=1024
 device_expert_layers=2
 device_expert_trailing=0
 dynamic_cache=0

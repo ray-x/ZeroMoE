@@ -424,9 +424,9 @@ bool prefetch_prepare(FullGraph &g, OffloadState &o) {
       // proceed below its own free-VRAM floor.  Reserve that floor on the main
       // GPU as well as the ring and its workspace; otherwise a ring can be
       // built only to have the graph declined, forcing the retry path.
-      size_t floor_bytes = 2ull * 1024ull * 1024ull * 1024ull;
-      if (const char *e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB"))
-        floor_bytes = (size_t)std::max(0, std::atoi(e)) << 20;
+      const long floor_mib = zeromoe::graphsettings::active_settings().tun.alloc_floor_mib.value;
+      size_t floor_bytes = floor_mib > 0 ? (size_t)floor_mib << 20
+                                         : 2ull * 1024ull * 1024ull * 1024ull;
       const double need = (double)want[part] + 0.85 * 1024.0 * 1024.0 * g.S +
                           0.15 * 1024.0 * 1024.0 * 1024.0 +
                           (part == 0 ? (double)floor_bytes : 0.0);

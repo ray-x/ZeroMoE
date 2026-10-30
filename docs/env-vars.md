@@ -118,7 +118,7 @@ These are model-specific. The model's own document (`docs/models/<model>.md`) is
 | `ZEROMOE_GLM5NEXT_CPU_THREADS`, `ZEROMOE_GLM5NEXT_PREFILL_CPU_THREADS`, `ZEROMOE_DEEPSEEK_V41_CPU_THREADS`, `ZEROMOE_MIMO2_CPU_THREADS` | Removed 2026-10-29 | CPU thread counts now use the shared `-t/--threads` option across models. |
 | `ZEROMOE_FULL_GRAPH_READ_THREADS` | Removed 2026-10-29 | Boot source loading uses a fixed two-reader policy to bound temporary memory. |
 | `ZEROMOE_GLM5NEXT_GRAPH_PRELOAD_LAYERS` | Removed 2026-10-29 | Use shared `graph_device_expert_layers` TOML key or `--graph-device-expert-layers` for GLM/Ling whole-layer placement. |
-| `ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB` | `2048` | Free-VRAM floor the graph allocator must leave before it builds GLM-5 Next graphs, in MiB. `0` removes the floor; it also gates pilot staging. |
+| `ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB`, `ZEROMOE_QWEN4EXP_GRAPH_ALLOC_FLOOR_MIB` | Removed 2026-10-30 | Use TOML `graph_alloc_floor_mib` or `--graph-alloc-floor-mib`; defaults 1024 MiB for Qwen and 2048 MiB for GLM. `0` keeps the family default. |
 | Retired: `ZEROMOE_GLM5NEXT_GRAPH_STRICT` | Removed 2026-10-30 | The shared graph planner already fails a declined graph when the plan fits; `bench/glm53/run_dsa_graph2gpu.sh` checks full-fit graph counters with `check_full_graph_moe_run.py`. |
 | `ZEROMOE_GLM5NEXT_CPU_LM_HEAD` | unset | ZeroMoE-specific low-VRAM fallback: keep `output_norm.weight` and `output.weight` on CPU instead of staging about 1.2 GiB on GPU. The CPU path was measured about 48 ms/token slower; the graph GPU head remains the default. |
 | `ZEROMOE_GLM5NEXT_GPU1_HOT_ON_GPU0` | Removed 2026-10-29 | The one-off placement verification path was retired; hot-expert buffers always use GPU1. |

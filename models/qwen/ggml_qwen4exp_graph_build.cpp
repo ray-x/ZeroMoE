@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include "ggml_qwen4exp_graph_internal.hpp"
+#include "graph_settings_global.hpp"
 #include "zm_hc.hpp"
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
@@ -1104,23 +1105,10 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     const cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
     if (prev_device >= 0)
       cudaSetDevice(prev_device);
-    size_t kMinGraphAllocHeadroomBytes = 1ull * 1024ull * 1024ull * 1024ull;
-    // Opt-in override of the admission floor (MiB, 64..4096). The default is
-    // unchanged. The measured S=1 decode workspace is ~0.13 GiB, so a large
-    // Option-B arena that leaves 0.5-1 GiB free can still build; the caller
-    // owns the risk of the allocator reserve itself running out of memory.
-    if (const char *floor_env =
-            zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_GRAPH_ALLOC_FLOOR_MIB")) {
-      char *end = nullptr;
-      const long mib = std::strtol(floor_env, &end, 10);
-      if (end != floor_env && *end == '\0' && mib >= 64 && mib <= 4096) {
-        kMinGraphAllocHeadroomBytes =
-            static_cast<size_t>(mib) * 1024ull * 1024ull;
-        LOG_WARN("[GGML-QWEN-FULL] graph allocator admission floor overridden "
-                 "to %ld MiB by ZEROMOE_QWEN4EXP_GRAPH_ALLOC_FLOOR_MIB\n",
-                 mib);
-      }
-    }
+    const long floor_mib = zeromoe::graphsettings::active_settings().tun.alloc_floor_mib.value;
+    size_t kMinGraphAllocHeadroomBytes =
+        floor_mib > 0 ? static_cast<size_t>(floor_mib) * 1024ull * 1024ull
+                      : 1ull * 1024ull * 1024ull * 1024ull;
     // Size check against the batch: the workspace is requested in one piece and scales with the prompt (no-allocation
     // sizing pass: 0.13 GiB at S=1, 12.38 GiB at S=1611, i.e. ~7.8 MiB per token; pinned host buffer ~1.1 MiB per token).
     // A request the device cannot satisfy must never reach cudaMalloc (an allocator failure here has crashed the box
