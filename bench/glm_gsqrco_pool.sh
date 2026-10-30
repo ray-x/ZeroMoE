@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # GLM-5.3-Flash GSQ-RCO offload-pool run (the config behind the 14.1-14.2 tok/s dual-GPU baseline).
 #   usage: bench/glm_gsqrco_pool.sh TAG [POOL_GIB=88] [prompt-file]     run from the repo root
-#   extra: GLM_RANKING (usage file for every hot-set/seeding decision)  ZEROMOE_BIN (engine binary, default ./build/zeromoe)  NGEN (tokens per prompt, default 100)  GLM_EXTRA_TOML (lines added to the
+#   extra: MOE_CACHE_GB (3090 expert cache GB)  GLM_RANKING (usage file for every hot-set/seeding decision)  ZEROMOE_BIN (engine binary, default ./build/zeromoe)  NGEN (tokens per prompt, default 100)  GLM_EXTRA_TOML (lines added to the
 #          root of the config)  GLM_EXTRA_ENV (VAR=val ... for the engine)  a prompt file may hold several lines (one prompt each)
 #   env:   GLM_MODEL=/path/to/GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf (required)   CVD=0,1 (default; 0 = 3090 only)   GPU1_HOT_GIB=14.2   CPUT (decode CPU threads, default 10)   PREFILL_THREADS=6
 # Refuses to start unless the GPUs are idle, no other model run is active, the load average is under 3 and 100 GiB are free:
@@ -25,6 +25,8 @@ quiet || { echo "box never became quiet"; exit 2; }
 sed -e "s#^log_path.*#log_path = \"$TAG.log\"#" -e "s#/path/to/models/GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf#$GLM_MODEL#" -e "s/^graph_offload_ddr_gib = .*/graph_offload_ddr_gib = $POOL/" "$CFG" > "$TAG.toml"
 # GLM_RANKING replaces the usage ranking everywhere it is read: the 3090 hot set (pin_file), the 5060 Ti hot set and the pool
 # seeding (--graph-offload-usage-file). The shipped ranking is used when it is not set.
+# MOE_CACHE_GB: the 3090 expert cache (config default 12.4; the dense arena of ~9 GiB must still fit, decode peaks at ~92% VRAM)
+[ -z "${MOE_CACHE_GB:-}" ] || sed -i "s/^moe_cache_gb = .*/moe_cache_gb = $MOE_CACHE_GB/" "$TAG.toml"
 [ -z "${GLM_RANKING:-}" ] || sed -i "s#^pin_file = .*#pin_file = \"$GLM_RANKING\"#" "$TAG.toml"
 [ -z "${GLM_EXTRA_TOML:-}" ] || python3 - "$TAG.toml" "$GLM_EXTRA_TOML" <<'PY'
 import sys
