@@ -415,18 +415,15 @@ class Glm5NextGraphModel final : public FullGraphModelBase<Glm5NextGraphModel> {
   void bind_vram_cache(GpuTopology *t) const override { glm5next_full_graph_set_vram_cache(t); }
   const char *name() const override { return "glm5next"; }
 
-  bool enabled(const StreamingEngine &engine,
-               ModelGraphPhase phase) const override {
-    if (engine.mtp_enabled)
-      return false;
-    if (phase == ModelGraphPhase::Prefill) {
-      // The batched sparse hot/cold MUL_MAT_ID split reaches a CUDA MMQ
-      // route-compaction limitation for inactive branch slots, so graph
-      // prefill stays opt-in until that is fixed upstream.
-      const char *prefill = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL");
-      return prefill && prefill[0] == '1';
-    }
-    return phase == ModelGraphPhase::Decode;
+  bool enabled(const StreamingEngine &engine, ModelGraphPhase) const override {
+    // Prefill and decode both run through the graph, like every other family
+    // (glm-dsa, Ling, MiMo, Qwen). MTP keeps the layered path: its speculative
+    // loop is not integrated with this graph. Graph prefill used to be opt-in
+    // (ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL) because the batched hot/cold
+    // MUL_MAT_ID split hit a CUDA MMQ route-compaction limitation for inactive
+    // branch slots; ggml patch 0006 (mmq-id-inactive-slots) fixes it and is part
+    // of the required patch series.
+    return !engine.mtp_enabled;
   }
   bool bootstrap(StreamingEngine &engine) const override {
     return glm5next_full_graph_bootstrap(engine);

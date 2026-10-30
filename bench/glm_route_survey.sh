@@ -12,7 +12,7 @@ for b in "${@:-0 1 2 3}"; do
   rm -f logs/perf/survey/b$b.trace
   PROMPT="$(cat logs/perf/survey/p$b.txt)" GLM_TOML=$root/logs/perf/dual_final.toml NGEN=96 \
     bench/glm_decode_profile.sh "$bin" survey_b$b CUDA_VISIBLE_DEVICES=0,1 LD_LIBRARY_PATH=$LP \
-    ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL=1 ZEROMOE_GLM5NEXT_GPU1_HOT_GIB=14.2 --graph-offload-ddr-gib 58 \
+    ZEROMOE_GLM5NEXT_GPU1_HOT_GIB=14.2 --graph-offload-ddr-gib 58 \
     --verbosity 5 > /dev/null 2>&1
   sed -n 's/.*\[MOE-ROUTE-TRACE\] //p' "$root/logs/perf/survey/survey_b$b.engine.log" > \
     "$root/logs/perf/survey/b$b.trace"

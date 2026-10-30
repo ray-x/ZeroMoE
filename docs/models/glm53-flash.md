@@ -122,11 +122,11 @@ The shipped usage ranking was collected on the AJ IQ2_XXS file; GSQ-RCO routes d
 3090-alone cold routes go 74.2% -> 63.2% the same way. The real gain on unseen prompts needs a held-out survey (the 2026-10-14
 AJ refit gave +2-3 tok/s on held-out prompts); `bench/make_survey_sets.py` builds a stratified train/test split of the 100
 survey prompts for that. Output text changes slightly with the ranking (different experts run on GPU vs CPU), as with any
-placement change. Run: `GLM_RANKING=<file> GLM_EXTRA_ENV=ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL=1 bench/glm_gsqrco_pool.sh ...`.
+placement change. Run: `GLM_RANKING=<file> bench/glm_gsqrco_pool.sh ...`.
 
-**Full-graph prefill** (`ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL=1`) works on this file at pool 88 now: 20-104 token prompts prefill in
+**Full-graph prefill is the default for GLM** (like every other family; the opt-in variable `ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL` was removed 2026-10-30; MTP is the only opt-out). On this file at pool 88: 20-104 token prompts prefill in
 0.7-3.6 s (20-31 tok/s) instead of ~46 s for 20 tokens on the layered path; 6 consecutive prompts in one session all decode on the
-graph path (`graph_prefill_runs=6`). It is opt-in and was validated only on those 6 prompts.
+graph path (`graph_prefill_runs=6`). Validation of the new default is listed in the handoff (section 3.1b and the status block); long prompts are covered there.
 
 Gotchas:
 - **Memory figures below were measured with a feature that has since been removed (2026-10-30).** Until then the engine freed its

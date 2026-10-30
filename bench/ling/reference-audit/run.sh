@@ -123,7 +123,6 @@ for i in range(1,4):
 print('[PREFLIGHT] host swap may be in use by unrelated processes; this run is confined to MemorySwapMax=0')
 PY
 flock -u 9
-export ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL=1
 export ZEROMOE_FULL_GRAPH_USAGE_FILE="$profile"
 graph_args=(
   --graph-offload-first-layer 4

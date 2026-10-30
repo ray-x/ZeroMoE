@@ -21,7 +21,6 @@ export ZEROMOE_GLM5NEXT_GPU1_MIN_LAYER=${ZEROMOE_GLM5NEXT_GPU1_MIN_LAYER:-31}
 NATIVE=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/build_native/ggml-build/src
 if [ -f "$NATIVE/ggml-cuda/libggml-cuda.so.0" ]; then
   export LD_LIBRARY_PATH=$GGML_KERNEL_LIBS:$NATIVE:$NATIVE/ggml-cuda
-  export ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL=1
 GLM_GRAPH_ARGS+=(--graph-prefill-op-offload 1)
   # --graph-offload-pinned-fraction 1.0 pins the whole DDR pool (~63 GiB of unreclaimable host RAM): prefill +0.3 s
   # faster (the prefetch ring copies straight from it), but it is the setting that overcommits the box when another large

@@ -28,7 +28,7 @@
 | GLM-DSA | on by default | on by default | `engine.mtp_enabled` keeps the layered path; the adapter has no speculative graph decode. |
 | Ling 3.1 Flash | on by default | on by default | `ZEROMOE_LING_NATIVE_GRAPH` selects the cache-backed native graph; without it the shared GLM5Next graph is used. `ZEROMOE_LING_HYBRID_CUDA_GRAPH` still selects the hybrid implementation. |
 | DeepSeek-V4.1 | on | on by default | `ZEROMOE_DEEPSEEK_V41_FULL_GRAPH_DECODE=0` selects native decode while graph prefill stays on. `engine.mtp_enabled` also opts out. |
-| GLM5Next | on by default (existing) | on by default (existing) | `ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL=1` remains the prefill opt-in for the CUDA MMQ route-compaction limitation; not changed here. |
+| GLM5Next | on by default (existing) | on by default (existing) | Prefill is on by default as of 2026-10-30; `ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL` was removed (the CUDA MMQ route-compaction limitation it guarded is fixed by ggml patch 0006). MTP keeps the layered path. |
 
 The CPU-only build keeps the graph stubs returning `false`. The graph needs
 the CUDA backend; "always on" means "always the default whenever the family's

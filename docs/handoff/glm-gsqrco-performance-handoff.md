@@ -20,7 +20,7 @@ comparison with the AJ IQ2_XXS file (87.35 GB, 2.230 bpw): `configs/bench/perf-b
   `bench/glm_gsqrco_pool.sh` (quiet-box gate, memory watchdog, contamination report, `GLM_RANKING`, `MOE_CACHE_GB`, `ZEROMOE_BIN`, CUDA error log, abort backtrace helper);
 - **bug fixed (`b7d6bd1`)**: the engine freed its dense host copies after the first decode graph, so every later request in a session ran with zeroed attention and zero
   logits; removed (found with a 6-prompt session; earlier benchmarks sent one prompt);
-- full-graph prefill (`ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL=1`) works on this file at pool 88: 20-104 token prompts in 0.7-3.6 s instead of ~46 s for 20 tokens (opt-in, validated on 6 prompts);
+- **full-graph prefill is now the GLM default, like every other family** (the opt-in variable `ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL` was removed on owner instruction; MTP keeps the layered path): on this file at pool 88, 20-104 token prompts take 0.7-3.6 s instead of ~46 s for 20 tokens; validation of the new default is recorded below;
 - survey tooling (`bench/make_survey_sets.py`, `bench/make_mix_ranking.py`), the pilot usage counts, the Q2_K dot benchmark, Nsight analysis scripts;
 - the early-ready lane names the cause (layer, call, hidden state, weights) before aborting on a non-finite router weight.
 
@@ -245,9 +245,9 @@ Two runs of the unchanged build (master `b7d6bd1`, 3090 + 5060 Ti, pool 88, prom
 | prefill | run 1 vs run 2 |
 |---|---|
 | layered prefill (the **fallback** path, used whenever the full-graph prefill is not enabled) | **not reproducible**: cosine 0.992 at step 0, 0.92-0.95 at steps 1-7, max abs 1.8-7.8, top-1 flips at step 1 (13 vs 624) |
-| full-graph prefill (`ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL=1`; the path that should run when the memory plan fits, project rule: no silent layered/legacy execution) | **bitwise identical on all 8 steps** |
+| full-graph prefill (now the default; before 2026-10-30 it needed `ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL=1`; the path that runs when the memory plan fits, project rule: no silent layered/legacy execution) | **bitwise identical on all 8 steps** |
 
-The layered prefill is a fallback path for all models, so its run-to-run noise is not a defect of the intended path. For GLM the full-graph prefill is still opt-in; making it the default when the plan fits is an open decision (it is validated on 6 prompts, deterministic and 20-100x faster). A parity test of the overlap change must use the full-graph prefill and then requires bitwise-equal logits (any difference is a real change). With the layered prefill
+The layered prefill is a fallback path for all models, so its run-to-run noise is not a defect of the intended path. For GLM the full-graph prefill used to be opt-in; on owner instruction it is now the default for GLM like for the other families (deterministic, 20-100x faster than the layered path). A parity test of the overlap change must use the full-graph prefill and then requires bitwise-equal logits (any difference is a real change). With the layered prefill
 the unchanged build differs from itself by as much as the earlier overlap attempt `e45e92d` differed from its parent (cosine 0.86-0.98), so that attempt's recorded
 "parity failure" cannot be attributed to the reorder (probable cause of the layered noise: experts placed on the GPU or CPU depending on upload timing; the two kernels quantize
 activations differently). The earlier revert was based on evidence that could not distinguish a bug from noise; the NaN diagnostic seen once in that attempt was a separate symptom.
