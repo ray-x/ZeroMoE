@@ -131,6 +131,7 @@ struct GraphSettings {
   Resolved<long> shared_cpu_oracle;
   Resolved<long> device_route;
   Resolved<long> adaptive_policy;
+  Resolved<long> prefill_device_state;
 };
 
 // Diagnostics: never hashed, never drift-checked.
@@ -265,6 +266,8 @@ inline const std::vector<Field<long>> &long_fields() {
       {"device_route", ZEROMOE_SETTINGS_REF(tun.device_route), 0, Parse::FlagOn,
        claims_for(F::Qwen), {}, false},
       {"adaptive_policy", ZEROMOE_SETTINGS_REF(tun.adaptive_policy), 0, Parse::FlagOn,
+       claims_for(F::Qwen), {}, false},
+      {"prefill_device_state", ZEROMOE_SETTINGS_REF(tun.prefill_device_state), 1, Parse::FlagUnlessOff,
        claims_for(F::Qwen), {}, false},
       {"preflight_strict", ZEROMOE_SETTINGS_REF(diag.preflight_strict), 0, Parse::FlagOn,
        kClaimAll, {}, true},
@@ -406,6 +409,7 @@ inline const char *meaning(const std::string &name) {
       {"shared_cpu_oracle", "Force Qwen shared experts to run on the CPU oracle for validation (default off)."},
       {"device_route", "Qwen device-side routing experiment (default off)."},
       {"adaptive_policy", "Qwen adaptive completion policy (default off)."},
+      {"prefill_device_state", "Qwen prefill device-state inputs (on unless set to 0)."},
       {"soft_pin_gib", "GiB of split expert arenas kept in separately freeable soft-pin buffers so prefill can reclaim them; 0 disables. Currently Qwen full-graph decode; intended to generalize to other families."},
       {"promo_cap", "Qwen4Exp adaptive expert promotion: promotions per committed token. Higher values react faster but copy more."},
       {"promo_burst", "Qwen4Exp adaptive expert promotion: extra promotions per step during the burst window at the start of a request."},

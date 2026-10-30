@@ -22,8 +22,8 @@ bool prefill_state_handoff_enabled() {
 }
 
 bool prefill_device_state_inputs_enabled(const StreamingEngine &engine) {
-  const char *value = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PREFILL_DEVICE_STATE");
-  return !(value && value[0] == '0') && prefill_state_handoff_enabled() &&
+  return zeromoe::graphsettings::active_settings().tun.prefill_device_state.value != 0 &&
+         prefill_state_handoff_enabled() &&
          !engine.prompt_cache && !engine.mtp_enabled &&
          engine.qwen4exp_gpu_stage_layers.empty();
 }
