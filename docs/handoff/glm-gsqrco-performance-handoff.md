@@ -1,7 +1,7 @@
 # GLM-5.3-Flash GSQ-RCO: performance handoff (2026-10-29)
 
 Goal that was set: GLM decode from ~10 tok/s toward ~20 tok/s (first recover the ~14 tok/s the project had before, on
-the 3090 first, then with the 5060 Ti). Result so far: **14.1 tok/s dual GPU, 10.7 tok/s on the 3090 alone.** 20 tok/s has
+the 3090 first, then with the 5060 Ti). Result so far: **14.1 tok/s on the 3090 + 5060 Ti, 10.7 tok/s on the 3090 alone.** 20 tok/s has
 no measured path yet; sections 1 and 3 list what is left.
 
 Hardware and file: Xeon W-2235 (6 cores / 12 threads, AVX-512 + VNNI, 4-channel DDR4, ~60 GB/s measured read), 125 GB RAM,
@@ -13,7 +13,7 @@ shared with other agents (builds, model runs): every number below was taken with
 
 ## 1. How to improve GLM performance: what was done, what is left
 
-### 1.1 Where the time goes (dual GPU, pool 88 GiB, zero SSD misses)
+### 1.1 Where the time goes (3090 + 5060 Ti, pool 88 GiB, zero SSD misses)
 
 Per token 70-71 ms (14.1-14.3 tok/s). From the engine's `[GLM5NEXT-LANE]` line (42 MoE layers):
 
@@ -28,7 +28,7 @@ Facts that bound what is possible:
   CPU part cannot go below ~30 ms; the whole token has a floor of ~61 ms (~16 tok/s) **unless fewer bytes are read per token**.
 - 3090 VRAM: 51% used during startup/prefill (12.9 GB, only the expert cache), **92% during decode** (22.7 GB, the dense arena
   8.96 GiB is uploaded when the decode graph is built). 5060 Ti holds 14.2 GiB of hot experts.
-- The AJ IQ2_XXS file (81.35 GiB = 87.35 GB, 2.230 bpw) gave 70.1 ms dual-GPU on 2026-10-15; GSQ-RCO (109.41 GiB, 3.000 bpw vs AJ 2.230 bpw, 1.345x the expert bytes) gives 70.5-71.1 ms.
+- The AJ IQ2_XXS file (81.35 GiB = 87.35 GB, 2.230 bpw) gave 70.1 ms on the 3090 + 5060 Ti on 2026-10-15; GSQ-RCO (109.41 GiB, 3.000 bpw vs AJ 2.230 bpw, 1.345x the expert bytes) gives 70.5-71.1 ms.
   Same speed with more bytes: the CPU kernels for the two quants have different efficiency (IQ2_XXS has the AVX-512 patch 0009;
   Q2_K runs ggml's stock AVX2 dot).
 
@@ -40,7 +40,7 @@ Facts that bound what is possible:
 | 3090 only, 6 decode threads | 93.8 | 10.7 |
 | 3090 + 5060 Ti (14.2 GiB hot), 6 decode threads | 76.9 | 13.0 |
 | same, 10 decode threads (**the default now**) | 70.5-71.1 | **14.1-14.2** |
-| same, K-quant GPU assist (1 slot) | 90.7 | 11.0 (worse, leave assist off with two GPUs) |
+| same, K-quant GPU assist (1 slot) | 90.7 | 11.0 (worse, leave assist off with the 3090 + 5060 Ti) |
 | launcher runs on the shared host, stock lib: 7 normal runs | 70.0-76.4 (70.0, 70.8, 70.8, 72.0, 72.3, 74.9, 76.4) | 13.1-14.3 |
 | same, 3 runs overlapped by a neighbour's compile | 85.7, 91.4, 173 | 11.7, 10.9, 5.8 (invalid) |
 
@@ -52,7 +52,7 @@ neighbour compiled: **never quote a number without the contamination report** (t
 | change | effect | where |
 |---|---|---|
 | pool 88 GiB (the cold set is ~88 GiB) instead of 80 / auto 67.9 | removes ~70 ms/token of SSD waits: 5.3 -> 10.7 tok/s on the 3090 | `graph_offload_ddr_gib` |
-| 10 CPU threads for the **decode** lane (was 6) | lane compute 45.7 -> 39.9 ms: 13.0 -> 14.2 tok/s dual | `ggml_glm5next_graph_decode.cpp` |
+| 10 CPU threads for the **decode** lane (was 6) | lane compute 45.7 -> 39.9 ms: 13.0 -> 14.2 tok/s on the 3090 + 5060 Ti | `ggml_glm5next_graph_decode.cpp` |
 | prefill threads independent of the decode setting (6) | 10 prefill threads grew host memory ~16 GiB after seeding and tripped the watchdog | `ggml_glm5next_graph.cpp`, `ZEROMOE_GLM5NEXT_PREFILL_CPU_THREADS` |
 | ~~dense host copies freed once the decode graph holds them~~ | **removed 2026-10-30**: it zeroed attention/logits for every request after the first (found with a 6-prompt session) | see the warning in `docs/models/glm53-flash.md` |
 | 5060 Ti holds 14.2 GiB of hot experts | 10.7 -> 13.0-14.2 tok/s | `ZEROMOE_GLM5NEXT_GPU1_HOT_GIB=14.2` |
@@ -60,7 +60,7 @@ neighbour compiled: **never quote a number without the contamination report** (t
 ### 1.4 Levers tried and rejected (do not repeat without a new idea)
 
 - **K-quant GPU assist** (`graph_gpu_assist_slots=1` + `ZEROMOE_GLM5NEXT_GPU_ASSIST_ANY_TYPE=1`): +10% on the 3090 alone at pool 80
-  (5.27 -> 5.83), **-15% with two GPUs** (11.0 vs 13.0). It pulls from the same DRAM, so it cannot beat the 60 GB/s floor.
+  (5.27 -> 5.83), **-15% with the 3090 + 5060 Ti** (11.0 vs 13.0). It pulls from the same DRAM, so it cannot beat the 60 GB/s floor.
 - **Skipping the dense host copies at startup** (to fit a bigger pool): breaks the layer-by-layer prefill, which builds its MLA
   caches from host `attn_k_b`/`attn_v_b`, and the dense arena size derives from the host copies (zeroed weights, a 0.65 s fake
   prefill). Reverted. The clean fix is a graph-only prefill that does not need the host copies.
@@ -127,7 +127,7 @@ GLM_MODEL=/data/sda/models/glm53flash/GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf bench/gl
 # 3090 only:  CVD=0 ... ; expected ~10.7 tok/s
 ```
 ~8 minutes: ~4 min seeding the pool from the SATA SSD, ~65 s first prefill (23 tokens), then ~13 s of decode. Expect misses=0,
-lane wait ~21 ms, compute ~40 ms, MemAvailable minimum 26-30 GiB (dual) or ~16 GiB (3090 only).
+lane wait ~21 ms, compute ~40 ms, MemAvailable minimum 26-30 GiB (3090 + 5060 Ti) or ~16 GiB (3090 only).
 
 ### 2.4 Open reliability problem (reproduce with the same launcher)
 
@@ -156,7 +156,7 @@ two pieces of work do not depend on each other. Candidates (to be validated by t
 
 | # | overlap | exact? | notes |
 |---|---|---|---|
-| A | GPU hot + shared experts (3090) and GPU1 hot experts (5060 Ti) **concurrent with** the CPU cold experts | yes | already designed in (`MoEIngraphPlan.caps.prefer_overlap`); must be verified that the scheduler really issues them before the blocking host node and that GPU0 and GPU1 branches run concurrently |
+| A | hot + shared experts on the 3090 and hot experts on the 5060 Ti (the engine calls it GPU1) **concurrent with** the CPU cold experts | yes | already designed in (`MoEIngraphPlan.caps.prefer_overlap`); must be verified that the scheduler really issues them before the blocking host node and that GPU0 and GPU1 branches run concurrently |
 | B | remove idle gaps inside the GPU part of a layer (many small kernels per layer; ~8189 graph nodes) | yes | launch overhead / sync points between splits (`splits=169`, `transitions=85`) |
 | C | start the layer-(L+1) CPU work before layer L is fully combined | **no** (needs the layer output) | only possible with speculative routing/inputs; changes numerics, forbidden without a same-input A/B |
 | D | precompute W*A for the next attention while the CPU works (split by linearity) | no (reassociation) and reads the dense weights twice | rejected in principle |
@@ -174,7 +174,7 @@ cannot touch the ~40 ms CPU part (that needs fewer bytes, section 1.5).
 
 ### 3.3 Data we need (not collected yet)
 
-`nsys` is installed (`/usr/bin/nsys`). Capture ~8 s of steady decode on the dual-GPU setup:
+`nsys` is installed (`/usr/bin/nsys`). Capture ~8 s of steady decode on the 3090 + 5060 Ti setup:
 
 ```bash
 # run via the launcher with nsys wrapped around the engine; start collecting after the first request's decode begins
@@ -185,7 +185,7 @@ nsys stats --report cuda_gpu_kern_sum,cuda_gpu_trace,cuda_api_sum /path/to/glm_d
 (decode starts ~395-400 s after launch: ~247 s seeding + ~65 s prefill + ~6 s graph build.) What to extract from the trace:
 1. GPU busy fraction per device within a token (sum of kernel time / 70 ms), and the gap histogram on the 3090 and the 5060 Ti.
 2. For one MoE layer: the order and duration of {attention kernels, router, D2H copies, host-node (CPU) interval, hot-expert kernels
-   on GPU0, hot-expert kernels on GPU1, shared expert, combine}. In particular: do GPU0/GPU1 hot kernels overlap the CPU interval, or
+   on GPU0 (3090), hot-expert kernels on GPU1 (5060 Ti), shared expert, combine}. In particular: do GPU0 (3090) / GPU1 (5060 Ti) hot kernels overlap the CPU interval, or
    do they run before/after it?
 3. The CPU interval per layer (host node) vs the GPU kernels' time in the same layer.
 4. Time between the last kernel of layer L and the first kernel of layer L+1 (launch / sync gap).
@@ -206,9 +206,9 @@ Where the overlap is built:
 
 Plan:
 1. **Profile** (3.3). Decide A vs B from where the idle time is. No code change before this.
-2. If A fails (hot/shared kernels are placed after the host node or GPU0 and GPU1 branches serialize): change the node order in the
+2. If A fails (hot/shared kernels are placed after the host node or GPU0 (3090) and GPU1 (5060 Ti) branches serialize): change the node order in the
    plan so the GPU branches are expanded before the host node (`ggml_build_forward_expand` order matters for the scheduler), and make
-   GPU1's hot branch use its own stream/backend so it overlaps GPU0; verify with nsys that they now overlap the host interval.
+   GPU1's (5060 Ti) hot branch use its own stream/backend so it overlaps GPU0 (3090); verify with nsys that they now overlap the host interval.
 3. If B (gaps inside the GPU part): look at splits/transitions around each layer, fuse small elementwise ops (hyper-connection fusion
    already exists, patch 0015), and check whether the CUDA graph capture (patch 0003) covers the layer body or is disabled by the host node.
 4. Every change goes through the project's rules: same-input A/B of the layer-boundary hidden state and routed IDs vs the unchanged

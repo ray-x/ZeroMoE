@@ -54,7 +54,7 @@ The GSQ-RCO file is larger and heavier per token than the AJ IQ2_XXS file used b
 | non-expert tensors (attention, shared experts, embedding, head) | Q6_K 8.63 B params; dense arena ~6.8 GiB | Q8_0 8.43 B params; dense arena ~9.0 GiB (8.6 GiB uploaded) |
 | expert bytes | 79.7 GB | 107.2 GB (1.345x; the whole file is also 1.345x) |
 | fits whole-layer on the 3090 + CPU | yes | no, offload pool needed (cold set ~88 GiB) |
-| dual-GPU decode (this box) | 70.1 ms/token = 14.3 tok/s (2026-10-15, perf-baselines.md) | 70.5-71.1 ms/token = 14.1-14.2 tok/s |
+| decode, 3090 + 5060 Ti (this box) | 70.1 ms/token = 14.3 tok/s (2026-10-15, perf-baselines.md) | 70.5-71.1 ms/token = 14.1-14.2 tok/s |
 
 So the larger quant reaches the same speed as the AJ file: the CPU kernels for IQ2_XXS are the AVX-512 ones from the patch series
 (0009), while Q2_K runs ggml's stock AVX2 dot, so a Q2_K-specific kernel is the remaining headroom. Output quality of the two
@@ -66,7 +66,7 @@ files is not equivalent (teacher-forced top-1 agreement 77%, mean KL 0.35, see t
   `graph_offload_ddr_gib = 88`, `host_ram_gb = 16`, one `[[gpus]]` entry for the 3090 with `moe_cache_gb = 12.4` so the dense arena
   fits, `vram_cache_full_layer_prefix = 0`, no GPU assist, `ram_pinned_budget_gb = 16`).
 - Launcher: `bench/glm_gsqrco_pool.sh TAG [POOL_GIB] [prompt]` from the repo root. It waits for a quiet box, sets
-  `CUDA_VISIBLE_DEVICES`, `ZEROMOE_GLM5NEXT_GPU1_HOT_GIB=14.2` (dual), `ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512`,
+  `CUDA_VISIBLE_DEVICES`, `ZEROMOE_GLM5NEXT_GPU1_HOT_GIB=14.2` (hot experts on the 5060 Ti; `CVD=0` runs the 3090 alone), `ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512`,
   `ZEROMOE_GLM5NEXT_PREFILL_CPU_THREADS=6`, runs under `scripts/run_capped.sh --limit-gb 118`, watches MemAvailable at 1 Hz
   (stops the engine below 6 GiB) and prints the steady decode rate and the lane breakdown. `CVD=0` runs the 3090 alone.
 - Run: `--temp 0 --predict 100 --force-start`, prompt "Write a Python function that checks whether a string is a palindrome,
@@ -92,7 +92,7 @@ graph_offload_ddr_gib = 88      # the cold set is ~88 GiB; 80 leaves ~2 SSD miss
 | 3090 only, 6 decode threads | 93.8 | 10.7 |
 | 3090 + 5060 Ti (14.2 GiB hot), 6 threads | 76.9 | 13.0 |
 | same, 10 decode threads (new default) | 70.5-71.1 | **14.1-14.2** |
-| same, K-quant GPU assist (1 slot) | 90.7 | 11.0 (worse: leave assist off with two GPUs) |
+| same, K-quant GPU assist (1 slot) | 90.7 | 11.0 (worse: leave assist off with the 3090 + 5060 Ti) |
 | 3090 only, pool 80 (2 misses/token, 70 ms of SSD wait) | 190 | 5.3; with K-quant assist 5.8 |
 
 Lane at 14.2 tok/s: wait 21 ms + CPU cold-expert compute 39 ms per token. Measured with the box partly loaded (load 12-14 from
@@ -108,7 +108,7 @@ the cause (layer, call, input hidden state, weights) before aborting on a non-fi
 The shipped usage ranking was collected on the AJ IQ2_XXS file; GSQ-RCO routes differently (77% top-1 agreement), so the hot sets
 (3090: `pin_file`; 5060 Ti: `--graph-offload-usage-file`) are mismatched. A 6-prompt pilot survey on this file
 (`docs/ssd-offload/data/glm53flash_gsqrco_pilot6_usage_decode.txt`, prompts `bench/data_glm_gsqrco_pilot6_prompts.txt`, recorded with
-`graph_usage_record_file`) shows the effect on **those same prompts** (dual GPU, 3122 hot experts, pool 88, 550 decode tokens):
+`graph_usage_record_file`) shows the effect on **those same prompts** (3090 + 5060 Ti, 3122 hot experts, pool 88, 550 decode tokens):
 
 | ranking | cold routes (offline) | steady decode (engine) |
 |---|---|---|
@@ -131,7 +131,7 @@ Gotchas:
   8.7 GiB of dense host copies once the first decode graph held them on the device. That broke every later request in a session
   (the layered prefill and the legacy logits path read `attn_k_b`/`attn_v_b`/`output.weight` from host memory: zeroed attention, zero
   logits, output `!`); the benchmarks sent one prompt per session, so it went unnoticed until a 6-prompt session failed on prompt 2.
-  With the copies kept, expect about 8.7 GiB lower MemAvailable than the figures below: dual GPU pool 88 about 17-21 GiB (above the
+  With the copies kept, expect about 8.7 GiB lower MemAvailable than the figures below: 3090 + 5060 Ti at pool 88 about 17-21 GiB (above the
   10 GiB guard), 3090 only pool 88 about 7 GiB (**below the guard: the 10.7 tok/s 3090-only figure needs a smaller pool or a graph-only
   prefill; not re-measured**). Any change that frees host memory must be validated with a session of at least two prompts.
 - Pool 88 peaks at ~104 GiB anonymous memory on the 3090-only run (15.7 GiB available, guard 10 GiB) and ~89-92 GiB with the
@@ -142,7 +142,7 @@ Gotchas:
 - Open: at pool 80 (3090 only) some runs hit a non-finite hidden state at decode start, `invalid argument` on dense-weight
   uploads, or runaway memory during seeding. Seen once at pool 88 (next bullet); cause not found. Ruled out: lane (messenger only), pool
   pinning, deferred host unregisters, registered upload sources, CUDA API errors (driver log). Notes in the handoff doc.
-- Intermittent: 1 of 6 launcher runs at pool 88 (dual GPU, neighbour compiling) aborted right after prefill with
+- Intermittent: 1 of 6 launcher runs at pool 88 (3090 + 5060 Ti, neighbour compiling) aborted right after prefill with
   `cudaMemcpyAsync ... invalid argument` in `ggml_backend_cuda_buffer_set_tensor` (same family as the pool-80 failures above).
   Not explained.
 - 20 tok/s has no measured path yet: per token 40 ms CPU expert compute + 21 ms graph. A 512-bit Q2_K dot was tried
