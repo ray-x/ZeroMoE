@@ -104,15 +104,9 @@ bool env_adaptive_completion_policy_enabled() {
 }
 
 int env_decode_kv_capacity(int max_t, int required) {
-  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE_KV_CAPACITY");
-  int requested = 2048;
-  if (v && v[0]) {
-    char *end = nullptr;
-    const long parsed = std::strtol(v, &end, 10);
-    if (end != v && *end == '\0' && parsed > 0)
-      requested = static_cast<int>(std::min<long>(parsed, max_t));
-  }
-  return std::min(max_t, std::max(required, requested));
+  const long requested = zeromoe::graphsettings::active_settings().tun.decode_kv_capacity.value;
+  const int clamped = requested > 0 ? static_cast<int>(std::min<long>(requested, max_t)) : 2048;
+  return std::min(max_t, std::max(required, clamped));
 }
 
 // Host-node mode runs the CPU MoE inside a CUDA host callback, so a CUDA driver thread
