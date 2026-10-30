@@ -303,7 +303,13 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
     cudaSetDevice(g->device);
     const bool have = cudaMemGetInfo(&free_b, &total_b) == cudaSuccess;
     constexpr double kGiB = 1024.0 * 1024.0 * 1024.0, kMiB = 1024.0 * 1024.0;
-    const double fixed = 0.2 * kGiB, per_token = 0.85 * kMiB, margin = 0.15 * kGiB; // device 0, see the ring check
+    // Runtime scratch (MMQ temporaries, allocator growth) is not part of the scheduler workspace counted below. The 0.15 GiB margin was fitted on
+    // the AJ IQ2_XXS file. On GSQ-RCO (Q2_K/Q3_K/Q4_K experts, 8.96 GiB dense arena on the 3090) a 2,313-token prompt ran out of memory in
+    // ggml_cuda_mul_mat_q with 0.3-0.45 GiB left after the workspace and completed with 1.45 GiB left (nvidia-smi samples, 2026-10-30), so GLM5Next keeps
+    // 1 GiB. Other families that share this graph keep their margin.
+    const bool glm5next_family = g->engine->family_ops.family == ModelFamily::GLM5NEXT;
+    const double fixed = 0.2 * kGiB, per_token = 0.85 * kMiB,
+                 margin = (glm5next_family ? 1.0 : 0.15) * kGiB; // device 0, see the ring check
     const double avail_host_gb = std::max(0.0, (double)MemoryGuard::read_available_mb() / 1024.0);
     const double host_need_gb = 12.0 + (double)S / 1024.0; // 10 GiB compute floor + slack + ~1 MiB per token
     int fit = S;
