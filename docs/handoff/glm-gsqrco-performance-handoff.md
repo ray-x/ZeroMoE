@@ -82,7 +82,7 @@ neighbour compiled: **never quote a number without the contamination report** (t
    method (prompt lookup / n-gram) is not implemented in the engine (`spec_type` only has the MTP-style draft path).
 4. **Graph-only prefill** so the dense host copies and ~16 GiB of pool headroom can be given back (pool 88 currently leaves 16-30
    GiB of MemAvailable; the guard stops at 10).
-5. **A restructured Q2_K kernel** (rows in flight, fewer scalar ops per block): ceiling ~1.6x on the CPU part, realistic far less;
+5. ~~A restructured Q2_K kernel~~ **measured 2026-10-30, closed**: an AVX512-VNNI two-blocks-in-flight dot (bit-exact, 1.11x in the microbenchmark) was 1.9 ms *slower* in the engine in a controlled A/B (stock 69.0/69.4 ms vs patched 70.9/71.2 ms; two clean rounds) and other agents saw no gain either; original estimate was:
    needs a same-input trace if float summation order changes. Low priority after the failed `ilv2`.
 6. ~~A bigger 3090 expert cache / 5060 Ti hot set~~ **measured 2026-10-30, closed**: 5060 Ti hot 14.2 -> 15.0 GiB and 3090 cache 12.4 -> 13.4 GB gave 69.7 -> 68.9 ms (-0.8 ms, inside noise); the dense arena still fits with 1 GB more cache.
 
