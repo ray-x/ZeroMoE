@@ -127,6 +127,7 @@ struct GraphSettings {
   Resolved<long> storage_timeout_ms;
   Resolved<long> ring_spin_us;
   Resolved<long> ple_row_cache;
+  Resolved<long> batch_d2d_unpack;
 };
 
 // Diagnostics: never hashed, never drift-checked.
@@ -253,6 +254,8 @@ inline const std::vector<Field<long>> &long_fields() {
       {"ring_spin_us", ZEROMOE_SETTINGS_REF(tun.ring_spin_us), 0, Parse::IntStrict,
        claims_for(F::Qwen), {}, false},
       {"ple_row_cache", ZEROMOE_SETTINGS_REF(tun.ple_row_cache), 1, Parse::FlagUnlessOff,
+       claims_for(F::Qwen), {}, false},
+      {"batch_d2d_unpack", ZEROMOE_SETTINGS_REF(tun.batch_d2d_unpack), 0, Parse::FlagOn,
        claims_for(F::Qwen), {}, false},
       {"preflight_strict", ZEROMOE_SETTINGS_REF(diag.preflight_strict), 0, Parse::FlagOn,
        kClaimAll, {}, true},
@@ -390,6 +393,7 @@ inline const char *meaning(const std::string &name) {
       {"storage_timeout_ms", "Qwen storage-wait timeout in milliseconds for the staged graph path (0..30000)."},
       {"ring_spin_us", "Qwen CPU offload ring spin budget in microseconds (0 disables spinning)."},
       {"ple_row_cache", "Cache PLE rows for repeated decode (on unless set to 0)."},
+      {"batch_d2d_unpack", "Qwen decode fast path: batch VRAM-cache D2D copies and unpack with one scatter kernel."},
       {"soft_pin_gib", "GiB of split expert arenas kept in separately freeable soft-pin buffers so prefill can reclaim them; 0 disables. Currently Qwen full-graph decode; intended to generalize to other families."},
       {"promo_cap", "Qwen4Exp adaptive expert promotion: promotions per committed token. Higher values react faster but copy more."},
       {"promo_burst", "Qwen4Exp adaptive expert promotion: extra promotions per step during the burst window at the start of a request."},

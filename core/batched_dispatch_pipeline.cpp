@@ -1,5 +1,6 @@
 #include "active_layer_upload_workers.hpp"
 #include "graph_config.hpp"
+#include "graph_settings_global.hpp"
 #include "async_prefetcher.hpp"
 #include "cpu_expert_executor.hpp"
 #include "gpu_expert_executor.hpp"
@@ -79,8 +80,7 @@ static bool qwen_ddr_only_expert_source(const StreamingEngine &engine,
 // existing per-expert transfer behavior.
 static bool qwen_batch_d2d_unpack_enabled() {
   static const bool enabled = [] {
-    const char *env = zeromoe::graphcfg::env("ZEROMOE_QWEN_BATCH_D2D_UNPACK");
-    return env && env[0] == '1';
+    return zeromoe::graphsettings::active_settings().tun.batch_d2d_unpack.value != 0;
   }();
   return enabled;
 }

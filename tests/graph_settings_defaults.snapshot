@@ -1,4 +1,5 @@
 alloc_floor_mib=1024
+batch_d2d_unpack=0
 device_expert_layers=2
 device_expert_trailing=0
 dynamic_cache=0
