@@ -3,6 +3,7 @@
 // owned by the native DDR/VRAM caches in both execution paths.
 
 #include "glm5next_graph_internal.hpp"
+#include "graph_settings_global.hpp"
 #include "dsv41_engram.hpp"
 #include "ggml_deepseek_v41_graph.hpp"
 #include "dsv41_trace.hpp"
@@ -219,7 +220,7 @@ bool v41_full_graph_enabled() {
 // Cast only dense tensors into reusable graph scratch; expert storage remains
 // the original quantized native cache, with no graph expert allocation.
 bool v41_native_f32() {
-  return zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_NATIVE_F32_GRAPH");
+  return zeromoe::graphsettings::active_settings().tun.native_f32_graph.value != 0;
 }
 bool v41_prefill_f32() { return v41_native_f32(); }
 ggml_tensor *v41_matmul(ggml_context *ctx, ggml_tensor *w, ggml_tensor *x) {

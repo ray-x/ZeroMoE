@@ -133,6 +133,7 @@ struct GraphSettings {
   Resolved<long> adaptive_policy;
   Resolved<long> prefill_device_state;
   Resolved<long> outproj_gpu;
+  Resolved<long> native_f32_graph;
 };
 
 // Diagnostics: never hashed, never drift-checked.
@@ -271,6 +272,8 @@ inline const std::vector<Field<long>> &long_fields() {
       {"prefill_device_state", ZEROMOE_SETTINGS_REF(tun.prefill_device_state), 1, Parse::FlagUnlessOff,
        claims_for(F::Qwen), {}, false},
       {"outproj_gpu", ZEROMOE_SETTINGS_REF(tun.outproj_gpu), 1, Parse::FlagUnlessOff,
+       claims_for(F::Other), {}, false},
+      {"native_f32_graph", ZEROMOE_SETTINGS_REF(tun.native_f32_graph), 0, Parse::FlagOn,
        claims_for(F::Other), {}, false},
       {"preflight_strict", ZEROMOE_SETTINGS_REF(diag.preflight_strict), 0, Parse::FlagOn,
        kClaimAll, {}, true},
@@ -414,6 +417,7 @@ inline const char *meaning(const std::string &name) {
       {"adaptive_policy", "Qwen adaptive completion policy (default off)."},
       {"prefill_device_state", "Qwen prefill device-state inputs (on unless set to 0)."},
       {"outproj_gpu", "DeepSeek V4.1 grouped out-projection on GPU (on unless set to 0)."},
+      {"native_f32_graph", "DeepSeek V4.1 native F32 graph precision mode (default off)."},
       {"soft_pin_gib", "GiB of split expert arenas kept in separately freeable soft-pin buffers so prefill can reclaim them; 0 disables. Currently Qwen full-graph decode; intended to generalize to other families."},
       {"promo_cap", "Qwen4Exp adaptive expert promotion: promotions per committed token. Higher values react faster but copy more."},
       {"promo_burst", "Qwen4Exp adaptive expert promotion: extra promotions per step during the burst window at the start of a request."},
