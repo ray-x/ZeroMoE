@@ -107,6 +107,7 @@ struct GraphSettings {
   Resolved<long> pilot_prefetch;
   Resolved<long> prefill_gpu1;
   Resolved<long> cpu_lm_head;
+  Resolved<long> sparse_decode_reserve;
   Resolved<double> gpu1_hot_gib;
   Resolved<long> gpu_assist2_slots;
   Resolved<double> offload_pinned_fraction;
@@ -263,6 +264,8 @@ inline const std::vector<Field<long>> &long_fields() {
        claims_for(F::Glm), {}, false},
       {"prefill_gpu1", ZEROMOE_SETTINGS_REF(tun.prefill_gpu1), 1, Parse::FlagUnlessOff,
        claims_for(F::Glm), {}, false},
+      {"sparse_decode_reserve", ZEROMOE_SETTINGS_REF(tun.sparse_decode_reserve), 1024, Parse::IntStrict,
+       claims_for(F::Glm), {}, false},
       {"cpu_lm_head", ZEROMOE_SETTINGS_REF(tun.cpu_lm_head), 0, Parse::FlagOn,
        claims_for(F::Glm), {}, false},
       {"gpu_assist2_slots", ZEROMOE_SETTINGS_REF(tun.gpu_assist2_slots), 1, Parse::IntAtoi,
@@ -400,6 +403,7 @@ inline bool valid_integer(const std::string &name, long n) {
   if (name == "alloc_floor_mib") return n >= 0 && n <= 4096;
   if (name == "storage_timeout_ms") return n >= 0 && n <= 30000;
   if (name == "ring_spin_us") return n >= 0 && n <= 1000;
+  if (name == "sparse_decode_reserve") return n >= 0 && n <= 1000000;
   if (name == "pilot_k") return n >= 0 && n <= 16;
   if (name == "pilot_cold_k") return n >= 0 && n <= 8;
   if (name == "pilot_gate_min_samples") return n >= 1 && n <= 1000000;
@@ -464,6 +468,7 @@ inline const char *meaning(const std::string &name) {
       {"pilot_stage", "GLM pilot staging depth K (0 disables)."},
       {"pilot_prefetch", "GLM pilot prefetch depth (0 disables; effective depth is at least pilot_stage)."},
       {"prefill_gpu1", "Use second GPU during GLM prefill (on unless set to 0)."},
+      {"sparse_decode_reserve", "GLM sparse decode reserve in tokens; 0 always uses sparse selection."},
       {"gpu1_hot_gib", "GLM hot-expert budget on the second GPU, in GiB (0 disables)."},
       {"cpu_lm_head", "Keep GLM output norm/weight on CPU (low-VRAM fallback; default off)."},
       {"cpu_lm_head", "Keep GLM output norm/weight on CPU (low-VRAM fallback; default off)."},

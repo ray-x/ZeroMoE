@@ -5,6 +5,7 @@
 
 #include "ggml_glm5next_graph_impl.hpp"
 #include "ggml_bailingmoe3_graph.hpp"
+#include "graph_settings_global.hpp"
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
 
@@ -137,8 +138,7 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     // costs ~6 ms/token (11 indexer layers, +693 nodes). Use it only when the prompt is long enough that generation can
     // reach top_k: pos_base + reserve > top_k (ZEROMOE_GLM5NEXT_SPARSE_DECODE_RESERVE, default 1024 tokens; 0 = always).
     static const int reserve = [] {
-      const char *e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_SPARSE_DECODE_RESERVE");
-      return e ? std::atoi(e) : 1024;
+      return static_cast<int>(zeromoe::graphsettings::active_settings().tun.sparse_decode_reserve.value);
     }();
     if (seeds_match && reserve > 0 && pos_base + reserve <= g->indexer_top_k) {
       LOG_INFO("[GGML-GLM5NEXT-FULL-DECODE] dense DSA decode: prompt=%d + reserve=%d <= top_k=%d "

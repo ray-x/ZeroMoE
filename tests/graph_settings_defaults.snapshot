@@ -65,6 +65,7 @@ promo_min_misses=2
 ring_spin_us=0
 shared_cpu_oracle=0
 soft_pin_gib=6
+sparse_decode_reserve=1024
 split_load=1
 storage_timeout_ms=100
 use_gpu1=1
