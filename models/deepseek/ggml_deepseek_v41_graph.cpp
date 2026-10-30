@@ -1397,7 +1397,7 @@ bool build_v41_gpu_trunk(FullGraph &g, const int *token_ids) {
     if (!cur) return false;
     v41_mark_trace(g, "hc-ffn-pre", l, cur);
     ggml_tensor *ffn = nullptr;
-    if (zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_CACHE_MOE_GRAPH")) {
+    if (zeromoe::graphsettings::active_settings().tun.cache_moe_graph.value != 0) {
       ffn = build_v41_cache_moe(g, cur, l, token_ids);
     } else {
       ffn = ggml_map_custom1(g.ctx, cur, v41_moe_node, 1, site);
@@ -1559,7 +1559,7 @@ bool build_v41_graph(FullGraph &g, const int *token_ids) {
            g.n_layers, ggml_graph_n_nodes(g.graph),
            ggml_backend_sched_get_n_splits(g.sched),
            (double)g.graph_workspace_bytes / (1024.0 * 1024.0 * 1024.0),
-           zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_CACHE_MOE_GRAPH")
+           zeromoe::graphsettings::active_settings().tun.cache_moe_graph.value != 0
                && v41_gpu_prefill_enabled() ? 0 : g.n_layers,
            g.dsv41_engram_embeddings.size(),
            std::count_if(c.dsv41_engram_layer_ids.begin(),
@@ -1657,7 +1657,7 @@ bool deepseek_v41_full_graph_prepare(StreamingEngine &engine, int S,
   // callback path remains available as the numerical reference.
   std::vector<ggml_backend_t> backends{g->cuda};
   if (v41_gpu_prefill_enabled() &&
-      zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_CACHE_MOE_GRAPH")) {
+      zeromoe::graphsettings::active_settings().tun.cache_moe_graph.value != 0) {
     for (int vi : engine.gpu->topology.vault_gpus) {
       const auto &dev = engine.gpu->topology.devices[(size_t)vi];
       if (dev.id != g->device && dev.expert_cache_pool) {

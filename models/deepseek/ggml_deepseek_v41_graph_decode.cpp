@@ -5,7 +5,6 @@
 #include "ggml_deepseek_v41_graph.hpp"
 #include "graph_config.hpp"
 #include "graph_settings_global.hpp"
-#include "graph_settings_global.hpp"
 #include "dsv41_attention.hpp"
 #include "glm5next_graph_internal.hpp"
 #include "cache_backed_moe.hpp"
@@ -897,8 +896,8 @@ bool deepseek_v41_full_graph_decode_prepare(StreamingEngine &e, int pos,
   if (!deepseek_v41_full_graph_decode_enabled() || !token_ids ||
       e.mtp_enabled || e.family_ops.family != ModelFamily::DeepSeek_V41 ||
       pos < 0 || pos >= e.max_t) return false;
-  const bool cache_moe_requested = zeromoe::graphcfg::flag_on(
-      "ZEROMOE_DEEPSEEK_V41_CACHE_MOE_DECODE");
+  const bool cache_moe_requested =
+      zeromoe::graphsettings::active_settings().tun.cache_moe_decode.value != 0;
   if (cache_moe_requested && cache_moe_graph_failed_engine == &e)
     return false;
   // The caches stay engine-owned, so a new prompt/position does not rebuild

@@ -3,6 +3,7 @@
 // a former local became an EngineRunner member of the same name.
 #include "engine_runner.hpp"
 #include "graph_config.hpp"
+#include "graph_settings_global.hpp"
 #include "ggml_bailingmoe3_graph.hpp"
 #include "ggml_mimo2_graph.hpp"
 
@@ -64,8 +65,8 @@ std::expected<void, std::string> EngineRunner::plan_expert_cache() {
             graph_engine_caps(engine).aliases_vram_cache;
         const bool dsv41_graph_rows =
             engine.family_ops.family == ModelFamily::DeepSeek_V41 &&
-            (zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_CACHE_MOE_GRAPH") ||
-             zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_CACHE_MOE_DECODE"));
+            (zeromoe::graphsettings::active_settings().tun.cache_moe_graph.value != 0 ||
+             zeromoe::graphsettings::active_settings().tun.cache_moe_decode.value != 0);
         if (config.vram_cache_full_layer_prefix > l || graph_cache_rows ||
             dsv41_graph_rows) {
           const size_t row_alignment =
@@ -308,7 +309,7 @@ if (graph_mode && qwen_hybrid_graph_placement && graph_model) {
            "which never calls the full graph).\n";
   }
   if (engine.family_ops.family == ModelFamily::DeepSeek_V41 &&
-      zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_CACHE_MOE_GRAPH")) {
+      zeromoe::graphsettings::active_settings().tun.cache_moe_graph.value != 0) {
     // This path binds each complete pool as a strided MUL_MAT_ID tensor.
     // The global LRU (already supported by GpuTopology) lets one layer's
     // required set borrow free slots across the pool. Validate its uniform
