@@ -145,27 +145,7 @@ int default_cpu_threads() {
       1, static_cast<int>(hw_threads == 0 ? 1 : hw_threads));
 #endif
 
-  // Qwen decode's MUL_MAT_ID graphs are small enough that SMT is not always
-  // beneficial: each selected expert performs irregular IQ unpacking and
-  // competes for the same LLC.  Keep the existing process-wide default, but
-  // allow a Qwen-only A/B override without changing any other model family or
-  // the application's global OpenMP setting.
-  const long requested = zeromoe::graphsettings::settings_for(zeromoe::graphsettings::Family::Qwen)
-                             .tun.cpu_threads_decode.value;
-  if (requested > 0)
-    return static_cast<int>(std::min<long>(available, requested));
-
-  // The host-node runner is a second GGML CPU execution context that may
-  // overlap the scheduler's ordinary CPU backend.  Keep its cap separate
-  // from ZEROMOE_QWEN_CPU_THREADS so contention can be diagnosed without
-  // changing the A/B baseline CPU split configuration.
-  const char *host_env = zeromoe::graphcfg::env("ZEROMOE_QWEN_HOST_NODE_THREADS");
-  if (host_env && host_env[0]) {
-    char *end = nullptr;
-    const long requested = std::strtol(host_env, &end, 10);
-    if (end != host_env && *end == '\0' && requested > 0)
-      return std::min(available, static_cast<int>(requested));
-  }
+  // Host-node and graph CPU work share the global --threads limit.
   return available;
 }
 

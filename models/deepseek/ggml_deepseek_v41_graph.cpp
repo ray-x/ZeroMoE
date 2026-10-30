@@ -215,32 +215,15 @@ bool v41_full_graph_enabled() {
   return true;
 }
 
-int v41_device_expert_layers() {
-  const char *v = zeromoe::graphcfg::env(
-      "ZEROMOE_DEEPSEEK_V41_GRAPH_PRELOAD_LAYERS");
-  if (!v || !v[0])
-    return 0;
-  char *end = nullptr;
-  const long n = std::strtol(v, &end, 10);
-  if (end == v || *end != '\0' || n <= 0)
-    return 0;
-  return static_cast<int>(std::min<long>(n, 39));
-}
-
 // Diagnostic precision mode: retain F32 activations and attention values.
 // Cast only dense tensors into reusable graph scratch; expert storage remains
 // the original quantized native cache, with no graph expert allocation.
 bool v41_native_f32() {
   return zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_NATIVE_F32_GRAPH");
 }
-bool v41_prefill_f32() {
-  return v41_native_f32() || zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_PREFILL_F32");
-}
 ggml_tensor *v41_matmul(ggml_context *ctx, ggml_tensor *w, ggml_tensor *x) {
-  if (v41_prefill_f32() && !v41_native_f32() && ggml_is_quantized(w->type))
-    w = ggml_cast(ctx, w, GGML_TYPE_F32);
   auto *out = ggml_mul_mat(ctx, w, x);
-  if (v41_prefill_f32()) ggml_prec_set_acc(out, GGML_PREC_F32);
+  if (v41_native_f32()) ggml_prec_set_acc(out, GGML_PREC_F32);
   if (v41_native_f32() && ggml_is_quantized(w->type))
     ggml_prec_set_src(out, GGML_PREC_F32, 1);
   return out;
@@ -524,7 +507,7 @@ ggml_tensor *build_v41_attention(
         ctx, sequence,
         ggml_reshape_3d(ctx, compressed, qh, 1, ncompressed), 2);
   const int key_count = g.S + ncompressed;
-  const int padded = v41_prefill_f32() ? key_count : ((key_count + 255) / 256) * 256;
+  const int padded = v41_native_f32() ? key_count : ((key_count + 255) / 256) * 256;
   if (padded > key_count) {
     float *pad_data = nullptr;
     ggml_tensor *pad = v41_host_f32(
@@ -616,7 +599,7 @@ ggml_tensor *build_v41_attention(
   auto *q_attn = ggml_permute(ctx, ggml_reshape_4d(ctx, q, qh, g.H, g.S, 1), 0, 2, 1, 3);
   auto *k_attn = ggml_permute(ctx, real, 0, 2, 1, 3);
   ggml_tensor *context = nullptr;
-  if (v41_prefill_f32()) {
+  if (v41_native_f32()) {
     // F32 QK, softmax with an explicit sink, and F32 weighted values. This
     // removes both Q8 activation conversion and F16 KV rounding from the
     // diagnostic GPU trunk while retaining complete graph scheduling.
@@ -1408,8 +1391,6 @@ bool build_v41_gpu_trunk(FullGraph &g, const int *token_ids) {
       auto *scale = v41_weight(g, g.ctx, p + stem + "_scale.weight");
       auto *base = v41_weight(g, g.ctx, p + stem + "_base.weight");
       if (!fn || !scale || !base) return (ggml_tensor *)nullptr;
-      if (v41_prefill_f32() && !v41_native_f32() && ggml_is_quantized(fn->type))
-        fn = ggml_cast(g.ctx, fn, GGML_TYPE_F32);
       return hc_pre(g, g.ctx, input, fn, scale, base, post, comb, pre, collapse);
     };
     ggml_tensor *post = nullptr, *comb = nullptr, *attn_pre = nullptr;
@@ -1581,7 +1562,7 @@ bool build_v41_graph(FullGraph &g, const int *token_ids) {
   g.graph_workspace_bytes = ggml_backend_sched_get_buffer_size(g.sched, g.cuda);
   LOG_INFO("[GGML-DSV41-PREFILL] gpu_trunk=%d tokens=%d dense_attention_f32=%d "
            "cache_owned_experts=1\n", int(v41_gpu_prefill_enabled()), g.S,
-           int(v41_prefill_f32()));
+           int(v41_native_f32()));
   LOG_INFO("[GGML-DSV41-FULL] graph built layers=%d nodes=%d splits=%d "
            "workspace=%.2f GiB host_moe_callbacks=%d "
            "engram_tensor_inputs=%zu native_engram_layers=%zu "
@@ -1680,10 +1661,8 @@ bool deepseek_v41_full_graph_prepare(StreamingEngine &engine, int S,
   g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(g->device));
   g->cpu = ggml_backend_cpu_init();
   if (g->cpu) {
-    const char *threads =
-        zeromoe::graphcfg::env("ZEROMOE_DEEPSEEK_V41_CPU_THREADS");
-    ggml_backend_cpu_set_n_threads(g->cpu,
-                                   threads ? std::max(1, std::atoi(threads)) : 6);
+    ggml_backend_cpu_set_n_threads(
+        g->cpu, engine.omp_max_threads);
   }
   if (!g->cuda || !g->cpu)
     return false;

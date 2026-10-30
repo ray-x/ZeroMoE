@@ -1,5 +1,11 @@
 # Environment surface: full-graph defaults and Qwen preload (2026-10-27)
 
+
+> Update 2026-10-29: Ling's `ZEROMOE_LING_NATIVE_GRAPH` and
+> `ZEROMOE_LING_HYBRID_CUDA_GRAPH` selectors have been retired. Ling now uses
+> the shared GLM5Next graph implementation; historical A/B results remain in
+> `docs/ling-3.1-flash-native-graph-2026-10-19.md`.
+
 ## Status
 
 - Code commit: `a8a1c7d` on `master`; the handoff/audit commits after it are

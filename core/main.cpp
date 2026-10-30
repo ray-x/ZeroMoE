@@ -29,6 +29,7 @@
 #include "shutdown.hpp"
 #include "startup_preflight.hpp"
 #include "version.hpp"
+#include "dsv41_trace.hpp"
 
 #include "ggml.h"
 
@@ -215,10 +216,13 @@ void print_usage(bool all = false) {
         << "  --config <file>       Load a model recipe (recommended)\n"
         << "  --model <path>        Override the model file/directory\n"
         << "  --prompt <text>       Run one prompt instead of interactive input\n"
+         << "  --log-prompts-dir <path> Log prompt token IDs to this directory\n"
         << "  -c, --ctx-size <tokens>  Context window\n"
         << "  -n, --predict <tokens>   Maximum generated tokens\n"
+        << "  -ub, --ubatch-size <tokens> Physical maximum prefill graph batch\n"
         << "  --ram <GiB>           Host expert-memory budget\n"
         << "  -t, --threads <N>     CPU thread limit\n"
+        << " --ignore-eos Continue generation through EOS/stop tokens\n"
         << "  --main-gpu <id>       GPU for single-device mode\n"
         << "  --temp <number>       Temperature; 0 selects greedy sampling\n"
         << "  --top-p <number>      Nucleus sampling threshold\n"
@@ -256,7 +260,9 @@ void print_usage(bool all = false) {
          "4096)\n"
       << "  -n, --predict <N>  Maximum new tokens to generate per response "
          "(default: 1024)\n"
+      << "  -ub, --ubatch-size <N>  Physical maximum prefill graph batch\n"
       << "  -t, --threads <N>  CPU thread limit (default: auto)\n"
+        << " --ignore-eos Continue generation through EOS/stop tokens\n"
       << "  --temp <F>       Sampling temperature. 0.0 for greedy decode "
          "(default: 0.7)\n"
       << "  --top-p <F>      Nucleus sampling top-p threshold (default: 0.90)\n"
@@ -308,6 +314,10 @@ void print_usage(bool all = false) {
       << "                   (default: max; enable_thinking=false selects "
          "direct answer).\n"
       << "  --log-file <file>  Redirect logging to a file instead of stderr\n"
+      << "  --log-prompts-dir <path>  Log prompt token IDs for attention replay\n"
+      << "  --trace-dir <dir>  DeepSeek numerical trace output directory\n"
+      << "  --trace-layer <n>  Limit DeepSeek traces to one layer\n"
+      << "  --trace-pos <n>  Limit DeepSeek traces to one position\n"
         << "  -v, --verbose, --log-verbose Enable all log messages\n"
         << "  -lv, --verbosity, --log-verbosity <0..5> llama.cpp log threshold\n"
       << "  --force-start    Bypass startup safety checks for deliberate, known-safe runs\n"
@@ -426,6 +436,10 @@ int main(int argc, char *argv[]) {
 
   std::string config_path = "";
   std::string prompt_cli;
+std::string log_prompts_dir_cli;
+std::string deepseek_trace_dir_cli;
+int deepseek_trace_layer_cli = -1;
+int deepseek_trace_pos_cli = -1;
   std::string model_path = "";
   std::string gen_config_path = "";
   bool gen_config_full = false;
@@ -437,8 +451,10 @@ int main(int argc, char *argv[]) {
   int prefetch_worker_threads_cli = -1;
   int max_ctx = 4096;
   int max_new_tokens = 1024;
+int ubatch_size_cli = -1;
   int gpu_id = 0;
   int threads_cli = -1;
+  bool ignore_eos_cli = false;
   bool gpu_cli_given = false;
   bool drop_pages = false;
   bool direct_io_cli = false;
@@ -526,10 +542,26 @@ int main(int argc, char *argv[]) {
                i + 1 < argc) {
       max_new_tokens = std::stoi(argv[++i]);
       ngen_cli_given = true;
+    } else if ((arg == "--ubatch-size" || arg == "-ub") && i + 1 < argc) {
+      try {
+        size_t end = 0;
+        const std::string value = argv[++i];
+        ubatch_size_cli = std::stoi(value, &end);
+        if (end != value.size() || ubatch_size_cli <= 0)
+          throw std::invalid_argument("ubatch-size");
+      } catch (const std::exception &) {
+        std::cerr << "Error: --ubatch-size must be a positive integer\n";
+        return 1;
+      }
+    } else if (arg == "--ubatch-size" || arg == "-ub") {
+      std::cerr << "Error: --ubatch-size requires a value\n";
+      return 1;
     } else if (arg == "--main-gpu" && i + 1 < argc) {
       gpu_id = std::stoi(argv[++i]);
       gpu_cli_given = true;
-    } else if ((arg == "--threads" || arg == "-t") && i + 1 < argc)
+    } else if (arg == "--ignore-eos")
+      ignore_eos_cli = true;
+    else if ((arg == "--threads" || arg == "-t") && i + 1 < argc)
       threads_cli = std::stoi(argv[++i]);
     else if (arg == "--spec-type" && i + 1 < argc)
       spec_type_cli = argv[++i];
@@ -561,6 +593,23 @@ int main(int argc, char *argv[]) {
       prefetch_worker_threads_cli = std::stoi(argv[++i]);
     else if (arg == "--log-file" && i + 1 < argc)
       log_path_cli = argv[++i];
+    else if (arg == "--log-prompts-dir" && i + 1 < argc)
+      log_prompts_dir_cli = argv[++i];
+    else if (arg == "--log-prompts-dir") {
+      std::cerr << "Error: --log-prompts-dir requires a directory path\n";
+      return 1;
+    }
+    else if (arg == "--trace-dir" && i + 1 < argc)
+      deepseek_trace_dir_cli = argv[++i];
+    else if (arg == "--trace-layer" && i + 1 < argc)
+      deepseek_trace_layer_cli = std::stoi(argv[++i]);
+    else if (arg == "--trace-pos" && i + 1 < argc)
+      deepseek_trace_pos_cli = std::stoi(argv[++i]);
+    else if (arg == "--trace-dir" || arg == "--trace-layer" ||
+             arg == "--trace-pos") {
+      std::cerr << "Error: trace options require values\n";
+      return 1;
+    }
     else if ((arg == "-lv" || arg == "--verbosity" ||
               arg == "--log-verbosity") && i + 1 < argc) {
       try {
@@ -644,8 +693,17 @@ int main(int argc, char *argv[]) {
     return 0;
   }
 
+  if ((deepseek_trace_layer_cli >= 0 || deepseek_trace_pos_cli >= 0) &&
+      deepseek_trace_dir_cli.empty()) {
+    std::cerr << "Error: --trace-layer/--trace-pos require --trace-dir\n";
+    return 1;
+  }
+
   EngineConfig config;
   config.graph_cli_settings = std::move(graph_cli_settings);
+  config.deepseek_trace_dir = deepseek_trace_dir_cli;
+  config.deepseek_trace_layer = deepseek_trace_layer_cli;
+  config.deepseek_trace_pos = deepseek_trace_pos_cli;
 
   // Public configs carry a placeholder model_path ("/path/to/model-or-shard-directory"). Resolve the model here:
   // --model wins; otherwise use a real model_path in the config; otherwise stop.
@@ -779,6 +837,10 @@ int main(int argc, char *argv[]) {
     config.context_size = max_ctx;
   if (ngen_cli_given)
     config.max_new_tokens = max_new_tokens;
+  if (ubatch_size_cli > 0)
+    config.prefill_batch_tokens = ubatch_size_cli;
+  if (ignore_eos_cli)
+    config.ignore_eos = true;
   if (threads_cli > 0)
     config.omp_max_threads = threads_cli;
   if (promote_threshold_cli > 0)
@@ -795,6 +857,8 @@ int main(int argc, char *argv[]) {
     config.log_path = log_path_cli;
   if (!log_level_cli.empty())
     config.log_level = log_level_cli;
+  if (!log_prompts_dir_cli.empty())
+    config.log_prompts_dir = log_prompts_dir_cli;
   if (temp_cli >= 0.0f)
     config.temperature = temp_cli;
   if (top_p_cli >= 0.0f)

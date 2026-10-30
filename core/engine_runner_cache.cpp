@@ -235,7 +235,7 @@ if (graph_mode && qwen_hybrid_graph_placement && graph_model) {
   // device_expert_layers) were previously invisible to this arena-request
   // loop: only Qwen4Exp populated qwen_ram_vram_only_layers, so GLM always
   // requested a complete host-RAM arena for every non-dense layer even when
-  // ZEROMOE_GLM5NEXT_GRAPH_PRELOAD_LAYERS asked for some of them to live
+  // graph_device_expert_layers asked for some of them to live
   // in VRAM instead. That silently doubled down on host RAM (the graph's
   // per-layer arena reservation is on top of the RAM tier's own preload)
   // and could exhaust the MemoryGuard ledger's watermark headroom for the

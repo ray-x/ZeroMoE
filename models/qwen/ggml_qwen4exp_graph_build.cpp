@@ -231,8 +231,8 @@ static ggml_tensor *build_qwen35moe_graph_layer(FullGraph &g,
       g, g.ctx, ffn_in, layer, router, bias, gate.cpu, up.cpu, down.cpu,
       split ? gate.gpu : nullptr, split ? up.gpu : nullptr,
       split ? down.gpu : nullptr, split_ids, nullptr,
-      probe_moe ? &route_ids : nullptr, nullptr, false,
-      nullptr, nullptr, probe_moe ? &route_weights : nullptr);
+      probe_moe ? &route_ids : nullptr,
+      probe_moe ? &route_weights : nullptr);
   if (!moe)
     return nullptr;
   probe("moe_routed", moe);
@@ -720,9 +720,6 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       ggml_build_forward_expand(g.graph, tap_p);
       g.probe_taps.emplace_back(l, tap_x, tap_p);
     }
-    if (!g.decode_mode && l == g.engine->qwen4exp_partial_layer && bias &&
-        partial_prefill_capture_enabled())
-      g.partial_layer_bias_out = bias;
 
     // The per-expert split path still needs separate gate/up tensors because
     // its two branches have different expert-axis remaps.  For ordinary
@@ -735,28 +732,9 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
         !split_it->second.empty();
     ggml_tensor *moe = nullptr;
 
-    // (Phase 1 static partial-layer GPU commit and the Phase 2 dynamic
-    // dispatch were removed together with the conditional-node graphs.)
-
-    // Prefill-only: capture this layer's routing `ids` for a real per-prompt
-    // readback in qwen4exp_full_graph_run, so decode can decide whether to
-    // commit to the path above. Never set outside prefill.
-    const bool partial_capture_here =
-        !g.decode_mode && l == g.engine->qwen4exp_partial_layer &&
-        partial_prefill_capture_enabled();
-    ggml_tensor **partial_ids_out =
-        partial_capture_here ? &g.partial_layer_ids_out : nullptr;
-    ggml_tensor **partial_probs_out =
-        partial_capture_here ? &g.partial_layer_probs_out : nullptr;
-
-    // Decode-only router-usage tap: captures this layer's real routed ids
-    // via build_moe's own ids_out param. Safe to fold into partial_ids_out's
-    // slot -- usage_track_enabled implies g.decode_mode, and partial_ids_out
-    // above is only ever non-null when !g.decode_mode, so the two never
-    // collide.
-    ggml_tensor *layer_ids_for_usage = nullptr;
+      ggml_tensor *layer_ids_for_usage = nullptr;
     ggml_tensor **ids_out_param =
-        ids_tap ? &layer_ids_for_usage : partial_ids_out;
+        ids_tap ? &layer_ids_for_usage : nullptr;
     if (!moe) {
       if (g.exl3_bridge_failed)
         return false;
@@ -785,11 +763,10 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       const std::vector<int> *split_ids =
           split_ok ? &g.split_gpu_expert_ids.at(l) : nullptr;
       moe = build_moe(g, g.ctx, ffn_in, l, router, bias, ge.cpu, ue.cpu,
-                      de.cpu, split_ok ? ge.gpu : nullptr,
-                      split_ok ? ue.gpu : nullptr,
-                      split_ok ? de.gpu : nullptr, split_ids, nullptr,
-                      ids_out_param, partial_probs_out, false,
-                      nullptr, nullptr);
+                  de.cpu, split_ok ? ge.gpu : nullptr,
+                  split_ok ? ue.gpu : nullptr,
+                  split_ok ? de.gpu : nullptr, split_ids, nullptr,
+                  ids_out_param, nullptr);
     }
     if (g.exl3_bridge_failed)
       return false;
@@ -971,18 +948,6 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     if (g.ple_hist_out) {
       ggml_set_output(g.ple_hist_out);
       ggml_build_forward_expand(g.graph, g.ple_hist_out);
-    }
-    if (g.partial_layer_ids_out) {
-      ggml_set_output(g.partial_layer_ids_out);
-      ggml_build_forward_expand(g.graph, g.partial_layer_ids_out);
-    }
-    if (g.partial_layer_probs_out) {
-      ggml_set_output(g.partial_layer_probs_out);
-      ggml_build_forward_expand(g.graph, g.partial_layer_probs_out);
-    }
-    if (g.partial_layer_bias_out) {
-      ggml_set_output(g.partial_layer_bias_out);
-      ggml_build_forward_expand(g.graph, g.partial_layer_bias_out);
     }
   } else {
     // State copies are graph nodes, but are intentionally not graph outputs:

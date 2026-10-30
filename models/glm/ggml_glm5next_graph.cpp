@@ -81,7 +81,7 @@ bool glm5next_full_graph_bootstrap(StreamingEngine &engine) {
                                ? &candidate.partial_experts
                                : nullptr))
     return false;
-  if (zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_GPU1_HOT_PRELOAD", 1) != 0 && !preload_partial_hot1(candidate))
+  if (!preload_partial_hot1(candidate))
     LOG_WARN("[GGML-GLM5NEXT-GPU1-HOT] boot preload failed; hot experts will upload at the first decode build\n");
 
   if (g_glm5next_source &&
@@ -115,7 +115,7 @@ bool glm5next_full_graph_bootstrap(StreamingEngine &engine) {
 }
 
 int glm5next_full_graph_device_expert_layers() {
-  return env_device_expert_layers();
+  return configured_device_expert_layers();
 }
 
 void glm5next_full_graph_shutdown() {
@@ -271,11 +271,9 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(g->device));
   g->cpu = ggml_backend_cpu_init();
   if (g->cpu) {
-    // Prefill runs the cold-expert matmuls on the CPU for a whole batch: it has its own thread count.
-    const char *e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PREFILL_CPU_THREADS");
-    if (!e || !e[0])
-      e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_CPU_THREADS");
-    ggml_backend_cpu_set_n_threads(g->cpu, e ? std::max(1, std::atoi(e)) : 6);
+    // The same --threads value controls graph CPU workers for every family.
+    ggml_backend_cpu_set_n_threads(
+        g->cpu, engine.omp_max_threads);
   }
   if (!g->cuda || !g->cpu)
     return false;
@@ -339,13 +337,9 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   const bool prefill_offload =
       g->engine->family_ops.family != ModelFamily::BailingMoE3 &&
       zeromoe::graphsettings::active_settings().tun.prefill_op_offload.value == 1;
-  // The scheduler needs events (ZEROMOE_SCHED_EVENTS, set below): without them every weight-input copy first
-  // synchronizes the whole destination stream, which serializes the copies of the two GPUs. parallel=true is not an
-  // option: it multiplies the graph inputs by the number of copies (56 GB of workspace).
-  if (zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_PREFILL_SCHED_EVENTS", 1) != 0)
-    setenv("ZEROMOE_SCHED_EVENTS", "1", 1);
-  const bool sched_parallel = zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_PREFILL_SCHED_PARALLEL", 0) != 0;
-  g->sched = ggml_backend_sched_new(backends, nullptr, g->gpu1 ? 3 : 2, kGraphSize, sched_parallel, prefill_offload);
+  // Parallel mode multiplies graph inputs and needs roughly 56 GiB of extra
+// workspace. Keep it disabled for the measured prefill path.
+g->sched = ggml_backend_sched_new(backends, nullptr, g->gpu1 ? 3 : 2, kGraphSize, false, prefill_offload);
   if (!g->sched)
     return false;
   if (g->engine->family_ops.family != ModelFamily::BailingMoE3 &&

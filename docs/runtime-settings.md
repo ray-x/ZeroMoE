@@ -54,28 +54,12 @@ The measured GPU reduce policy is now fixed: it improved Qwen host-node decode b
 
 Measured (6 interleaved runs each, idle box): 26.46 vs 26.03 tok/s (+1.65%, every ON run >= every OFF run except one). Output text identical in the checked pair; the reduction order differs from the CPU path so it is not guaranteed bit-identical.
 
-## `ZEROMOE_QWEN_CPU_THREADS`
+## CPU thread count (`-t`, `--threads`)
 
-| | |
-|---|---|
-| Values | Positive integer N. Unset, empty, non-numeric or <= 0 = ignored. |
-| Default | all OpenMP threads (`omp_get_max_threads()`: the `omp_max_threads` config key / `OMP_NUM_THREADS`; 12 on the reference box) |
-| Effect | **Caps** (never raises) the threads used for Qwen4Exp CPU MoE work: the full-graph CPU backend, the host-node CPU runner, and the grouped CPU kernels. Effective value = `min(N, available)`. |
-
-It is applied per call site and never calls `omp_set_num_threads()`, so attention and other model families keep the global
-OpenMP setting.
-
-Related: `ZEROMOE_QWEN_HOST_NODE_THREADS` caps only the host-node runner. It is consulted only when
-`ZEROMOE_QWEN_CPU_THREADS` is unset.
-
-**Guidance**
-
-* Plain scheduler-split decode: leave unset (12). More threads were better in the earlier sweep (2 -> 6.9, 4 -> 8.3, 8 -> 14.0,
-  12 -> 15.6-15.9 tok/s on the older configuration).
-* Host-node mode with a *spinning* CUDA schedule: `11` recovers most of the loss (18.18 -> 22.10 tok/s, +21.6%) by leaving a
-  logical CPU for the generation thread. With the blocking schedule (now the host-node default) it is not needed, and the two
-  are not additive (22.03 combined).
-* Do not combine with `GOMP_CPU_AFFINITY` pinning (measured slower).
+CPU worker threads use the same global option for every model. Set `--threads N` on the
+ZeroMoE command line or `omp_max_threads = N` in the config. If unset, ZeroMoE uses its
+automatic process-wide thread limit. The old model-specific `*_CPU_THREADS` environment
+variables and `ZEROMOE_QWEN_HOST_NODE_THREADS` were removed.
 
 ## `ZEROMOE_CUDA_SCHEDULE`
 
@@ -111,11 +95,11 @@ cache conditions and raw logs. The GGUF recommendations below are unchanged.
 
 ## Recommended combinations
 
-| Mode | `HOST_NODE` | `QWEN_CPU_THREADS` | `CUDA_SCHEDULE` | `OMP_WAIT_POLICY` |
+| Mode | `HOST_NODE` | `--threads` | `CUDA_SCHEDULE` | `OMP_WAIT_POLICY` |
 |---|---|---|---|---|
-| Plain scheduler-split decode (22/26, Option-B 0/44/4) | unset | unset | unset (`auto`) | leave default (spinning) |
-| Host-node / single-graph capture | `1` | unset | unset (auto-selects `blocking`) | leave default |
-| A/B a host-node build without the fix | `1` | `11` | `auto` | leave default |
+| Plain scheduler-split decode (22/26, Option-B 0/44/4) | unset | auto | unset (`auto`) | leave default (spinning) |
+| Host-node / single-graph capture | `1` | auto | unset (auto-selects `blocking`) | leave default |
+| Limit CPU workers for any model | unchanged | `--threads 11` | `auto` | leave default |
 
 Leave `OMP_WAIT_POLICY` and `GOMP_SPINCOUNT` at their defaults: on 0/44/4, passive waiting cost 11% (30.43 vs 34.31 tok/s) and
 `GOMP_SPINCOUNT=1000` cost 6%, even though a CPU-only microbenchmark favours passive (threads idle during GPU phases between CPU
@@ -143,7 +127,8 @@ test, plus reusable GPU zero-state buffers; size depends on prompt shape and
 placement). Fresh prefills use immutable CUDA zero-state inputs instead of
 clearing and uploading recurrent state on every request. KV and PLE host snapshots remain
 available. Prompt caching, MTP, and compact expert staging use the host path.
-`ZEROMOE_QWEN4EXP_PREFILL_STATE_HANDOFF=0` or `1` overrides the TOML setting.
+The environment override was removed; use the TOML setting. The A/B runner
+generates temporary configs with the setting toggled for each arm.
 See [the state-handoff A/B guide](../tests/qwen4exp_state_handoff_howto.md) for
 reproduction commands, measured timings, and the memory tradeoff.
 Full-GPU Qwen graphs omit the artificial CPU staging node and compute the

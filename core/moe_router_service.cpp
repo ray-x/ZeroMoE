@@ -425,69 +425,6 @@ static bool qwen4exp_decode_scheduler_enabled(const StreamingEngine &engine) {
   return engine.qwen4exp_decode_scheduler;
 }
 
-// Predictive Partial Pinning empirical filter (2026-09-19): which layer to
-// check, read directly from the same env var Phase 1/2 uses
-// (ZEROMOE_QWEN4EXP_PARTIAL_LAYER) -- this measurement runs in LEGACY
-// dispatch (where qwen4exp_router_pilot actually lives), so it cannot rely
-// on engine.qwen4exp_partial_layer/plan_partial_layer(), which are only
-// ever populated from the full-graph prepare path.
-static int qwen4exp_ppp_target_layer() {
-  static const int layer = [] {
-    const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PARTIAL_LAYER");
-    if (!v || !v[0])
-      return -1;
-    char *end = nullptr;
-    const long n = std::strtol(v, &end, 10);
-    return (end == v || *end != '\0' || n < 0) ? -1 : static_cast<int>(n);
-  }();
-  return layer;
-}
-
-// Mirrors plan_partial_layer's own ranking (ggml_qwen4exp_graph.cpp) --
-// duplicated rather than shared across translation units because that
-// function has internal linkage and engine.qwen4exp_partial_layer_gpu_ids
-// is only ever populated by the full-graph prepare path, never by legacy
-// dispatch. Computed once (function-local static cache), since the usage
-// file and env vars are fixed for the life of the process.
-static const std::unordered_set<int> &qwen4exp_ppp_pin_set(StreamingEngine &engine) {
-  static const std::unordered_set<int> pin_set = [&engine] {
-    std::unordered_set<int> result;
-    const int layer = qwen4exp_ppp_target_layer();
-    if (layer < 0)
-      return result;
-    const char *topn_env = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PARTIAL_LAYER_TOP_N");
-    int top_n = 256;
-    if (topn_env && topn_env[0]) {
-      char *end = nullptr;
-      const long n = std::strtol(topn_env, &end, 10);
-      if (end != topn_env && *end == '\0' && n > 0)
-        top_n = static_cast<int>(n);
-    }
-    const std::string path = engine.qwen4exp_graph_pin_file.empty()
-                                 ? std::string(".zeromoe_usage")
-                                 : engine.qwen4exp_graph_pin_file;
-    auto [entries, maxc] = StreamingEngine::load_usage(path);
-    (void)maxc;
-    std::vector<StreamingEngine::UsageEntry> layer_entries;
-    for (const auto &e : entries)
-      if (e.layer == layer)
-        layer_entries.push_back(e);
-    std::stable_sort(layer_entries.begin(), layer_entries.end(),
-                     [](const auto &a, const auto &b) {
-                       return a.count > b.count;
-                     });
-    for (size_t i = 0; i < layer_entries.size() &&
-                       static_cast<int>(i) < top_n;
-         ++i)
-      result.insert(layer_entries[i].expert);
-    LOG_INFO("[QWEN-PILOT-PPP] layer=%d static pin set: %zu expert(s) from "
-             "%s (top_n=%d)\n",
-             layer, result.size(), path.c_str(), top_n);
-    return result;
-  }();
-  return pin_set;
-}
-
 bool MoeRouterService::route(MoePipelineContext &context) {
   auto &engine = context.engine;
   auto &ram_mgr = context.ram_mgr;
@@ -1516,73 +1453,15 @@ if (moe_ggml_gpu_router() && qwen_prefill_gpu_router &&
               record_pick(k, id, token_probs[id]);
             }
           } else {
-            // Cache-aware selection (opt-in, decode only): among the best
-            // topk+12 candidates, add a small score bonus to experts already
-            // resident in VRAM (ZEROMOE_DSV41_CACHE_BONUS_VRAM) or DDR
-            // (ZEROMOE_DSV41_CACHE_BONUS_RAM) before taking the top-k, so a
-            // near-tie prefers an expert that needs no slow load. Weights still
-            // come from the unbiased router probability of whichever experts
-            // are chosen. This changes the model's output; 0 (default) = off.
-            static const float bonus_vram = [] {
-              const char *e = zeromoe::graphcfg::env("ZEROMOE_DSV41_CACHE_BONUS_VRAM");
-              return e ? (float)std::atof(e) : 0.0f;
-            }();
-            static const float bonus_ram = [] {
-              const char *e = zeromoe::graphcfg::env("ZEROMOE_DSV41_CACHE_BONUS_RAM");
-              return e ? (float)std::atof(e) : 0.0f;
-            }();
-            const bool cache_aware =
-                (bonus_vram > 0.0f || bonus_ram > 0.0f) && S == 1 &&
-                engine.family_ops.family == ModelFamily::DeepSeek_V41 &&
-                ram_mgr.vram_cache;
-            if (cache_aware) {
-              constexpr int kExtra = 12;
-              const int nc = std::min(n_experts, topk + kExtra);
-              std::partial_sort(scratch.scores.begin(),
-                                scratch.scores.begin() + nc,
-                                scratch.scores.begin() + n_experts,
-                                [](const ExpertScore &a, const ExpertScore &b) {
-                                  return a.score > b.score;
-                                });
-              float adj[64];
-              int order[64];
-              for (int i = 0; i < nc; ++i) {
-                const int id = scratch.scores[i].id;
-                const bool in_vram = ram_mgr.vram_cache->main_layer_has(layer_idx, id);
-                const bool in_ram = !in_vram && ram_mgr.is_ram_resident(layer_idx, id);
-                adj[i] = scratch.scores[i].score + (in_vram ? bonus_vram : 0.0f) +
-                         (in_ram ? bonus_ram : 0.0f);
-                order[i] = i;
-              }
-              std::stable_sort(order, order + nc,
-                               [&](int a, int b) { return adj[a] > adj[b]; });
-              int changed = 0;
-              for (int k = 0; k < topk; ++k) {
-                const int idx = order[k];
-                if (idx >= topk) ++changed;
-                record_pick(k, scratch.scores[idx].id,
-                            token_probs[scratch.scores[idx].id]);
-              }
-              static std::atomic<uint64_t> n_calls{0}, n_changed{0};
-              n_changed.fetch_add((uint64_t)changed, std::memory_order_relaxed);
-              const uint64_t n = n_calls.fetch_add(1, std::memory_order_relaxed) + 1;
-              if (n % 1560 == 0)
-                LOG_INFO("[DSV41-CACHE-BONUS] vram=%.3f ram=%.3f layer-tokens=%llu "
-                         "substituted experts=%llu (%.2f per token)\n",
-                         bonus_vram, bonus_ram, (unsigned long long)n,
-                         (unsigned long long)n_changed.load(),
-                         (double)n_changed.load() * 40.0 / (double)n);
-            } else {
-              std::partial_sort(scratch.scores.begin(),
-                                scratch.scores.begin() + topk,
-                                scratch.scores.begin() + n_experts,
-                                [](const ExpertScore &a, const ExpertScore &b) {
-                                  return a.score > b.score;
-                                });
-              for (int k = 0; k < topk; ++k)
-                record_pick(k, scratch.scores[k].id,
-                            token_probs[scratch.scores[k].id]);
-            }
+            std::partial_sort(scratch.scores.begin(),
+                              scratch.scores.begin() + topk,
+                              scratch.scores.begin() + n_experts,
+                              [](const ExpertScore &a, const ExpertScore &b) {
+                                return a.score > b.score;
+                              });
+            for (int k = 0; k < topk; ++k)
+              record_pick(k, scratch.scores[k].id,
+                          token_probs[scratch.scores[k].id]);
           }
         }
         if (!gpu_router_handled && c.expert_weights_norm) {
@@ -2363,46 +2242,6 @@ if (moe_ggml_gpu_router() && qwen_prefill_gpu_router &&
           1, std::memory_order_relaxed);
       perf().n_qwen_pilot_prefetch_recall_pred_size_sum.fetch_add(
           (uint64_t)prefetch_count, std::memory_order_relaxed);
-    }
-    // Predictive Partial Pinning empirical filter (2026-09-19): does
-    // (static pin set) UNION (pilot's staged predictions) cover this
-    // token's REAL routed experts for the configured partial layer? Only
-    // meaningful here, not in build_moe_partial_gpu's own dispatch --
-    // this is a pure measurement, no actual staging/fetch is issued.
-    if (layer_idx == qwen4exp_ppp_target_layer()) {
-      const std::unordered_set<int> &pin_set = qwen4exp_ppp_pin_set(engine);
-      if (!pin_set.empty()) {
-        const int stage_k_scenarios[PerfCounters::kPPPStagingScenarios] = {
-            0, prefetch_count, 5};
-        for (int sc = 0; sc < PerfCounters::kPPPStagingScenarios; ++sc) {
-          const int stage_k =
-              std::min(stage_k_scenarios[sc], scratch.qwen_pilot_pred_count);
-          int miss = 0;
-          for (int k = 0; k < topk; ++k) {
-            const int routed = scratch.tok_topk_ids[(size_t)s * topk + k];
-            if (routed < 0 || pin_set.count(routed))
-              continue;
-            bool staged = false;
-            for (int pk = 0; pk < stage_k; ++pk) {
-              if (scratch.qwen_pilot_pred_ids[pk] == routed) {
-                staged = true;
-                break;
-              }
-            }
-            if (!staged)
-              ++miss;
-          }
-          if (miss == 0)
-            perf().n_ppp_m0[sc].fetch_add(1, std::memory_order_relaxed);
-          else if (miss == 1)
-            perf().n_ppp_m1[sc].fetch_add(1, std::memory_order_relaxed);
-          else
-            perf().n_ppp_m2plus[sc].fetch_add(1, std::memory_order_relaxed);
-            perf().n_ppp_m2plus_sum[sc].fetch_add(
-                (uint64_t)miss, std::memory_order_relaxed);
-        }
-        perf().n_ppp_tokens_checked.fetch_add(1, std::memory_order_relaxed);
-      }
     }
     scratch.qwen_pilot_pred_layer = -1;
     scratch.qwen_pilot_pred_count = 0;

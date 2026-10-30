@@ -68,12 +68,7 @@ static void ensure_ggml_cpu_initialized() {
 // omp_set_num_threads() and perturbing concurrent work globally.
 int qwen_cpu_grouped_threads() {
 #if defined(_OPENMP)
-  static const int requested = [] {
-    const long value = zeromoe::graphcfg::integer("ZEROMOE_QWEN_CPU_THREADS", 0);
-    return value > 0 ? static_cast<int>(value) : 0;
-  }();
-  const int available = std::max(1, omp_get_max_threads());
-  return requested > 0 ? std::min(requested, available) : available;
+  return std::max(1, omp_get_max_threads());
 #else
   return 1;
 #endif
@@ -3051,14 +3046,10 @@ bool cpu_has_avx512_vbmi() {
 #endif
 }
 
-bool force_q2_0_fallback() {
-  return zeromoe::graphcfg::flag_on("ZEROMOE_Q2_0_DISABLE_VNNI");
-}
-
 } // namespace
 
 bool q2_0_vnni_enabled() {
-  return cpu_has_avx512_vnni() && !force_q2_0_fallback();
+  return cpu_has_avx512_vnni();
 }
 
 bool q2_0_vbmi_enabled() {

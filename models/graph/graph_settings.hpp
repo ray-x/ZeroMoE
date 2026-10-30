@@ -83,7 +83,6 @@ struct GraphSettings {
   Resolved<long> device_expert_trailing;
   Resolved<long> phase_cache_mib;          // optional decode-only extension, 0 = disabled
   Resolved<long> phase_cache_reserve_mib;  // free VRAM kept for decode workspace
-  Resolved<long> cpu_threads_decode;
   Resolved<long> prefill_chunk;            // 0 = family/engine decides
   Resolved<long> prefill_min_batch;
   Resolved<long> prefill_op_offload;       // -1 auto, 0 off, 1 on
@@ -164,7 +163,7 @@ inline const std::vector<Field<long>> &long_fields() {
   using F = Family;
   static const std::vector<Field<long>> t = {
       {"device_expert_layers", ZEROMOE_SETTINGS_REF(tun.device_expert_layers), 2, Parse::IntStrict,
-       claims_for(F::Qwen),
+       claims_for(F::Qwen, F::Glm, F::Ling),
 {}, false},
       {"device_expert_trailing", ZEROMOE_SETTINGS_REF(tun.device_expert_trailing), 0, Parse::FlagOn,
        claims_for(F::Qwen),
@@ -173,15 +172,12 @@ inline const std::vector<Field<long>> &long_fields() {
        kClaimAll, {}, false},
       {"phase_cache_reserve_mib", ZEROMOE_SETTINGS_REF(tun.phase_cache_reserve_mib), 512, Parse::IntStrict,
        kClaimAll, {}, false},
-      {"cpu_threads_decode", ZEROMOE_SETTINGS_REF(tun.cpu_threads_decode), 10, Parse::IntStrict,
-       claims_for(F::MiMo2, F::Qwen),
-       {only_family(F::Qwen, "ZEROMOE_QWEN_CPU_THREADS")}, false},
       {"prefill_chunk", ZEROMOE_SETTINGS_REF(tun.prefill_chunk), 0, Parse::IntAtoi,
        claims_for(F::MiMo2, F::Ling), {}, false},
       {"prefill_min_batch", ZEROMOE_SETTINGS_REF(tun.prefill_min_batch), 64, Parse::IntStrict,
        claims_for(F::MiMo2, F::Ling), {}, false},
       {"prefill_op_offload", ZEROMOE_SETTINGS_REF(tun.prefill_op_offload), -1, Parse::TriState,
-       claims_for(F::MiMo2, F::Glm),
+       claims_for(F::MiMo2, F::Glm, F::Qwen),
        {}, false},
       {"prefill_offload_min_tokens", ZEROMOE_SETTINGS_REF(tun.prefill_offload_min_tokens), 256, Parse::IntStrict,
        claims_for(F::MiMo2), {}, false},
@@ -313,11 +309,10 @@ inline const char *family_name(Family fam) {
 
 inline const char *meaning(const std::string &name) {
   static const std::map<std::string, const char *> descriptions{
-      {"device_expert_layers", "Qwen whole expert layers resident on GPU (0, or 2..48); 0 keeps the global-pool placement. Separate from the partial hotset budget."},
+      {"device_expert_layers", "Whole expert layers resident on GPU (0, or 2..48); 0 keeps shared-cache/global-pool placement. Separate partial hotset budget."},
       {"device_expert_trailing", "Place the whole GPU-resident expert block at the end (llama.cpp -ncmoe style) rather than the start; only used when device_expert_layers is nonzero."},
       {"phase_cache_mib", "Optional decode-hot VRAM extension, in MiB; 0 disables it. Additional to the main expert cache."},
       {"phase_cache_reserve_mib", "Free VRAM retained for decode workspace when sizing the phase cache, in MiB."},
-      {"cpu_threads_decode", "CPU expert worker count; Qwen uses this as a cap (0 = available threads), MiMo as its team size."},
       {"prefill_chunk", "Prompt tokens per graph chunk (MiMo maximum: 512); 0 lets the family/engine decide. Not a context limit."},
       {"prefill_min_batch", "Smallest multi-token prefill graph batch; smaller batches use single-token steps."},
       {"prefill_op_offload", "Copy host experts to GPU for prefill: true, false or \"auto\". Requires family support and workspace."},
@@ -405,16 +400,20 @@ struct Override {
 
 inline const std::vector<Override> &family_overrides() {
   static const std::vector<Override> t = {
+      {Family::Glm, "device_expert_layers", 0,
+       "GLM uses the shared expert cache unless a whole-layer GPU block is explicitly configured"},
+      {Family::Ling, "device_expert_layers", 0,
+       "Ling uses the shared expert cache unless a whole-layer GPU block is explicitly configured"},
       {Family::MiMo2, "prefill_chunk", 512,
        "chunks >= 256 tokens let op-offload beat the CPU cold-expert path (docs/models/mimo26-flash.md)"},
       {Family::MiMo2, "prefill_min_batch", 8,
        "the default (64) made every chunk after the first run as one-token steps (docs/design/model-family-framework.md s1)"},
+      {Family::Qwen, "prefill_op_offload", 1,
+       "preserve Qwen's measured host-expert prefill copy default; use graph_prefill_op_offload to disable"},
       {Family::Glm, "gpu_assist_slots", 3,
        "GPU assist of 3 slots is the measured setting for the GLM graph (docs/GLM5.3-Flash-baseline.md)"},
       {Family::Ling, "prefill_min_batch", 2,
        "value used by Ling31FlashGraphModel before the resolver existed"},
-      {Family::Qwen, "cpu_threads_decode", 0,
-       "0 keeps the existing Qwen available-thread count; positive values cap it"},
   };
   return t;
 }
@@ -543,11 +542,6 @@ inline ResolvedSettings resolve_settings(Family fam, const EnvView &env, std::st
       note(message);
     }
   });
-  if (fam == Family::MiMo2 && config.contains("cpu_threads_decode") &&
-      r.tun.cpu_threads_decode.value == 0) {
-    if (!err) throw std::invalid_argument("graph_cpu_threads_decode must be positive for MiMo");
-    note("graph_cpu_threads_decode must be positive for MiMo");
-  }
   if (fam == Family::MiMo2 && config.contains("prefill_chunk") &&
       r.tun.prefill_chunk.value > 512) {
     if (!err) throw std::invalid_argument("graph_prefill_chunk must be between 0 and 512 for MiMo");
@@ -721,10 +715,6 @@ inline std::vector<std::string> settings_findings(const ResolvedSettings &r) {
   if (t.phase_cache_mib.value < 0 || t.phase_cache_mib.value > 1024*1024 ||
       t.phase_cache_reserve_mib.value < 0 || t.phase_cache_reserve_mib.value > 1024*1024)
     out.push_back("phase-cache size and reserve must be between 0 and 1048576 MiB");
-  if (r.family != Family::Qwen && (t.cpu_threads_decode.value < 1 ||
-      (t.cpu_threads_decode.src != Source::Default && t.cpu_threads_decode.value < 10)))
-    out.push_back("cpu_threads_decode=" + std::to_string(t.cpu_threads_decode.value) +
-                  " is below the common default (10): the early-ready lane runs cold experts on these threads");
   if (t.prefill_op_offload.value != 0 && !t.offload_pin.value && t.gpu_assist_slots.value == 0)
     out.push_back("prefill op-offload may copy experts from an unpinned arena (offload_pin=0): "
                   "copies run at pageable-memory bandwidth");

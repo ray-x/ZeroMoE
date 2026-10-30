@@ -164,13 +164,6 @@ void GgmlMoeRunner::shutdown() {
   }
   wbuf_bytes_ = 0;
   reset_transfer_state(device_);
-  for (int i = 0; i < NBUF; ++i) {
-    if (chunk_scatter_done_events_[i]) {
-      cudaEventDestroy((cudaEvent_t)chunk_scatter_done_events_[i]);
-      chunk_scatter_done_events_[i] = nullptr;
-    }
-  }
-  free_chunk_state();
   if (galloc_) {
     ggml_gallocr_free((ggml_gallocr_t)galloc_);
     galloc_ = nullptr;
@@ -178,35 +171,6 @@ void GgmlMoeRunner::shutdown() {
   if (graph_done_event_) {
     ggml_backend_event_free((ggml_backend_event_t)graph_done_event_);
     graph_done_event_ = nullptr;
-  }
-  if (chunk_ready_event_) {
-    ggml_backend_event_free((ggml_backend_event_t)chunk_ready_event_);
-    chunk_ready_event_ = nullptr;
-  }
-  if (chunk_graph_event_) {
-    ggml_backend_event_free((ggml_backend_event_t)chunk_graph_event_);
-    chunk_graph_event_ = nullptr;
-  }
-  for (int i = 0; i < NBUF; ++i) {
-    if (chunk_graph_events_[i]) {
-      ggml_backend_event_free((ggml_backend_event_t)chunk_graph_events_[i]);
-      chunk_graph_events_[i] = nullptr;
-    }
-  }
-  if (chunk_accum_event_) {
-    ggml_backend_event_free((ggml_backend_event_t)chunk_accum_event_);
-    chunk_accum_event_ = nullptr;
-  }
-  for (int i = 0; i < NBUF; ++i) {
-    if (chunk_weight_done_events_[i]) {
-      ggml_backend_event_free(
-          (ggml_backend_event_t)chunk_weight_done_events_[i]);
-      chunk_weight_done_events_[i] = nullptr;
-    }
-    if (chunk_token_device_[i]) {
-      cudaFree(chunk_token_device_[i]);
-      chunk_token_device_[i] = nullptr;
-    }
   }
   graph_in_flight_ = false;
   // backend_ is shared (ggml_shared_backend) and deliberately not freed here.
@@ -242,151 +206,11 @@ void GgmlMoeRunner::free_graph() {
   graph_ = nullptr;
   graph_x_ = graph_x_input_ = graph_ids_ = graph_w_ = nullptr;
   graph_source_view_ = nullptr;
-  graph_token_ids_ = nullptr;
   graph_gate_out_ = graph_up_out_ = graph_act_out_ = graph_down_out_ = nullptr;
   graph_out_ = nullptr;
-  graph_tokens_ = graph_source_tokens_ = graph_topk_ = graph_d_model_ =
-      graph_d_ff_ = 0;
+  graph_tokens_ = graph_topk_ = graph_d_model_ = graph_d_ff_ = 0;
   graph_slots_ = 0;
   graph_gate_type_ = graph_up_type_ = graph_down_type_ = 0;
-  graph_chunked_ = false;
-}
-
-void GgmlMoeRunner::free_chunk_state() {
-  if (device_ >= 0) cudaSetDevice(device_);
-  if (chunk_accum_) {
-    cudaFree(chunk_accum_);
-    chunk_accum_ = nullptr;
-  }
-  chunk_accum_bytes_ = 0;
-  chunk_token_bytes_ = 0;
-  if (chunk_final_buf_) {
-    ggml_backend_buffer_free((ggml_backend_buffer_t)chunk_final_buf_);
-    chunk_final_buf_ = nullptr;
-  }
-  if (chunk_final_ctx_) {
-    ggml_free((ggml_context *)chunk_final_ctx_);
-    chunk_final_ctx_ = nullptr;
-  }
-  chunk_final_ = nullptr;
-  chunk_final_tokens_ = 0;
-  chunk_ready_recorded_ = false;
-  chunk_accum_recorded_ = false;
-  chunk_input_published_ = false;
-  chunk_has_submission_ = false;
-  chunk_stage_index_ = 0;
-  for (int i = 0; i < NBUF; ++i) {
-    chunk_weight_recorded_[i] = false;
-    chunk_scatter_recorded_[i] = false;
-  }
-  for (int i = 0; i < NBUF; ++i) {
-    chunk_token_stage_[i].clear();
-    chunk_id_stage_[i].clear();
-    chunk_weight_stage_[i].clear();
-  }
-  chunk_token_keepalive_.clear();
-  chunk_id_keepalive_.clear();
-  chunk_weight_keepalive_.clear();
-}
-
-bool GgmlMoeRunner::ensure_chunk_state() {
-  if (!backend_ || !plan_.chunked || plan_.source_tokens <= 0 ||
-      plan_.n_tokens <= 0 || plan_.d_model <= 0)
-    return false;
-  const size_t token_bytes = (size_t)plan_.n_tokens * sizeof(int32_t);
-  if (chunk_token_bytes_ != token_bytes) {
-    for (int i = 0; i < NBUF; ++i) {
-      if (chunk_token_device_[i]) {
-        cudaFree(chunk_token_device_[i]);
-        chunk_token_device_[i] = nullptr;
-      }
-      chunk_scatter_recorded_[i] = false;
-    }
-    chunk_token_bytes_ = 0;
-  }
-  if (chunk_token_bytes_ == 0) {
-    for (int i = 0; i < NBUF; ++i) {
-      if (cudaMalloc(&chunk_token_device_[i], token_bytes) != cudaSuccess ||
-          !chunk_token_device_[i]) {
-        LOG_ERROR("[GGML-MOE] chunk token snapshot allocation failed (%zu bytes)\n",
-                  token_bytes);
-        for (int j = 0; j <= i; ++j) {
-          if (chunk_token_device_[j]) {
-            cudaFree(chunk_token_device_[j]);
-            chunk_token_device_[j] = nullptr;
-          }
-        }
-        return false;
-      }
-    }
-    chunk_token_bytes_ = token_bytes;
-  }
-  const size_t accum_bytes = (size_t)plan_.source_tokens * plan_.d_model *
-                             sizeof(float);
-  if (!chunk_accum_ || chunk_accum_bytes_ != accum_bytes) {
-    // begin_layer() has already fenced an old graph if the shape changed.
-    if (chunk_accum_) cudaFree(chunk_accum_);
-    chunk_accum_ = nullptr;
-    if (cudaMalloc(&chunk_accum_, accum_bytes) != cudaSuccess || !chunk_accum_) {
-      LOG_ERROR("[GGML-MOE] chunk accumulator allocation failed (%.2f MiB)\n",
-                (double)accum_bytes / (1024.0 * 1024.0));
-      chunk_accum_bytes_ = 0;
-      return false;
-    }
-    chunk_accum_bytes_ = accum_bytes;
-  }
-
-  if (!chunk_final_ || chunk_final_buf_ == nullptr || chunk_final_ctx_ == nullptr ||
-      chunk_final_tokens_ != plan_.source_tokens) {
-    if (chunk_final_buf_) {
-      ggml_backend_buffer_free((ggml_backend_buffer_t)chunk_final_buf_);
-      chunk_final_buf_ = nullptr;
-    }
-    if (chunk_final_ctx_) {
-      ggml_free((ggml_context *)chunk_final_ctx_);
-      chunk_final_ctx_ = nullptr;
-    }
-    ggml_init_params ip = {};
-    ip.mem_size = ggml_tensor_overhead();
-    ip.no_alloc = true;
-    ggml_context *ctx = ggml_init(ip);
-    if (!ctx) return false;
-    ggml_tensor *out = ggml_new_tensor_2d(
-        ctx, GGML_TYPE_F32, plan_.d_model, plan_.source_tokens);
-    if (!out) {
-      ggml_free(ctx);
-      return false;
-    }
-    ggml_backend_buffer_t buf =
-        ggml_backend_alloc_ctx_tensors(ctx, (ggml_backend_t)backend_);
-    if (!buf) {
-      ggml_free(ctx);
-      return false;
-    }
-    chunk_final_ctx_ = ctx;
-    chunk_final_buf_ = buf;
-    chunk_final_ = out;
-    chunk_final_tokens_ = plan_.source_tokens;
-  }
-
-  cudaSetDevice(device_);
-  if (chunk_accum_recorded_)
-    cudaStreamWaitEvent(0, (cudaEvent_t)
-                              ((ggml_backend_event_t)chunk_accum_event_)->context,
-                        0);
-  if (cudaMemsetAsync(chunk_accum_, 0, accum_bytes, 0) != cudaSuccess)
-    return false;
-  if (cudaEventRecord(
-          (cudaEvent_t)((ggml_backend_event_t)chunk_ready_event_)->context, 0) !=
-      cudaSuccess)
-    return false;
-  chunk_ready_recorded_ = true;
-  chunk_accum_recorded_ = false;
-  chunk_input_published_ = false;
-  chunk_has_submission_ = false;
-  chunk_stage_index_ = 0;
-  for (int i = 0; i < NBUF; ++i) chunk_scatter_recorded_[i] = false;
-  return true;
 }
 
 void GgmlMoeRunner::free_weight_tensors() {
@@ -446,33 +270,6 @@ bool GgmlMoeRunner::ensure_backend(int device) {
   // quantized-buffer initializer from trying to clear padding beyond it.
   ggml_backend_buffer_set_usage(
       (ggml_backend_buffer_t)external_buf_, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
-  chunk_ready_event_ = ggml_backend_event_new(
-      ggml_backend_get_device((ggml_backend_t)backend_));
-  chunk_graph_event_ = ggml_backend_event_new(
-      ggml_backend_get_device((ggml_backend_t)backend_));
-  chunk_accum_event_ = ggml_backend_event_new(
-      ggml_backend_get_device((ggml_backend_t)backend_));
-  for (int i = 0; i < NBUF; ++i) {
-    chunk_graph_events_[i] = ggml_backend_event_new(
-        ggml_backend_get_device((ggml_backend_t)backend_));
-  }
-  for (int i = 0; i < NBUF; ++i) {
-    chunk_weight_done_events_[i] = ggml_backend_event_new(
-        ggml_backend_get_device((ggml_backend_t)backend_));
-    if (cudaEventCreateWithFlags(
-            (cudaEvent_t *)&chunk_scatter_done_events_[i],
-            cudaEventDisableTiming) != cudaSuccess) {
-      LOG_ERROR("[GGML-MOE] chunk scatter event creation failed\n");
-      return false;
-    }
-  }
-  if (!chunk_ready_event_ || !chunk_graph_event_ || !chunk_accum_event_ ||
-      !chunk_graph_events_[0] || !chunk_graph_events_[1] ||
-      !chunk_weight_done_events_[0] || !chunk_weight_done_events_[1] ||
-      !chunk_scatter_done_events_[0] || !chunk_scatter_done_events_[1]) {
-    LOG_ERROR("[GGML-MOE] chunk pipeline event creation failed\n");
-    return false;
-  }
   device_ = device;
   // The backend-stream copy experiment showed no separate decode benefit and
   // was removed. Keep the conservative copy-stream handoff and one weight
@@ -602,11 +399,7 @@ bool GgmlMoeRunner::begin_layer(const GgmlMoeLayerPlan &plan) {
   const int slots =
       plan.n_expert_slots > 0 ? plan.n_expert_slots : plan.n_experts;
   if (slots < plan.n_experts) return false;
-  GgmlMoeLayerPlan normalized_plan = plan;
-  if (normalized_plan.source_tokens <= 0)
-    normalized_plan.source_tokens = normalized_plan.n_tokens;
-  if (normalized_plan.source_tokens <= 0) return false;
-  plan_ = normalized_plan;
+  plan_ = plan;
   if (!type_supported(plan.gate_type) || !type_supported(plan.up_type) ||
       !type_supported(plan.down_type))
     return false;
@@ -651,7 +444,7 @@ bool GgmlMoeRunner::begin_layer(const GgmlMoeLayerPlan &plan) {
   const size_t raw_expert_stride =
       gate_exp_bytes_ + up_exp_bytes_ + down_exp_bytes_;
   if (plan.external_weights &&
-      (!external_buf_ || plan.chunked || !plan.external_gate ||
+      (!external_buf_ || !plan.external_gate ||
        !plan.external_up || !plan.external_down ||
        plan.external_expert_stride < raw_expert_stride ||
        plan.external_expert_stride != raw_expert_stride ||
@@ -1001,15 +794,6 @@ bool GgmlMoeRunner::begin_layer(const GgmlMoeLayerPlan &plan) {
 
   plan_.n_expert_slots = tensor_slots;
   if (!ensure_graph()) return false;
-  if (plan_.chunked) {
-    if (!ensure_chunk_state()) return false;
-  } else if (chunk_has_submission_) {
-    // A mode switch can only happen at a shape/topology boundary. Drain the
-    // shared backend before releasing the raw chunk accumulator and its GGML
-    // publication tensor.
-    ggml_backend_synchronize((ggml_backend_t)backend_);
-    free_chunk_state();
-  }
   layer_ready_ = true;
   return true;
 }
@@ -1019,13 +803,11 @@ bool GgmlMoeRunner::ensure_graph() {
 
   const bool matches =
       graph_ctx_ && graph_ && graph_tokens_ == plan_.n_tokens &&
-      graph_source_tokens_ == plan_.source_tokens &&
       graph_topk_ == plan_.topk && graph_d_model_ == plan_.d_model &&
       graph_d_ff_ == plan_.d_ff && graph_slots_ == plan_.n_expert_slots &&
       graph_gate_type_ == plan_.gate_type &&
       graph_up_type_ == plan_.up_type &&
-      graph_down_type_ == plan_.down_type &&
-      graph_chunked_ == plan_.chunked;
+      graph_down_type_ == plan_.down_type;
   if (matches) return true;
 
   // A layer may change the compact-slot count or quantization type, forcing
@@ -1071,57 +853,27 @@ bool GgmlMoeRunner::ensure_graph() {
   const int S = plan_.n_tokens;
   const int K = plan_.topk;
   const int D = plan_.d_model;
-  // Keep the ordinary graph's input storage two-dimensional. In chunk mode
-  // the same flat storage is reshaped to [D,source_tokens,1], gathered by
-  // token_ids, and then presented to MUL_MAT_ID as [D,1,pairs].
   ggml_tensor *t_x_flat = ggml_new_tensor_2d(
-      ctx, GGML_TYPE_F32, D, plan_.source_tokens);
-  // MUL_MAT_ID's b tensor is [D, n_expert_used, n_tokens].  The ordinary
-  // top-k graph therefore needs [D,1,S], while the chunk graph gathers rows
-  // from [D,S,1] and then presents the gathered result as [D,1,pairs].
-  ggml_tensor *t_x = nullptr;
-  if (t_x_flat) {
-    t_x = plan_.chunked
-              ? ggml_reshape_3d(ctx, t_x_flat, D, plan_.source_tokens, 1)
-              : ggml_reshape_3d(ctx, t_x_flat, D, 1, plan_.n_tokens);
-  }
-  ggml_tensor *t_ids = nullptr;
-  ggml_tensor *t_w = nullptr;
-  ggml_tensor *t_token_ids = nullptr;
-  ggml_tensor *expert_x = nullptr;
-  if (plan_.chunked) {
-    t_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, S);
-    t_w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 1, S);
-    // GET_ROWS uses [pair_count,1] indices for a [D,source_tokens,1]
-    // activation. Reshape its [D,pairs,1] result to the [D,1,pairs] layout
-    // expected by MUL_MAT_ID.
-    t_token_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, S, 1);
-    ggml_tensor *rows = t_token_ids ? ggml_get_rows(ctx, t_x, t_token_ids)
-                                    : nullptr;
-    expert_x = rows ? ggml_reshape_3d(ctx, rows, D, 1, S) : nullptr;
-  } else {
-    t_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, K, S);
-    t_w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, K, S);
-    expert_x = t_x;
-  }
-  if (!t_x || !t_ids || !t_w || !expert_x ||
-      (plan_.chunked && !t_token_ids)) {
+      ctx, GGML_TYPE_F32, D, S);
+  ggml_tensor *t_x = t_x_flat ? ggml_reshape_3d(ctx, t_x_flat, D, 1, S)
+                              : nullptr;
+  ggml_tensor *t_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, K, S);
+  ggml_tensor *t_w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, K, S);
+  ggml_tensor *expert_x = t_x;
+  if (!t_x || !t_ids || !t_w || !expert_x) {
     ggml_free(ctx);
     return false;
   }
   ggml_set_input(t_x_flat);
   ggml_set_input(t_ids);
   ggml_set_input(t_w);
-  if (t_token_ids) ggml_set_input(t_token_ids);
-  ggml_set_name(t_x_flat, plan_.chunked ? "moe_chunk_x" : "moe_x");
+  ggml_set_name(t_x_flat, "moe_x");
   ggml_set_name(t_ids, "moe_ids");
   ggml_set_name(t_w, "moe_w");
-  if (t_token_ids) ggml_set_name(t_token_ids, "moe_token_ids");
 
   const moe::MoeGraphNodes nodes = moe::build_moe_topology(
       ctx, (ggml_tensor *)t_gate_, (ggml_tensor *)t_up_,
-      (ggml_tensor *)t_down_, expert_x, t_ids, t_w, D, S, K,
-      plan_.chunked);
+      (ggml_tensor *)t_down_, expert_x, t_ids, t_w, D, S, K, false);
   ggml_tensor *moe = nodes.output;
   if (!nodes.gate || !nodes.up || !nodes.activation || !nodes.down || !moe) {
     ggml_free(ctx);
@@ -1154,14 +906,12 @@ bool GgmlMoeRunner::ensure_graph() {
   graph_x_input_ = t_x;
   graph_ids_ = t_ids;
   graph_w_ = t_w;
-  graph_token_ids_ = t_token_ids;
   graph_gate_out_ = nodes.gate;
   graph_up_out_ = nodes.up;
   graph_act_out_ = nodes.activation;
   graph_down_out_ = nodes.down;
   graph_out_ = moe;
   graph_tokens_ = S;
-  graph_source_tokens_ = plan_.source_tokens;
   graph_topk_ = K;
   graph_d_model_ = D;
   graph_d_ff_ = plan_.d_ff;
@@ -1169,7 +919,6 @@ bool GgmlMoeRunner::ensure_graph() {
   graph_gate_type_ = plan_.gate_type;
   graph_up_type_ = plan_.up_type;
   graph_down_type_ = plan_.down_type;
-  graph_chunked_ = plan_.chunked;
   LOG_INFO("[GGML-MOE] persistent graph: S=%d topk=%d D=%d d_ff=%d "
            "experts=%d slots=%d types=%u/%u/%u\n",
            S, K, D, plan_.d_ff, plan_.n_experts, plan_.n_expert_slots,
@@ -1377,44 +1126,6 @@ bool GgmlMoeRunner::run_layer_device_impl(const float *host_x,
       LOG_DEBUG("[GGML-MOE-TRACE] weight completion event recorded\n");
   }
 
-  // Opt-in Layer-0 A/A diagnostic.  The first runner invocation in the
-  // unbatched Qwen replay is layer 0; export the native GGML intermediates so
-  // the routed FFN can be compared against llama.cpp's ffn_moe_down dump.  This is
-  // intentionally synchronizing and never runs without the diagnostic flag.
-  if (const char *dump_base = zeromoe::graphcfg::env("ZEROMOE_GGML_MOE_DUMP")) {
-    static std::atomic<bool> dumped_first_runner{false};
-    bool expected = false;
-    if (dumped_first_runner.compare_exchange_strong(
-            expected, true, std::memory_order_relaxed)) {
-      ggml_backend_synchronize((ggml_backend_t)backend_);
-      auto dump_tensor = [&](const char *label, void *opaque) {
-        const ggml_tensor *tensor = (const ggml_tensor *)opaque;
-        if (!tensor || !tensor->data) return;
-        const size_t elements = (size_t)ggml_nelements(tensor);
-        std::vector<float> host(elements);
-        if (cudaMemcpy(host.data(), tensor->data,
-                       elements * sizeof(float),
-                       cudaMemcpyDeviceToHost) != cudaSuccess)
-          return;
-        std::string path = std::string(dump_base) + "." + label + ".f32";
-        std::ofstream out(path, std::ios::binary | std::ios::trunc);
-        if (out)
-          out.write(reinterpret_cast<const char *>(host.data()),
-                    static_cast<std::streamsize>(elements * sizeof(float)));
-        LOG_INFO("[GGML-MOE-DUMP] %s elements=%zu type=%u ne=%lld,%lld,%lld,%lld path=%s\n",
-                 label, elements, (unsigned)tensor->type,
-                 (long long)tensor->ne[0], (long long)tensor->ne[1],
-                 (long long)tensor->ne[2], (long long)tensor->ne[3],
-                 path.c_str());
-      };
-      dump_tensor("gate", graph_gate_out_);
-      dump_tensor("up", graph_up_out_);
-      dump_tensor("act", graph_act_out_);
-      dump_tensor("down", graph_down_out_);
-      dump_tensor("out", graph_out_);
-    }
-  }
-
   if (backend_stream_copies_) {
     ggml_backend_synchronize((ggml_backend_t)backend_);
     graph_in_flight_ = false;
@@ -1455,178 +1166,6 @@ bool GgmlMoeRunner::run_layer_device_input_tensor_device_route(
                                device_weights);
 }
 
-bool GgmlMoeRunner::run_chunk_device_input_tensor(
-    const void *device_tensor, const int32_t *token_ids, const int32_t *ids,
-    const float *weights, int copy_buf, const void **device_output) {
-  if (device_output) *device_output = nullptr;
-  if (!layer_ready_ || !plan_.chunked || !backend_ || !device_tensor ||
-      !token_ids || !ids || !weights || !device_output ||
-      copy_buf < 0 || copy_buf >= NBUF || !graph_token_ids_ || !chunk_accum_ ||
-      !chunk_final_ || !chunk_ready_recorded_)
-    return false;
-
-  ggml_tensor *src = (ggml_tensor *)device_tensor;
-  if (src->type != GGML_TYPE_F32 || src->ne[0] != plan_.d_model ||
-      src->ne[1] < plan_.source_tokens || src->ne[2] != 1 || src->ne[3] != 1 ||
-      src->nb[0] != sizeof(float) ||
-      src->nb[1] != (size_t)plan_.d_model * sizeof(float) || !src->buffer ||
-      !src->data)
-    return false;
-
-  cudaSetDevice(device_);
-  if (!chunk_input_published_) {
-    ggml_tensor *src_view = ggml_view_2d(
-        (ggml_context *)graph_ctx_, src, plan_.d_model, plan_.source_tokens,
-        src->nb[1], 0);
-    if (!src_view) return false;
-    ggml_backend_tensor_copy_async((ggml_backend_t)backend_,
-                                   (ggml_backend_t)backend_, src_view,
-                                   (ggml_tensor *)graph_x_);
-    chunk_input_published_ = true;
-  }
-
-  const size_t pairs = (size_t)plan_.n_tokens;
-  // Keep every queued source alive until the final reduction.  The backend
-  // setter is asynchronous and the next chunk may be submitted before the
-  // previous graph has consumed its route table; recycling a two-entry host
-  // ring here corrupts IDs/weights while the GPU is still reading them.
-  const size_t keep = chunk_token_keepalive_.size();
-  chunk_token_keepalive_.emplace_back(token_ids, token_ids + pairs);
-  chunk_id_keepalive_.emplace_back(ids, ids + pairs);
-  chunk_weight_keepalive_.emplace_back(weights, weights + pairs);
-  const int route_slot = chunk_stage_index_++ % NBUF;
-  chunk_token_stage_[route_slot] = chunk_token_keepalive_[keep];
-  chunk_id_stage_[route_slot] = chunk_id_keepalive_[keep];
-  chunk_weight_stage_[route_slot] = chunk_weight_keepalive_[keep];
-  ggml_backend_tensor_set_async(
-      (ggml_backend_t)backend_, (ggml_tensor *)graph_token_ids_,
-      chunk_token_keepalive_[keep].data(), 0,
-      pairs * sizeof(int32_t));
-  ggml_backend_tensor_set_async(
-      (ggml_backend_t)backend_, (ggml_tensor *)graph_ids_,
-      chunk_id_keepalive_[keep].data(), 0, pairs * sizeof(int32_t));
-  ggml_backend_tensor_set_async(
-      (ggml_backend_t)backend_, (ggml_tensor *)graph_w_,
-      chunk_weight_keepalive_[keep].data(), 0, pairs * sizeof(float));
-
-  // First chunk waits for the zeroing memset; subsequent chunks wait for the
-  // preceding default-stream scatter-add. The dependency is queued on the
-  // shared backend and never blocks the CPU.
-  if (chunk_accum_recorded_) {
-    ggml_backend_event_wait((ggml_backend_t)backend_,
-                            (ggml_backend_event_t)chunk_accum_event_);
-  } else {
-    ggml_backend_event_wait((ggml_backend_t)backend_,
-                            (ggml_backend_event_t)chunk_ready_event_);
-  }
-  if (pending_[copy_buf]) {
-    ggml_backend_event_wait(
-        (ggml_backend_t)backend_,
-        (ggml_backend_event_t)backend_stage_event_[copy_buf]);
-  }
-
-  if (ggml_backend_graph_compute_async((ggml_backend_t)backend_,
-                                       (ggml_cgraph *)graph_) !=
-      GGML_STATUS_SUCCESS)
-    return false;
-
-  // Chunk mode has two asynchronous consumers of the graph's reusable
-  // tensors: the next GGML submission and the default-stream scatter.  Keep
-  // a bounded diagnostic here so a bad value can be attributed to the graph
-  // itself before either consumer is involved.  This is intentionally opt-in
-  // because it synchronizes and copies every inspected intermediate.
-
-
-  // The graph has produced a weighted [D,pairs] chunk. Bridge to the default
-  // CUDA stream for the existing scatter kernel, then publish that completion
-  // back to the GGML stream before the next chunk graph is queued.
-  ggml_backend_event_record(
-      (ggml_backend_event_t)chunk_graph_events_[copy_buf],
-      (ggml_backend_t)backend_);
-  if (cudaStreamWaitEvent(
-          0,
-          (cudaEvent_t)((ggml_backend_event_t)
-                            chunk_graph_events_[copy_buf])->context,
-          0) != cudaSuccess)
-    return false;
-  if (cudaMemcpyAsync(chunk_token_device_[copy_buf],
-                      ((ggml_tensor *)graph_token_ids_)->data,
-                      pairs * sizeof(int32_t), cudaMemcpyDeviceToDevice, 0) !=
-      cudaSuccess)
-    return false;
-  launch_expert_scatter_add(
-      (const float *)((ggml_tensor *)graph_out_)->data,
-      (const int *)chunk_token_device_[copy_buf],
-      (float *)chunk_accum_, plan_.n_tokens, plan_.d_model,
-      plan_.source_tokens, 0);
-  if (cudaEventRecord(
-          (cudaEvent_t)((ggml_backend_event_t)chunk_accum_event_)->context,
-          0) != cudaSuccess)
-    return false;
-  if (cudaEventRecord((cudaEvent_t)chunk_scatter_done_events_[copy_buf], 0) !=
-      cudaSuccess)
-    return false;
-
-
-  ggml_backend_event_record(
-      (ggml_backend_event_t)chunk_weight_done_events_[copy_buf],
-      (ggml_backend_t)backend_);
-  chunk_weight_recorded_[copy_buf] = true;
-  chunk_scatter_recorded_[copy_buf] = true;
-  chunk_accum_recorded_ = true;
-  chunk_has_submission_ = true;
-  graph_in_flight_ = true;
-  return true;
-}
-
-bool GgmlMoeRunner::finish_chunked_output(const void **device_output) {
-  if (device_output) *device_output = nullptr;
-  if (!layer_ready_ || !plan_.chunked || !device_output ||
-      !chunk_has_submission_ || !chunk_accum_recorded_ || !chunk_final_)
-    return false;
-  cudaSetDevice(device_);
-  if (cudaStreamWaitEvent(
-          0,
-          (cudaEvent_t)((ggml_backend_event_t)chunk_accum_event_)->context,
-          0) != cudaSuccess)
-    return false;
-  const size_t bytes = (size_t)plan_.source_tokens * plan_.d_model *
-                       sizeof(float);
-  if (cudaMemcpyAsync(((ggml_tensor *)chunk_final_)->data, chunk_accum_, bytes,
-                      cudaMemcpyDeviceToDevice, 0) != cudaSuccess)
-    return false;
-  // Re-record after the final copy. The backend has no later wait on this
-  // event from the last chunk, and the next layer's memset is ordered after
-  // this publication on the same default stream.
-  if (cudaEventRecord(
-          (cudaEvent_t)((ggml_backend_event_t)chunk_accum_event_)->context,
-          0) != cudaSuccess)
-    return false;
-  ggml_backend_event_wait((ggml_backend_t)backend_,
-                          (ggml_backend_event_t)chunk_accum_event_);
-  ggml_backend_event_record((ggml_backend_event_t)graph_done_event_,
-                            (ggml_backend_t)backend_);
-  if (backend_stream_copies_) {
-    // Chunked execution uses the same alternating VRAM weight buffers as the
-    // ordinary device-output path, but it does not pass through
-    // run_layer_device_impl(), where the buffer completion event is normally
-    // recorded.  Without recording it here, begin_layer() can reuse this
-    // buffer for a later layer while this layer's queued IQ1_M GEMM is still
-    // reading it.  The resulting corruption first appears as sporadic NaNs
-    // inside the quantized up/down projection.
-    void *event = backend_weight_done_event_[backend_weight_event_next_];
-    if (!event) return false;
-    ggml_backend_event_record((ggml_backend_event_t)event,
-                              (ggml_backend_t)backend_);
-    backend_weight_last_event_[weight_buffer_index_] = event;
-    backend_weight_buffer_in_use_[weight_buffer_index_] = true;
-    backend_weight_event_next_ =
-        (backend_weight_event_next_ + 1) % NWEIGHT_EVENTS;
-  }
-  *device_output = chunk_final_;
-  return true;
-}
-
 void GgmlMoeRunner::wait_device_output() {
   if (!backend_stream_copies_ || !backend_ || !graph_in_flight_ ||
       !graph_done_event_)
@@ -1640,24 +1179,22 @@ void GgmlMoeRunner::wait_device_output() {
 bool GgmlMoeRunner::copy_device_output_to_host(const void *device_output,
                                                 float *host_out) {
   if (!layer_ready_ || !device_output || !host_out ||
-      (device_output != graph_out_ && device_output != chunk_final_)) {
+      device_output != graph_out_) {
     static std::atomic<int> invalid_readback_logs{0};
     const int n = invalid_readback_logs.fetch_add(1, std::memory_order_relaxed);
     if (n < 12) {
       LOG_WARN("[GGML-MOE] rejected device readback: runner=%p ready=%d "
-               "device_output=%p graph_out=%p chunk_final=%p backend=%p "
-               "plan_tokens=%d plan_d=%d chunked=%d\n",
+               "device_output=%p graph_out=%p backend=%p plan_tokens=%d "
+               "plan_d=%d\n",
                (void *)this, layer_ready_ ? 1 : 0, device_output,
-               (void *)graph_out_, (void *)chunk_final_, (void *)backend_,
-               plan_.n_tokens, plan_.d_model, plan_.chunked ? 1 : 0);
+               (void *)graph_out_, (void *)backend_, plan_.n_tokens,
+               plan_.d_model);
     }
     return false;
   }
   cudaSetDevice(device_);
-  const int out_tokens = plan_.chunked ? plan_.source_tokens : plan_.n_tokens;
+  const int out_tokens = plan_.n_tokens;
   const size_t bytes = (size_t)out_tokens * plan_.d_model * sizeof(float);
-  if (plan_.chunked)
-    ggml_backend_event_synchronize((ggml_backend_event_t)graph_done_event_);
   ggml_backend_tensor_get((ggml_tensor *)device_output, host_out, 0, bytes);
   return true;
 }
@@ -1705,8 +1242,6 @@ void GgmlMoeRunner::invalidate_graph() {}
 void GgmlMoeRunner::free_weight_tensors() {}
 bool GgmlMoeRunner::ensure_backend(int) { return false; }
 bool GgmlMoeRunner::ensure_weight_buffer(size_t, size_t) { return false; }
-bool GgmlMoeRunner::ensure_chunk_state() { return false; }
-void GgmlMoeRunner::free_chunk_state() {}
 bool GgmlMoeRunner::begin_layer(const GgmlMoeLayerPlan &) { return false; }
 bool GgmlMoeRunner::run_layer(const float *, const int32_t *, const float *,
                               float *) {
@@ -1728,12 +1263,10 @@ bool GgmlMoeRunner::run_layer_device_input_tensor_device_route(
     const void *, const void *, const void *, const void **) {
   return false;
 }
-bool GgmlMoeRunner::run_chunk_device_input_tensor(
     const void *, const int32_t *, const int32_t *, const float *, int,
     const void **) {
   return false;
 }
-bool GgmlMoeRunner::finish_chunked_output(const void **) { return false; }
 void GgmlMoeRunner::wait_device_output() {}
 bool GgmlMoeRunner::copy_device_output_to_host(const void *, float *) {
   return false;

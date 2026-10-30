@@ -15,7 +15,7 @@ Peak recipe (short prompt, 64 GiB DDR pool):
       ZEROMOE_GLM5NEXT_PILOT_PREFETCH=3 ZEROMOE_GLM5NEXT_PILOT_STAGE=3 \
       ZEROMOE_GLM5NEXT_MODEL_DIRECT=1 # ZEROMOE_OFFLOAD_RETARGET is on by default (=0 disables)
 
-Long prompt (426 tokens): `PROMPT_TEXT=<prompt> OFFLOAD_DDR_GIB=74 ZEROMOE_MEM_GUARD_FLOOR_MB=16384` plus the recipe above.
+Long prompt (426 tokens): `PROMPT_TEXT=<prompt> OFFLOAD_DDR_GIB=74 ZEROMOE_MEM_GUARD_FLOOR_MB=16384` plus the recipe above. The 16 GiB guard floor is stricter than the engine's 10 GiB default; it is not a relaxation.
 Needs ZEROMOE_BIN (default `./build/zeromoe`) built Release with the ggml tree that carries patches 0006/0007.
 Set `GLM_MODEL` to the model file or shard directory and `GLM_STORE` to the expert-store file before running;
 the TOML and scripts use tracked usage profiles by default. Keep model weights and generated stores outside the repository.

@@ -1,5 +1,5 @@
-// Qwen4Exp full graph: Planning: VRAM split between experts and dense state, partial-layer
-// selection, expert source sizing.
+// Qwen4Exp full graph: VRAM split between experts and dense state,
+// expert-source sizing, and whole-layer placement.
 //
 // Split out of the former single-file ggml_qwen4exp_graph.cpp; shared
 // declarations live in ggml_qwen4exp_graph_internal.hpp.
@@ -337,52 +337,6 @@ void plan_expert_vram_split(FullGraph &g) {
            g.split_gpu_expert_ids.size(), experts_placed);
 }
 
-// Phase 1 partial-layer planner: ranks ONE specific layer's experts by real
-// usage (same pin_file the startup [PIN] preload block and
-// plan_expert_vram_split already read) and keeps the top N. Idempotent --
-// only does real work once per process (engine.qwen4exp_partial_layer_planned
-// guards it), since a layer's usage ranking doesn't change mid-process and
-// this must survive the prefill->decode FullGraph object swap (see
-// engine.hpp's own comment on why this state is engine-owned).
-void plan_partial_layer(StreamingEngine &engine) {
-  engine.qwen4exp_partial_layer = env_partial_layer();
-  if (engine.qwen4exp_partial_layer < 0)
-    return;
-  engine.qwen4exp_partial_layer_top_n = env_partial_layer_top_n();
-  engine.qwen4exp_partial_layer_min_coverage = env_partial_layer_min_coverage();
-  if (engine.qwen4exp_partial_layer_planned)
-    return;
-
-  const std::string path = engine.qwen4exp_graph_pin_file.empty()
-                               ? std::string(".zeromoe_usage")
-                               : engine.qwen4exp_graph_pin_file;
-  auto [entries, maxc] = StreamingEngine::load_usage(path);
-  (void)maxc;
-
-  std::vector<StreamingEngine::UsageEntry> layer_entries;
-  for (const auto &e : entries)
-    if (e.layer == engine.qwen4exp_partial_layer)
-      layer_entries.push_back(e);
-  std::stable_sort(layer_entries.begin(), layer_entries.end(),
-                   [](const auto &a, const auto &b) {
-                     return a.count > b.count;
-                   });
-
-  engine.qwen4exp_partial_layer_gpu_ids.clear();
-  for (size_t i = 0; i < layer_entries.size() &&
-                     static_cast<int>(i) < engine.qwen4exp_partial_layer_top_n;
-       ++i)
-    engine.qwen4exp_partial_layer_gpu_ids.push_back(layer_entries[i].expert);
-  engine.qwen4exp_partial_layer_planned = true;
-
-  LOG_INFO("[PARTIAL-LAYER] layer=%d top_n=%d ranked from %s: %zu known "
-           "expert(s) for this layer, using top %zu for the GPU-resident "
-           "compact set\n",
-           engine.qwen4exp_partial_layer, engine.qwen4exp_partial_layer_top_n,
-           path.c_str(), layer_entries.size(),
-           engine.qwen4exp_partial_layer_gpu_ids.size());
-}
-
 size_t full_expert_source_bytes(const StreamingEngine &engine,
                                 int layer_limit)  {
   const auto &c = engine.model_file.architecture_config;
@@ -557,32 +511,6 @@ size_t device_expert_bytes(const FullGraph &g) {
     if (total > SIZE_MAX - layer_bytes)
       return 0;
     total += layer_bytes;
-  }
-  // Phase 1/2 partial-layer compact GPU tensor (build_moe_partial_gpu):
-  // qwen4exp_partial_layer_gpu_ids.size() experts' gate+up+down for
-  // engine.qwen4exp_partial_layer, on every decode instance that could
-  // possibly build it -- Phase 1's g_graph when it might commit, and
-  // ALL THREE Phase 2 instances (only SuffixGpu actually builds the
-  // tensor, but reserving on Prefix/SuffixCpu too is a small, bounded,
-  // always-safe no-op there). Without this, g.expert.buffer is
-  // never allocated at all when device_expert_layers<=0 and
-  // split_gpu_expert_ids is empty (this feature's only two OTHER
-  // consumers) -- build_split_gpu_tensor then silently fails via
-  // bind_device_expert_gather's own `!g.expert.buffer` guard,
-  // and the whole compact path falls back to ordinary dispatch for
-  // that layer (found via real hardware testing, 2026-09-18: the
-  // [PARTIAL-LAYER] "compact GPU tensor construction failed... RAM
-  // arena not ready?" warning).
-  if (g.decode_mode && !engine.qwen4exp_partial_layer_gpu_ids.empty() &&
-      engine.qwen4exp_partial_layer >= 0) {
-    const size_t per_expert =
-        engine.compute_expert_slab_bytes(engine.qwen4exp_partial_layer);
-    const size_t n = engine.qwen4exp_partial_layer_gpu_ids.size();
-    if (per_expert != 0 && n <= SIZE_MAX / per_expert) {
-      const size_t layer_bytes = per_expert * n;
-      if (total <= SIZE_MAX - layer_bytes)
-        total += layer_bytes;
-    }
   }
   // Generalized GPU staging (build_gpu_stage_node): a fixed compact
   // gate+up+down destination per staged host-resident layer, sized for

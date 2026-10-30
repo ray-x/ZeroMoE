@@ -637,47 +637,16 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                        ggml_tensor *down_exps_gpu,
                        const std::vector<int> *split_gpu_ids,
                        ggml_tensor *gate_up_exps,
-                       // Phase 1 partial-layer instrumentation only: when
-                       // non-null, receives this call's routing `ids`
-                       // tensor so the caller can mark it as a prefill
-                       // graph output for a real per-prompt routing
-                       // readback. Never used for anything decode does.
                        ggml_tensor **ids_out,
-                       // Same idea, but captures the raw post-softmax
-                       // router distribution (BEFORE selection_bias) so a
-                       // diagnostic can check how peaked/confident real
-                       // routing actually is -- see the "near-uniform =>
-                       // noise" precedent already used for the LM head in
-                       // generation_loop.hpp.
-                       ggml_tensor **probs_out,
-                       // Phase 2 prefix builds only: compute the router
-                       // (logits/probs/ids/weights, already added to the
-                       // graph via the ggml_build_forward_expand below)
-                       // and return nullptr immediately, WITHOUT
-                       // constructing any dispatch/FFN nodes at all. Lets
-                       // the prefix graph capture ids_out for the host
-                       // decision without paying for (or even
-                       // constructing) the big expert matmuls it will
-                       // never use -- the real dispatch happens once,
-                       // for real, in whichever suffix graph gets chosen.
-                       bool routing_only,
-                       ggml_tensor *fixed_route_ids,
-                       ggml_tensor *fixed_route_weights,
-                       ggml_tensor **route_weights_out)  {
+                       ggml_tensor **route_weights_out) {
   const auto &c = g.engine->model_file.architecture_config;
   const moe_routed::RouterSpec rspec =
       family_router_spec(g.engine->family_ops.family, c, g.S);
-  ggml_tensor *probs = nullptr;
-  if (!fixed_route_ids || !fixed_route_weights || probs_out)
-    probs = moe_routed::gate_probs(ctx, rspec, router, cur);
-  if (probs_out)
-    *probs_out = probs;
-  ggml_tensor *ids = fixed_route_ids;
-  if (!ids)
-    ids = moe_routed::select_ids(ctx, rspec, probs, selection_bias);
+  ggml_tensor *probs = moe_routed::gate_probs(ctx, rspec, router, cur);
+  ggml_tensor *ids = moe_routed::select_ids(ctx, rspec, probs, selection_bias);
   if (!ids)
     return nullptr;
-  if (!fixed_route_ids && g.decode_mode && g.stage_enabled &&
+  if (g.decode_mode && g.stage_enabled &&
       layer == g.stage_layer) {
     if (!g.stage_route_ids) {
       g.stage_route_ids = host_input(
@@ -723,29 +692,19 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     // ranking sliced into S fake "per-token" chunks -- found via real
     // hardware testing, 2026-09-18 (every reported PREFILL coverage/
     // routing-divergence number computed before this fix is invalid;
-    // see [[qwen4exp-legacy-vs-fullgraph-routing-divergence]] and
-    // [[qwen4exp-partial-layer-phase2-implemented]]). DECODE (S==1) was
+    // see [[qwen4exp-legacy-vs-fullgraph-routing-divergence]]. DECODE (S==1) was
     // never affected -- there is only one row, so the flat read already
     // lands on real data with no other row to conflate it with.
     // ggml_cont() forces a real, densely-strided [topk, S] copy so any
-    // host-side flat readback of *ids_out is safe.
+    // host-side usage/diagnostic readback through *ids_out is safe.
     *ids_out = ggml_cont(ctx, ids);
   }
-  ggml_tensor *weights = fixed_route_weights;
-  if (!weights)
-    weights = moe_routed::route_weights(ctx, rspec, probs, ids);
+  ggml_tensor *weights = moe_routed::route_weights(ctx, rspec, probs, ids);
   if (!weights)
     return nullptr;
   if (route_weights_out)
     *route_weights_out = weights;
   ggml_build_forward_expand(g.graph, weights);
-  if (routing_only) {
-    // Phase 2 prefix graph: caller only wanted ids_out/probs_out for the
-    // per-token host dispatch decision. Stop here -- no FFN/dispatch
-    // nodes constructed, so this layer's real expert compute happens
-    // exactly once, in whichever suffix graph actually gets chosen.
-    return nullptr;
-  }
 
   std::string exl3_bridge_path;
   if (g.exl3_cuda_adapter && g.engine && g.engine->gpu &&

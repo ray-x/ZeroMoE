@@ -337,12 +337,12 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   // are in the engine). The paths with their own per-layer machinery are not continued.
   if (pos_base > 0) {
     if (g_qwen4exp_cont_engine != &engine || g_qwen4exp_cont_total != pos_base ||
-        (int64_t)pos_base + S > (int64_t)engine.max_t || engine.qwen4exp_partial_layer >= 0 ||
+        (int64_t)pos_base + S > (int64_t)engine.max_t ||
         !engine.qwen4exp_gpu_stage_layers.empty() || engine.qwen4exp_cpu_offload || engine.prompt_cache) {
       LOG_WARN("[GGML-QWEN-FULL] prefill batch at pos_base=%d S=%d is not continued: state_engine_match=%d state_total=%d "
-               "max_t=%d partial_layer=%d stage_layers=%zu cpu_offload=%d prompt_cache=%d\n",
+               "max_t=%d stage_layers=%zu cpu_offload=%d prompt_cache=%d\n",
                pos_base, S, g_qwen4exp_cont_engine == &engine ? 1 : 0, g_qwen4exp_cont_total, engine.max_t,
-               engine.qwen4exp_partial_layer, engine.qwen4exp_gpu_stage_layers.size(),
+               engine.qwen4exp_gpu_stage_layers.size(),
                engine.qwen4exp_cpu_offload ? 1 : 0, engine.prompt_cache ? 1 : 0);
       return false;
     }
@@ -362,12 +362,9 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
     return false;
   }
   const auto &c = engine.model_file.architecture_config;
-  plan_partial_layer(engine);
   const bool prefill_compact_arena_needed =
-      (engine.qwen4exp_partial_layer >= 0 &&
-       !engine.qwen4exp_partial_layer_gpu_ids.empty()) ||
-      (engine.qwen4exp_gpu_stage_enabled &&
-       !engine.qwen4exp_gpu_stage_layers.empty());
+      engine.qwen4exp_gpu_stage_enabled &&
+      !engine.qwen4exp_gpu_stage_layers.empty();
   const bool reuse_prefill_weight_arenas =
       !prefill_compact_arena_needed;
   if (engine.qwen_ram_preload_all_experts) {
@@ -541,7 +538,7 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   if (!g->cuda_raw || !g->cuda || !g->cpu)
     return false;
   verify_cuda_graphs_compiled_in(g->cuda_raw);
-  g->cpu_threads = graph_cpu_threads();
+  g->cpu_threads = g->engine->omp_max_threads;
   ggml_backend_cpu_set_n_threads(g->cpu, g->cpu_threads);
   ggml_threadpool_params cpu_tp_params =
       ggml_threadpool_params_default(g->cpu_threads);
@@ -632,11 +629,12 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   // Prefill batches (S >= 32) run the host-resident expert matmuls on the GPU: the scheduler copies the experts a batch
   // uses across (ggml patch 0007), as llama.cpp's default does (BeeLlama on this box, same model: 200-257 tok/s with it,
   // 30 without). Measured here: 1611 tokens 61 -> 305 tok/s. The reserve needs one pipeline copy (4.7 GiB at 1611
-  // tokens; 44 GiB with the four copies decode uses), so prefill builds with copies=1. ZEROMOE_QWEN4EXP_PREFILL_OP_
-  // OFFLOAD=0 restores the CPU experts. Off for the paths with their own per-layer expert machinery.
+  // tokens; 44 GiB with the four copies decode uses), so prefill builds with copies=1.
+  // graph_prefill_op_offload=false restores the CPU experts. Off for paths
+  // with their own per-layer expert machinery.
   const bool prefill_op_offload =
-      zeromoe::graphcfg::atoi_or("ZEROMOE_QWEN4EXP_PREFILL_OP_OFFLOAD", 1) != 0 &&
-      engine.qwen4exp_partial_layer < 0 && engine.qwen4exp_gpu_stage_layers.empty() && !engine.qwen4exp_cpu_offload;
+      qwen4exp_prefill_op_offload_enabled() &&
+      engine.qwen4exp_gpu_stage_layers.empty() && !engine.qwen4exp_cpu_offload;
   g_qwen4exp_prefill_op_offload = prefill_op_offload;
   g->sched =
       ggml_backend_sched_new(backends, sched_bufts_ptr, 2, kGraphSize,

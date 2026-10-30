@@ -8,7 +8,7 @@
 #   ZEROMOE_SURVEY_BINARY=build_ggmlcuda/zeromoe
 #   CUDA_VISIBLE_DEVICES=0 ZEROMOE_CUDA_SCHEDULE=auto
 #   --graph-device-expert-trailing 1 --graph-device-expert-layers 22
-#   ZEROMOE_BENCH_IGNORE_STOP=1 (forces exactly --ngen tokens/response --
+#   --ignore-eos (forces exactly --ngen tokens/response --
 #   verified coherent continuation on this fixed build, not the degenerate
 #   collapse seen before the HC bugfix)
 #
@@ -21,7 +21,7 @@
 #      a real per-(layer,expert) routing histogram instead of reusing the
 #      frozen 7-prompt tuning file.
 #   3. max_new_tokens raised to 150 (matches --ngen below; with
-#      ZEROMOE_BENCH_IGNORE_STOP=1 this guarantees >=120 output
+#      --ignore-eos this guarantees >=120 output
 #      tokens/question, the original survey requirement).
 
 model_path = "/path/to/models/qwen3.8-flash-next/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf"

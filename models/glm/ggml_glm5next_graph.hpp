@@ -9,8 +9,8 @@ class GpuTopology;
 
 // The registered GLM5NEXT graph is the CUDA execution path.
 bool glm5next_full_graph_enabled();
-// Ling uses the full graph by default.  ZEROMOE_LING_NATIVE_GRAPH selects its
-// cache-backed implementation instead of the shared KDA/MLA graph.
+// Ling uses the shared KDA/MLA graph; experimental cache-backed native and
+// hybrid routes are retired.
 bool ling_full_graph_enabled();
 
 // Load the graph's host expert source arena during engine startup.  This is

@@ -7,7 +7,6 @@
 #include "ggml-quants.h"
 #include "moe_routed_ggml.hpp"
 #include "ggml_f32_quant_backend.hpp"
-#include <cstdlib>
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
@@ -241,20 +240,30 @@ static void grouped_graph(int device, int I, int O, int S, int G) {
 
 int main() {
   try {
-    const char *mode=std::getenv("ZEROMOE_TEST_NATIVE_F32");
-    native_mode=mode && mode[0]=='1';
-    if(native_mode)require(zeromoe_install_f32_quant_graph_hook(),"GGML F32 hook unavailable");
-    std::printf("native_f32=%d\n",int(native_mode));std::fflush(stdout);
-    int count=0;cuda_check(cudaGetDeviceCount(&count));require(count>=2,"both GPUs required");
-    for(int dev=0;dev<2;++dev) {
-      run(dev,256,256,1,9,6);
-      run(dev,256,256,19,9,6);
-      run(dev,256,256,817,9,6);
-      run(dev,5120,2304,1,7,6);
-      if(native_mode) {
-        grouped_graph(dev,256,7,3,3);
-        grouped_graph(dev,4096,128,17,8);
+    int count = 0;
+    cuda_check(cudaGetDeviceCount(&count));
+    require(count >= 2, "both GPUs required");
+    for (int mode = 0; mode < 2; ++mode) {
+      native_mode = mode != 0;
+      if (native_mode)
+        require(zeromoe_install_f32_quant_graph_hook(),
+                "GGML F32 hook unavailable");
+      std::printf("native_f32=%d\n", int(native_mode));
+      std::fflush(stdout);
+      for (int dev = 0; dev < 2; ++dev) {
+        run(dev, 256, 256, 1, 9, 6);
+        run(dev, 256, 256, 19, 9, 6);
+        run(dev, 256, 256, 817, 9, 6);
+        run(dev, 5120, 2304, 1, 7, 6);
+        if (native_mode) {
+          grouped_graph(dev, 256, 7, 3, 3);
+          grouped_graph(dev, 4096, 128, 17, 8);
+        }
       }
     }
-  }catch(const std::exception &e){std::fprintf(stderr,"FAIL: %s\n",e.what());return 1;}
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "FAIL: %s\n", e.what());
+    return 1;
+  }
+  return 0;
 }

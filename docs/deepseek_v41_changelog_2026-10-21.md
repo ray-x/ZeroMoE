@@ -31,7 +31,7 @@ NOT reached; honest steady-state decode is about 4.0-4.5 tok/s.
 | `mirror_model_path` + `mirror_coverage_file` (down-only sparse mirror on a 2nd NVMe; built by `bench/dsv41_pack_cold_mirror.py`) | dba16ce | disk time -10..-31%, decode about +2% |
 | `decode_promote_all_misses` | 5650d2f | +1.6% decode |
 | `ZEROMOE_DSV41_PILOT_K=k` (next-layer router prefetch) | f82d3ac | disk -30%, decode +2-4% |
-| `ZEROMOE_DSV41_CACHE_BONUS_VRAM/_RAM` (cache-aware expert selection) | 0737a17 | 3.62 -> 5.9 (b=0.40) .. 7.64 tok/s on one teacher-forced text. **Changes the output; quality cost not yet measured.** |
+| `ZEROMOE_DSV41_CACHE_BONUS_VRAM/_RAM` (cache-aware expert selection) | 0737a17 | 3.62 -> 5.9 (b=0.40) .. 7.64 tok/s on one teacher-forced text. **Changes the output; quality cost not yet measured.** Removed 2026-10-30; the default top-k router path remains. |
 | `ZEROMOE_ROUTE_LOG`, `ZEROMOE_ROUTER_IN_LOG`, `ZEROMOE_TEACHER_FORCE_NLL` | 00150ef, f82d3ac, 0737a17 | instrumentation |
 
 Tools: `bench/dsv41_graph_profile.py` (`--quantized-graph`, `--prompt-file`), `bench/dsv41_mirror_io_bench.py`,

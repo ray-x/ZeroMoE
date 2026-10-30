@@ -369,14 +369,6 @@ struct GgmlMoeLayerPlan {
   int topk = 0;         // experts per token
   int d_model = 0;      // D
   int d_ff = 0;         // moe_inter
-  // In the chunk pipeline, n_tokens is the padded routed-pair count and
-  // source_tokens is the original hidden-state batch. Normal graphs leave
-  // source_tokens at zero and use n_tokens for both dimensions.
-  int source_tokens = 0;
-  bool chunked = false;
-  // GGUFType numeric values. ZeroMoE's GGUFType is ggml's own numbering
-  // (see include/gguf_loader.hpp's enum, which documents the 2026 renumbering
-  // it was corrected against), so these are cast straight to ggml_type.
   uint32_t gate_type = 0;
   uint32_t up_type = 0;
   uint32_t down_type = 0;
@@ -624,17 +616,6 @@ class GgmlMoeRunner : private moe::GgmlMoeTransferManager {
       const void *device_tensor, const void *device_ids,
       const void *device_weights, const void **device_output);
 
-  // Chunk-pipeline variant. The source activation is [D,source_tokens]. The
-  // three host arrays are padded to plan.n_tokens and describe one routed
-  // expert chunk. Token rows are gathered on the GPU, and the chunk result is
-  // scatter-added into a persistent device accumulator.
-  bool run_chunk_device_input_tensor(const void *device_tensor,
-                                     const int32_t *token_ids,
-                                     const int32_t *ids,
-                                     const float *weights, int copy_buf,
-                                     const void **device_output);
-  bool finish_chunked_output(const void **device_output);
-
   // Queue the completion dependency for the most recent device output on the
   // shared GGML backend.  Consumers in another runner (HC) must call this
   // before reading graph_out_; a same-backend tensor copy is not sufficient
@@ -724,8 +705,6 @@ class GgmlMoeRunner : private moe::GgmlMoeTransferManager {
   bool end_h2d_timing(int buf, int slot);
   void free_graph();
   bool ensure_graph();
-  bool ensure_chunk_state();
-  void free_chunk_state();
   void free_weight_tensors();
   bool run_layer_device_impl(const float *host_x, const void *device_x,
                              const int32_t *ids, const float *w,
@@ -781,14 +760,12 @@ class GgmlMoeRunner : private moe::GgmlMoeTransferManager {
   void *graph_source_view_ = nullptr; // ggml_tensor*
   void *graph_ids_ = nullptr;    // ggml_tensor*
   void *graph_w_ = nullptr;      // ggml_tensor*
-  void *graph_token_ids_ = nullptr; // ggml_tensor* (chunk graph only)
   void *graph_gate_out_ = nullptr; // ggml_tensor* (debug only)
   void *graph_up_out_ = nullptr;   // ggml_tensor* (debug only)
   void *graph_act_out_ = nullptr;  // ggml_tensor* (debug only)
   void *graph_down_out_ = nullptr; // ggml_tensor* (debug only)
   void *graph_out_ = nullptr;    // ggml_tensor*
   int graph_tokens_ = 0;
-  int graph_source_tokens_ = 0;
   int graph_topk_ = 0;
   int graph_d_model_ = 0;
   int graph_d_ff_ = 0;
@@ -796,46 +773,9 @@ class GgmlMoeRunner : private moe::GgmlMoeTransferManager {
   uint32_t graph_gate_type_ = 0;
   uint32_t graph_up_type_ = 0;
   uint32_t graph_down_type_ = 0;
-  bool graph_chunked_ = false;
   size_t graph_workspace_bytes_ = 0;
   void *graph_done_event_ = nullptr; // ggml_backend_event_t
   bool graph_in_flight_ = false;
-
-  // Device-side chunk accumulation. graph_out_ is one chunk in [D,pairs]
-  // layout; the scatter kernel reduces it into [D,source_tokens]. The final
-  // GGML tensor lets the existing HC device handoff consume the result.
-  void *chunk_accum_ = nullptr;       // raw CUDA float*
-  size_t chunk_accum_bytes_ = 0;
-  void *chunk_final_ctx_ = nullptr;   // ggml_context*
-  void *chunk_final_buf_ = nullptr;   // ggml_backend_buffer_t
-  void *chunk_final_ = nullptr;       // ggml_tensor*
-  int chunk_final_tokens_ = 0;
-  void *chunk_ready_event_ = nullptr; // ggml_backend_event_t
-  void *chunk_graph_event_ = nullptr; // ggml_backend_event_t
-  void *chunk_graph_events_[NBUF] = {}; // ggml_backend_event_t per slot
-  void *chunk_accum_event_ = nullptr; // ggml_backend_event_t
-  void *chunk_weight_done_events_[NBUF] = {};
-  void *chunk_scatter_done_events_[NBUF] = {}; // raw CUDA events
-  void *chunk_token_device_[NBUF] = {};       // raw CUDA int32 buffers
-  bool chunk_weight_recorded_[NBUF] = {};
-  bool chunk_scatter_recorded_[NBUF] = {};
-  size_t chunk_token_bytes_ = 0;
-  bool chunk_ready_recorded_ = false;
-  bool chunk_accum_recorded_ = false;
-  bool chunk_input_published_ = false;
-  bool chunk_has_submission_ = false;
-  int chunk_stage_index_ = 0;
-  std::vector<int32_t> chunk_token_stage_[NBUF];
-  std::vector<int32_t> chunk_id_stage_[NBUF];
-  std::vector<float> chunk_weight_stage_[NBUF];
-  // ggml_backend_tensor_set_async may leave the host source in use until the
-  // queued graph reaches the backend stream.  Chunk graphs are deliberately
-  // kept in flight, so the two alternating weight buffers are not sufficient
-  // as route-table storage.  Retain one immutable route-table triple per
-  // submitted chunk until finish_chunked_output() publishes the reduction.
-  std::vector<std::vector<int32_t>> chunk_token_keepalive_;
-  std::vector<std::vector<int32_t>> chunk_id_keepalive_;
-  std::vector<std::vector<float>> chunk_weight_keepalive_;
 
   // --- current plan ---
   GgmlMoeLayerPlan plan_{};
@@ -972,7 +912,7 @@ class GgmlQwenCpuMoeRunner {
   bool wait_strided_async();
 
   // Actual GGML worker count for diagnostics. This may differ from the
-  // process-wide OpenMP maximum when ZEROMOE_QWEN_CPU_THREADS is used.
+  // process-wide OpenMP maximum under the shared -t/--threads limit.
   int thread_count() const { return n_threads_; }
 
   // Start the pre-sized direct team during graph construction, before graph

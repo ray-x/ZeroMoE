@@ -13,7 +13,7 @@
 //
 // Queue: `warmup` requests (not reported), then for each prompt `reps` requests of --bench-ngen tokens, then (with
 // --bench-long) two requests of the first prompt generating --bench-long tokens, reported as per-bucket speeds so
-// drift over a long generation is visible. Bench mode forces: full-length generation (ZEROMOE_BENCH_IGNORE_STOP),
+// drift over a long generation is visible. Bench mode forces: full-length generation (--ignore-eos),
 // no per-token printing or VRAM sampling (ZEROMOE_BENCH_SILENT, as llama-bench does) and no prompt-state cache (a
 // repeated prompt must be prefilled every time).
 //
@@ -111,8 +111,6 @@ class Session {
       // The engine reads a per-request token stream from <dir>/request-<k>.tokens (k counts requests from 0) and
       // skips sampling for forced steps.
       setenv("ZEROMOE_TEACHER_FORCE_REQUEST_DIR", dir_.c_str(), 1);
-      setenv("ZEROMOE_TEACHER_FORCE_SKIP_SAMPLING", "1", 1);
-      setenv("ZEROMOE_BENCH_IGNORE_STOP", "1", 1);
       setenv("ZEROMOE_BENCH_SILENT", "1", 1);
       prompt_cache_flag = false;
       startup_s_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_process_start).count();
@@ -131,7 +129,6 @@ class Session {
       prompts_.push_back({std::filesystem::path(file).stem().string(), text});
       labels_.push_back(prompts_.back().label);
     }
-    setenv("ZEROMOE_BENCH_IGNORE_STOP", "1", 1);
     setenv("ZEROMOE_BENCH_SILENT", "1", 1);
     prompt_cache_flag = false;
     for (int i = 0; i < plan_.warmup; ++i)

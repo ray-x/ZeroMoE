@@ -40,7 +40,7 @@ Gate order is mandatory:
 
 #### Debugging a numerical mismatch
 
-Replay llama.cpp's token sequence with `ZEROMOE_TEACHER_FORCE_TOKEN_FILE` and `ZEROMOE_TEACHER_FORCE_SKIP_SAMPLING=1`; compare identical tensor boundaries, not free-running text. For Qwen, use `ZEROMOE_QWEN4EXP_PROBE_DUMP=<dir>` and `ZEROMOE_QWEN4EXP_PROBE_LAYER=<layer>` for graph/router and selected expert-stage taps. Inspect the earliest differing boundary, align expert slots by ID, and record numeric error plus the top-k margin. Fix and replay that boundary before tuning downstream layers. Never waive operation-order or routing differences as “mathematically equivalent” without a same-input A/B.
+Replay llama.cpp's token sequence with `ZEROMOE_TEACHER_FORCE_TOKEN_FILE`; teacher-forced steps consume the supplied token directly without sampling; compare identical tensor boundaries, not free-running text. For Qwen, use `ZEROMOE_QWEN4EXP_PROBE_DUMP=<dir>` and `ZEROMOE_QWEN4EXP_PROBE_LAYER=<layer>` for graph/router and selected expert-stage taps. Inspect the earliest differing boundary, align expert slots by ID, and record numeric error plus the top-k margin. Fix and replay that boundary before tuning downstream layers. Never waive operation-order or routing differences as “mathematically equivalent” without a same-input A/B.
 
 #### When onboarding is finished
 

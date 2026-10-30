@@ -348,29 +348,6 @@ bool GgmlMoeRunner::begin_copy_batch(int buf) {
     if (!backend_stage_event_[buf]) return false;
     if (copy_batch_started_[buf]) return true;
     cudaSetDevice(device_);
-    if (plan_.chunked && chunk_weight_recorded_[buf] &&
-        chunk_weight_done_events_[buf]) {
-      // The alternating chunk slot is reused only after the previous graph
-      // has finished reading it. This dependency stays on the copy stream;
-      // the host does not round-trip at the chunk boundary.
-      if (cudaStreamWaitEvent(
-              (cudaStream_t)copy_stream_,
-              (cudaEvent_t)((ggml_backend_event_t)
-                                chunk_weight_done_events_[buf])
-                  ->context,
-              0) != cudaSuccess)
-        return false;
-    }
-    if (plan_.chunked && chunk_scatter_recorded_[buf] &&
-        chunk_scatter_done_events_[buf]) {
-      // The default-stream scatter reads the per-slot token snapshot.  The
-      // copy stream must not reuse that slot until the previous reduction has
-      // finished, even though the GGML graph itself finished earlier.
-      if (cudaStreamWaitEvent(
-              (cudaStream_t)copy_stream_,
-              (cudaEvent_t)chunk_scatter_done_events_[buf], 0) != cudaSuccess)
-        return false;
-    }
     direct_h2d_bytes_[buf] = 0;
     h2d_timing_count_[buf] = 0;
     if (cudaEventRecord((cudaEvent_t)backend_copy_t0_event_[buf],

@@ -1,5 +1,5 @@
-// Qwen4Exp full graph: Environment-driven settings of the full graph: feature gates, decode
-// capacity, CPU thread / scheduler policy, partial-layer knobs.
+// Qwen4Exp full graph: Environment-driven feature gates, decode capacity,
+// and scheduler policy.
 //
 // Split out of the former single-file ggml_qwen4exp_graph.cpp; shared
 // declarations live in ggml_qwen4exp_graph_internal.hpp.
@@ -9,7 +9,6 @@
 #include <sched.h>
 #include <vector>
 #include <string>
-#include <fstream>
 #include <algorithm>
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
@@ -18,23 +17,21 @@ using namespace qwen4exp_graph;
 
 namespace qwen4exp_graph {
 
-bool env_prefill_state_handoff_enabled() {
-  const char *value =
-      zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PREFILL_STATE_HANDOFF");
-  if (value && value[0])
-    return value[0] == '1';
+bool prefill_state_handoff_enabled() {
   return g_config_prefill_state_handoff;
 }
 
 bool prefill_device_state_inputs_enabled(const StreamingEngine &engine) {
   const char *value = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PREFILL_DEVICE_STATE");
-  const char *phase2 =
-      zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PARTIAL_LAYER_PHASE2");
-  const bool phase2_enabled = phase2 && phase2[0] == '1';
-  return !(value && value[0] == '0') && env_prefill_state_handoff_enabled() &&
+  return !(value && value[0] == '0') && prefill_state_handoff_enabled() &&
          !engine.prompt_cache && !engine.mtp_enabled &&
-         (engine.qwen4exp_partial_layer < 0 || phase2_enabled) &&
          engine.qwen4exp_gpu_stage_layers.empty();
+}
+
+bool qwen4exp_prefill_op_offload_enabled() {
+  const auto &settings = zeromoe::graphsettings::settings_for(
+      zeromoe::graphsettings::Family::Qwen);
+  return settings.tun.prefill_op_offload.value != 0;
 }
 
 int env_device_expert_layers() {
@@ -91,77 +88,6 @@ bool env_layer_timing_verbose() {
   return Logger::instance().would_log(LogLevel::DEBUG);
 }
 
-// Phase 1 "all-or-nothing" partial-layer GPU dispatch (see
-// engine.hpp's qwen4exp_partial_layer field group for the full contract).
-int env_partial_layer() {
-  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PARTIAL_LAYER");
-  if (!v || !v[0])
-    return -1;
-  char *end = nullptr;
-  const long n = std::strtol(v, &end, 10);
-  if (end == v || *end != '\0' || n < 0)
-    return -1;
-  return static_cast<int>(n);
-}
-
-int env_partial_layer_top_n() {
-  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PARTIAL_LAYER_TOP_N");
-  if (!v || !v[0])
-    return 256;
-  char *end = nullptr;
-  const long n = std::strtol(v, &end, 10);
-  if (end == v || *end != '\0' || n <= 0)
-    return 256;
-  return static_cast<int>(n);
-}
-
-// Required prefill-routing coverage (fraction of this prompt's actual
-// distinct layer-13-style routing already inside the top-N pinned set)
-// before decode commits to the GPU-only path for the session. Default 1.0
-// (100%) is deliberately strict: Phase 1 has no per-token fallback once
-// committed, so an out-of-set expert mid-session is silently dropped by
-// GGML_MUL_MAT_ID's negative-id contract rather than mis-routed -- see
-// build_moe_partial_gpu's own comment. Lower this only to experiment; it
-// trades a small, measured accuracy risk for a higher commit rate.
-float env_partial_layer_min_coverage() {
-  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PARTIAL_LAYER_MIN_COVERAGE");
-  if (!v || !v[0])
-    return 1.0f;
-  char *end = nullptr;
-  const double n = std::strtod(v, &end);
-  if (end == v || n < 0.0 || n > 1.0)
-    return 1.0f;
-  return static_cast<float>(n);
-}
-
-// Phase 2: true per-token dynamic GPU/CPU dispatch for the partial layer
-// (see FullGraph::Phase2Mode's own comment for the 3-graph-instance
-// mechanism). Off by default -- Phase 1's static session-level commit
-// (env_partial_layer_min_coverage) remains the default behavior even when
-// qwen4exp_partial_layer is configured; this flag opts into the dynamic
-// per-token variant instead for a direct A/B against Phase 1.
-bool env_partial_layer_phase2_enabled() {
-  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_PARTIAL_LAYER_PHASE2");
-}
-
-// The payload-backed staged child is a separate opt-in from the validated
-// resident/CPU Phase-2 A/B. It requires the host storage boundary and a
-// persistent CompletionGraph, and remains disabled in the production profile.
-// Whether the PREFILL graph should capture the partial layer's router outputs
-// (ids/probs/bias) for the Phase-1 coverage gate. Those tensors have to be marked
-// ggml_set_output, which keeps them out of allocator reuse and backend fusion for the
-// whole graph and so perturbs prefill numerics from a later layer onward (diag: every
-// position diverges from early-ready from layer ~35, RMS 2.4e-2 at layer 47, while
-// skipping the capture is bit-identical). Phase 2 routes per token in decode and never
-// consumes the Phase-1 gate, so under Phase 2 the capture is skipped. Set
-// ZEROMOE_QWEN4EXP_PARTIAL_LAYER_PREFILL_CAPTURE=1 to force the old behaviour.
-bool partial_prefill_capture_enabled() {
-  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PARTIAL_LAYER_PREFILL_CAPTURE");
-  if (v && v[0])
-    return v[0] == '1';
-  return !env_partial_layer_phase2_enabled();
-}
-
 // A storage miss must not hold decode indefinitely. The DDR/CPU suffix is an
 // exact fallback while the worker continues its read; the worker retires the
 // timed-out generation when it finishes so repeated slow reads cannot strand
@@ -202,8 +128,7 @@ int env_decode_kv_capacity(int max_t, int required) {
 // CPUs and the identical graph computes ~33% slower than it does from the main thread
 // (standalone repro, tests/option_b_split_reverify_howto.md section 19). Pinning thread i to
 // the i-th allowed CPU recovers most of it: host-node 22.75 -> 25.37 tok/s. Applied only in
-// host-node mode (binding hurts the plain scheduler-split modes);
-// ZEROMOE_QWEN4EXP_HOST_NODE_PIN=0 disables it.
+// host-node mode (binding hurts the plain scheduler-split modes).
 void pin_host_node_threads(ggml_threadpool_params &p, int n_threads) {
   if (!env_qwen4exp_host_node_enabled())
     return;
@@ -228,48 +153,6 @@ void pin_host_node_threads(ggml_threadpool_params &p, int n_threads) {
   LOG_INFO("[GGML-QWEN-FULL] host-node mode: pinning %d CPU worker threads "
            "to distinct logical CPUs\n",
            n_threads);
-}
-
-// Physical cores usable by this process: distinct hardware threads' sibling groups in sysfs, 0 when unknown.
-// The CPU side of the graph (cold experts, host-node ops) is a spin-synchronised team; a worker on an SMT sibling
-// of another worker only competes for the same core's vector ports, and a seventh thread on a 6-core part cost
-// 8% in the MTP window while 6 gained 3% over hardware_concurrency()-2 (Xeon W-2235, 6C/12T).
-static int physical_core_count() {
-  cpu_set_t allowed;
-  CPU_ZERO(&allowed);
-  if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0)
-    return 0;
-  std::vector<std::string> groups;
-  for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
-    if (!CPU_ISSET(cpu, &allowed))
-      continue;
-    std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/thread_siblings_list");
-    std::string list;
-    if (!std::getline(f, list))
-      return 0;
-    if (std::find(groups.begin(), groups.end(), list) == groups.end())
-      groups.push_back(list);
-  }
-  return static_cast<int>(groups.size());
-}
-
-int graph_cpu_threads() {
-#if defined(_OPENMP)
-  const int available = std::max(1, omp_get_max_threads());
-#else
-  // The native ggml CPU backend has its own persistent worker pool when
-  // OpenMP is disabled.  Using one thread here would make the non-OpenMP
-  // build an accidental serial baseline and would also defeat the host-node
-  // runner's shared-pool experiment.
-  const unsigned hw_threads = std::thread::hardware_concurrency();
-  const int available = std::max(
-      1, static_cast<int>(hw_threads == 0 ? 1 : hw_threads));
-#endif
-  const long cap = zeromoe::graphsettings::settings_for(zeromoe::graphsettings::Family::Qwen)
-                       .tun.cpu_threads_decode.value;
-  if (cap > 0) return static_cast<int>(std::min<long>(available, cap));
-  const int physical = physical_core_count();
-  return physical > 0 ? std::min(available, physical) : available;
 }
 
 // REVERTED (2026-09-17): a prior commit defaulted this to false, reasoning

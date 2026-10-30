@@ -437,15 +437,17 @@ public:
 
     // Option B: static hot/cold expert split. The full graph places each
     // selected layer's top-N usage-ranked experts in its fixed CUDA arena and
-    // routes complementary experts through the fixed DDR/CPU branch. Unlike
-    // qwen4exp_partial_layer, this is not a GPU-only fast path and therefore
-    // has no silent dropped-route risk.
+    // routes complementary experts through the fixed DDR/CPU branch.
     int qwen4exp_option_b_layer = -1;
     int qwen4exp_option_b_top_n = 0;
     float qwen4exp_option_b_min_coverage = 0.80f;
     bool qwen4exp_option_b_right_size_top_n = false;
     int qwen4exp_option_b_global_top_k = 0;
     int prefill_batch_tokens = 0; // EngineConfig::prefill_batch_tokens (0 = family default)
+    bool capture_prefill_usage = false; // derived from prefill_pin_file and freeze_usage_stats
+    int omp_max_threads = 0; // EngineConfig::omp_max_threads; set by -t/--threads
+  bool ignore_eos = false; // continue generation past EOS/stop tokens
+    std::string log_prompts_dir; // --log-prompts-dir; empty disables token logs
     int qwen4exp_option_b_global_floor_per_layer = 1;
     // Finalized selected layers after startup usage-file filtering.  This is
     // distinct from the config allow-list, which remains available to main's
@@ -523,21 +525,6 @@ public:
       return std::binary_search(qwen4exp_gpu_stage_layers.begin(),
                                 qwen4exp_gpu_stage_layers.end(), layer);
     }
-
-    // Phase 1 "all-or-nothing" partial-layer GPU dispatch (per-session, not
-    // per-token -- see qwen4exp-full-graph-decode-benchmark-baseline memory's
-    // follow-on note for why per-token was ruled out: ggml has no in-graph
-    // conditional execution, so a genuine per-token GPU-or-CPU choice needs
-    // splitting the decode graph at this layer's boundary, which Phase 1
-    // deliberately defers). Engine-owned (not FullGraph-owned) because
-    // decode_prepare tears down and rebuilds a FRESH FullGraph object after
-    // prefill -- this decision must survive that swap.
-    int qwen4exp_partial_layer = -1;          // -1 = feature off
-    int qwen4exp_partial_layer_top_n = 256;
-    float qwen4exp_partial_layer_min_coverage = 1.0f;
-    std::vector<int> qwen4exp_partial_layer_gpu_ids; // top-N experts, ranked by usage
-    bool qwen4exp_partial_layer_planned = false;      // gpu_ids computed at least once
-    bool qwen4exp_partial_layer_committed = false;    // this session: use the GPU-only path
 
     // Router-selection frequency histogram, [n_layers * n_experts], accumulated
     // across a run and dumped to the usage file at shutdown (Phase A 

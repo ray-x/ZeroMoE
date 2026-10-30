@@ -562,6 +562,7 @@ struct MimoMoeFfn final : FfnBlock {
 
 std::unique_ptr<Graph> create_graph(StreamingEngine &e, int tokens) {
   const auto &c = e.model_file.architecture_config;
+  const auto &st = zeromoe::graphsettings::settings_for(zeromoe::graphsettings::Family::MiMo2);
   auto g = std::make_unique<Graph>();
   g->engine = &e; g->model = g_model.get(); g->S = tokens; g->D = c.hidden;
   g_model->phase_cache.bind(*g);
@@ -569,8 +570,8 @@ std::unique_ptr<Graph> create_graph(StreamingEngine &e, int tokens) {
   g->cpu = ggml_backend_cpu_init(); g->owns_cpu = true;
   if (!g->cpu || !MemoryGuard::try_reserve_host_bytes(kContextBytes)) return nullptr;
   // The early-ready lane runs the cold experts on this backend, so decode needs real threads too.
-  const auto &st = zeromoe::graphsettings::settings_for(zeromoe::graphsettings::Family::MiMo2);
-  ggml_backend_cpu_set_n_threads(g->cpu, int(st.tun.cpu_threads_decode.value));
+  ggml_backend_cpu_set_n_threads(
+      g->cpu, g->engine->omp_max_threads);
   g->context_reservation_bytes = kContextBytes;
   g->ctx = ggml_init({kContextBytes, nullptr, true});
   if (!g->ctx) return nullptr;
@@ -586,7 +587,6 @@ std::unique_ptr<Graph> create_graph(StreamingEngine &e, int tokens) {
   g->op_offload = tokens > 1 && g_model->ingraph_moe &&
                   (force_offload >= 0 ? force_offload != 0
                                       : tokens >= st.tun.prefill_offload_min_tokens.value);
-  if (g->op_offload) setenv("ZEROMOE_SCHED_EVENTS", "1", 1);
   g->sched = ggml_backend_sched_new(backends, nullptr, g->model->gpu1 ? 3 : 2, kNodes, false, g->op_offload);
   if (g->sched && g->op_offload && g->expert_copy.attach(g->sched))
     LOG_INFO("[MIMO2-GRAPH] S=%d prefill op-offload: cold experts compute on the GPU (selective copies)\n", tokens);

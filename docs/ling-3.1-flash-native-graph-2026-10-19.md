@@ -1,5 +1,7 @@
 # Ling 3.1 Flash native-cache graph (2026-10-19)
 
+> Historical experiment. The native-cache and hybrid selectors were retired on 2026-10-29; current Ling runs use the shared GLM5Next graph. Measurements below are retained as evidence for that decision.
+
 ## Implementation
 
 Ling 3.1 Flash (`bailingmoe3`) runs the full graph by default; the

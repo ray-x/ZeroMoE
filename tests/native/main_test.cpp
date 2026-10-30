@@ -778,24 +778,35 @@ bool test_exl3_cuda_kernels() {
     return cudaSetDevice(original_device) == cudaSuccess;
 }
 
-int main() {
-    if (std::getenv("ZEROMOE_TEST_ONLY_RAM_PROMOTION"))
-        return test_ram_async_source_hold() ? 0 : 1;
+int main(int argc, char **argv) {
+    bool run_bench = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--bench") {
+            run_bench = true;
+        } else if (arg == "--help" || arg == "-h") {
+            std::cout << "Usage: zeromoe_tests [--bench]\n"
+                         "  --bench  Run optional CPU throughput and THP benchmarks\n";
+            return 0;
+        } else {
+            std::cerr << "Unknown option: " << arg
+                      << " (use --help)\n";
+            return 2;
+        }
+    }
     if (std::getenv("ZEROMOE_TEST_ONLY_EXL3_GGML_CONFIG"))
         return test_exl3_ggml_graph_capture_config() ? 0 : 1;
     if (!test_exl3_cpu_dispatch()) return 1;
     if (!test_exl3_cpu_matrix_cache()) return 1;
     if (std::getenv("ZEROMOE_TEST_EXL3_CPU_ONLY")) return 0;
     if (!test_graph_config()) return 1;
+    if (!test_qwen_q2_0_vnni_kernel()) return 1;
     if (!test_exl3_cuda_kernels()) return 1;
     if (std::getenv("ZEROMOE_TEST_EXL3_ONLY")) return 0;
     std::cout << "========================================\n";
     std::cout << "  ZeroMoE Native Test Harness\n";
     std::cout << "========================================\n";
 
-    if (std::getenv("ZEROMOE_TEST_ONLY_Q2_0_VNNI")) {
-        return test_qwen_q2_0_vnni_kernel() ? 0 : 1;
-    }
     if (std::getenv("ZEROMOE_TEST_ONLY_QWEN_STATE_HANDOFF_CONFIG")) {
         return test_qwen_prefill_state_handoff_config() ? 0 : 1;
     }
@@ -820,37 +831,6 @@ int main() {
         bool ok = bench_qwen_cpu_moe();
         return ok ? 0 : 1;
     }
-    if (std::getenv("ZEROMOE_TEST_ONLY_Q3K_CPU_BENCH")) {
-        bench_q3k_cpu_only();
-        return 0;
-    }
-#ifdef __linux__
-    if (std::getenv("ZEROMOE_TEST_ONLY_Q3K_THP_BENCH")) {
-        bench_q3k_thp_cpu_only();
-        return 0;
-    }
-#endif
-    if (std::getenv("ZEROMOE_TEST_ONLY_CPU_IQ")) {
-        // Keep both diagnostics independent.  In particular, an IQ1_M
-        // failure must not hide the Qwen graph test, and a graph failure must
-        // not hide the lower-level quantized-kernel result.
-        const bool iq_ok = test_cpu_iq_matmul_paths();
-        const bool graph_ok = test_qwen_cpu_moe_graph();
-        const bool iq1m_graph_ok = test_qwen_cpu_moe_iq1m_graph();
-        const bool mixed_graph_ok = test_qwen_cpu_moe_mixed_strided_graph();
-        const bool iq2_graph_ok = test_qwen_cpu_moe_iq2_strided_graph();
-        return (iq_ok && graph_ok && iq1m_graph_ok && mixed_graph_ok &&
-                iq2_graph_ok)
-                   ? 0
-                   : 1;
-    }
-    if (std::getenv("ZEROMOE_TEST_ONLY_CUDA_FUSED")) {
-        return test_cuda_fused_kernels() ? 0 : 1;
-    }
-    if (std::getenv("ZEROMOE_TEST_ONLY_COMPACT_CACHE")) {
-        return test_compact_vram_slot_planner() ? 0 : 1;
-    }
-
     test_cpu_matrix_ops();
     test_graph_initializer();
     test_attention_extraction();
@@ -871,14 +851,18 @@ int main() {
     // pass/fail verdict. Skipped by default so a normal `make test`/targeted
     // re-run (e.g. Test 11's real-expert comparison via
     // ZEROMOE_REAL_EXPERT_BIN/ZEROMOE_REAL_ACTIVATION_BIN) stays fast;
-    // set ZEROMOE_RUN_BENCH=1 to opt back into the throughput numbers.
-    if (std::getenv("ZEROMOE_RUN_BENCH")) {
+    // set zeromoe_tests --bench to opt into the CPU throughput and THP benchmark suite.
+    if (run_bench) {
         bench_cpu_dequant_matmul();
         bench_qabsorb_cpu_vs_gpu();
         bench_iq2xxs_vnni_prototype();
         bench_iq3xxs_avx2_prototype();
+        bench_q3k_cpu_only();
+#ifdef __linux__
+        bench_q3k_thp_cpu_only();
+#endif
     } else {
-        std::cout << "\n[Test 8] SKIPPED by default (set ZEROMOE_RUN_BENCH=1 to run the throughput bench)\n";
+        std::cout << "\n[Test 8] SKIPPED by default (pass --bench to run CPU benchmarks)\n";
     }
     bool bf16_dense_ok = test_bf16_cublas_dense_matmul();
     bool bf16_matched_dense_ok = test_bf16_matched_cublas_dense_matmul();

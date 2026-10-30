@@ -5,7 +5,6 @@
 // Shared internals of the GLM5NEXT / DeepSeek-V4 full-graph translation units.
 
 #include "graph_config.hpp"
-#include "pilot_ridge.hpp"
 #include "dense_dispatch.hpp"
 #include "direct_io.hpp"
 #include "engine.hpp"
@@ -132,8 +131,6 @@ struct PartialExpertLayer {
   size_t hot1_vram_slot_stride = 0;
   std::vector<int> slot_last_use;
   std::vector<uint32_t> miss_count;
-  std::vector<float> heat;        // decayed re-reference score of each cold expert (ZEROMOE_GLM5NEXT_DYNAMIC_HEAT)
-  std::vector<uint64_t> heat_at;  // token clock of the last heat update
   std::vector<uint8_t> slot_in_flight;
   std::vector<uint8_t> expert_in_flight;
   uint64_t route_count = 0;
@@ -256,7 +253,6 @@ struct FullGraph : zeromoe::graph::GraphCore {
   int gpu1_first = -1, gpu1_last = -2;
   std::vector<ggml_backend_buffer_t> gpu1_buffers;
   std::unordered_map<int, ggml_tensor *> stage_pred; // layer -> pilot ids predicted for it (built one layer earlier)
-  std::vector<ggml_backend_buffer_t> ridge_buffers;   // device copies of the pilot ridge corrections (one per corrected layer)
   size_t gpu1_bytes = 0;
   int indexer_heads = 0;
   int indexer_key_length = 0;
@@ -559,10 +555,6 @@ struct FullGraph : zeromoe::graph::GraphCore {
       if (b)
         ggml_backend_buffer_free(b);
     gpu1_buffers.clear();
-    for (ggml_backend_buffer_t b : ridge_buffers)
-      if (b)
-        ggml_backend_buffer_free(b);
-    ridge_buffers.clear();
     if (expert.buffer) {
       ggml_backend_buffer_free(expert.buffer);
       expert.buffer = nullptr;

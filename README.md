@@ -163,7 +163,7 @@ ZeroMoE borrows heavily from llama.cpp's design while keeping its own runtime:
 - **ggml is the backend layer.** The CUDA engine always builds and links ggml's CUDA backend. ggml is fetched from a pinned llama.cpp commit and patched at configure time; the submodule is copied, never modified. See [docs/build-ggml.md](docs/build-ggml.md) and [patches/README.md](patches/README.md).
 - **Formats follow ggml.** GGUF parsing, quantization block layouts (Q2_0, IQ1_S, IQ2_*, MXFP4, ...), and CPU reference dequantization use ggml's definitions. The IQ2 dequantizer in `kernels/quant/iq2_matmul.cu` is a port of ggml's `dequantize_row_iq2_*`.
 - **Full CUDA graph design.** The engine follows llama.cpp's approach of letting ggml's CUDA backend capture pure-CUDA graph spans and replay them, then extends it with a whole-model parent graph and graph-level offload (next section).
-- **Partial CLI compatibility.** `--ctx-size`, `--predict`, `--threads`, `--main-gpu`, `--log-file`, and `--verbosity` match llama.cpp names. ZeroMoE is not a drop-in replacement for `llama-cli`.
+- **Partial CLI compatibility.** `--ctx-size`, `--predict`, `--threads`, `--ignore-eos`, `--main-gpu`, `--log-file`, and `--verbosity` match llama.cpp names. ZeroMoE is not a drop-in replacement for `llama-cli`.
 - **llama.cpp is the correctness oracle.** [`scripts/validate_vs_llama.sh`](scripts/validate_vs_llama.sh) runs an unpatched llama.cpp build on the same GGUF and compares per-step logits: `cosine`, `max_abs`, `rmse`, and the top-1 token. See [Logits against llama.cpp](docs/validation.md#2-logits-against-llamacpp-the-oracle-for-a-new-model).
 - **llama.cpp is the performance reference.** A model is not accepted until steady-state decode reaches at least 90% of llama.cpp on the same GGUF, GPU, context, prompt length, and thread count; see `AGENTS.md` and `tools/check_full_graph_moe_perf.py`.
 
@@ -296,9 +296,9 @@ For a GPU-less build host, supply the architectures explicitly. Verify that a
 5060 Ti benchmark binary contains `sm_120a`; an `sm_86`-only build is not a
 valid performance comparison.
 
-#### Runtime settings (host-node mode, CPU threads, CUDA schedule)
+#### Runtime settings (host-node mode, shared `--threads` CPU limit, CUDA schedule)
 
-`ZEROMOE_QWEN4EXP_HOST_NODE`, `ZEROMOE_QWEN_CPU_THREADS` and `ZEROMOE_CUDA_SCHEDULE` change how the Qwen4Exp CPU/GPU
+`ZEROMOE_QWEN4EXP_HOST_NODE` and `ZEROMOE_CUDA_SCHEDULE` change how the Qwen4Exp CPU/GPU
 decode path executes and interact with each other (host-node mode automatically selects a blocking CUDA wait, +24%). Values,
 defaults, measurements and recommended combinations are in [docs/runtime-settings.md](docs/runtime-settings.md).
 

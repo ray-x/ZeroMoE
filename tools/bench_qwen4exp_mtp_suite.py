@@ -230,11 +230,6 @@ def main() -> int:
         base_env = {k: v for k, v in os.environ.items() if not k.startswith("ZEROMOE_")}
         base_env.update({
             "CUDA_VISIBLE_DEVICES": args.gpu,
-            "OMP_NUM_THREADS": str(args.threads),
-            "ZEROMOE_QWEN4EXP_FULL_GRAPH": "1",
-            "ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE": "1",
-            "ZEROMOE_QWEN_CPU_THREADS": str(args.threads),
-            "ZEROMOE_BENCH_IGNORE_STOP": "1",
             "ZEROMOE_BENCH_SILENT": "1",
         "ZEROMOE_MTP_GREEDY_FAST_PATH": "1" if args.greedy_fast_path == "on" else "0",
         "ZEROMOE_MTP_PREFILL_OVERLAP": "1" if args.prefill_overlap == "on" else "0",
@@ -262,7 +257,7 @@ def main() -> int:
                     wait_for_idle(args.gpu, args.idle_timeout)
                     print(f"{prompt_file.name} rep={rep+1} mode={mode}", flush=True)
                     with stdout.open("w") as out:
-                        subprocess.run([str(engine), "--graph-device-expert-layers", "0", "--graph-device-expert-trailing", "1", "--config", str(run_dir / "config.toml")],
+                        subprocess.run([str(engine), "--ignore-eos", "--threads", str(args.threads), "--graph-device-expert-layers", "0", "--graph-device-expert-trailing", "1", "--config", str(run_dir / "config.toml")],
                                        input=prompt + "\n:q\n", text=True,
                                        stdout=out, stderr=subprocess.STDOUT,
                                        cwd=ROOT, env=env, timeout=args.timeout, check=True)

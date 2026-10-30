@@ -188,16 +188,10 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
                 "source after graph decline\n");
   };
   auto decline_decode_graph = [&]() {
-    // Design policy: a GLM5NEXT request is served by the full graph or it fails. ZEROMOE_GLM5NEXT_GRAPH_STRICT=1
-    // turns the legacy-decode fallback into a hard error (default stays permissive until prefill is graph-only too).
-    if (const char *strict = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_GRAPH_STRICT");
-        strict && strict[0] == '1') {
-      LOG_ERROR("[GGML-GLM5NEXT-FULL-DECODE] decode graph declined and "
-                "ZEROMOE_GLM5NEXT_GRAPH_STRICT=1: failing the request "
-                "instead of falling back to the layered path\n");
-      std::fflush(nullptr);
-      std::abort();
-    }
+    // The shared startup planner controls whether layered fallback is
+    // permitted. A fitting required graph is rejected by the execution
+    // policy if this path declines; only explicit insufficient memory allows
+    // the retained layered fallback.
     retain_source_on_failure();
     g_glm5next_decode_disabled_engine = &engine;
     return false;
@@ -206,8 +200,8 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(g->device));
   g->cpu = ggml_backend_cpu_init();
   if (g->cpu) {
-    const char *e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_CPU_THREADS");
-    ggml_backend_cpu_set_n_threads(g->cpu, e ? std::max(1, std::atoi(e)) : 6);
+    ggml_backend_cpu_set_n_threads(
+        g->cpu, engine.omp_max_threads);
   }
   if (!g->cuda || !g->cpu)
     return decline_decode_graph();

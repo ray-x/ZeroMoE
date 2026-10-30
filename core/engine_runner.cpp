@@ -4,7 +4,13 @@
 #include "engine_runner.hpp"
 #include "expert_promotion_mode.hpp"
 #include "graph_settings_global.hpp"
+#include "dsv41_trace.hpp"
+#include <algorithm>
 #include <cstdlib>
+#include <thread>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 std::expected<void, std::string> EngineRunner::apply_graph_tuning() {
   const FullGraphModel *model = engine.family_ops.graph_model;
@@ -191,6 +197,13 @@ std::expected<void, std::string> EngineRunner::run() {
 }
 
 std::expected<void, std::string> EngineRunner::apply_engine_config() {
+  try {
+    dsv41_trace::configure(config.deepseek_trace_dir,
+                           config.deepseek_trace_layer,
+                           config.deepseek_trace_pos);
+  } catch (const std::exception &e) {
+    return std::unexpected(e.what());
+  }
   if (!config.graph_settings.empty() || !config.graph_cli_settings.empty()) {
 #if !defined(ZEROMOE_USE_GGML_CUDA)
     return std::unexpected(
@@ -227,6 +240,19 @@ std::expected<void, std::string> EngineRunner::apply_engine_config() {
   engine.qwen4exp_option_b_global_top_k =
       config.qwen4exp_option_b_global_top_k;
   engine.prefill_batch_tokens = config.prefill_batch_tokens;
+  engine.capture_prefill_usage =
+      !config.prefill_pin_file.empty() && !config.freeze_usage_stats;
+  engine.ignore_eos = config.ignore_eos;
+  engine.log_prompts_dir = config.log_prompts_dir;
+  engine.omp_max_threads = config.omp_max_threads;
+  if (engine.omp_max_threads <= 0) {
+#ifdef _OPENMP
+    engine.omp_max_threads = std::max(1, omp_get_max_threads());
+#else
+    const unsigned hw = std::thread::hardware_concurrency();
+    engine.omp_max_threads = std::max(1, static_cast<int>(hw) - 2);
+#endif
+  }
   engine.qwen4exp_option_b_global_floor_per_layer =
       config.qwen4exp_option_b_global_floor_per_layer;
   engine.qwen4exp_option_b_max_layers = config.qwen4exp_option_b_max_layers;

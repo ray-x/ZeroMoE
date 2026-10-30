@@ -24,7 +24,6 @@
 // matches that pattern -- DEQUANT returns a float by value instead of
 // writing through a pointer.
 
-#include "graph_config.hpp"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -476,22 +475,9 @@ KQUANT_MATMUL_KERNEL_LANE8(q6_K, block_q6_K_cu, dequant_q6_K_lane8)
 //                cuda/q8_0_matmul.cu carries a comment about a real Xid 13
 //                "Misaligned Address" GPU exception from exactly this class
 //                of bug -- hence an explicit gate rather than an assumption.
-// ZEROMOE_KQUANT_LEGACY=1 forces the cooperative path even where lane8
-// applies. Read once into a function-local static (the same idiom as
-// dense_dispatch.hpp's cpu_only_flag()), so this costs one predictable branch,
-// not a getenv, on the dispatch path. Exists so a lane8-vs-coop A/B can be run
-// from ONE binary in ONE session -- this project's own history (the "GLM-5.2 is
-// much slower than a week-old reference build" investigation) found that
-// comparing against a previously-recorded baseline from another session can
-// chase drift rather than the change under test.
-static inline bool kquant_legacy_forced() {
-    static const bool forced = [](){ const char* e = zeromoe::graphcfg::env("ZEROMOE_KQUANT_LEGACY");
-                                     return e && e[0] == '1'; }();
-    return forced;
-}
-
+// Use lane8 when its shape and alignment preconditions hold.
 static inline bool kquant_lane8_ok(int I) {
-    return !kquant_legacy_forced() && (I / 256) >= 8 && (I % 4) == 0;
+    return (I / 256) >= 8 && (I % 4) == 0;
 }
 
 // DeepSeek grouped output-A uses the native AVX-512 dot as its numerical

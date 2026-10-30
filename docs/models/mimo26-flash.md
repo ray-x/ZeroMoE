@@ -67,7 +67,7 @@ comparison, rather than making a claim about the faster setting's accuracy.
   Mimo recipes use it until BF16 route-ID parity and quality are validated.
   This is a shared engine control, so the Mimo pass does not retire the global
   reader.
-- `ZEROMOE_SCHED_EVENTS` is set internally when Mimo enables prefill
+- The old `ZEROMOE_SCHED_EVENTS` shim is removed: the pinned GGML revision has no reader for it.
   op-offload so GGML schedules its copy events correctly. It is not a user
   tuning input.
 

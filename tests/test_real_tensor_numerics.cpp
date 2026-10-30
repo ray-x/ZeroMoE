@@ -152,7 +152,7 @@ int main(int argc, char **argv) {
   std::printf("layer %d: %lld tokens, %zu distinct experts; gate/up %s %lldx%lld, down %s %lldx%lld\n", L, (long long)T, uniq.size(),
               ggml_type_name(gate.type), (long long)gate.K, (long long)gate.N, ggml_type_name(down.type), (long long)down.K, (long long)down.N);
   ggml_backend_t cuda = ggml_backend_cuda_init(0), cpu = ggml_backend_cpu_init();
-  ggml_backend_cpu_set_n_threads(cpu, std::getenv("CPU_THREADS") ? std::atoi(std::getenv("CPU_THREADS")) : 8);
+  ggml_backend_cpu_set_n_threads(cpu, 8);
   const int64_t S = int64_t(uniq.size());
   auto run = [&](ggml_backend_t be, const Plane &w, const std::vector<float> &b, int64_t bu) { return mmid(be, w, S, b, bu, ids, used, T); };
 

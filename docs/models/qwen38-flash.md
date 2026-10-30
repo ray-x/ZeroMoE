@@ -14,9 +14,14 @@ ZEROMOE_BIN=./build/zeromoe bench/qwen_decode_baselines.sh split 10 400
 
 The script sets `CUDA_VISIBLE_DEVICES=0`, passes
 `--graph-device-expert-layers 40 --graph-device-expert-trailing 1`, and uses
-`ZEROMOE_BENCH_SILENT=1` / `ZEROMOE_BENCH_IGNORE_STOP=1`. Full-graph prefill/decode are defaults; the
+`ZEROMOE_BENCH_SILENT=1` / `--ignore-eos`. Full-graph prefill/decode are defaults; the
 old `ZEROMOE_QWEN4EXP_FULL_GRAPH*` switches are removed. Input
 `Tell a story.\n:q\n` (16 tokens). Metric: `[REQUEST-DECODE-WALL]`.
+
+Qwen's host-resident expert prefill offload defaults on. Use TOML
+`graph_prefill_op_offload = false` or `--graph-prefill-op-offload 0` to keep
+those experts on CPU; the scheduler's one-copy prefill path needs batch-sized
+VRAM workspace.
 
 ## Frozen baseline
 

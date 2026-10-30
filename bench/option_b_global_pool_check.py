@@ -89,8 +89,6 @@ def main():
             del env[key]
     env.update({
         "CUDA_VISIBLE_DEVICES": args.gpu,
-        "ZEROMOE_QWEN_CPU_THREADS": str(args.cpu_threads),
-        "ZEROMOE_BENCH_IGNORE_STOP": "1",
     })
     prompt_ids = args.out_dir / "prompt.tokens"
     teacher = args.out_dir / "A.tokens"
@@ -112,7 +110,6 @@ def main():
         else:
             run_env["ZEROMOE_PROMPT_TOKEN_INPUT_FILE"] = str(prompt_ids)
             run_env["ZEROMOE_TEACHER_FORCE_TOKEN_FILE"] = str(teacher)
-            run_env["ZEROMOE_TEACHER_FORCE_SKIP_SAMPLING"] = "1"
         if not (args.resume and logits.exists() and captured.exists()):
             # Recheck before every launch: another session can start after A.
             deadline = time.monotonic() + args.wait_idle
@@ -134,7 +131,7 @@ def main():
             print(f"Running {name} ({args.ngen} tokens)...", flush=True)
             started = time.monotonic()
             with (args.out_dir / f"{name}.stdout").open("w") as stdout:
-                subprocess.run([str(args.engine), "--verbosity", "5", "--graph-device-expert-layers", "0", "--graph-device-expert-trailing", "1", "--config", str(cfg), "--predict", str(args.ngen)],
+                subprocess.run([str(args.engine), "--ignore-eos", "--threads", str(args.cpu_threads), "--verbosity", "5", "--graph-device-expert-layers", "0", "--graph-device-expert-trailing", "1", "--config", str(cfg), "--predict", str(args.ngen)],
                                input=prompt + "\n:q\n", text=True, stdout=stdout,
                                stderr=subprocess.STDOUT, cwd=ROOT, env=run_env, check=True)
             print(f"Finished {name} in {time.monotonic() - started:.1f}s", flush=True)

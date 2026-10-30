@@ -58,8 +58,6 @@ def parse_env_overrides(values: list[str]) -> dict[str, str]:
     reserved = {
         "CUDA_VISIBLE_DEVICES", "ZEROMOE_DECODE_LOGITS_DUMP",
         "ZEROMOE_GENERATED_TOKEN_FILE", "ZEROMOE_TEACHER_FORCE_TOKEN_FILE",
-        "ZEROMOE_TEACHER_FORCE_SKIP_SAMPLING", "ZEROMOE_BENCH_IGNORE_STOP",
-        "ZEROMOE_QWEN4EXP_FULL_GRAPH", "ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE",
     }
     result = {}
     for item in values:
@@ -87,6 +85,8 @@ def make_config(base: str, name: str, log_path: Path, tokens: int,
     text = set_root_key(text, "max_new_tokens", str(tokens))
     text = set_root_key(text, "temperature", "0.0")
     text = set_root_key(text, "freeze_usage_stats", "true")
+    text = set_root_key(text, "qwen4exp_full_graph", "true")
+    text = set_root_key(text, "qwen4exp_full_graph_decode", "true")
     if top_k is not None:
         text = set_root_key(text, "qwen4exp_option_b_global_top_k", str(top_k))
     if usage_file is not None:
@@ -128,9 +128,9 @@ def wait_for_idle(gpu: str, timeout: int) -> None:
 
 
 def run_engine(engine: Path, engine_repo: Path, config: Path, prompt: str,
-               env: dict[str, str], stdout_path: Path, timeout: int) -> None:
+               threads: int, env: dict[str, str], stdout_path: Path, timeout: int) -> None:
     with stdout_path.open("w") as output:
-        subprocess.run([str(engine), "--graph-device-expert-layers", "0",
+        subprocess.run([str(engine), "--ignore-eos", "--threads", str(threads), "--graph-device-expert-layers", "0",
                             "--graph-device-expert-trailing", "1",
                             "--config", str(config)], input=prompt + "\n:q\n",
                        text=True, stdout=output, stderr=subprocess.STDOUT,
@@ -268,12 +268,7 @@ def main() -> int:
         common_env = {k: v for k, v in os.environ.items() if not k.startswith("ZEROMOE_")}
         common_env.update({
             "CUDA_VISIBLE_DEVICES": args.gpu,
-            "OMP_NUM_THREADS": str(args.threads),
-            "ZEROMOE_QWEN4EXP_FULL_GRAPH": "1",
-            "ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE": "1",
-            "ZEROMOE_QWEN_CPU_THREADS": str(args.threads),
-            "ZEROMOE_BENCH_IGNORE_STOP": "1",
-        })
+            })
         for prompt_path in prompts:
             key = re.sub(r"[^A-Za-z0-9_.-]+", "_", prompt_path.stem)
             prompt = prompt_text[prompt_path.name]
@@ -312,11 +307,10 @@ def main() -> int:
                 env["ZEROMOE_GENERATED_TOKEN_FILE"] = str(generated_path)
                 if forced:
                     env["ZEROMOE_TEACHER_FORCE_TOKEN_FILE"] = str(token_file)
-                    env["ZEROMOE_TEACHER_FORCE_SKIP_SAMPLING"] = "1"
                 env.update(parse_env_overrides(env_overrides))
                 wait_for_idle(args.gpu, args.idle_timeout)
                 print(f"{prompt_path.name}: run {name} ({args.tokens} tokens)", flush=True)
-                run_engine(engine, engine_repo, toml_path, prompt, env,
+                run_engine(engine, engine_repo, toml_path, prompt, args.threads, env,
                            run_dir / "stdout.txt", args.timeout)
                 if sum(1 for _ in records(logits_path)) != args.tokens:
                     raise RuntimeError(f"{prompt_path.name}/{name}: expected {args.tokens} logit rows")

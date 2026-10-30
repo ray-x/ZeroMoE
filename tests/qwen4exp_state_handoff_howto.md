@@ -9,8 +9,9 @@ qwen4exp_prefill_state_handoff = true
 ```
 
 The handoff defaults to **false**. The IQ2_XS RCO50 3090 GPU-only profile enables
-it; the 5060 Ti profile leaves it disabled. The environment override
-`ZEROMOE_QWEN4EXP_PREFILL_STATE_HANDOFF=0` or `1` takes precedence.
+it; the 5060 Ti profile leaves it disabled. The A/B runner writes the TOML key
+in a temporary copy of the selected config for each arm; regular launches use
+`qwen4exp_prefill_state_handoff` from TOML.
 
 When enabled, completed prefill GDN state and convolution history stay in
 VRAM. Fresh prefills read immutable GPU zero-state inputs, avoiding repeated

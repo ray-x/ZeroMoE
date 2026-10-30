@@ -614,8 +614,8 @@ struct EarlyReadyLane {
         Assist &A = assists[a];
         if (!A.graph) continue;
         // The second device's link is slower, so it only helps while the CPU still has about as much to do as that copy
-        // takes (ZEROMOE_GLM5NEXT_ASSIST2_KEEP experts stay on the CPU, default 1).
-        static const int keep = std::max(1, zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_ASSIST2_KEEP", 1));
+        // Keep one ready expert on CPU as the second-device copy runs.
+        constexpr int keep = 1;
         const int want = a == 0 ? std::min({A.slots, n_ready / 2, 8})
                                 : std::min({A.slots, std::max(0, n_ready - taken - keep), 8});
         for (; cursor >= 0 && n_assisted[a] < want; --cursor) {

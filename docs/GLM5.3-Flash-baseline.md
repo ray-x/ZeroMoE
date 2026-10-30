@@ -84,9 +84,9 @@ Environment variables:
 | Variable | Value | Effect |
 |---|---|---|
 | `ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB` | `512` | AJ needs it: dense arena 6.65 GiB leaves 0.87 GiB free, below the 1 GiB / 2 GiB defaults, so the graph is declined and decode silently falls back to legacy. Real graph workspace is 0.15 GiB |
-| `ZEROMOE_GLM5NEXT_CPU_THREADS` | `6` | ggml CPU threads. 6 and 8 are equal; 10 is slower; default was 4 |
+| `--threads` | `6` | Shared CPU thread limit used for graph CPU workers; prior measurements found 6 and 8 equal and 10 slower. |
 | `ZEROMOE_GLM5NEXT_UNFUSED_HC` | unset | fused hyper-connection ops are the default (graph 6,131 nodes vs 31,061) |
-| `ZEROMOE_GLM5NEXT_CPU_LM_HEAD` | unset | set to 1 to put the LM head back on the CPU (about -48 ms/token) |
+| `ZEROMOE_GLM5NEXT_CPU_LM_HEAD` | unset | ZeroMoE-specific low-VRAM fallback: keeps the ~1.2 GiB LM head on CPU, about 48 ms/token slower. The graph GPU head remains the performance default. |
 | `ZEROMOE_GLM5NEXT_GPU1_LAYERS` | unset | e.g. `11-17` uploads those layers' experts to the 5060 Ti (not part of this baseline) |
 | `GGML_SCHED_PROF` | optional `1` | neurall-fork scheduler profiler; logs a per-graph CPU/GPU/copy breakdown |
 Per-layer timing and other DEBUG diagnostics follow the common `--verbosity 5`
@@ -99,9 +99,9 @@ The engine reads the prompt from stdin.
 ```
 cd /path/to/ZeroMoE
 nvidia-smi; pgrep -af zeromoe     # GPU co-existence guard: nothing else on the GPU
-export ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512 ZEROMOE_GLM5NEXT_CPU_THREADS=6
+export ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512
 echo "Write an extremely long and detailed 4000-word essay about the history, mathematics and engineering of mixture of experts models. Do not stop early." \
-  | ./build_b11401/zeromoe --config configs/bench/glm53flash_AJ_IQ2XXS_wholelayer8_cpu.toml --predict 1500 \
+  | ./build_b11401/zeromoe --threads 6 --config configs/bench/glm53flash_AJ_IQ2XXS_wholelayer8_cpu.toml --predict 1500 \
   > logs/glm53flash_aj_run.log 2>&1
 ```
 

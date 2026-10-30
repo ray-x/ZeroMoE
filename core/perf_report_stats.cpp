@@ -575,39 +575,6 @@ void report_qwen4exp_pilot_stats() {
                  l, predicted_k, lh, lp, la, lc, prefetch_part,
                  layer_rank_line.empty() ? " none" : layer_rank_line.c_str());
     }
-    {
-      const uint64_t ppp_tokens =
-          p.n_ppp_tokens_checked.load(std::memory_order_relaxed);
-      if (ppp_tokens > 0) {
-        static const char *kScenarioNames[PerfCounters::kPPPStagingScenarios] = {
-            "K=0 (static pin only, no pilot)",
-            "K=prefetch_k (today's real config)",
-            "K=5 (full diagnostic top-5 staged)"};
-        LOG_INFO("[QWEN-PILOT-PPP] Predictive Partial Pinning empirical "
-                 "filter: %llu real decode token(s) checked on the "
-                 "configured partial layer. M = uncovered routed experts "
-                 "after (static pin set) UNION (staged set).\n",
-                 (unsigned long long)ppp_tokens);
-        for (int sc = 0; sc < PerfCounters::kPPPStagingScenarios; ++sc) {
-          const uint64_t m0 = p.n_ppp_m0[sc].load(std::memory_order_relaxed);
-          const uint64_t m1 = p.n_ppp_m1[sc].load(std::memory_order_relaxed);
-          const uint64_t m2 =
-              p.n_ppp_m2plus[sc].load(std::memory_order_relaxed);
-          const uint64_t total = m0 + m1 + m2;
-          const uint64_t m2_sum =
-              p.n_ppp_m2plus_sum[sc].load(std::memory_order_relaxed);
-          LOG_INFO("[QWEN-PILOT-PPP]   %s: M=0 %llu (%.1f%%) M=1 %llu "
-                   "(%.1f%%) M>=2 %llu (%.1f%%, avg M=%.2f)\n",
-                   kScenarioNames[sc], (unsigned long long)m0,
-                   total > 0 ? 100.0 * m0 / total : 0.0,
-                   (unsigned long long)m1,
-                   total > 0 ? 100.0 * m1 / total : 0.0,
-                   (unsigned long long)m2,
-                   total > 0 ? 100.0 * m2 / total : 0.0,
-                   m2 > 0 ? (double)m2_sum / m2 : 0.0);
-        }
-      }
-    }
     if (layers_seen > 0) {
         LOG_INFO("[QWEN-PILOT] %d target layer(s) tracked; accuracy is "
                  "predicted IDs overlapping the real top-k divided by "

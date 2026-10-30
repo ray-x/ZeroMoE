@@ -982,18 +982,11 @@ bool preload_expert_source(FullGraph &g) {
   std::string first_error;
   std::mutex error_mutex;
   const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-  // Packed gate/up tensors need a temporary gate+up buffer while they are
-  // interleaved into the graph arena.  Four readers made that temporary peak
-  // large enough to compete with the 78 GiB source arena on a 128 GiB host.
-  // This is boot-time I/O, so cap the default at two; an explicit override is
-  // available for a machine with more headroom.
-  unsigned read_threads = 2;
-  if (const char *env = zeromoe::graphcfg::env("ZEROMOE_FULL_GRAPH_READ_THREADS")) {
-    char *end = nullptr;
-    const long n = std::strtol(env, &end, 10);
-    if (end != env && *end == '\0' && n > 0)
-      read_threads = (unsigned)std::min<long>(n, 16);
-  }
+  // Packed gate/up tensors need temporary gate+up buffers while they are
+  // interleaved into the graph arena. Four readers made the temporary peak
+  // compete with the 78 GiB source arena on a 128 GiB host. Keep boot reads
+  // fixed at two workers; runtime CPU compute uses the shared --threads cap.
+  constexpr unsigned read_threads = 2;
   const unsigned n_threads =
       std::min<unsigned>(read_threads, std::min<unsigned>(hw, jobs.size()));
   auto worker = [&]() {

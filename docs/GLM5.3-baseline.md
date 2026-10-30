@@ -35,8 +35,8 @@ Environment recipe (set by `bench/glm53/run_ab.sh` + `run_dsa_graph2gpu.sh`):
 | `ZEROMOE_GLM5NEXT_PILOT_PREFETCH` / `_STAGE` | 3 / 3 | layer-ahead pilot depth |
 | `ZEROMOE_GLM5NEXT_MODEL_DIRECT` | 1 | O_DIRECT reads on the model drive |
 | **`ZEROMOE_OFFLOAD_RETARGET`** | **on (default; `0` disables)** | **hand an evicted expert's populated pages to the incoming expert (`mremap(MREMAP_DONTUNMAP)`) instead of `madvise(DONTNEED)` + refault** |
-| `ZEROMOE_MEM_GUARD_FLOOR_MB` | 16384 (long prompts only) | lowers the 20 GiB MemAvailable stop floor so a 74 GiB pool fits after a long prefill; default floor unchanged |
-| `ZEROMOE_GLM5NEXT_CPU_THREADS` | 6 | lane threads (5-8 flat, 12 is 24% slower) |
+| `ZEROMOE_MEM_GUARD_FLOOR_MB` | 16384 (long prompts only) | sets the MemAvailable stop floor to 16 GiB for long-prompt 74 GiB pool runs; the engine default is 10 GiB, so this is a stricter reserve |
+`--threads` = 6 (shared CPU limit; 5–8 was flat, 12 was 24% slower).
 | `ZEROMOE_GLM5NEXT_ASSIST_*` | device 0 / second device 1, 3 slots | GPU-assist ring (slot count is flat) |
 
 ## 3. Results

@@ -38,15 +38,10 @@ int main(int argc, char **argv) {
     CHECK(reference.find("mimo2=512") != std::string::npos);
     CHECK(reference.find("qwen4exp=2") != std::string::npos);
     std::string error;
-    resolve_settings(Family::MiMo2, env_of({}), &error, {{"cpu_threads_decode", "0"}});
-    CHECK(!error.empty());
-    CHECK(resolve_settings(Family::Qwen, env_of({}), nullptr,
-                           {{"cpu_threads_decode", "0"}}).tun.cpu_threads_decode.value == 0);
     error.clear();
     resolve_settings(Family::MiMo2, env_of({}), &error, {{"prefill_chunk", "513"}});
     CHECK(!error.empty());
     error.clear();
-    CHECK(!validate_config({{"cpu_threads_decode", "0"}}, {Family::Other, Family::MiMo2}, error));
     error.clear();
     CHECK(!validate_config({{"prefill_chunk", "513"}}, {Family::Other, Family::MiMo2}, error));
     auto chunk = resolve_settings(Family::MiMo2, env_of({}));
@@ -74,24 +69,12 @@ int main(int argc, char **argv) {
     }
   }
   {
-    ConfigValues config{{"cpu_threads_decode", "12"}, {"prefill_chunk", "256"},
+    ConfigValues config{{"prefill_chunk", "256"},
                         {"offload_pin", "false"}, {"offload_ddr_gib", "24.5"}};
     auto r = resolve_settings(Family::MiMo2, env_of({}), nullptr, config);
-    CHECK(r.tun.cpu_threads_decode.value == 12 && r.tun.cpu_threads_decode.src == Source::Toml);
     CHECK(r.tun.prefill_chunk.value == 256 && r.tun.offload_pin.value == 0);
     CHECK(r.tun.offload_ddr_gib.value == 24.5);
-    CHECK(r.tun.cpu_threads_decode.origin == "graph_cpu_threads_decode");
-    auto cli = resolve_settings(Family::MiMo2, env_of({}), nullptr, config,
-                                {{"cpu_threads_decode", "8"}});
-    CHECK(cli.tun.cpu_threads_decode.value == 8 && cli.tun.cpu_threads_decode.src == Source::Cli);
-    CHECK(cli.warnings.empty());
     CHECK(r.warnings.empty());
-    CHECK(format_settings(r).find("toml:graph_cpu_threads_decode") != std::string::npos);
-    for (const auto &value : {"12x", "-1", "1.5", "99999999999999999999999999"}) {
-      std::string error;
-      resolve_settings(Family::MiMo2, env_of({}), &error, {{"cpu_threads_decode", value}});
-      CHECK(!error.empty());
-    }
     for (const auto &value : {"nan", "inf", "0.5x", "-5"}) {
       std::string error;
       resolve_settings(Family::MiMo2, env_of({}), &error, {{"offload_ddr_gib", value}});
@@ -108,9 +91,16 @@ int main(int argc, char **argv) {
     error.clear();
     CHECK(validate_config(config, {Family::MiMo2}, error));
     auto q = resolve_settings(Family::Qwen, env_of({}));
-    CHECK(q.tun.cpu_threads_decode.value == 0);
     CHECK(q.tun.device_expert_layers.value == 2 && q.tun.device_expert_trailing.value == 0);
     CHECK(settings_findings(q).empty());
+    auto glm = resolve_settings(Family::Glm, env_of({}));
+    CHECK(glm.tun.device_expert_layers.value == 0);
+    auto glm_layers = resolve_settings(Family::Glm, env_of({}), nullptr,
+                                       {{"device_expert_layers", "4"}});
+    CHECK(glm_layers.tun.device_expert_layers.value == 4 &&
+          glm_layers.tun.device_expert_layers.src == Source::Toml);
+    auto ling = resolve_settings(Family::Ling, env_of({}));
+    CHECK(ling.tun.device_expert_layers.value == 0);
     // 0 is the explicit no-whole-layer sentinel; one enabled layer is not.
     auto no_block = resolve_settings(Family::Qwen, env_of({}), nullptr,
                                      {{"device_expert_layers", "0"}});
@@ -121,12 +111,11 @@ int main(int argc, char **argv) {
                          {{"device_expert_layers", "8"}, {"device_expert_trailing", "true"}});
     CHECK(q.tun.device_expert_layers.value == 8 && q.tun.device_expert_trailing.value == 1);
     for (const auto &contents : {
-        "graph_cpu_threads_decode = 12x", "graph_cpu_threads_decode = true",
         "graph_device_expert_layers = 49", "graph_device_expert_layers = 1",
         "graph_device_expert_trailing = 1",
         "graph_offload_pin = \"false\"", "graph_prefill_op_offload = 1",
         "graph_typo = 1", "graph_offload_pin_dma = 1",
-        "graph_offload_pin_dma = \"true\"", "[[gpus]]\ngraph_cpu_threads_decode = 4"}) {
+        "graph_offload_pin_dma = \"true\""}) {
       ConfigValues values;
       std::string failure;
       CHECK(!collect_config(cpu_toml::parse(contents), values, failure));
@@ -146,11 +135,11 @@ int main(int argc, char **argv) {
     ConfigValues values;
     error.clear();
     CHECK(collect_config(cpu_toml::parse(
-        "graph_cpu_threads_decode = 12\ngraph_offload_pin = false\n"
+        "graph_offload_pin = false\n"
         "graph_prefill_op_offload = \"auto\"\ngraph_offload_ddr_gib = \"auto\"\n"
         "graph_offload_usage_file = \"/tmp/usage\"\n"), values, error));
     r = resolve_settings(Family::MiMo2, env_of({}), nullptr, values);
-    CHECK(r.tun.cpu_threads_decode.value == 12 && r.tun.offload_pin.value == 0);
+    CHECK(r.tun.offload_pin.value == 0);
     CHECK(r.tun.prefill_op_offload.value == -1 && r.tun.offload_ddr_gib.value == -1);
     CHECK(r.tun.offload_usage_file.value == "/tmp/usage");
   }
@@ -177,7 +166,6 @@ int main(int argc, char **argv) {
   {
     auto m = resolve_settings(Family::MiMo2, env_of({}), &err);
     CHECK(err.empty());
-    CHECK(m.tun.cpu_threads_decode.value == 10);
     CHECK(m.tun.prefill_chunk.value == 512);
     CHECK(m.tun.prefill_min_batch.value == 8);
     CHECK(m.tun.prefill_op_offload.value == -1);
@@ -207,14 +195,13 @@ int main(int argc, char **argv) {
     CHECK(m.tun.prefill_chunk.value == 128 && m.tun.prefill_chunk.src == Source::Cli);
     CHECK(m.tun.offload_pin.value == 0);
     CHECK(m.tun.offload_ddr_gib.value == 60.0);
-    CHECK(m.tun.cpu_threads_decode.value == 10); // MiMo uses the shared worker default
     auto l2 = resolve_settings(Family::Ling, env_of({}), nullptr, {},
                                {{"prefill_chunk", "1024"}});
     CHECK(l2.tun.prefill_chunk.value == 1024 && l2.tun.prefill_chunk.src == Source::Cli);
     auto l3 = resolve_settings(Family::Ling, env_of({}), nullptr, {{"prefill_chunk", "1024"}});
     CHECK(l3.tun.prefill_chunk.value == 1024 && l3.tun.prefill_chunk.src == Source::Toml);
     auto a = resolve_settings(Family::Glm, env_of({}), nullptr, {},
-                              {{"offload_async", "1"}});
+                              {{"offload_async", "true"}});
     CHECK(a.tun.offload_async.value == 1);
     auto fl = resolve_settings(Family::Ling, env_of({}), nullptr, {},
                                {{"offload_first_layer", "9"}});
@@ -235,12 +222,12 @@ int main(int argc, char **argv) {
     CHECK(g.tun.offload_seed_gpu1_hot.value == 1 && g.tun.offload_thp.value == 0);
     const CliValues overrides{
         {"offload_pinned_fraction", "0.2"}, {"offload_policy", "seg"},
-        {"offload_pin_dma", "2"}, {"gpu_assist_slots", "0"},
+        {"offload_pin_dma", "false"}, {"gpu_assist_slots", "0"},
         {"offload_ddr_gib", "auto"}};
     auto e = resolve_settings(Family::Glm, env_of({}), nullptr, {}, overrides);
     CHECK(e.tun.offload_pinned_fraction.value == 0.2);
     CHECK(e.tun.offload_policy.value == "seg");
-    CHECK(e.tun.offload_pin_dma.value == 0);                // "== \"1\"" semantics: 2 is off
+    CHECK(e.tun.offload_pin_dma.value == 0); // false disables pinning
     CHECK(e.tun.gpu_assist_slots.value == 0 && e.tun.gpu_assist_slots.src == Source::Cli);
     CHECK(e.tun.offload_ddr_gib.value < 0 && e.tun.offload_ddr_gib.src == Source::Cli);
     auto le = resolve_settings(Family::Ling, env_of({}), nullptr, {}, overrides);
@@ -262,15 +249,15 @@ int main(int argc, char **argv) {
     CHECK(d.tun.gpu_assist2_slots.value == 1);
     auto e = resolve_settings(
         Family::Glm, env_of({}), nullptr, {},
-        {{"early_ready", "0"}, {"split_load", "0"}, {"pilot_copy", "0"},
-         {"dynamic_cache", "1"}, {"gpu_assist2_slots", "4"}});
+        {{"early_ready", "false"}, {"split_load", "false"}, {"pilot_copy", "false"},
+         {"dynamic_cache", "true"}, {"gpu_assist2_slots", "4"}});
     CHECK(e.tun.early_ready.value == 0 && e.tun.split_load.value == 0 && e.tun.pilot_copy.value == 0);
     CHECK(e.tun.dynamic_cache.value == 1 && e.tun.gpu_assist2_slots.value == 4);
     auto f = resolve_settings(Family::Glm, env_of({}), nullptr, {},
-                              {{"early_ready", "1"}});
+                              {{"early_ready", "true"}});
     CHECK(f.tun.early_ready.value == 1);
     auto m = resolve_settings(Family::MiMo2, env_of({}), nullptr, {},
-                              {{"early_ready", "0"}});
+                              {{"early_ready", "false"}});
     CHECK(m.tun.early_ready.value == -1); // MiMo does not claim early_ready
   }
   // 3. Overrides: layer order and provenance.
@@ -278,7 +265,6 @@ int main(int argc, char **argv) {
     auto m = resolve_settings(Family::MiMo2, env_of({}));
     CHECK(m.tun.prefill_min_batch.src == Source::Family && !m.tun.prefill_min_batch.reason.empty());
     auto e = resolve_settings(Family::MiMo2, env_of({}));
-    CHECK(e.tun.cpu_threads_decode.src == Source::Default);
   }
   // 4. Every override has a reason, differs from the default and names a real field.
   {
@@ -293,9 +279,6 @@ int main(int argc, char **argv) {
   {
     for (Family f : {Family::MiMo2, Family::Ling, Family::Other, Family::Glm})
       CHECK(settings_findings(resolve_settings(f, env_of({}))).empty());
-    auto t = resolve_settings(Family::MiMo2, env_of({}), nullptr, {},
-                              {{"cpu_threads_decode", "1"}});
-    CHECK(settings_findings(t).size() == 1);
     auto p = resolve_settings(Family::MiMo2, env_of({}), nullptr, {},
                               {{"offload_pin", "false"}});
     CHECK(settings_findings(p).size() == 1);

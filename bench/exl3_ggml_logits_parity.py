@@ -63,7 +63,6 @@ def run_decode(engine, config, out_dir, label, prompt, tokens, extra_env,
         "ZEROMOE_EXL3_GGML_VERIFY_CPU_LAYER",
         "ZEROMOE_EXL3_GGML_CPU_REFERENCE_OUTPUT",
         "ZEROMOE_TEACHER_FORCE_TOKEN_FILE",
-        "ZEROMOE_TEACHER_FORCE_SKIP_SAMPLING",
         "ZEROMOE_DECODE_LOGITS_DUMP",
         "ZEROMOE_GENERATED_TOKEN_FILE",
     ):
@@ -121,7 +120,6 @@ def main():
     for label, reference_output in (("cpu_reference", True), ("gpu_bridge", False)):
         extra_env = {
             "ZEROMOE_TEACHER_FORCE_TOKEN_FILE": str(token_path),
-            "ZEROMOE_TEACHER_FORCE_SKIP_SAMPLING": "1",
             "ZEROMOE_DECODE_LOGITS_DUMP": str(args.out_dir / f"{label}.logits"),
         }
         if reference_output:

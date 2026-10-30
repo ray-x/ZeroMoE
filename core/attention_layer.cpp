@@ -53,15 +53,10 @@ void invalidate_glm5next_kda_gpu_states(StreamingEngine &engine) {
     engine.gpu->glm5next_kda_invalidate_device_states();
 }
 
-// A/B control for the S>1 (prefill) score GPU path ONLY. Set
-// ZEROMOE_SCORE_PREFILL_LEGACY=1 to force prefill back through the CPU
-// AVX-512 score loop while leaving decode (S==1) on the GPU path exactly as
-// before -- i.e. it reproduces the pre-2026-09-02 gate from the SAME binary,
-// so an A/B can be run interleaved in one session instead of against a
-// baseline recorded earlier (this project has already been burned once by
-// trusting a cross-session reference number; see CLAUDE.md's "GLM-5.2 is much
-// slower than a week-old reference build" entry). Same function-local-static
-// idiom as kquant_matmul.cu's own ZEROMOE_KQUANT_LEGACY.
+// Prefill uses the GPU score path whenever it is configured. If the required
+// KV mirror or CUDA operation is unavailable, the existing CPU score loop
+// remains the fallback. The legacy-prefill A/B override was retired on
+// 2026-10-30; see the configuration knob audit.
 // ---------------------------------------------------------------------------
 // ZEROMOE_WUV_INT8=1  --  int8-persistent WUV storage (OFF by default)
 // ---------------------------------------------------------------------------
@@ -126,13 +121,7 @@ static bool wuv_int8_enabled() {
   return on;
 }
 
-static bool score_prefill_legacy_forced() {
-  static const bool forced = [] {
-    const char *e = zeromoe::graphcfg::env("ZEROMOE_SCORE_PREFILL_LEGACY");
-    return e && e[0] == '1';
-  }();
-  return forced;
-}
+
 
 
 static bool gdn_full_stats_enabled() {
@@ -1025,8 +1014,7 @@ void mla_attention_absorbed_gguf(StreamingEngine &engine, int layer_idx,
   // KV mirror never allocated, or a CUDA/cublas call failed) and the
   // existing CPU loop below runs unchanged.
   bool score_gpu_ok = false;
-  if (engine.attn_score_gpu && engine.gpu &&
-      !(S > 1 && score_prefill_legacy_forced())) {
+  if (engine.attn_score_gpu && engine.gpu) {
     // 2026-09-01: the `S == 1` gate that used to be here is gone. Its
     // stated reason -- "prefill has a DIFFERENT past_context_len per row
     // within the same batch" -- is now handled where it belongs, inside
@@ -1972,80 +1960,20 @@ static void qwen4exp_gdn_delta_rule(const float *Q, const float *K,
   // Heads are fully independent (own state region) -- one OMP team per
   // call, real work per head (hd*hd state), matching this project's "one
   // spawn per real workload" discipline.
-  // Prefill uses the CHUNKED closed form; decode (S==1) stays on the
-  // sequential recurrence. This mirrors llama.cpp exactly --
-  // delta-net-base.cpp:483 dispatches build_delta_net_autoregressive only
-  // when n_tokens==1 and build_delta_net_chunking (CS=64) otherwise. Both
-  // compute the same rule; qwen4exp_gdn_delta_chunk is verified against
-  // qwen4exp_gdn_delta_step itself in tests/test_components.cpp
-  // ("qwen4exp GDN chunked vs sequential", max diff ~9e-8, i.e. float
-  // rounding). Opt-in for now via ZEROMOE_GDN_CHUNKED=1 so the two can be
-  // A/B'd on real hardware before it becomes the default; same env-flag
-  // precedent as ZEROMOE_KQUANT_LEGACY / ZEROMOE_WUV_INT8.
-  static const bool gdn_chunked = [] {
-    const char *e = zeromoe::graphcfg::env("ZEROMOE_GDN_CHUNKED");
-    return e && e[0] == '1';
-  }();
-  // 64 matches llama.cpp's own CS for the non-KDA (GDN) branch.
-  constexpr int kGdnChunk = 64;
-
-  // GPU chunkwise path (`ZEROMOE_GDN_CHUNKED`). Same chunk size and
-  // same closed form as the CPU chunk function below -- chunks stay
-  // sequential (the state carries) but all H_v heads and hd columns run in
-  // parallel, which the CPU form cannot do. Prefill only, matching
-  // llama.cpp's own n_tokens==1 dispatch rule for the sequential variant.
-
+  // Keep the sequential recurrent update for all prompt sizes until a chunked
+  // runtime implementation has an accepted hardware A/B result.
 #pragma omp parallel for schedule(static)
   for (int h = 0; h < H_v; ++h) {
     const int hk = h % H_k;
     float *st = state + (size_t)h * hd * hd;
-    if (gdn_chunked && S > 1) {
-      // Gather this head's rows contiguously -- Q/K/V are interleaved
-      // by head in the [S, H, hd] layout, and the chunk kernel wants
-      // [C, hd] blocks.
-      static thread_local std::vector<float> qc, kc, vc, bc, gc, oc;
-      for (int s0 = 0; s0 < S; s0 += kGdnChunk) {
-        const int C = std::min(kGdnChunk, S - s0);
-        const size_t n = (size_t)C * hd;
-        if (qc.size() < n) {
-          qc.resize(n);
-          kc.resize(n);
-          vc.resize(n);
-          oc.resize(n);
-        }
-        if ((int)bc.size() < C) {
-          bc.resize((size_t)C);
-          gc.resize((size_t)C);
-        }
-        for (int i = 0; i < C; ++i) {
-          const int s = s0 + i;
-          std::memcpy(qc.data() + (size_t)i * hd,
-                      Q + ((size_t)s * H_k + hk) * hd,
-                      (size_t)hd * sizeof(float));
-          std::memcpy(kc.data() + (size_t)i * hd,
-                      K + ((size_t)s * H_k + hk) * hd,
-                      (size_t)hd * sizeof(float));
-          std::memcpy(vc.data() + (size_t)i * hd,
-                      V + ((size_t)s * H_v + h) * hd,
-                      (size_t)hd * sizeof(float));
-          bc[(size_t)i] = beta[(size_t)s * H_v + h];
-          gc[(size_t)i] = g_log[(size_t)s * H_v + h];
-        }
-        qwen4exp_gdn_delta_chunk(qc.data(), kc.data(), vc.data(), bc.data(),
-                                 gc.data(), st, oc.data(), C, hd);
-        for (int i = 0; i < C; ++i)
-          std::memcpy(out + ((size_t)(s0 + i) * H_v + h) * hd,
-                      oc.data() + (size_t)i * hd, (size_t)hd * sizeof(float));
-      }
-    } else {
-      for (int s = 0; s < S; ++s) {
-        qwen4exp_gdn_delta_step(
-            Q + ((size_t)s * H_k + hk) * hd, K + ((size_t)s * H_k + hk) * hd,
-            V + ((size_t)s * H_v + h) * hd, beta[(size_t)s * H_v + h],
-            g_log[(size_t)s * H_v + h], st, out + ((size_t)s * H_v + h) * hd,
-            hd);
-      }
+        for (int s = 0; s < S; ++s) {
+      qwen4exp_gdn_delta_step(
+          Q + ((size_t)s * H_k + hk) * hd, K + ((size_t)s * H_k + hk) * hd,
+          V + ((size_t)s * H_v + h) * hd, beta[(size_t)s * H_v + h],
+          g_log[(size_t)s * H_v + h], st, out + ((size_t)s * H_v + h) * hd,
+          hd);
     }
+
   }
 }
 

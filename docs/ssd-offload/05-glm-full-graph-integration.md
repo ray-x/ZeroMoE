@@ -110,7 +110,7 @@ prefill still uses the layered path; making it the default needs a graph-only pr
 
 ### Independent check against llama.cpp (neurall's llama-server, same GGUF, `--n-cpu-moe 99`)
 
-Teacher-forced on the same 96 tokens with the engine's own prompt ids (`ZEROMOE_DUMP_PROMPT_TOKENS`), comparing
+Historical run: teacher-forced on the same 96 tokens with the engine's own prompt IDs, captured by the retired `ZEROMOE_DUMP_PROMPT_TOKENS` env name; current CLI is `--log-prompts-dir PATH`, comparing
 log-softmax of ZeroMoE's raw logits with llama.cpp's top-40 log-probs (`glm_runs/llama_ref.py`, `cmp_llama.py`):
 
 | ZeroMoE configuration | steps where top-1 == llama.cpp | median mean-abs logprob delta (llama's top 10) |

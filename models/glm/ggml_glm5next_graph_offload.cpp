@@ -220,14 +220,10 @@ void prefetch_record(PrefetchRing &ring, const PrefetchLayer &lp) {
 // engine, and the activations that cross between the two GPUs are staged through the host, so they wait behind everything
 // already queued there. Queueing a layer's whole cold set at once delayed them by the full copy time.
 void prefetch_issue(PrefetchRing *ring, PrefetchLayer *lp, OffloadState *o) {
-  static const int chunk = std::max(1, zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_PREFILL_PREFETCH_CHUNK", 2));
+  constexpr int chunk = 2; // measured two-layer transfer chunks
   // A copy another stream submits while a long run of weight copies is in flight is not served until the run ends (the copy
   // engine does not interleave streams), so the small inputs of the layer that the miss node has just released (the
   // rewritten ids, ...) would wait for the whole run. The run therefore starts after those uploads have been issued.
-  static const int delay_us = zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_PREFILL_PREFETCH_DELAY_US", 0);
-  if (delay_us > 0)
-    std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
-  static const bool drain = zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_PREFILL_PREFETCH_DRAIN", 1) != 0;
   const auto issue_t0 = std::chrono::steady_clock::now();
   struct Chunker {
     cudaEvent_t ev[2] = {nullptr, nullptr};
@@ -256,8 +252,7 @@ void prefetch_issue(PrefetchRing *ring, PrefetchLayer *lp, OffloadState *o) {
         // Waiting for the chunk just queued empties the device's copy queue at the chunk boundary, which is the only point
         // where the small uploads of the compute graph (ids, KDA history, activations crossing between the GPUs) get
         // served; while the queue never empties they wait for the whole layer's run (67 ms measured).
-        if (drain)
-          cudaEventSynchronize(c.ev[c.n % 2]);
+        cudaEventSynchronize(c.ev[c.n % 2]);
         ++c.n;
         c.in_chunk = 0;
       }
@@ -352,7 +347,7 @@ bool prefetch_prepare(FullGraph &g, OffloadState &o) {
     return false;
   const auto &c = g.engine->model_file.architecture_config;
   auto ring = std::make_unique<PrefetchRing>();
-  ring->sets = std::max(2, std::min(4, zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_PREFILL_PREFETCH_SETS", 2)));
+  ring->sets = 2; // measured memory-safe reusable ring depth
   // The cold experts of a layer are split between the two GPUs in the ratio of their PCIe links (the main GPU's share is
   // ZEROMOE_GLM5NEXT_PREFILL_SPLIT, default 0.63), so both links copy at once and each GPU needs less buffer.
   const bool two = g.gpu1 != nullptr;
@@ -504,7 +499,7 @@ bool prefetch_prepare(FullGraph &g, OffloadState &o) {
   g_ring = std::move(ring);
   // The first layers' copies start now, while the dense layers in front of them compute (otherwise the first offload layer
   // has nothing prefetched and the miss node copies its whole cold set itself).
-  if (zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_PREFILL_PREFETCH_EARLY", 1) != 0 && !g_ring->layers.empty()) {
+  if (!g_ring->layers.empty()) {
     PrefetchLayer &first = g_ring->layers.begin()->second;
     first.issued = true;
     first.worker = std::async(std::launch::async, prefetch_issue, g_ring.get(), &first, &o);
@@ -640,11 +635,7 @@ void offload_miss_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
     r = o.store->ensure_transient(site->layer, ids.data(), (int)ids.size());
     const int last = o.first + o.n_layers - 1;
     // Read ahead only for prompts that touch most experts of a layer anyway (a small prompt would read ~2x what it uses).
-    static const int min_tokens = [] {
-      const char *e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PREFILL_AHEAD_MIN_TOKENS");
-      return e ? std::atoi(e) : 64;
-    }();
-    for (int k = 1; k <= ahead && site->n_tokens >= min_tokens; ++k) {
+    for (int k = 1; k <= ahead && site->n_tokens >= 64; ++k) {
       const int next = site->layer + k;
       if (next > last || pending.count(next)) continue;
       zeromoe::offload::ExpertStore *store = o.store.get();

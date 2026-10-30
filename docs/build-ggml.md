@@ -60,7 +60,7 @@ stream/graph bridges), 0004 (padding clear bounded by the buffer size; upstream 
 
 Moved to `patches/obsolete` (they target the older upstream): 0007 and 0008 (they patch the scheduler's
 built-in MUL_MAT_ID expert copy, which upstream replaced with `ggml_backend_sched_set_copy_callback`;
-ZeroMoE's `ExpertCopy` uses that callback; 0008's `ZEROMOE_SCHED_EVENTS` has no equivalent yet, MiMo's
+ZeroMoE's `ExpertCopy` uses that callback; 0008's `ZEROMOE_SCHED_EVENTS` has no reader in the pinned GGML and its internal setenv shim was removed; MiMo's
 op-offloaded prefill sets it, effect unmeasured), 0011 (bridge-only variant of 0003 for newer context;
 0003 now carries the bridge) and the `0007-sched-early-cpu-hook` text patch (superseded by host-node/0003).
 
@@ -97,7 +97,7 @@ checkout are not the pinned ggml.
 - Ling short decode (`[REQUEST-DECODE-OUTPUT]`): 10.31 tok/s, tokens identical to the earlier runs
   (baseline 10.07).
 - MiMo dual-GPU, four prompts: decode 13.65 / 15.00 / 15.38 / 14.87 tok/s, prefill 24.9 / 41.4 / 74.7 /
-  77.8 tok/s, tokens identical. So the missing `ZEROMOE_SCHED_EVENTS` (patch 0008) does not change MiMo
+  77.8 tok/s, tokens identical. Patch 0008 `ZEROMOE_SCHED_EVENTS` has no reader in this GGML revision and did not change MiMo behavior; its shim was removed 2026-10-29
   prefill on this upstream.
 - **Historical JIT-only result**: builds without a native `sm_120a` cubin made the 5060 Ti JIT-compile
   kernels from older PTX. The 2026-10-23 Ling/MiMo first-run numbers (4.49 tok/s and 44.7 s prefill)
@@ -117,4 +117,4 @@ the merged series has no ggml changes beyond master's, so the master build above
 
 - `cmake/ZeroMoEGgmlPatches.cmake` is used only when CMake builds ggml itself; the scripts are the
   tested path.
-- 0008's `ZEROMOE_SCHED_EVENTS` has no equivalent on this upstream; MiMo's prefill is unchanged without it.
+- Patch 0008's `ZEROMOE_SCHED_EVENTS` has no reader on this upstream; the dead MiMo/GLM `setenv` shims were removed 2026-10-29.

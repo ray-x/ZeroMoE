@@ -588,9 +588,9 @@ callback still checks GPU FFN parity, then substitutes that callback's CPU
 reference output into the same full graph. Dump logits in both the ordinary
 GPU-output run and this CPU-reference-output run with
 `ZEROMOE_DECODE_LOGITS_DUMP`; use `ZEROMOE_GENERATED_TOKEN_FILE` on a
-deterministic warmup and `ZEROMOE_TEACHER_FORCE_TOKEN_FILE` plus
-`ZEROMOE_TEACHER_FORCE_SKIP_SAMPLING=1` for both compared runs so every
-decode step sees the same token history. Compare the dumps with
+deterministic warmup and `ZEROMOE_TEACHER_FORCE_TOKEN_FILE` for both compared runs. Teacher-forced
+steps consume the supplied token directly without sampling, so every decode
+step sees the same token history. Compare the dumps with
 `python3 bench/compare_decode_logits.py`. The CPU-reference substitution has
 passed the focused routed-FFN benchmark, but a full-model logits comparison
 has not yet been run. The end-to-end sequence is automated by

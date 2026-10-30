@@ -385,17 +385,14 @@ host callbacks. Full data and input hashes are in
 `results.json`. The partial-graph prototype and callback implementation were removed because
 the bounded callback and graph-stream serialization cost about 21.6%.
 
-The existing Phase-2 prefix/suffix graph can provide the pure-CUDA conditional
-body while the suffix CPU graph carries the host callback. A top-256 proof
-constructed all three graph instances but declined the extra 11.17-GiB expert
-arena; a top-64 retry still declined a 10.93-GiB arena. Preserve
-`logs/option_b_partial_phase2_layer13_logits/` and
-`logs/option_b_partial_phase2_layer13_top64_logits/`. Resource sharing must be
-fixed before treating the conditional proof as runnable. Prefix construction
-now prebinds the compact expert planes into its owner graph so suffixes can
-reuse stable addresses; the remaining failure is allocator admission before
-that borrowed ownership is reached. The prototype remains
-opt-in and the production profile is unchanged.
+Historical Phase-2 prefix/suffix attempts constructed three graph instances
+but declined the extra 11.17-GiB arena; a top-64 retry declined 10.93 GiB.
+Preserve `logs/option_b_partial_phase2_layer13_logits/` and
+`logs/option_b_partial_phase2_layer13_top64_logits/` as experiment evidence.
+The conditional-node Phase-2 selector, Phase-1 partial-layer GPU-only path,
+and their prefill-state/capture bypasses were removed on 2026-10-30. The
+accepted early-ready and Option B paths remain; the production profile is
+unchanged. Later references in this dated report are historical records.
 
 ## Milestone 4 foundation: storage dispatch/completion boundary
 
@@ -578,9 +575,9 @@ attempted to allocate an additional 10.9 GiB compact arena and hit CUDA OOM
 during graph setup. A pre-allocation admission guard now measures free VRAM
 against the compact-arena estimate plus a 768 MiB margin; the reproduced case
 now declines cleanly at 8.95 GiB free (`need=10.92 GiB`) before `cudaMalloc`
-and aborts the experimental request without a driver fault. The risky
-allocation can be explicitly forced for diagnosis with
-`ZEROMOE_QWEN4EXP_PHASE2_ALLOW_RISKY_ALLOC=1`.
+and aborts the experimental request without a driver fault. The temporary
+`ZEROMOE_QWEN4EXP_PHASE2_ALLOW_RISKY_ALLOC` bypass was removed on 2026-10-30;
+the admission guard is unconditional now.
 
 The diagnostic then compared the same Prefix/Route handoff with a debug CPU
 suffix. The CPU suffix produced the same wrong next token as the staged path,
