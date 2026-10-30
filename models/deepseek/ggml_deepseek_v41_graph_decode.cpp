@@ -4,6 +4,7 @@
 // live DDR/VRAM slots and holds them through compute. Both GGUF layouts work.
 #include "ggml_deepseek_v41_graph.hpp"
 #include "graph_config.hpp"
+#include "graph_settings_global.hpp"
 #include "dsv41_attention.hpp"
 #include "glm5next_graph_internal.hpp"
 #include "cache_backed_moe.hpp"
@@ -70,9 +71,7 @@ LayerScratch *runtime_scratch = nullptr;
 
 bool v41_grouped_outproj_gpu_enabled() {
   static const bool enabled = [] {
-    const char *value =
-        zeromoe::graphcfg::env("ZEROMOE_DEEPSEEK_V41_OUTPROJ_GPU");
-    return !value || value[0] != '0';
+    return zeromoe::graphsettings::active_settings().tun.outproj_gpu.value != 0;
   }();
   return enabled;
 }
