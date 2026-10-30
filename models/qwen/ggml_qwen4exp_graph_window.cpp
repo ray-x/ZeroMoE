@@ -141,7 +141,7 @@ bool qwen4exp_full_graph_window_commit(StreamingEngine &engine, int m) {
       return false;
   }
   g.decode_last_pos = g.window_pos + m - 1;
-  g.decode_host_state_dirty = env_prefill_state_handoff_enabled();
+  g.decode_host_state_dirty = prefill_state_handoff_enabled();
   if (has_ple_layer(engine.model_file.architecture_config)) {
     auto &hist = engine.qwen4exp_ple_tok_hist;
     for (int i = 0; i < m; ++i)

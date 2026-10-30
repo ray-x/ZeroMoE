@@ -302,26 +302,6 @@ struct PerfCountersPart03 : PerfCountersPart02 {
     std::atomic<uint64_t> n_qwen_pilot_pred_already_ram{0};
     std::atomic<uint64_t> n_qwen_pilot_pred_already_vram{0};
     std::atomic<uint64_t> n_qwen_pilot_pred_needs_fetch{0};
-    // Predictive Partial Pinning empirical filter (2026-09-19): for the
-    // ONE configured partial layer (ZEROMOE_QWEN4EXP_PARTIAL_LAYER),
-    // per real decode token, M = |E_routed \ (S_pinned U E_staged)| --
-    // the count of routed experts NOT covered by the static usage-ranked
-    // VRAM pin set even after adding the pilot's own top-K predicted
-    // experts as a hypothetical "staged" set. Tracked at three staging
-    // depths (K=0 -- no pilot help at all, K=configured prefetch_k, K=5
-    // -- the full diagnostic top-5 reporting set) to show the marginal
-    // value of staging more predictions, not just today's configured
-    // value. Bucketed at M=0 (complete hit), M=1, M>=2. See
-    // qwen4exp-legacy-vs-fullgraph-routing-divergence.md and the Phase 2
-    // session for why this has to be measured, not assumed.
-    static constexpr int kPPPStagingScenarios = 3; // K=0, K=prefetch_k, K=5
-    std::array<std::atomic<uint64_t>, kPPPStagingScenarios> n_ppp_m0{};
-    std::array<std::atomic<uint64_t>, kPPPStagingScenarios> n_ppp_m1{};
-    std::array<std::atomic<uint64_t>, kPPPStagingScenarios> n_ppp_m2plus{};
-    // Sum of the real M value for every M>=2 token, so the M>=2 bucket's
-    // average can be reported exactly instead of assumed.
-    std::array<std::atomic<uint64_t>, kPPPStagingScenarios> n_ppp_m2plus_sum{};
-    std::atomic<uint64_t> n_ppp_tokens_checked{0};
     std::atomic<uint64_t> n_qwen_pilot_hints_pushed{0};
     std::atomic<uint64_t> n_qwen_pilot_hints_skipped_resident{0};
     // Qwen estimation-based next-layer active-area prefetch. These are

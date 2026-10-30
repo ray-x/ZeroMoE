@@ -36,17 +36,12 @@ static bool configure_ling_vram_reference_experts(FullGraph &g) {
 
   g.partial_experts.assign((size_t)c.n_layers, {});
   const int gpu1_id = second_gpu_device(g.device);
-  const bool disable_all_alias =
-      zeromoe::graphcfg::flag_on("ZEROMOE_LING_NO_VRAM_CACHE_ALIAS");
-  const bool disable_gpu1_alias =
-      zeromoe::graphcfg::flag_on("ZEROMOE_LING_NO_GPU1_CACHE_ALIAS");
-  const bool have_gpu1 = !disable_all_alias && !disable_gpu1_alias &&
-                         gpu1_id >= 0 &&
+  const bool have_gpu1 = gpu1_id >= 0 &&
                          ggml_shared_backend(gpu1_id) != nullptr;
   zeromoe::graph::AliasedExpertPlacement aliased;
   zeromoe::graph::AliasedPlacementOptions alias_opt;
   alias_opt.device = g.device;
-  alias_opt.alias_primary = !disable_all_alias;
+  alias_opt.alias_primary = true;
   alias_opt.secondary_device = have_gpu1 ? gpu1_id : -1;
   if (!aliased.configure(*g.engine, *g.topology, alias_opt))
     return false;
@@ -73,8 +68,6 @@ static bool configure_ling_vram_reference_experts(FullGraph &g) {
     p.slot_last_use.assign(p.hot.size(), 0);
     p.slot_in_flight.assign(p.hot.size(), 0);
     p.miss_count.assign((size_t)c.n_experts, 0);
-    p.heat.assign((size_t)c.n_experts, 0.0f);
-    p.heat_at.assign((size_t)c.n_experts, 0);
     p.expert_in_flight.assign((size_t)c.n_experts, 0);
   }
 
@@ -239,8 +232,6 @@ bool configure_vram_reference_experts(FullGraph &g) {
     p.slot_last_use.assign(p.hot.size(), 0);
     p.slot_in_flight.assign(p.hot.size(), 0);
     p.miss_count.assign((size_t)c.n_experts, 0);
-    p.heat.assign((size_t)c.n_experts, 0.0f);
-    p.heat_at.assign((size_t)c.n_experts, 0);
     p.expert_in_flight.assign((size_t)c.n_experts, 0);
   }
 
@@ -388,8 +379,6 @@ bool configure_partial_experts_base(FullGraph &g) {
     p.slot_last_use.assign(p.hot.size(), 0);
     p.slot_in_flight.assign(p.hot.size(), 0);
     p.miss_count.assign((size_t)c.n_experts, 0);
-    p.heat.assign((size_t)c.n_experts, 0.0f);
-    p.heat_at.assign((size_t)c.n_experts, 0);
     p.expert_in_flight.assign((size_t)c.n_experts, 0);
     for (size_t slot = 0; slot < p.hot.size(); ++slot) {
       const int expert = p.hot[slot];
@@ -578,11 +567,8 @@ ggml_tensor *hot1_weight(FullGraph &g, ggml_context *ctx, int layer,
   auto it = g_hot1_buffers.find(key);
   const bool fresh = it == g_hot1_buffers.end();
   if (fresh) {
-    // ZEROMOE_GLM5NEXT_GPU1_HOT_ON_GPU0=1 is a verification aid: same branch, buffers on the main GPU, so its
-    // logits can be compared against the GPU1 placement with identical kernels.
-    static const bool on_gpu0 = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_GPU1_HOT_ON_GPU0") != nullptr;
     buf = ggml_backend_buft_alloc_buffer(
-        ggml_backend_get_default_buffer_type(on_gpu0 ? g.cuda : g.gpu1), ggml_nbytes(t) + 4096);
+        ggml_backend_get_default_buffer_type(g.gpu1), ggml_nbytes(t) + 4096);
     if (!buf)
       return nullptr;
     ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
@@ -707,11 +693,8 @@ void assign_gpu1_hot(FullGraph &g, double gib) {
   if (gib <= 0.0 || g.partial_experts.empty())
     return;
   const auto &c = g.engine->model_file.architecture_config;
-  const char *uenv = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_GPU1_HOT_USAGE");
-  const std::string usage_path = uenv && uenv[0]
-                                     ? std::string(uenv)
-                                     : zeromoe::graphsettings::active_settings()
-                                           .tun.offload_usage_file.value;
+  const std::string usage_path =
+      zeromoe::graphsettings::active_settings().tun.offload_usage_file.value;
   auto [entries, max_count] = StreamingEngine::load_usage(usage_path);
   (void)max_count;
   std::vector<std::vector<uint8_t>> is_cold((size_t)c.n_layers);
@@ -846,20 +829,14 @@ ggml_tensor *partial_map(FullGraph &g, ggml_context *ctx, int layer, bool hot,
     }
   }
 
-  // Batched MMQ negative-id skipping regressed Ling's short-prompt prefill
-  // (13.2 s vs 1.4 s for the same two-token input). Keep batched Ling routes
-  // on the valid dummy id; the single-token decode path still uses MMVQ's
-  // negative-id skip through SentinelPolicy::Auto.
-  // Ling keeps the valid-dummy default for short prompts: the patched
-  // batched negative-skip path regressed its two-token prefill.  Long prompts
-  // cannot use repeated dummy id 0 safely (ggml's batched id compaction then
-  // over-runs the per-expert row ranges), so allow an explicit opt-in to the
-  // patched path for those runs.
+  // Keep Ling's short MMQ batches on valid dummy ids: the patched skip
+  // regressed the measured two-token prefill (13.2 s vs 1.4 s). Larger
+  // batches need the patched path because repeated dummy ids can overrun
+  // GGML's per-expert row compaction. Select it from the batch size.
+  const bool ling_batch =
+      g.engine->family_ops.family == ModelFamily::BailingMoE3;
   const bool allow_batched_negative_skip =
-      (g.engine->family_ops.family != ModelFamily::BailingMoE3 ||
-       zeromoe::graphcfg::atoi_or(
-           "ZEROMOE_GLM5NEXT_BATCHED_NEGATIVE_SKIP", 0) != 0) &&
-      layer_experts_take_mmq(g, layer);
+      (!ling_batch || g.S > 64) && layer_experts_take_mmq(g, layer);
   const moe_partial::SentinelPolicy policy =
       allow_batched_negative_skip ? moe_partial::SentinelPolicy::AutoBatched
                                   : moe_partial::SentinelPolicy::Auto;
@@ -1256,32 +1233,6 @@ void route_tap_flush(RouteTap &t) {
   std::fclose(f);
 }
 
-// ZEROMOE_GLM5NEXT_DYNAMIC_HEAT=theta (> 0): promote a cold expert into VRAM only when its decayed re-reference score (+1 per route,
-// halved every DYNAMIC_HEAT_HALFLIFE tokens, default 30) is >= theta, instead of the cumulative "missed twice" rule. Admission by reuse:
-// an upload costs about one CPU compute, so it only pays for experts that come back.
-float dynamic_heat_threshold() {
-  static const float v = [] {
-    const char *e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_DYNAMIC_HEAT");
-    return e && e[0] ? (float)std::atof(e) : 0.0f;
-  }();
-  return v;
-}
-float dynamic_heat_halflife() {
-  static const float v = [] {
-    const char *e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_DYNAMIC_HEAT_HALFLIFE");
-    const float h = e && e[0] ? (float)std::atof(e) : 30.0f;
-    return h > 0.5f ? h : 30.0f;
-  }();
-  return v;
-}
-float decayed_heat(const PartialExpertLayer &p, int expert, uint64_t clock) {
-  const float h = p.heat[(size_t)expert];
-  if (h <= 0.0f)
-    return 0.0f;
-  const float dt = (float)(clock - std::min<uint64_t>(clock, p.heat_at[(size_t)expert]));
-  return h * std::exp2(-dt / dynamic_heat_halflife());
-}
-
 void update_partial_routes(FullGraph &g, int pos_base, double compute_ms) {
   if (!g.partial_expert_residency || g.moe_route_ids.empty())
     return;
@@ -1318,10 +1269,6 @@ void update_partial_routes(FullGraph &g, int pos_base, double compute_ms) {
           p.expert_in_flight[(size_t)expert]) {
         if (p.miss_count[(size_t)expert] < UINT32_MAX)
           ++p.miss_count[(size_t)expert];
-        if ((size_t)expert < p.heat.size()) {
-          p.heat[(size_t)expert] = decayed_heat(p, expert, clock) + 1.0f;
-          p.heat_at[(size_t)expert] = clock;
-        }
         continue;
       }
       const auto hot = std::find(p.hot.begin(), p.hot.end(), expert);
@@ -1452,20 +1399,11 @@ void update_partial_routes(FullGraph &g, int pos_base, double compute_ms) {
           continue;
         int candidate_index = -1;
         uint32_t candidate_hits = 1; // Ignore one-off routes.
-        float best_heat = 0.0f;
         for (size_t i = 0; i < p.cold.size(); ++i) {
           const int expert = p.cold[i];
           if (expert < 0 || expert >= c.n_experts ||
               p.expert_in_flight[(size_t)expert])
             continue;
-          if (dynamic_heat_threshold() > 0.0f && p.heat.size() == (size_t)c.n_experts) {
-            const float h = decayed_heat(p, expert, g.dynamic_clock);
-            if (h >= dynamic_heat_threshold() && h > best_heat) {
-              best_heat = h;
-              candidate_index = (int)i;
-            }
-            continue;
-          }
           const uint32_t hits = p.miss_count[(size_t)expert];
           if (hits > candidate_hits) {
             candidate_hits = hits;

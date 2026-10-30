@@ -91,8 +91,8 @@ paths resolve from).
 ```bash
 cd /tmp/reverify_wt
 echo "Explain what a binary search tree is and give a short example in Python." | \
-ZEROMOE_BENCH_IGNORE_STOP=1 CUDA_VISIBLE_DEVICES=0 ZEROMOE_CUDA_SCHEDULE=auto \
-./build_ggmlcuda/zeromoe --config path/to/config.toml --graph-device-expert-layers 0 --predict 40
+CUDA_VISIBLE_DEVICES=0 ZEROMOE_CUDA_SCHEDULE=auto \
+./build_ggmlcuda/zeromoe --ignore-eos --config path/to/config.toml --graph-device-expert-layers 0 --predict 40
 ```
 
 Use `--graph-device-expert-layers X` for whichever row

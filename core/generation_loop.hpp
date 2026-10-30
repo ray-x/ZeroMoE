@@ -17,6 +17,9 @@
 #include "qwen4exp_graph_mtp.hpp"
 #include "shutdown.hpp"
 #include <vector>
+#include <atomic>
+#include <chrono>
+#include <filesystem>
 #include <string>
 #include <numeric>
 #include <algorithm>
@@ -33,6 +36,38 @@
 
 extern void matmul(float* y, const float* x, const float* W, int S, int I, int O);
 extern void rmsnorm_row(float* out, const float* x, const float* w, int D, float eps);
+
+inline void log_prompt_tokens_if_enabled(
+    const std::string &log_prompts_dir, const std::vector<int> &prompt_ids) {
+  if (log_prompts_dir.empty()) return;
+
+  static std::atomic<uint64_t> sequence{0};
+  std::error_code ec;
+  const std::filesystem::path directory(log_prompts_dir);
+  std::filesystem::create_directories(directory, ec);
+  if (ec) {
+    LOG_WARN("[PROMPT-LOG] cannot create directory '%s': %s\n",
+             log_prompts_dir.c_str(), ec.message().c_str());
+    return;
+  }
+
+  const auto timestamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+  const auto index = sequence.fetch_add(1, std::memory_order_relaxed);
+  const auto filename = "prompt-" + std::to_string(::getpid()) + "-" +
+                        std::to_string(timestamp) + "-" +
+                        std::to_string(index) + ".tokens";
+  std::ofstream out(directory / filename, std::ios::trunc);
+  if (!out) {
+    LOG_WARN("[PROMPT-LOG] cannot write token file in '%s'\n",
+             log_prompts_dir.c_str());
+    return;
+  }
+  for (int id : prompt_ids) out << id << '\n';
+  if (!out)
+    LOG_WARN("[PROMPT-LOG] failed while writing token file '%s'\n",
+             filename.c_str());
+}
 
 // Diagnostic: count NaN/Inf in a hidden-state buffer, for bisecting WHERE in
 // the pipeline corruption first appears (prefill vs. a specific decode step)
@@ -112,19 +147,6 @@ inline bool decode_logits_hash_enabled() {
     return Logger::instance().would_log(LogLevel::DEBUG);
 }
 
-// Diagnostic-only prefill parity switch.  When enabled, process the prompt
-// one token at a time through the same S==1 path used by autoregressive
-// decode.  This is intentionally separate from moe_prefill_batched: that
-// option controls expert regrouping inside an S>1 forward, whereas this
-// switch changes the model-level prompt batch geometry so it can be compared
-// with llama.cpp launched using -b 1 -ub 1.
-inline bool prefill_unbatched_enabled() {
-    static const bool enabled = [] {
-        const char *value = zeromoe::graphcfg::env("ZEROMOE_PREFILL_UNBATCHED");
-        return value && value[0] == '1';
-    }();
-    return enabled;
-}
 
 inline void log_decode_logits_hash(int step, uint64_t hash, int sampled_token,
                                    int forced_token) {
@@ -186,14 +208,6 @@ inline const std::vector<int> & teacher_force_tokens_if_enabled(int step) {
     return tokens;
 }
 
-inline bool teacher_force_skip_sampling_enabled() {
-    static const bool enabled = [] {
-        const char *value =
-            zeromoe::graphcfg::env("ZEROMOE_TEACHER_FORCE_SKIP_SAMPLING");
-        return value && value[0] == '1';
-    }();
-    return enabled;
-}
 // token_ids: the S current input token ids that produced hidden_states'
 // S rows (one per row, same order) -- needed by DeepSeek-V4 hash-routed MoE
 // layers (moe_forward_gguf's ffn_gate_tid2eid lookup, per-token, per-layer
@@ -487,22 +501,15 @@ inline void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GG
     // throughput comparisons, allow the caller to request exactly the full
     // configured decode length in both plain and MTP modes. This is opt-in and
     // leaves normal inference behavior unchanged.
-    const bool bench_ignore_stop = [] {
-        const char *env = zeromoe::graphcfg::env("ZEROMOE_BENCH_IGNORE_STOP");
-        return env && env[0] == '1';
-    }();
-    // llama-bench measures token generation without decoding/printing every
-    // token or sampling device memory on every step. This opt-in mode keeps
-    // ZeroMoE's compute path and request summary while removing that CLI
-    // streaming work from apples-to-apples throughput measurements.
-    const bool bench_silent = control || [] {
+    const bool ignore_eos = engine.ignore_eos;
+  const bool bench_silent = control || [] {
         const char *env = zeromoe::graphcfg::env("ZEROMOE_BENCH_SILENT");
         return env && env[0] == '1';
     }();
 const bool token_loop_diag_enabled =
     Logger::instance().would_log(LogLevel::DEBUG);
-    if (bench_ignore_stop) {
-        LOG_STREAM_INFO() << "[BENCH] ZEROMOE_BENCH_IGNORE_STOP=1: "
+    if (ignore_eos) {
+        LOG_STREAM_INFO() << "[GENERATION] --ignore-eos: "
                              "EOS/stop tokens will not end this bounded decode\n";
     }
     if (bench_silent) {
@@ -720,7 +727,8 @@ const bool token_loop_diag_enabled =
     // llama.cpp builds its complete model graph before entering the measured
     // prefill.  The prompt IDs are needed only by Qwen's PLE path; graph
     // construction and static weight upload are outside PERF_START.
-    const bool unbatched_prefill = prefill_unbatched_enabled();
+    // llama.cpp-compatible -ub 1 selects the exact S=1 prefill parity path.
+    const bool unbatched_prefill = engine.prefill_batch_tokens == 1;
     const FullGraphModel *graph_model = engine.family_ops.graph_model;
     // Tokens run as one batch through the prefill forward below. A family whose prefill graph has
     // bounded buffers (max_prefill_tokens) runs only the first N tokens through the graph and the
@@ -810,12 +818,9 @@ const bool token_loop_diag_enabled =
         return;
     }
 
+    log_prompt_tokens_if_enabled(engine.log_prompts_dir, prompt_ids);
     if (!bench_silent) {
         std::cout << "\n[Prefill] Processing " << prompt_ids.size() << " tokens..." << std::flush;
-        if (const char *dump = zeromoe::graphcfg::env("ZEROMOE_DUMP_PROMPT_TOKENS"); dump && dump[0]) {
-            std::ofstream pf(dump, std::ios::trunc);
-            for (auto id : prompt_ids) pf << id << '\n';
-        }
     }
     // Brackets the SAME window PERF_START(prefill)/PERF_END(prefill, ...)
     // measures, reusing the exact Snapshot/operator-/print_summary
@@ -845,11 +850,9 @@ const bool token_loop_diag_enabled =
         hidden_states.assign(engine.prompt_state_cache.last_hidden.begin(),
                              engine.prompt_state_cache.last_hidden.end());
     } else {
-        // llama.cpp's -b 1 -ub 1 parity mode: run each prompt token through
-        // the existing S==1 path.  This preserves the normal recurrent/KV
-        // update order while avoiding the batched HC projection and batched
-        // activation-quantization kernels.  The default prompt path below is
-        // unchanged when ZEROMOE_PREFILL_UNBATCHED is not enabled.
+        // A physical batch size of 1 runs each prompt token through the
+        // existing S==1 path. This preserves recurrent/KV update order while
+        // avoiding batched HC projection and activation-quantization kernels.
         if (unbatched_prefill && pc_n_new > 1) {
             LOG_STREAM_INFO() << "[PREFILL] unbatched parity mode: "
                               << pc_n_new << " x S=1 forward calls\n";
@@ -1112,7 +1115,7 @@ const bool token_loop_diag_enabled =
     std::chrono::steady_clock::time_point first_token_output;
     std::chrono::steady_clock::time_point last_token_output;
     bool mtp_started = false;
-    const int mtp_eos_id = bench_ignore_stop ? -1 : eos_id;
+    const int mtp_eos_id = ignore_eos ? -1 : eos_id;
     const bool mtp_context_ready =
         engine.mtp_enabled && pc_reuse == 0 && pc_n_new == prompt_ids.size() &&
         !prompt_ids.empty();
@@ -1123,7 +1126,7 @@ const bool token_loop_diag_enabled =
             // Same ordering fix as the main decode loop above: check for a
             // stop token before printing its decoded text, so a correctly-
             // detected stop token's own string isn't echoed to the user.
-            const bool is_stop = !bench_ignore_stop &&
+            const bool is_stop = !ignore_eos &&
                 (next_token == eos_id || tokenizer.is_stop_token(next_token));
             if (control) {
                 ++control->generated_tokens;
@@ -1370,29 +1373,26 @@ const bool token_loop_diag_enabled =
         const auto &teacher_tokens = teacher_force_tokens_if_enabled(step);
         const bool has_teacher_token =
             step < static_cast<int>(teacher_tokens.size());
-        const bool skip_teacher_sampling =
-            has_teacher_token && teacher_force_skip_sampling_enabled();
-        // ZEROMOE_TEACHER_FORCE_NLL=1: log -log p(forced token) under this
-        // step's raw logits (natural log), so two configs can be compared on
-        // a fixed text by mean NLL (quality) as well as by speed.
-        if (has_teacher_token) {
-            static const bool log_nll = [] {
-                const char *e = zeromoe::graphcfg::env("ZEROMOE_TEACHER_FORCE_NLL");
-                return e && e[0] == '1';
-            }();
+        // Teacher-forced NLL is a full-vocabulary diagnostic. Compute it only
+        // when DEBUG logging is enabled; ordinary teacher-forced runs avoid the
+        // extra softmax pass.
+        const bool log_nll = has_teacher_token &&
+            Logger::instance().would_log(LogLevel::DEBUG);
+        if (log_nll) {
             const int ft = teacher_tokens[step];
-            if (log_nll && ft >= 0 && ft < V) {
+            if (ft >= 0 && ft < V) {
                 float mx = logits[0];
                 for (int i = 1; i < V; ++i) mx = std::max(mx, logits[i]);
                 double sum = 0.0;
-                for (int i = 0; i < V; ++i) sum += std::exp((double)logits[i] - mx);
+                for (int i = 0; i < V; ++i)
+                    sum += std::exp((double)logits[i] - mx);
                 const double nll = (double)mx + std::log(sum) - (double)logits[ft];
-                LOG_STREAM_INFO() << "[TF-NLL] step=" << step << " nll=" << nll << "\n";
+                LOG_STREAM_DEBUG() << "[TF-NLL] step=" << step << " nll=" << nll << "\n";
             }
         }
-        const int sampled_token = skip_teacher_sampling
-                                      ? teacher_tokens[step]
-                                      : sampler.sample(logits, temperature, top_p);
+        const int sampled_token = has_teacher_token
+                                ? teacher_tokens[step]
+                                : sampler.sample(logits, temperature, top_p);
         dump_generated_token_if_enabled(step, sampled_token);
 
         int next_token = sampled_token;
@@ -1425,7 +1425,7 @@ const bool token_loop_diag_enabled =
         // stop-token ID, not ordinary vocabulary tokens that merely spell
         // out that text. The model was stopping correctly; only the
         // display was wrong.
-        const bool is_stop_now = !bench_ignore_stop &&
+        const bool is_stop_now = !ignore_eos &&
             (next_token == eos_id || tokenizer.is_stop_token(next_token));
         if (control) {
             ++control->generated_tokens;

@@ -148,7 +148,7 @@ bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
   }
   ggml_backend_sched_synchronize(g.sched);
   release_graph_vram_experts(g);
-  if (zeromoe::graphcfg::flag_on("ZEROMOE_GLM5NEXT_PREFILL_ROUTE_CAPTURE")) {
+  if (g.engine->capture_prefill_usage) {
     size_t captured_routes = 0;
     for (const auto &[layer, snapshot] : g.prefill_route_ids) {
       if (!snapshot || snapshot->type != GGML_TYPE_I32 || layer < 0)

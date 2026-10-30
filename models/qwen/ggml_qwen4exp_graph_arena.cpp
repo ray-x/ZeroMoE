@@ -405,26 +405,10 @@ bool init_device_expert_arena(FullGraph &g) {
     return true;
   }
   const bool split_active = !g.split_gpu_expert_ids.empty();
-  // See device_expert_bytes's own comment: the Phase 1/2 partial-layer
-  // compact tensor needs this same arena, on every decode instance that
-  // could possibly build it, even when neither of the other two features
-  // that normally drive this arena's sizing is active.
-  const bool partial_active =
-      g.decode_mode && g.engine &&
-      !g.engine->qwen4exp_partial_layer_gpu_ids.empty() &&
-      g.engine->qwen4exp_partial_layer >= 0;
-  // device_expert_bytes() already sizes in qwen4exp_gpu_stage_layers'
-  // compact per-layer tensors (see its own comment), but this early-return
-  // guard never checked for them -- with 0 preloaded layers and no Option-B
-  // split, it returned before device_expert_buffer was ever allocated, so
-  // EVERY gpu-stage layer's make_dst() call failed on a null buffer
-  // ("compact device destination allocation failed") regardless of how
-  // small the real requirement was. Same class of gap partial_active above
-  // already guards against for the Phase 1/2 tensor.
   const bool gpu_stage_active =
       g.decode_mode && g.engine && g.engine->qwen4exp_gpu_stage_enabled &&
       !g.engine->qwen4exp_gpu_stage_layers.empty();
-  if (g.device_expert_layers <= 0 && !split_active && !partial_active &&
+  if (g.device_expert_layers <= 0 && !split_active &&
       !gpu_stage_active)
     return true;
   const ggml_backend_buffer_type_t buft =
@@ -434,14 +418,13 @@ bool init_device_expert_arena(FullGraph &g) {
   // cannot fit on the 24-GiB card.  Clamp only whole-layer residency requests
   // to the largest arena that actually allocates; the graph then keeps the
   // remaining layers on the DDR/CPU backend instead of abandoning the entire
-  // full graph. Per-expert split allocations (and the partial-layer compact
-  // tensor, same rationale) remain strict until their own budget is made
-  // independently retryable.
+  // full graph. Per-expert split allocations remain strict until their own
+  // budget is independently retryable.
   const bool required_full_fit_qwen =
       g.engine && g.engine->family_ops.family == ModelFamily::Qwen &&
       g.engine->cuda_moe_full_graph_decode_required;
   const bool allow_layer_clamp = requested_layers > 0 && !split_active &&
-                                 !partial_active && !required_full_fit_qwen;
+                                 !required_full_fit_qwen;
 
   auto sync_option_b_hot_masks = [&]() {
     if (!g.engine || !g.engine->qwen4exp_option_b_fill_vram)
@@ -574,7 +557,7 @@ bool init_device_expert_arena(FullGraph &g) {
   for (;;) {
     size_t bytes = device_expert_bytes(g);
     if (bytes == 0) {
-      if (g.device_expert_layers <= 0 && !split_active && !partial_active) {
+      if (g.device_expert_layers <= 0 && !split_active) {
         g.split_gpu_expert_ids.clear();
         return true;
       }
@@ -598,9 +581,6 @@ bool init_device_expert_arena(FullGraph &g) {
     // Each split layer allocates 3 more small tensors (gate/up/down) into the
     // same bump arena -- same per-tensor alignment slack accounting as above.
     tensor_slack += g.split_gpu_expert_ids.size() * 3 * kAlignment;
-    // The partial-layer compact tensor is also 3 tensors (gate/up/down).
-    if (partial_active)
-      tensor_slack += 3 * kAlignment;
     constexpr size_t kArenaSlack = 1ull << 20;
     if (bytes > SIZE_MAX - tensor_slack - kArenaSlack) {
       if (allow_layer_clamp && g.device_expert_layers > 1) {

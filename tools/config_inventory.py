@@ -16,6 +16,9 @@ PATTERNS = {
     "toml": re.compile(r'\bget_(?:str|int|double|float|bool|int_array|type)\s*\(\s*"([a-z][a-z0-9_]*)"'),
     "graph_setting": re.compile(r'\{"([a-z][a-z0-9_]*)",\s*ZEROMOE_SETTINGS_REF'),
 }
+TEST_ENVIRONMENT_PATTERN = re.compile(
+    r"\b(ZEROMOE_(?:TEST_[A-Z0-9_]+|REAL_[A-Z0-9_]+|RUN_BENCH))\b"
+)
 
 
 def inventory(root=ROOT):
@@ -44,6 +47,19 @@ def inventory(root=ROOT):
                 if re.match(r"^\s*#\s*(?:if|ifdef|ifndef|elif)\b", line):
                     for name in re.findall(r"\b(?:ZEROMOE|GGML)_[A-Z0-9_]+", line.split("//", 1)[0]):
                         entries["macro", name].add(f"{path.relative_to(root)}:{number}")
+
+    # Keep native test selectors and test fixture paths visible without
+    # inflating the product-runtime environment count above.
+    test_suffixes = {".cpp", ".hpp", ".h", ".cu", ".cuh", ".py", ".sh"}
+    for path in sorted((root / "tests").rglob("*")):
+        if path.suffix not in test_suffixes or not path.is_file():
+            continue
+        text = path.read_text()
+        for match in TEST_ENVIRONMENT_PATTERN.finditer(text):
+            line = text.count("\n", 0, match.start()) + 1
+            entries["test_environment", match[1]].add(
+                f"{path.relative_to(root)}:{line}"
+            )
     # Graph CLI flags are generated from the canonical graph-setting table,
     # rather than stored as individual string literals in the CLI parser.
     for (kind, name), locations in list(entries.items()):
@@ -74,7 +90,6 @@ def inventory(root=ROOT):
 def check_migrated_reads(root=ROOT):
     failures = []
     migrated = {
-        "ZEROMOE_QWEN_CPU_THREADS",
         "ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS",
         "ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING",
     }

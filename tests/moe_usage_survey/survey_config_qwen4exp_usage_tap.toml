@@ -14,7 +14,7 @@
 #   ZEROMOE_SURVEY_BINARY=build_ggmlcuda/zeromoe
 #   CUDA_VISIBLE_DEVICES=0 ZEROMOE_CUDA_SCHEDULE=auto
 #   --graph-device-expert-trailing 1 --graph-device-expert-layers 22
-#   ZEROMOE_BENCH_IGNORE_STOP=1
+#   --ignore-eos
 
 model_path = "/path/to/models/qwen3.8-flash-next/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf"
 

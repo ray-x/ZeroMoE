@@ -53,7 +53,7 @@ The command below is historical: the current no-copy runner caps memory at
 performance work.
 
 ```bash
-LING_DDR_GIB=64 LING_CAP_GIB=96 LING_STOP_GIB=26 LING_GPU_PREFILL=1 \
+LING_DDR_GIB=64 LING_CAP_GIB=96 LING_STOP_GIB=26 \
 LING_USAGE_FILE="$PWD/bench/ling/reference-audit/trace-first-reply.pin" \
 LING_TOKEN_FILE="$PWD/bench/ling/reference-audit/baseline.tokens" \
 LING_LOG=/tmp/ling-reference-selected-copy.log \
@@ -77,7 +77,9 @@ For a longer prefill measurement, `run.sh` accepts `LING_PROMPT_FILE` and
 `LING_CONTEXT_SIZE`. The runner logs the prompt path and SHA-256. To build a
 prompt-matched usage profile, choose new output paths for `LING_USAGE_FILE`
 and `LING_PREFILL_USAGE_FILE`, set `LING_FREEZE_USAGE_STATS=0`, and run once
-with the prompt. Then run again with the same prompt and profile paths using
+with the prompt. The configured `prefill_pin_file` enables prefill-route
+collection automatically; no extra environment switch is needed. Then run
+again with the same prompt and profile paths using
 the default frozen statistics. This keeps the prompt used for profile
 collection and measurement identical; the free-running decode check should
 still omit `LING_TOKEN_FILE`.

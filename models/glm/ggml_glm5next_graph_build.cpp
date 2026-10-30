@@ -199,7 +199,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                                     g.partial_expert_residency && ids;
   const bool capture_prefill_routes =
       !g.decode_mode && ids &&
-      zeromoe::graphcfg::flag_on("ZEROMOE_GLM5NEXT_PREFILL_ROUTE_CAPTURE");
+      g.engine->capture_prefill_usage;
   if (capture_decode_routes || capture_prefill_routes) {
     // Keep a graph output copy of each layer's IDs.  The scheduler may
     // recycle the original intermediate after MUL_MAT_ID consumes it, so
@@ -293,8 +293,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     // The weighting and the sum over the routed experts stay on the GPU that ran the experts: left to the scheduler they ran
     // on the main GPU, so the unreduced [D, topk, S] result (105 MB for 805 tokens) crossed between the GPUs through the host
     // (56 ms per layer) instead of the [D, S] sum (13 MB).
-    static const bool pin_on = zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_PIN_BRANCH_SUM", 1) != 0;
-    if (pin_be && g.sched && pin_on && !g.decode_mode) {
+    if (pin_be && g.sched && !g.decode_mode) {
       ggml_backend_sched_set_tensor_backend(g.sched, experts, pin_be);
       ggml_backend_sched_set_tensor_backend(g.sched, summed, pin_be);
     }
@@ -404,8 +403,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     bg.decode = g.decode_mode;
     bg.n_tokens = g.S;
     bg.name_prefix = "glm5next";
-    bg.pin_prefill_branch_sums =
-        zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_PIN_BRANCH_SUM", 1) != 0;
+    bg.pin_prefill_branch_sums = true;
     zeromoe::graph::MoEBlockLayer &bl = plan.layer;
     bl.layer = layer;
     bl.input = cur;

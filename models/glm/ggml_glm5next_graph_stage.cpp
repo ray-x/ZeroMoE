@@ -155,7 +155,7 @@ void stage_post_job(StageRuntime *st, int layer, int set, const ggml_tensor *pre
   job.layer = layer;
   job.set = set;
   const int K = (int)(pred->ne[0] / 2), nc = std::min(K, 8);
-  const float min_score = pilot_min_score();
+  constexpr float min_score = -1e30f;
   StageRuntime::Cand &cd = st->cand[layer];
   cd.n = nc;
   job.n = 0;
@@ -373,39 +373,6 @@ bool build_pilot_stage(FullGraph &g, ggml_context *ctx, ggml_tensor *cur_pre, in
     break;
   }
   ggml_tensor *score = bias ? ggml_add(ctx, probs, bias) : probs;
-  // Learned correction (ZEROMOE_GLM5NEXT_PILOT_RIDGE): score += (rms(x) - mu) R + c, fitted offline on the pilot's residual.
-  static const PilotRidgeTable ridge = PilotRidgeTable::load("ZEROMOE_GLM5NEXT_PILOT_RIDGE", "GLM-PILOT-RIDGE");
-  if (const PilotRidgeTable::Record *rec = ridge.find(next);
-      rec && ridge.d == (int)rn->ne[0] && ridge.e == (int)router->ne[1] && g.cuda) {
-    ggml_tensor *mu_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ridge.d, 1);
-    ggml_tensor *r_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, ridge.d, ridge.e);
-    ggml_tensor *c_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ridge.e, 1);
-    ggml_tensor *parts[3] = {mu_t, r_t, c_t};
-    size_t offsets[3], total = 0;
-    for (int i = 0; i < 3; ++i) {
-      offsets[i] = total;
-      total += (ggml_nbytes(parts[i]) + 255) & ~size_t(255);
-    }
-    ggml_backend_buffer_t rb = ggml_backend_alloc_buffer(g.cuda, total);
-    if (!rb) {
-      LOG_WARN("[GGML-GLM5NEXT-STAGE] layer %d: pilot ridge buffer allocation failed; using the plain pilot\n", next);
-    } else {
-      auto *base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(rb));
-      bool placed = true;
-      for (int i = 0; i < 3 && placed; ++i)
-        placed = ggml_backend_tensor_alloc(rb, parts[i], base + offsets[i]) == GGML_STATUS_SUCCESS;
-      if (!placed) {
-        ggml_backend_buffer_free(rb);
-      } else {
-        g.ridge_buffers.push_back(rb);
-        ggml_backend_tensor_set(mu_t, rec->mu.data(), 0, ggml_nbytes(mu_t));
-        ggml_backend_tensor_set(r_t, rec->r.data(), 0, ggml_nbytes(r_t));
-        ggml_backend_tensor_set(c_t, rec->c.data(), 0, ggml_nbytes(c_t));
-        ggml_tensor *corr = ggml_mul_mat(ctx, r_t, ggml_sub(ctx, rn, mu_t));
-        score = ggml_add(ctx, ggml_add(ctx, score, corr), c_t);
-      }
-    }
-  }
   ggml_tensor *mask = stage_hot_mask(g, ctx, next);
   if (!mask) {
     LOG_WARN("[GGML-GLM5NEXT-STAGE] layer %d: hot-mask allocation failed (dense arena %zu/%zu)\n", next, g.dense.used, g.dense.capacity);

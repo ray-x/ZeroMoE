@@ -70,8 +70,8 @@ if model_count != 1 or log_count != 1:
     raise SystemExit("config must contain one model_path and one log_path")
 Path(sys.argv[2]).write_text(text)
 PY
-  local env=(ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512 ZEROMOE_GLM5NEXT_CPU_THREADS=8
-             CUDA_VISIBLE_DEVICES=0 ZEROMOE_BENCH_IGNORE_STOP=1
+  local env=(ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512
+             CUDA_VISIBLE_DEVICES=0
              ZEROMOE_DECODE_LOGITS_DUMP="$out/$tag.logits"
              ZEROMOE_GENERATED_TOKEN_FILE="$out/$tag.tokens")
   local graph_args=(--graph-offload-first-layer 3 --graph-offload-ddr-gib 32
@@ -86,7 +86,7 @@ PY
   esac
   printf '%s\n:q\n' "$PROMPT" | env "${env[@]}" \
       systemd-run --user --scope -q -p MemoryMax=80G -p MemorySwapMax=0 \
-      "$bin" --config "$out/$tag.toml" "${graph_args[@]}" --predict 48 > "$out/$tag.stdout" 2>&1
+      "$bin" --ignore-eos --threads 8 --config "$out/$tag.toml" "${graph_args[@]}" --predict 48 > "$out/$tag.stdout" 2>&1
   echo "$tag exit=$?"
 }
 

@@ -66,48 +66,6 @@ extern bool qwen4exp_copy_gdn_device_output_to_host(const void *device_output,
 #include "moe_pipeline_internal.hpp"
 #include "shared_expert_executor.hpp"
 
-static int ggml_fixed_chunk_pair_capacity() {
-  static const int value = [] {
-    const char *env = zeromoe::graphcfg::env("ZEROMOE_GGML_FIXED_PAIR_CAPACITY");
-    if (!env || !env[0])
-      return 0;
-    const int requested = std::atoi(env);
-    if (requested <= 0)
-      return 0;
-    return ((requested + 255) / 256) * 256;
-  }();
-  return value;
-}
-
-// The reference GGML graph keeps the expert axis fixed at the model's full
-// expert count.  The compact MoE adapter normally rounds the routed set to a
-// 64-expert high-water mark, which still causes a graph/allocator rebuild
-// whenever a layer exposes a new high-water mark.  Opt-in fixed slots let us
-// measure the same stable graph topology without changing the default memory
-// budget.  Unused slots are never addressed by ids and are initialized by the
-// existing quantized-tail clear path.
-static int ggml_fixed_expert_slots() {
-  static const int value = [] {
-    const char *env = zeromoe::graphcfg::env("ZEROMOE_GGML_FIXED_EXPERT_SLOTS");
-    if (!env || !env[0])
-      return 0;
-    const int requested = std::atoi(env);
-    if (requested <= 0)
-      return 0;
-    return ((requested + 63) / 64) * 64;
-  }();
-  return value;
-}
-
-// Qwen's `ram_preload_all_experts` is a source-ownership contract for layers
-// assigned to the host-RAM tier, not for layers explicitly assigned to the
-// full-graph VRAM block.  Those VRAM-only layers are excluded from the DDR
-// preload manifest, so a cold GPU-cache miss there must retain the normal
-// GGUF mmap staging source.  Applying the DDR-only rule globally made the
-// first miss in a VRAM-only layer reject the grouped path and fall back to
-// per-expert dispatch, even though that layer was never supposed to have a
-// DDR copy.  Keep the strict no-mmap rule for host-owned layers and preserve
-// existing behavior for other model families.
 static bool qwen_ddr_only_expert_source(const StreamingEngine &engine,
                                         int layer_idx) {
   return engine.family_ops.family == ModelFamily::Qwen4Exp &&
@@ -145,284 +103,6 @@ static bool qwen_batch_d2d_unpack_enabled() {
 // ggml-cuda on the GPU instead, from `ids` alone -- which is why this function
 // does not need offs[]/slot[]/act_arena at all, only the raw routing table.
 // ============================================================
-// Chunked variant of the device MoE path. The ordinary runner submits one
-// graph after all compact expert weights have landed. This version keeps two
-// compact weight ranges in flight: while GGML computes chunk N, the copy
-// stream stages chunk N+1 into the other range. Each graph gathers only the
-// token rows routed to that chunk and a CUDA scatter-add reduces its weighted
-// output into one [S,D] device accumulator.
-static bool run_ggml_moe_layer_chunked(
-    StreamingEngine &engine, RAMSafetyManager &ram_mgr, GpuTopology *topo,
-    int layer_idx, int S, int D, int moe_inter, int topk, int n_experts,
-    const std::vector<int> &used, const int *tok_topk_ids,
-    const float *tok_topk_weights, int chunk_experts, bool unpacked_layer,
-    int chosen_device, size_t gb0, size_t ub0, size_t db0, const GGUFTensor *g0,
-    const GGUFTensor *u0, const GGUFTensor *d0, const void *device_input,
-    const void **device_output) {
-  if (!device_input || !device_output || unpacked_layer || S <= 1 ||
-      topk <= 0 || used.empty() || chunk_experts <= 0 || !topo)
-    return false;
-
-  // This graph requires one uniform 3-D weight geometry, just like the
-  // non-chunked MUL_MAT_ID path. Reject mixed layers before allocating any
-  // state so the caller can use its established fallback safely.
-  for (int e : used) {
-    size_t gb, ub, db;
-    const GGUFTensor *gm, *um, *dm;
-    if (!engine.expert_geometry_for(layer_idx, e, gb, ub, db, gm, um, dm) ||
-        gb != gb0 || ub != ub0 || db != db0 || gm->type != g0->type ||
-        um->type != u0->type || dm->type != d0->type)
-      return false;
-  }
-
-  struct ChunkPairs {
-    std::vector<int32_t> token;
-    std::vector<int32_t> local;
-    std::vector<float> weight;
-  };
-  const int chunk = std::min(chunk_experts, (int)used.size());
-  const int n_chunks = ((int)used.size() + chunk - 1) / chunk;
-  std::vector<ChunkPairs> pairs((size_t)n_chunks);
-  std::vector<int> local((size_t)n_experts, -1);
-  for (int i = 0; i < (int)used.size(); ++i)
-    local[(size_t)used[(size_t)i]] = i;
-  int max_pairs = 0;
-  for (int s = 0; s < S; ++s) {
-    for (int k = 0; k < topk; ++k) {
-      const size_t flat = (size_t)s * topk + k;
-      const int e = tok_topk_ids[flat];
-      if (e < 0 || e >= n_experts || local[(size_t)e] < 0)
-        return false;
-      const int compact = local[(size_t)e];
-      const int ci = compact / chunk;
-      const int slot = compact % chunk;
-      pairs[(size_t)ci].token.push_back((int32_t)s);
-      pairs[(size_t)ci].local.push_back((int32_t)slot);
-      pairs[(size_t)ci].weight.push_back(tok_topk_weights[flat]);
-    }
-  }
-  for (const auto &p : pairs)
-    max_pairs = std::max(max_pairs, (int)p.token.size());
-  if (max_pairs <= 0)
-    return false;
-  // Keep the graph shape stable across nearby layers. Padding is cheap: the
-  // padded route weights are zero, so the device scatter contributes nothing.
-  int pair_capacity = ((max_pairs + 255) / 256) * 256;
-  const int fixed_pair_capacity = ggml_fixed_chunk_pair_capacity();
-  if (fixed_pair_capacity > 0) {
-    if (max_pairs > fixed_pair_capacity) {
-      LOG_WARN("[GGML-MOE] fixed pair capacity %d is below layer=%d "
-               "maximum routed pairs=%d; keeping observed capacity\n",
-               fixed_pair_capacity, layer_idx, max_pairs);
-    } else {
-      pair_capacity = fixed_pair_capacity;
-    }
-  }
-
-  GgmlMoeRunner &runner = GgmlMoeRunner::instance_for(
-      (uint32_t)g0->type, (uint32_t)u0->type, (uint32_t)d0->type);
-  runner.set_batch_d2d_unpack(
-      engine.family_ops.family == ModelFamily::Qwen4Exp &&
-      qwen_batch_d2d_unpack_enabled());
-  GgmlMoeLayerPlan plan;
-  plan.device_id = chosen_device;
-  plan.n_experts = 2 * chunk; // two alternating compact slot ranges
-  plan.n_expert_slots = 2 * chunk;
-  plan.n_tokens = pair_capacity; // padded routed-pair count
-  plan.source_tokens = S;
-  plan.topk = 1;
-  plan.d_model = D;
-  plan.d_ff = moe_inter;
-  plan.gate_type = (uint32_t)g0->type;
-  plan.up_type = (uint32_t)u0->type;
-  plan.down_type = (uint32_t)d0->type;
-  plan.chunk_experts = chunk;
-  plan.chunked = true;
-  if (!runner.begin_layer(plan))
-    return false;
-  // If this signature was used by an earlier layer, its copy stream may still
-  // be reading the old VRAM-cache sources. Drain and release those holds only
-  // when this runner is reused, allowing the other signature runner to make
-  // progress between the two uses.
-  runner.release_completed_vram_holds();
-  if (runner.gate_expert_bytes() != gb0 || runner.up_expert_bytes() != ub0 ||
-      runner.down_expert_bytes() != db0)
-    return false;
-
-  struct D2DHold {
-    int expert_id;
-    const uint8_t *device_ptr;
-  };
-  struct RamH2DHold {
-    MoEExpertBlock *block;
-  };
-  std::vector<D2DHold> d2d_holds;
-  std::vector<RamH2DHold> ram_h2d_holds;
-  d2d_holds.reserve(used.size());
-  ram_h2d_holds.reserve(used.size());
-  int n_reused = 0;
-  size_t mmap_staged_total = 0;
-
-  auto abort_pipeline = [&]() {
-    // A failed chunk may have queued work on both streams. Drain it before
-    // releasing held slabs and reset the singleton so the caller's fallback
-    // cannot reuse partially published graph state.
-    cudaSetDevice(chosen_device);
-    cudaDeviceSynchronize();
-    for (const auto &h : d2d_holds)
-      topo->release_hold(layer_idx, h.expert_id, h.device_ptr, false);
-    for (const auto &h : ram_h2d_holds)
-      ram_mgr.ram_unpin(*h.block);
-    runner.release_completed_vram_holds();
-    runner.shutdown();
-    return false;
-  };
-
-  const size_t ram_cap =
-      layer_idx >= 0 && layer_idx < (int)engine.layers_experts.size()
-          ? std::min(engine.layers_experts[(size_t)layer_idx].size(),
-                     (size_t)std::max(1, ram_mgr.cap_for_layer(layer_idx)))
-          : 0;
-  const bool qwen_ddr_only_source =
-      qwen_ddr_only_expert_source(engine, layer_idx);
-
-  for (int ci = 0; ci < n_chunks; ++ci) {
-    const int first = ci * chunk;
-    const int count = std::min(chunk, (int)used.size() - first);
-    const int buf = ci % GgmlMoeRunner::NBUF;
-    const int slot_base = buf * chunk;
-    runner.wait_stage_free(buf);
-
-    std::vector<unsigned char> staged((size_t)count, 1);
-    if (!runner.begin_copy_batch(buf))
-      return abort_pipeline();
-
-    for (int i = 0; i < count; ++i) {
-      const int e = used[(size_t)(first + i)];
-      const ExpertLocation *rl = topo->find_expert(layer_idx, e);
-      if (rl && rl->device_ptr && rl->upload_ready &&
-          rl->gpu_id == chosen_device &&
-          topo->hold_for_compute(layer_idx, e, rl->device_ptr, false)) {
-        if (runner.copy_expert_d2d(buf, slot_base + i, rl->device_ptr)) {
-          staged[(size_t)i] = 0;
-          d2d_holds.push_back({e, rl->device_ptr});
-          ++n_reused;
-        } else {
-          topo->release_hold(layer_idx, e, rl->device_ptr, false);
-        }
-      }
-    }
-    if (!runner.mark_copy_d2d_done(buf))
-      return abort_pipeline();
-    cudaSetDevice(chosen_device);
-
-    std::vector<const uint8_t *> ram_sources((size_t)count, nullptr);
-    std::vector<MoEExpertBlock *> ram_stage_holds;
-    if (ram_cap > 0) {
-      auto &ram_slots = engine.layers_experts[(size_t)layer_idx];
-      for (int i = 0; i < count; ++i) {
-        if (!staged[(size_t)i])
-          continue;
-        const uint8_t *slab = nullptr;
-        size_t capacity = 0;
-        MoEExpertBlock *rb = ram_mgr.find_ram_slot_if_ready_held(
-            ram_slots, ram_cap, layer_idx, used[(size_t)(first + i)], &slab,
-            &capacity);
-        if (rb && slab && capacity >= gb0 + ub0 + db0) {
-          ram_sources[(size_t)i] = slab;
-          ram_stage_holds.push_back(rb);
-        } else if (rb) {
-          ram_mgr.ram_unpin(*rb);
-        }
-      }
-    }
-
-    std::vector<GgmlMoeStageSlot> slots((size_t)count);
-    for (int i = 0; i < count; ++i)
-      slots[(size_t)i] = runner.stage_slot(buf, i);
-    std::atomic<bool> stage_ok{true};
-    size_t staged_bytes = 0;
-#pragma omp parallel for schedule(static) reduction(+ : staged_bytes)
-    for (int i = 0; i < count; ++i) {
-      if (!staged[(size_t)i])
-        continue;
-      const int e = used[(size_t)(first + i)];
-      const GgmlMoeStageSlot &sl = slots[(size_t)i];
-      const uint8_t *base = ram_sources[(size_t)i];
-      const uint8_t *gs = nullptr;
-      const uint8_t *us = nullptr;
-      const uint8_t *ds = nullptr;
-      if (base) {
-        gs = base;
-        us = base + gb0;
-        ds = us + ub0;
-      } else if (qwen_ddr_only_source) {
-        // Do not let an incomplete RAM preload turn this optional pipeline
-        // into a hidden file-backed expert read.  The caller will reject the
-        // chunked path and use the normal DDR-aware fallback.
-        stage_ok.store(false, std::memory_order_relaxed);
-        continue;
-      } else if (engine.model_file.mmap_active()) {
-        const uint64_t goff = g0->offset + (uint64_t)e * gb0;
-        const uint64_t uoff = u0->offset + (uint64_t)e * ub0;
-        const uint64_t doff = d0->offset + (uint64_t)e * db0;
-        gs = engine.model_file.mmap_bytes(*g0, goff, gb0);
-        us = engine.model_file.mmap_bytes(*u0, uoff, ub0);
-        ds = engine.model_file.mmap_bytes(*d0, doff, db0);
-      }
-      if (!sl.gate || !gs || !us || !ds) {
-        stage_ok.store(false, std::memory_order_relaxed);
-        continue;
-      }
-      std::memcpy(sl.gate, gs, gb0);
-      std::memcpy(sl.up, us, ub0);
-      std::memcpy(sl.down, ds, db0);
-      staged_bytes += gb0 + ub0 + db0;
-    }
-    for (MoEExpertBlock *rb : ram_stage_holds)
-      ram_mgr.ram_unpin(*rb);
-    mmap_staged_total += staged_bytes;
-
-    std::vector<unsigned char> mask = staged;
-    if (!stage_ok.load(std::memory_order_relaxed) ||
-        !runner.push_chunk(buf, slot_base, count, (const bool *)mask.data()))
-      return abort_pipeline();
-
-    std::vector<int32_t> token((size_t)pair_capacity, 0);
-    std::vector<int32_t> ids((size_t)pair_capacity, slot_base);
-    std::vector<float> weights((size_t)pair_capacity, 0.0f);
-    const auto &p = pairs[(size_t)ci];
-    for (size_t i = 0; i < p.token.size(); ++i) {
-      token[i] = p.token[i];
-      ids[i] = slot_base + p.local[i];
-      weights[i] = p.weight[i];
-    }
-    const void *ignored = nullptr;
-    if (!runner.run_chunk_device_input_tensor(device_input, token.data(),
-                                              ids.data(), weights.data(), buf,
-                                              &ignored))
-      return abort_pipeline();
-  }
-
-  if (!runner.finish_chunked_output(device_output))
-    return abort_pipeline();
-  // Keep D2D source slots protected until this runner's copy stream reaches
-  // its completion event. Reuse of this signature, or the request boundary,
-  // performs the wait and releases the holds. The GGML graph and HC consumer
-  // remain queued asynchronously on their own stream.
-  for (const auto &h : d2d_holds)
-    runner.defer_vram_hold((void *)topo, layer_idx, h.expert_id, h.device_ptr);
-  for (const auto &h : ram_h2d_holds)
-    ram_mgr.ram_unpin(*h.block);
-  perf().n_prefill_stream_vram_hit.fetch_add((uint64_t)n_reused,
-                                             std::memory_order_relaxed);
-  perf().n_prefill_stream_vram_miss.fetch_add(
-      (uint64_t)((int)used.size() - n_reused), std::memory_order_relaxed);
-  perf().bytes_disk_read.fetch_add(mmap_staged_total,
-                                   std::memory_order_relaxed);
-  return true;
-}
-
 static bool run_ggml_moe_layer(
     StreamingEngine &engine, RAMSafetyManager &ram_mgr, GpuTopology *topo,
     int layer_idx, int S, int D, int moe_inter, int topk, int n_experts,
@@ -478,21 +158,9 @@ static bool run_ggml_moe_layer(
   // per process -- cudaMemGetInfo is not free, and the answer cannot change
   // meaningfully between layers.
   static int chosen_device = [&]() -> int {
-    // ZEROMOE_GGML_MOE_DEVICE pins the graph to a specific GPU. The
-    // automatic choice below maximises FREE VRAM, which on a box whose vault
-    // GPU is deliberately filled with expert cache picks the OTHER card --
-    // and on this hardware that is the PCIe x8 5060 Ti (6.8 GB/s H2D) rather
-    // than the x16 3090 (12.3 GB/s), i.e. it optimises the wrong thing. There
-    // is no way to weigh "more free VRAM" against "twice the link bandwidth"
-    // without knowing how much of each the layer will need, so this is a
-    // manual override rather than a heuristic.
-    if (const char *envd = zeromoe::graphcfg::env("ZEROMOE_GGML_MOE_DEVICE")) {
-      const int d = std::atoi(envd);
-      LOG_INFO("[GGML-MOE] device forced to GPU %d by "
-               "ZEROMOE_GGML_MOE_DEVICE\n",
-               d);
-      return d;
-    }
+    // An explicit moe_ggml_device TOML value pins this executor. Otherwise
+    // the automatic choice below maximizes free VRAM, which may select a
+    // slower-link card when the primary vault GPU is heavily cached.
     if (moe_ggml_device() >= 0) {
       LOG_INFO("[GGML-MOE] device set to GPU %d by config moe_ggml_device\n",
                moe_ggml_device());
@@ -521,30 +189,6 @@ static bool run_ggml_moe_layer(
   if (chosen_device < 0)
     return false;
 
-  static const bool chunk_pipeline = [] {
-    const char *env = zeromoe::graphcfg::env("ZEROMOE_GGML_CHUNK_PIPELINE");
-    return env && env[0] == '1';
-  }();
-  if (chunk_pipeline && !device_route_ids && !device_route_weights &&
-      device_output && device_input && !unpacked_layer) {
-    if (run_ggml_moe_layer_chunked(
-            engine, ram_mgr, topo, layer_idx, S, D, moe_inter, topk, n_experts,
-            used, tok_topk_ids, tok_topk_weights, chunk_experts, unpacked_layer,
-            chosen_device, gb0, ub0, db0, g0, u0, d0, device_input,
-            device_output)) {
-      static bool logged = false;
-      if (!logged) {
-        LOG_INFO("[GGML-MOE] chunked device prefill pipeline active: "
-                 "GPU gather + alternating weight chunks + device scatter\n");
-        logged = true;
-      }
-      return true;
-    }
-    LOG_WARN("[GGML-MOE] chunked pipeline rejected layer=%d; using the "
-             "single-graph path\n",
-             layer_idx);
-  }
-
   GgmlMoeRunner &runner = GgmlMoeRunner::instance_for(
       (uint32_t)g0->type, (uint32_t)u0->type, (uint32_t)d0->type);
   runner.set_batch_d2d_unpack(
@@ -559,14 +203,9 @@ static bool run_ggml_moe_layer(
   // ordinary host route table remapped to that compact axis.
   bool use_device_route_for_graph =
       device_route_ids && device_route_weights && device_input;
-  // The runner normally rounds this request to a grow-only compact-slot
-  // high-water mark (64-expert increments).  A fixed slot count is an opt-in
-  // Full-graph shape experiment: it keeps the graph/allocator stable
-  // across all layers of a quantization signature.  ids still address only
-  // [0,n_used), so the unused tail is dead storage rather than extra work.
-  const int fixed_expert_slots = ggml_fixed_expert_slots();
-  plan.n_expert_slots =
-      fixed_expert_slots > 0 ? std::max(fixed_expert_slots, n_used) : n_used;
+  // The runner keeps a grow-only compact-slot high-water mark so normal
+  // layer-to-layer shape changes do not force graph rebuilds.
+  plan.n_expert_slots = n_used;
   plan.n_tokens = S;
   plan.topk = topk;
   plan.d_model = D;

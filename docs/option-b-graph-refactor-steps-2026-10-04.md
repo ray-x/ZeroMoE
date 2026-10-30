@@ -151,8 +151,9 @@ post-attention input. The auxiliary GPU work is ordered after the early input
 fork and before hot/shared work, so it can overlap current cold CPU work.
 `ZEROMOE_QWEN_EARLY_READY_PREDICT_LAYER` can restrict the target.
 
-`ZEROMOE_QWEN_EARLY_READY_ROUTE_TRACE=path` records static cold masks and
-actual/predicted IDs after replay synchronization. Trace I/O is excluded from
+`[EARLY-READY-ROUTE]` DEBUG log records static cold masks and
+actual/predicted IDs after replay synchronization. The maintained topic checker
+filters those records into route JSONL artifacts. Trace I/O is excluded from
 throughput. Static cold usage and previous-token routes will be controls at
 matched cold-candidate counts; measure forecast overhead before staging.
 

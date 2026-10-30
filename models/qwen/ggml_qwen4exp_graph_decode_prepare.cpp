@@ -170,13 +170,6 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   const int required = pos_base + std::clamp(engine.qwen4exp_decode_window, 1, 8);
   const int dev = engine.gpu_device_id >= 0 ? engine.gpu_device_id : 0;
 
-  // Whether this session should attempt Phase 2 (true per-token dynamic
-  // GPU/CPU dispatch for the partial layer) instead of Phase 1's static,
-  // session-level commit. Both share the same usage-ranked expert set
-  // (plan_partial_layer/qwen4exp_partial_layer_gpu_ids) -- Phase 2 just
-  // decides per-token instead of once at prefill.
-  if (engine.family_ops.family != ModelFamily::Qwen)
-    plan_partial_layer(engine); // Qwen full-fit uses every expert on device.
   if (g_graph && g_graph->ready && g_graph->engine == &engine &&
       g_graph->decode_mode && g_graph->kv_capacity >= required &&
       g_graph->decode_last_pos + 1 == pos_base) {
@@ -225,10 +218,8 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   FullGraph *prefill_state_source = nullptr;
   const bool decode_compact_arena_needed =
       engine.family_ops.family != ModelFamily::Qwen &&
-      ((engine.qwen4exp_partial_layer >= 0 &&
-        !engine.qwen4exp_partial_layer_gpu_ids.empty()) ||
-       (engine.qwen4exp_gpu_stage_enabled &&
-        !engine.qwen4exp_gpu_stage_layers.empty()));
+      engine.qwen4exp_gpu_stage_enabled &&
+      !engine.qwen4exp_gpu_stage_layers.empty();
   const bool borrow_prefill_arenas = !decode_compact_arena_needed;
   if (decode_compact_arena_needed) {
     LOG_INFO("[GGML-QWEN-FULL-DECODE] arena borrowing skipped because this "
@@ -267,7 +258,7 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   // path.  The latter remains necessary for KV because prefill allocates only
   // S rows while decode reserves the full context capacity.
   const bool prefill_state_handoff =
-      env_prefill_state_handoff_enabled() && prefill_state_source &&
+      prefill_state_handoff_enabled() && prefill_state_source &&
       prefill_state_source->prefill_host_state_deferred &&
       prepare_prefill_state_handoff(*prefill_state_source);
   if (prefill_state_source && prefill_state_source->prefill_host_state_deferred &&
@@ -399,7 +390,7 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     if (!g->cuda_raw || !g->cuda || !g->cpu)
       return nullptr;
     verify_cuda_graphs_compiled_in(g->cuda_raw);
-    g->cpu_threads = graph_cpu_threads();
+    g->cpu_threads = g->engine->omp_max_threads;
     ggml_backend_cpu_set_n_threads(g->cpu, g->cpu_threads);
     ggml_threadpool_params cpu_tp_params =
         ggml_threadpool_params_default(g->cpu_threads);
@@ -433,21 +424,17 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     if (!init_device_dense_arena(*g) || !init_device_state_arena(*g))
       return nullptr;
     const bool compact_arena_planned =
-        g->device_expert_layers > 0 || !g->split_gpu_expert_ids.empty() ||
-        (!engine.qwen4exp_partial_layer_gpu_ids.empty() &&
-         engine.qwen4exp_partial_layer >= 0);
+        g->device_expert_layers > 0 || !g->split_gpu_expert_ids.empty();
     if (compact_arena_planned && !expert_source) {
       size_t free_bytes = 0, total_bytes = 0;
       const cudaError_t mem_status = cudaMemGetInfo(&free_bytes, &total_bytes);
       constexpr size_t kPhase2ArenaMargin = 768ull * 1024ull * 1024ull;
       const size_t expert_need = device_expert_bytes(*g);
-      const bool risky_override =
-          zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PHASE2_ALLOW_RISKY_ALLOC") != nullptr;
       const bool insufficient =
           mem_status != cudaSuccess ||
           expert_need > SIZE_MAX - kPhase2ArenaMargin ||
           free_bytes < expert_need + kPhase2ArenaMargin;
-      if (insufficient && !risky_override) {
+      if (insufficient) {
         qwen4exp_memory_snapshot("decode.vram_admission.declined", g->device,
                                  "compact_expert_arena");
         LOG_WARN("[GGML-QWEN-FULL] declining decode graph before expert "

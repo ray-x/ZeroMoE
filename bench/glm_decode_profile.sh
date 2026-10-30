@@ -8,6 +8,7 @@ bin=$(readlink -f "${1:?engine}"); tag=${2:?tag}; shift 2
 runtime_env=()
 graph_args=()
 verbosity_args=()
+thread_args=()
 while (($#)); do
   case "$1" in
     --graph-*)
@@ -16,6 +17,9 @@ while (($#)); do
     --verbosity)
       (($# >= 2)) || { echo "$1 requires a value" >&2; exit 2; }
       verbosity_args+=("$1" "$2"); shift 2 ;;
+    --threads|-t)
+      (($# >= 2)) || { echo "$1 requires a value" >&2; exit 2; }
+      thread_args+=(--threads "$2"); shift 2 ;;
     *=*) runtime_env+=("$1"); shift ;;
     *) echo "unsupported run option: $1" >&2; exit 2 ;;
   esac
@@ -51,10 +55,10 @@ if model_count != 1 or log_count != 1:
 Path(sys.argv[2]).write_text(text)
 PY
 printf '%s\n:q\n' "$PROMPT" | env \
-  ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512 ZEROMOE_GLM5NEXT_CPU_THREADS=8 \
-  CUDA_VISIBLE_DEVICES=0 ZEROMOE_BENCH_IGNORE_STOP=1 "${runtime_env[@]}" \
+  ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512 \
+  CUDA_VISIBLE_DEVICES=0 "${runtime_env[@]}" \
   systemd-run --user --scope -q -p MemoryMax=${GLM_MEMMAX:-80G} -p MemorySwapMax=0 \
-  "$bin" --config "$out/$tag.toml" \
+  "$bin" --ignore-eos --config "$out/$tag.toml" "${thread_args[@]}" \
   --graph-offload-first-layer 3 --graph-offload-ddr-gib 32 \
   --graph-offload-pinned-fraction 0.5 --graph-offload-policy lru \
   --graph-offload-store "$STORE" --graph-offload-model "$MODEL" \

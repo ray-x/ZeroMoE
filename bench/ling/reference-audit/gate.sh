@@ -7,7 +7,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
 LING_BIN=$1 LING_DDR_GIB=72 LING_CAP_GIB=95 LING_STOP_GIB=20 LING_GPU0_CACHE_GIB=3.0 LING_GPU1_CACHE_GIB=12.5 \
-LING_PINNED_VRAM_CAPACITY=3700 LING_OFFLOAD_PINNED=0.5 LING_GPU_ASSIST=3 LING_ASSIST2_SLOTS=1 LING_CPU_THREADS=10 \
+LING_PINNED_VRAM_CAPACITY=3700 LING_OFFLOAD_PINNED=0.5 LING_GPU_ASSIST=3 LING_ASSIST2_SLOTS=1 \
 LING_USAGE_FILE="$PWD/bench/ling/reference-audit/usage-hi-there-robust4.pin" LING_LOG="$PWD/logs/ling_$2_short.log" \
-  timeout 900 bench/ling/reference-audit/run.sh > "logs/ling_$2_run.out" 2>&1
+  timeout 900 bench/ling/reference-audit/run.sh --threads 10 > "logs/ling_$2_run.out" 2>&1
 echo "$2: $(grep -a 'REQUEST-DECODE-OUTPUT' "logs/ling_$2_short.log" | grep -o 'rate=[0-9.]*')"

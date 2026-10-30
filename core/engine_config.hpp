@@ -114,6 +114,7 @@ struct EngineConfig {
   // Generation parameters
   int context_size = 4096;   // Max context window (tokens)
   int max_new_tokens = 1024; // Max tokens to generate per response
+  bool ignore_eos = false; // llama.cpp --ignore-eos
   float temperature = 0.7f;
   float top_p = 0.90f;
   float repeat_penalty = 1.0f;
@@ -638,13 +639,11 @@ struct EngineConfig {
   // build_moe. Default 0.0 = feature off, identical to today's behavior.
   double qwen4exp_graph_expert_vram_budget_gb = 0.0;
 
-  // Option B: static power-law placement for one Qwen layer.  The full
-  // graph keeps the selected experts in a permanent CUDA graph arena and
-  // leaves the complementary experts in the fixed-stride DDR arena.  A
-  // value below zero disables the option; this is deliberately separate
-  // from the older partial-layer environment experiment, whose GPU-only
-  // path has different correctness semantics.
-  int qwen4exp_option_b_layer = -1;
+  // Option B: static power-law placement for one Qwen layer. The full
+ // graph keeps selected experts in the permanent CUDA graph arena and
+ // leaves complementary experts in the fixed-stride DDR arena. A negative
+ // value disables the option; uncaptured experts remain on DDR/CPU.
+ int qwen4exp_option_b_layer = -1;
   int qwen4exp_option_b_top_n = 0;
   float qwen4exp_option_b_min_coverage = 0.80f;
   // When true, top_n is only a ceiling: each selected layer's real hot-set
@@ -2131,6 +2130,12 @@ struct EngineConfig {
   // and shows only startup info and real warnings/errors.
   std::string log_path;
   std::string log_level = "INFO";
+// CLI-only llama.cpp-compatible prompt token logging directory.
+std::string log_prompts_dir;
+// DeepSeek numerical trace controls are CLI-only and do not enter TOML.
+std::string deepseek_trace_dir;
+int deepseek_trace_layer = -1;
+int deepseek_trace_pos = -1;
 
   // GPU configuration
   std::vector<GpuConfig> gpus;
@@ -3682,6 +3687,14 @@ inline void EngineConfig::print() const {
            "template, stdin content is tokenized verbatim\n";
   LOG_STREAM_INFO() << "[CONFIG] Log level: " << log_level << " | Log path: "
                     << (log_path.empty() ? "(stderr)" : log_path) << "\n";
+  if (!log_prompts_dir.empty())
+    LOG_STREAM_INFO() << "[CONFIG] Prompt token log directory: "
+                      << log_prompts_dir << "\n";
+  if (!deepseek_trace_dir.empty())
+    LOG_STREAM_INFO() << "[CONFIG] DeepSeek trace directory: "
+                      << deepseek_trace_dir << " | layer="
+                      << deepseek_trace_layer << " | position="
+                      << deepseek_trace_pos << "\n";
   for (size_t i = 0; i < gpus.size(); ++i) {
     const auto &g = gpus[i];
     LOG_STREAM_INFO() << "[CONFIG] GPU " << g.device_id << " (" << g.name

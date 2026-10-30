@@ -183,9 +183,9 @@ std::unique_ptr<LingNativeGraph> build_graph(StreamingEngine &engine, int S,
 
 bool bailingmoe3_native_graph_enabled() {
 #if defined(ZEROMOE_USE_GGML_CUDA)
-  // The family-wide full graph is always on; this flag only chooses the
-  // cache-backed native implementation over the shared GLM5Next graph.
-  return zeromoe::graphcfg::flag_on("ZEROMOE_LING_NATIVE_GRAPH");
+  // The slower cache-backed native graph experiment was retired; Ling uses
+  // the shared GLM5Next graph implementation.
+  return false;
 #else
   return false;
 #endif
@@ -193,8 +193,9 @@ bool bailingmoe3_native_graph_enabled() {
 
 bool bailingmoe3_hybrid_cuda_graph_enabled() {
 #if defined(ZEROMOE_USE_GGML_CUDA)
-  return bailingmoe3_native_graph_enabled() &&
-         zeromoe::graphcfg::flag_on("ZEROMOE_LING_HYBRID_CUDA_GRAPH");
+  // The experimental hybrid graph selector was retired; Ling uses the
+  // shared GLM5Next graph implementation.
+  return false;
 #else
   return false;
 #endif

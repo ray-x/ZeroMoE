@@ -6,13 +6,11 @@
 #   GLM_RANKING       usage file used for both the 3090 cache (toml pin_file) and the 5060 Ti hot set.
 export CUDA_VISIBLE_DEVICES=0,1
 export ZEROMOE_GLM5NEXT_GPU1_HOT_GIB=${ZEROMOE_GLM5NEXT_GPU1_HOT_GIB:-15.0}
-export ZEROMOE_GLM5NEXT_CPU_THREADS=${ZEROMOE_GLM5NEXT_CPU_THREADS:-10}
 GGML_KERNEL_LIBS=${GGML_KERNEL_LIBS:?set GGML_KERNEL_LIBS to the directory containing the required libggml-cpu.so.0}
 ORIG=${GGML_BASE_LIBS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/build/ggml-build/src}
 export LD_LIBRARY_PATH=$GGML_KERNEL_LIBS:$ORIG:$ORIG/ggml-cuda${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 GLM_RANKING=${GLM_RANKING:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/docs/ssd-offload/data/glm53flash_usage_base_plus_decode100.txt}
-export ZEROMOE_GLM5NEXT_GPU1_HOT_USAGE=$GLM_RANKING
-GLM_GRAPH_ARGS=(--graph-offload-usage-file "$GLM_RANKING")
+GLM_GRAPH_ARGS=(--threads 10 --graph-offload-usage-file "$GLM_RANKING")
 # The 5060 Ti holds only layers >= 31 (the 3090's pin_file ranking has those layers zeroed, pin_global_floor_per_layer = 0), so a
 # layer's hot set is on one GPU: +3% on held-out prompts, neutral on the benchmark sequence.
 export ZEROMOE_GLM5NEXT_GPU1_MIN_LAYER=${ZEROMOE_GLM5NEXT_GPU1_MIN_LAYER:-31}

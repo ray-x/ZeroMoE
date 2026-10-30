@@ -38,7 +38,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <iomanip>
 #include <memory>
 #include <mutex>
@@ -123,23 +122,18 @@ uint64_t qwen4exp_fnv64(const void *data, size_t bytes);
 bool qwen4exp_dump_f32(const char *path, const float *data, size_t elements);
 void CUDART_CB qwen4exp_cuda_host_node_callback(void *user_data);
 void CUDART_CB qwen4exp_cuda_host_node_arm_direct_workers( void *user_data);
-bool env_prefill_state_handoff_enabled();
+bool prefill_state_handoff_enabled();
 bool prefill_device_state_inputs_enabled(const StreamingEngine &engine);
+bool qwen4exp_prefill_op_offload_enabled();
 int env_device_expert_layers();
 bool env_device_expert_trailing();
 bool env_layer_timing_enabled();
 bool env_qwen4exp_host_node_enabled();
 bool env_layer_timing_verbose();
-int env_partial_layer();
-int env_partial_layer_top_n();
-float env_partial_layer_min_coverage();
-bool env_partial_layer_phase2_enabled();
-bool partial_prefill_capture_enabled();
 std::chrono::milliseconds env_storage_wait_timeout();
 bool env_adaptive_completion_policy_enabled();
 int env_decode_kv_capacity(int max_t, int required);
 void pin_host_node_threads(ggml_threadpool_params &p, int n_threads);
-int graph_cpu_threads();
 bool graph_cuda_host_buffers();
 bool graph_match_llama_cpp_topology(const FullGraph &graph);
 bool graph_layout_debug();
@@ -171,7 +165,6 @@ size_t expert_soft_bytes_allocated(const FullGraph &owner);
 std::string device_expert_single_key(const void *host, size_t bytes, const std::string &source_tag);
 void *alloc_registered_host(FullGraph &g, size_t bytes);
 void plan_expert_vram_split(FullGraph &g);
-void plan_partial_layer(StreamingEngine &engine);
 size_t full_expert_source_bytes(const StreamingEngine &engine, int layer_limit = -1);
 bool preloaded_ram_expert_source(FullGraph &g, const std::string &name, const GGUFTensor &meta, void *&ptr, size_t &bytes, size_t &expert_stride, size_t &arena_bytes);
 int device_expert_resident_layer_count(const FullGraph &g);
@@ -200,7 +193,7 @@ ggml_tensor *build_qwen4exp_host_node(FullGraph &g, ggml_context *ctx,
 int build_gpu_stage_node(FullGraph &g, ggml_context *ctx, ggml_tensor *ids, int layer);
 ExpertSplitTables build_expert_split_tables(FullGraph &g, ggml_context *ctx, int n_experts, const std::vector<int> &gpu_ids, bool safe_dummy_fill = false);
 bool exl3_ggml_bridge_requested(const FullGraph &g, int layer, std::string &model_path);
-ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur, int layer, ggml_tensor *router, ggml_tensor *selection_bias, ggml_tensor *gate_exps, ggml_tensor *up_exps, ggml_tensor *down_exps, ggml_tensor *gate_exps_gpu = nullptr, ggml_tensor *up_exps_gpu = nullptr, ggml_tensor *down_exps_gpu = nullptr, const std::vector<int> *split_gpu_ids = nullptr, ggml_tensor *gate_up_exps = nullptr, ggml_tensor **ids_out = nullptr, ggml_tensor **probs_out = nullptr, bool routing_only = false, ggml_tensor *fixed_route_ids = nullptr, ggml_tensor *fixed_route_weights = nullptr, ggml_tensor **route_weights_out = nullptr);
+ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur, int layer, ggml_tensor *router, ggml_tensor *selection_bias, ggml_tensor *gate_exps, ggml_tensor *up_exps, ggml_tensor *down_exps, ggml_tensor *gate_exps_gpu = nullptr, ggml_tensor *up_exps_gpu = nullptr, ggml_tensor *down_exps_gpu = nullptr, const std::vector<int> *split_gpu_ids = nullptr, ggml_tensor *gate_up_exps = nullptr, ggml_tensor **ids_out = nullptr, ggml_tensor **route_weights_out = nullptr);
 bool qwen_moe_layer_cpu_only(const FullGraph &g, int layer);
 bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding);
 bool sync_prefill_recurrent_state_to_host(FullGraph &g);
@@ -463,7 +456,7 @@ struct FullGraph : zeromoe::graph::GraphCore {
   bool exl3_bridge_failed = false;
   ggml_threadpool_t cpu_threadpool = nullptr;
   int cpu_threads = 0;
-  std::unique_ptr<std::ofstream> early_route_trace;
+  bool early_ready_route_masks_logged = false;
   std::unique_ptr<Qwen4ExpStageShapeClassPool> early_stage_shapes;
   std::vector<std::unique_ptr<Qwen4ExpStagePool>> early_stage_pools;
   // Scratch of the fused cold-expert ops (one per layer); the graph nodes hold raw pointers into these.
@@ -699,64 +692,9 @@ std::vector<std::tuple<int, ggml_tensor *>> layer_input_taps;
   cudaEvent_t stage_compute_start_event = nullptr;
   cudaEvent_t stage_compute_end_event = nullptr;
   ggml_tensor *stage_route_ids = nullptr;
-  // Phase 1 partial-layer dispatch: prefill-only, non-null exactly when
-  // this graph is building engine->qwen4exp_partial_layer's MoE block
-  // during a non-decode (S>1) build. Marked as a graph output so
-  // qwen4exp_full_graph_run can read back this prompt's real routing for
-  // that layer and decide, once, whether decode may commit to the
-  // GPU-only path. Shape [topk, S] I32, same layout ggml_argsort_top_k
-  // itself produces.
-  ggml_tensor *partial_layer_ids_out = nullptr;
-  // Diagnostic sibling of partial_layer_ids_out: the partial layer's raw
-  // post-softmax router distribution ([n_experts, S]), for checking
-  // whether routing is genuinely peaked or effectively near-uniform noise.
-  ggml_tensor *partial_layer_probs_out = nullptr;
-  // Phase-2 prefix: selected, post-normalization router weights in original
-  // route-slot order. Resident, staged and CPU continuations reuse these
-  // values so each selected route contributes with the exact prefix weight.
-  ggml_tensor *partial_layer_weights_out = nullptr;
-  // Root-cause diagnostic (2026-09-18): the raw exp_probs_b.bias tensor
-  // for the partial layer, exposed as a graph output so
-  // qwen4exp_full_graph_run can dump its actual values -- see
-  // [[qwen4exp-legacy-vs-fullgraph-routing-divergence]].
-  ggml_tensor *partial_layer_bias_out = nullptr;
 
-  // Phase 2: true per-token GPU/CPU dispatch for the partial layer,
-  // validated via a standalone spike test (splitting a computation across
-  // two separately-submitted ggml graphs with a persistent device-tensor
-  // handoff -- see qwen4exp-full-graph-decode-benchmark-baseline memory's
-  // follow-on note). Off (Full) is byte-identical to today's single-graph
-  // decode for every other config; Prefix/SuffixGpu/SuffixCpu are three
-  // DISTINCT FullGraph instances (own ctx/graph/sched) built once at
-  // decode-prepare time, chosen per token by a cheap host-side readback of
-  // the prefix's own layer routing.
-  // Prefix-only: the persistent handoff buffer this instance writes `res`
-  // (the residual right after the split layer's attention) into. Suffix
-  // instances read the prefix instance's own phase2_handoff_buf/addr
-  // directly (the prefix instance IS g_graph, phase2_mode==Prefix -- see
-  // the g_graph global's own comment) and bind a fresh leaf tensor to the
-  // SAME address in their own ctx -- never touch this pair themselves.
-  // Host mirrors used only by the CPU continuation.  Route/HC publication
-  // buffers are CUDA-owned for GPU children; CPU MUL_MAT_ID and HC nodes must
-  // receive explicit D2H materializations instead of reading those device
-  // addresses through a mixed scheduler edge.
-  // Frozen split-layer HC/router inputs. The prefix publishes these once;
-  // every Phase-2 branch aliases the same FFN input, injection vector, route
-  // IDs and normalized route weights for this layer invocation.
-  // SplitGpu/SplitStaged write the post-FFN residual here; Tail starts from
-  // this address after the conditional child has completed.
-  // SuffixGpu and SuffixCpu build the SAME layer range [split_layer+1,
-  // n_layers) and therefore issue new_device_state_tensor() calls in an
-  // IDENTICAL sequence (GDN/dense-attn/PLE classification per layer is a
-  // static model property, not decode-time data) -- but only ONE of them
-  // runs per token, so their GDN/KV/PLE state for those shared layers
-  // must be the SAME physical buffer, or it would silently diverge the
-  // moment dispatch alternates between them. The instance built FIRST
-  // (SuffixGpu) allocates for real and records each address in
-  // state_addrs, in call order; the instance built SECOND
-  // (SuffixCpu, via state_source_graph pointing at the first) replays
-  // that list instead of allocating its own arena slots, binding a fresh
-  // leaf in ITS OWN ctx to each recorded address in turn.
+  // Decode graphs reuse state buffers from a source graph while keeping
+  // each ggml tensor handle local to its own context.
   FullGraph *state_source_graph = nullptr;
   std::vector<void *> state_addrs;
   size_t state_replay_cursor = 0;
@@ -773,33 +711,29 @@ std::vector<std::tuple<int, ggml_tensor *>> layer_input_taps;
   std::vector<ggml_backend_buffer_t> state_handoff_buffers;
   size_t state_handoff_cursor = 0;
   std::unordered_set<ggml_tensor *> state_handoff_tensors;
-  // Phase 2 sibling graphs use the same read-only dense-weight arena.  The
-  // source graph owns the CUDA buffer; borrowers bind their own ggml tensor
-  // handles to the source addresses.  Unlike the state arena above, dense
-  // weights are keyed by model tensor name because prefix and suffix graphs
-  // do not materialize the same layer range.
+  // Borrowed decode graphs bind their dense-weight tensors to storage
+  // owned by a source graph.
   FullGraph *dense_source_graph = nullptr;
   std::unordered_map<std::string, void *> dense_addrs;
-  // Phase-2 continuations read immutable route/input outputs from the prefix
-  // graph. Aliases are backed by its persistent output buffers and are
-  // consumed only after the prefix has completed for this token.
-  struct CompletionPayloadBinding {
-    void *gate = nullptr;
-    void *up = nullptr;
-    void *down = nullptr;
-    size_t gate_bytes = 0;
-    size_t up_bytes = 0;
-    size_t down_bytes = 0;
-    size_t gate_stride = 0;
-    size_t up_stride = 0;
-    size_t down_stride = 0;
-    void *staged_route_mask = nullptr;
-    void *staged_dispatch_ids = nullptr;
-    ggml_tensor *staged_route_mask_tensor = nullptr;
-    ggml_tensor *staged_dispatch_ids_tensor = nullptr;
-    int topk = 0;
-    int layer = -1;
-  } completion_payload_binding;
+// Staged work retains expert planes and route metadata until its asynchronous
+// completion. The source graph owns the backing tensors for the full request.
+struct CompletionPayloadBinding {
+  void *gate = nullptr;
+  void *up = nullptr;
+  void *down = nullptr;
+  size_t gate_bytes = 0;
+  size_t up_bytes = 0;
+  size_t down_bytes = 0;
+  size_t gate_stride = 0;
+  size_t up_stride = 0;
+  size_t down_stride = 0;
+  void *staged_route_mask = nullptr;
+  void *staged_dispatch_ids = nullptr;
+  ggml_tensor *staged_route_mask_tensor = nullptr;
+  ggml_tensor *staged_dispatch_ids_tensor = nullptr;
+  int topk = 0;
+  int layer = -1;
+} completion_payload_binding;
 
   ggml_tensor *topology_cpu_prologue = nullptr;
   ggml_tensor *ple_embedding = nullptr;
@@ -888,7 +822,7 @@ std::vector<std::tuple<int, ggml_tensor *>> layer_input_taps;
     cold_fused.clear();
     early_stage_shapes.reset();
     early_ready.clear();
-    early_route_trace.reset();
+    early_ready_route_masks_logged = false;
     // Host-node CPU runners borrow this graph-owned pool.  Detach them after
     // the scheduler is gone, but before the pool itself is destroyed.  The
     // runner's graph plan is synchronous, so no callback can still be using
@@ -976,9 +910,6 @@ std::vector<std::tuple<int, ggml_tensor *>> layer_input_taps;
     split_gpu_expert_ids.clear();
     expert_source_graph = nullptr;
     expert_addrs.clear();
-    partial_layer_ids_out = nullptr;
-    partial_layer_probs_out = nullptr;
-    partial_layer_weights_out = nullptr;
     state_source_graph = nullptr;
     state_addrs.clear();
     state_replay_cursor = 0;

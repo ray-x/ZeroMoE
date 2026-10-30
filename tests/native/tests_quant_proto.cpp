@@ -1,7 +1,7 @@
 // Native test harness: tests_quant_proto (split from tests/native/main_test.cpp).
 #include "native_tests.hpp"
 
-// Gated feasibility bench (ZEROMOE_RUN_BENCH=1, same convention as the
+// Gated feasibility bench (zeromoe_tests --bench, same convention as the
 // others above) for dot_iq2_xxs_vnni_prototype (kernels_cpu.cpp) -- answers
 // "does a VNNI int8 dot beat the existing dot_iq2_xxs_f32_avx512 FMA path"
 // BEFORE committing to a real production kernel (see CLAUDE.md's

@@ -2,7 +2,7 @@
 
 Status: **defaults, family overrides, canonical root TOML, compatibility environment
 aliases and generated graph CLI flags implemented**. Qwen whole-layer placement and
-shared CPU thread caps also use the resolver. Profile pins and capability negotiation
+CPU threads use the process-wide `-t/--threads` option. Profile pins and capability negotiation
 remain design proposals. User-facing behavior and commands: [configuration guide](../configuration.md).
 The sections below describe the broader target design, not all shipped behavior.
 Code: `models/graph/graph_settings.hpp`
@@ -30,7 +30,6 @@ enum class Source : uint8_t { Default, Family, Profile, Toml, Env, Cli };
 template <class T> struct Resolved { T value{}; Source src = Source::Default; const char *note = ""; };
 
 struct GraphSettings {            // tunables: may change performance or numerics
-  Resolved<int>    cpu_threads_decode, cpu_threads_prefill;
   Resolved<int>    prefill_chunk, prefill_min_batch;
   Resolved<int>    prefill_offload_min_tokens;   // op-offload threshold
   Resolved<bool>   prefill_op_offload;
@@ -86,7 +85,6 @@ model = "mimo-v2.6-flash"; quant = "gsq-rco-3bit"; devices = ["rtx3090:24:4x16",
 [pins]                      # ONLY measured fields
 prefill_chunk            = 512
 prefill_offload_min_tokens = 256
-cpu_threads_decode       = 10
 [baseline]
 baseline_default_hash = "c41e…"   # hash of the base defaults table when frozen
 unpinned_hash    = "9f3c…"  # hash of resolved unpinned tunables at freeze time
@@ -123,7 +121,6 @@ Step 1 moves these in with today's defaults, no change in value:
 
 | Field | MiMo today | Ling today | Source today |
 |---|---|---|---|
-| `cpu_threads_decode` | 10 | 10 | Qwen CPU-worker alias remains; MiMo2 uses `graph_cpu_threads_decode` / `--graph-cpu-threads-decode` |
 | `prefill_chunk` | 512 | per Ling code | `…_PREFILL_CHUNK` |
 | `prefill_min_batch` | 8 | 64 (base default) | `min_prefill_batch()` override |
 | `prefill_op_offload`, `prefill_offload_min_tokens` | auto, 256 | disabled in code | `…_PREFILL_OP_OFFLOAD`, `…_OFFLOAD_MIN` |
@@ -151,7 +148,6 @@ Printed table (one block per run, e.g. `[SETTINGS]`):
 
 ```
 prefill_chunk             512   family:mimo2 (reason: 512-token chunks measured 74 vs 41 tok/s)
-cpu_threads_decode         10   default
 moe_cache_gb[0]            12   toml
 prefill_op_offload         on   default      capability: wants_op_offload=true (family:mimo2)
 profile: mimo-v2.6-flash/3090+5060ti  defaults hash c41e (live c41e)  drift: none
@@ -204,7 +200,7 @@ a rebase pass over all profiles.
 * Remaining environment aliases keep their old parse (strict strtol, atoi, on-unless-0). These aliases
   are being retired in favor of the canonical TOML/CLI surface.
 * Not migrated: the `ZEROMOE_MIMO2_INGRAPH_MOE` / `_FULL_GRAPH` gates (feature gates, not tunables),
-  GLM's other ~45 knobs, Ling's native/hybrid graph gates, `ZEROMOE_LING_NO_*_CACHE_ALIAS`.
+  GLM's other ~45 knobs, Ling's retired native/hybrid graph gates (removed 2026-10-29), `ZEROMOE_LING_NO_*_CACHE_ALIAS`.
 * Ling's chunk: TOML/CLI value wins; otherwise the engine's prefill batch or 2048. The default stays
   0 = "the model decides" because that fallback needs the engine.
 * `defaults_table()` / `defaults_hash()` exist; `tests/graph_settings_defaults.snapshot` is diffed by the
@@ -218,6 +214,14 @@ a rebase pass over all profiles.
 ### Added after step 1
 
 * `usage_record_file` (diagnostic, outside the defaults hash): canonical `graph_usage_record_file` TOML/CLI setting; no environment alias. Turns on the shared route survey (`models/graph/graph_route_survey.hpp`). Only the in-graph MoE path is tapped; MiMo's synchronous fallback (`ZEROMOE_MIMO2_INGRAPH_MOE=0`) and layered path record nothing, so the file stays empty there.
-* One prefill-chunk model for graph families: env (`prefill_chunk` aliases) > the TOML's `prefill_batch_tokens` >
-  the family override (MiMo 512) > default. MiMo's configs no longer set `prefill_batch_tokens = 16`, which the
-  MiMo graph used to ignore and which would otherwise have capped the chunk at 16.
+* GLM and GLM-DSA use the shared `prefill_batch_tokens` value, set by llama.cpp-compatible `-ub/--ubatch-size`
+  or TOML, then the GLM family default of 2048. The duplicate `ZEROMOE_GLM5NEXT_PREFILL_CHUNK` override was
+  removed on 2026-10-30. MiMo and Ling use the canonical graph prefill setting and their family/engine defaults.
+  MiMo's configs no longer set `prefill_batch_tokens = 16`, which the MiMo graph used to ignore and which would
+  otherwise have capped its chunk at 16.
+* `prefill_op_offload` is now the canonical graph TOML/CLI field for MiMo, the shared GLM/Ling graph, and Qwen.
+  Qwen's family default is on; `prefill_offload_min_tokens` remains MiMo-specific. The Qwen-prefixed offload env
+  override was removed on 2026-10-30.
+* Qwen's host-expert prefill offload uses the shared `graph_prefill_op_offload` TOML/CLI field, with a Qwen
+  family default of on. `ZEROMOE_QWEN4EXP_PREFILL_OP_OFFLOAD` was removed on 2026-10-30; setting the field to
+  false keeps host-resident experts on CPU during prefill.

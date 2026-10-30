@@ -29,8 +29,17 @@ Metric: `[REQUEST-DECODE-OUTPUT]` (or `[REQUEST-DECODE-WALL]`).
 
 - **Cache-backed graph** (one host callback per layer) reuses the native RAM/VRAM cache; graph
   owns **zero** MoE weight bytes (`docs/deepseek_v41_changelog_2026-10-21.md`).
+- Whole-prompt prefill remains the default. Use `prefill_batch_tokens` or llama.cpp-compatible
+  `-ub/--ubatch-size` only when an explicit graph-batch limit is needed.
 - `pin_ram_fraction=1.0` + `ram_pinned_budget_gb=40` + `pin_global_tiers` (default off) cut SSD
   reads and lift decode 5-11%.
+
+## Numerical trace
+
+Use `--trace-dir DIR` to capture float32 boundary tensors as `.f32` files. Optional
+`--trace-layer N` and `--trace-pos N` select one layer and position. The
+profiling runner exposes the same selectors and passes them to the binary as
+CLI options. These are developer diagnostics; no environment aliases remain.
 
 ## Gotchas
 

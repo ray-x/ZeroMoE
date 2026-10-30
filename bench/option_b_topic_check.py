@@ -27,6 +27,28 @@ PROMPTS = {
                  'details and dialogue, and end with a difficult choice.'),
 }
 
+ROUTE_TRACE_MARKER = '[EARLY-READY-ROUTE] '
+
+
+def extract_route_records(log_paths, destination):
+    records = []
+    for log_path in log_paths:
+        if not log_path.is_file():
+            raise RuntimeError(f'missing engine log for route capture: {log_path}')
+        with log_path.open(errors='replace') as log:
+            for line in log:
+                marker = line.find(ROUTE_TRACE_MARKER)
+                if marker < 0:
+                    continue
+                payload = line[marker + len(ROUTE_TRACE_MARKER):].strip()
+                if payload:
+                    json.loads(payload)
+                    records.append(payload)
+    if not records:
+        raise RuntimeError(f'no {ROUTE_TRACE_MARKER.strip()} records in {log_paths}')
+    destination.write_text('\n'.join(records) + '\n')
+    return len(records)
+
 
 def wait_idle(seconds):
     deadline = time.monotonic() + seconds
@@ -64,8 +86,7 @@ def main():
     for name in ('OMP_WAIT_POLICY', 'GOMP_SPINCOUNT', 'OMP_PROC_BIND', 'OMP_PLACES'):
         env.pop(name, None)
     env.update(CUDA_VISIBLE_DEVICES='0', GGML_CUDA_BF16_MMVF_CUBLAS='0',
-                ZEROMOE_QWEN_CPU_THREADS='10',
-        ZEROMOE_BENCH_IGNORE_STOP='1', ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT='1',
+        ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT='1',
         ZEROMOE_QWEN_EARLY_READY_RESIDENT_TABLES='1', ZEROMOE_QWEN_EARLY_READY_PREDICT='1')
     manifest = {
         'engine': str(engine), 'engine_sha256': hashlib.sha256(engine.read_bytes()).hexdigest(),
@@ -90,8 +111,7 @@ def main():
         config = directory / 'capture.toml'
         config.write_text(setting(A.read_text(), 'log_path', json.dumps(str(directory / 'capture.engine.log'))))
         run_env = dict(env, ZEROMOE_PROMPT_TOKEN_FILE=str(directory / 'prompt.tokens'),
-            ZEROMOE_GENERATED_TOKEN_FILE=str(directory / 'continuation.tokens'),
-            ZEROMOE_QWEN_EARLY_READY_ROUTE_TRACE=str(directory / 'capture.routes.jsonl'))
+            ZEROMOE_GENERATED_TOKEN_FILE=str(directory / 'continuation.tokens'))
         if args.resume and (directory / 'prediction_scores.json').exists():
             scores = json.loads((directory / 'prediction_scores.json').read_text())
             print(f'Reusing captured {topic}', flush=True)
@@ -99,9 +119,10 @@ def main():
             wait_idle(args.wait_idle)
             print(f'Capturing {topic}', flush=True)
             with (directory / 'capture.stdout').open('w') as output:
-                subprocess.run([str(engine), '--graph-device-expert-layers', '0', '--graph-device-expert-trailing', '1', '--config', str(config), '--predict', str(args.ngen)],
+                subprocess.run([str(engine), '--ignore-eos', '--threads', '10', '--verbosity', '5', '--graph-device-expert-layers', '0', '--graph-device-expert-trailing', '1', '--config', str(config), '--predict', str(args.ngen)],
                     input=prompt + '\n:q\n', text=True, cwd=ROOT, env=run_env,
                     stdout=output, stderr=subprocess.STDOUT, check=True)
+            extract_route_records([directory / 'capture.engine.log'], directory / 'capture.routes.jsonl')
             scores = analyze(directory / 'capture.routes.jsonl',
                 ROOT / 'tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_usage_tap', 12.3e9)
             (directory / 'prediction_scores.json').write_text(json.dumps(scores, indent=2) + '\n')
@@ -115,7 +136,6 @@ def main():
             '--baseline-env', 'ZEROMOE_QWEN_EARLY_READY_PREDICT=1',
             '--candidate-env', 'ZEROMOE_QWEN_EARLY_READY_RESIDENT_TABLES=1',
             '--candidate-env', 'ZEROMOE_QWEN_EARLY_READY_PREDICT=1',
-            '--candidate-env', f'ZEROMOE_QWEN_EARLY_READY_ROUTE_TRACE={directory / "staging.routes.jsonl"}',
             '--candidate-env', f'ZEROMOE_QWEN_EARLY_READY_STAGE_LAYER={args.stage_layer}']
         if args.verify:
             command += ['--candidate-env', 'ZEROMOE_QWEN_EARLY_READY_STAGE_VERIFY=1']
@@ -125,6 +145,8 @@ def main():
             command += ['--resume']
         with (directory / 'comparison.log').open('a' if args.resume else 'w') as output:
             subprocess.run(command, cwd=ROOT, stdout=output, stderr=subprocess.STDOUT, check=True)
+        candidate_logs = sorted((directory / 'comparison').glob('candidate_*.engine.log'))
+        extract_route_records(candidate_logs, directory / 'staging.routes.jsonl')
         staged_scores = analyze(directory / 'staging.routes.jsonl',
             ROOT / 'tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_usage_tap', 12.3e9)
         (directory / 'staging_scores.json').write_text(json.dumps(staged_scores, indent=2) + '\n')

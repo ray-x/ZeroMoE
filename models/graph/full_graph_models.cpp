@@ -56,12 +56,11 @@ class Qwen4ExpGraphModel final : public FullGraphModelBase<Qwen4ExpGraphModel> {
     return qwen4exp_full_graph_device_expert_trailing();
   }
 
-  // Tokens per prefill graph batch: ZEROMOE_QWEN4EXP_PREFILL_CHUNK, else the toml's `prefill_batch_tokens`, else the
-  // whole prompt (0). Batches continue each other (recurrent state, dense KV rows and the PLE window are carried through
-  // the engine), and the memory pre-check lowers a batch that does not fit to the one that does (suggested batch).
+  // Tokens per prefill graph batch use llama.cpp's -ub/--ubatch-size (through
+  // `prefill_batch_tokens`) or the matching TOML setting; 0 keeps whole-prompt
+  // prefill. Batches continue each other through recurrent state, dense KV rows,
+  // and the PLE window. The memory pre-check lowers a batch to one that fits.
   int max_prefill_tokens(const StreamingEngine &e) const override {
-    if (const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PREFILL_CHUNK"); v && v[0])
-      return std::atoi(v);
     return e.prefill_batch_tokens > 0 ? e.prefill_batch_tokens : 0;
   }
   int suggested_prefill_batch(const StreamingEngine &) const override {
@@ -438,14 +437,13 @@ class Glm5NextGraphModel final : public FullGraphModelBase<Glm5NextGraphModel> {
   }
   bool supports_cpu_lane() const override { return true; }
 
-  // Tokens per prefill batch (llama.cpp's n_ubatch): ZEROMOE_GLM5NEXT_PREFILL_CHUNK, else the toml's
-  // `prefill_batch_tokens`, else 2048 (every batch restreams all cold experts, so 512 prefills a 1065-token prompt at
-  // 90 tok/s against 250 for one batch). 0 = the whole prompt in one graph. Each batch continues the previous one's state
-  // (up to the sparse top-k of 2048 tokens of context). Whatever is configured is reduced by the prepare check to what
-  // fits in free VRAM / host RAM, so an oversized value cannot request memory the box does not have.
+  // Tokens per prefill batch use llama.cpp's -ub/--ubatch-size (through
+  // `prefill_batch_tokens`) or the matching TOML setting, then default to 2048.
+  // Every batch restreams all cold experts, so 512 prefills a 1065-token prompt
+  // at 90 tok/s against 250 for one batch. Each batch continues the previous
+  // one's state. The prepare check reduces an oversized value to what fits in
+  // free VRAM and host RAM.
   int max_prefill_tokens(const StreamingEngine &e) const override {
-    if (const char *v = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PREFILL_CHUNK"); v && v[0])
-      return std::atoi(v);
     return e.prefill_batch_tokens > 0 ? e.prefill_batch_tokens : 2048;
   }
   int suggested_prefill_batch(const StreamingEngine &) const override {
@@ -507,8 +505,6 @@ class GlmDsaGraphModel final : public FullGraphModelBase<GlmDsaGraphModel> {
   }
 
   int max_prefill_tokens(const StreamingEngine &e) const override {
-    if (const char *v = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PREFILL_CHUNK"); v && v[0])
-      return std::atoi(v);
     return e.prefill_batch_tokens > 0 ? e.prefill_batch_tokens : 2048;
   }
   int suggested_prefill_batch(const StreamingEngine &) const override { return glm5next_full_graph_suggested_batch(); }
@@ -642,14 +638,10 @@ class DeepseekV41GraphModel final
   int device_expert_layers() const override {
     return deepseek_v41_full_graph_device_expert_layers();
   }
-  int max_prefill_tokens(const StreamingEngine &) const override {
-    static const int chunk = [] {
-      const char *v = zeromoe::graphcfg::env("ZEROMOE_DEEPSEEK_V41_PREFILL_CHUNK");
-      // Native cache-backed attention supports the whole prompt. A 128-token
-      // cap sent the rest of long prompts through serial decode.
-      return v && v[0] ? std::max(0, std::atoi(v)) : 0;
-    }();
-    return chunk;
+  int max_prefill_tokens(const StreamingEngine &e) const override {
+    // Native cache-backed attention supports whole-prompt prefill by default.
+    // The shared TOML/CLI batch limit remains available for explicit runs.
+    return e.prefill_batch_tokens > 0 ? e.prefill_batch_tokens : 0;
   }
 
   bool accepts(const StreamingEngine &e, const ModelGraphRequest &r) const {

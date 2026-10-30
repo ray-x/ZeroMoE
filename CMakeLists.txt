@@ -40,8 +40,8 @@ target_include_directories(graph_settings_binding_test PRIVATE core models/graph
 find_package(Threads REQUIRED)
 target_link_libraries(graph_settings_binding_test PRIVATE Threads::Threads)
 add_test(NAME graph_settings_binding COMMAND graph_settings_binding_test)
-set_tests_properties(graph_settings_binding PROPERTIES ENVIRONMENT_MODIFICATION
-    "Qwen graph placement is resolved from typed graph settings")
+set_tests_properties(graph_settings_binding PROPERTIES LABELS
+    "Qwen graph placement resolved typed graph settings")
 
 add_executable(mtp_graph_contract_test EXCLUDE_FROM_ALL
     tests/test_mtp_graph_contract.cpp)

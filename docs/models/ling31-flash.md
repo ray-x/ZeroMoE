@@ -12,10 +12,10 @@
 LING_DDR_GIB=72 LING_CAP_GIB=95 LING_STOP_GIB=20 \
 LING_GPU0_CACHE_GIB=3.0 LING_GPU1_CACHE_GIB=12.5 \
 LING_PINNED_VRAM_CAPACITY=3700 LING_OFFLOAD_PINNED=0.5 \
-LING_GPU_ASSIST=3 LING_ASSIST2_SLOTS=1 LING_CPU_THREADS=10 \
+LING_GPU_ASSIST=3 LING_ASSIST2_SLOTS=1 \
 LING_USAGE_FILE="$PWD/bench/ling/reference-audit/usage-hi-there-robust4.pin" \
 LING_LOG=/tmp/ling-short.log LING_BIN=./build/zeromoe \
-bench/ling/reference-audit/run.sh
+bench/ling/reference-audit/run.sh --threads 10
 ```
 
 Metric: `[REQUEST-DECODE-OUTPUT]` (first output to last output), *not* the shutdown `Rates:` line
@@ -32,9 +32,9 @@ Metric: `[REQUEST-DECODE-OUTPUT]` (first output to last output), *not* the shutd
 
 - **No-copy offload graph**: the graph aliases existing VRAM slots and streams cold experts from
   the DDR pool; no MoE weights are copied into the graph.
-- **`ZEROMOE_GLM5NEXT_BATCHED_NEGATIVE_SKIP=1`** for prompts >64 tokens (patched negative-id
-  skip) — without it the valid-dummy fallback aliases tokens onto expert 0 and over-runs its row
-  range (`CUDA error: illegal memory access` at layer 4).
+- Ling batched MMQ selects the patched negative-id skip automatically for graph batches over 64
+  tokens. Smaller batches keep valid dummy ids, avoiding the measured two-token prefill regression.
+  The threshold also avoids the expert-0 row-compaction overrun on large batches.
 
 ## Gotchas
 

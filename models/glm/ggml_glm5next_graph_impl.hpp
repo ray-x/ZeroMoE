@@ -6,7 +6,6 @@
 // full-graph implementation.
 
 #include "graph_config.hpp"
-#include "pilot_ridge.hpp"
 #include "ggml_glm5next_graph.hpp"
 
 #include "dense_dispatch.hpp"
@@ -86,10 +85,9 @@ bool pilot_prefetch_on();
 bool pilot_copy_on();
 int pilot_prefetch_k();
 int pilot_lookahead();
-float pilot_min_score();
 bool dynamic_cache_enabled();
 bool route_stats_enabled();
-int env_device_expert_layers();
+int configured_device_expert_layers();
 bool type_ok(GGUFType type);
 bool layer_timing_env();
 bool early_ready_wanted(bool has_overlap_work);

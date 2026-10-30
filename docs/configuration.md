@@ -39,11 +39,14 @@ ZeroMoE/model-specific.
 | --- | --- | --- |
 | Model, prompt | `--model`, `--prompt` | same |
 | Context, output length | `-c/--ctx-size`, `-n/--predict` | same |
+| End-of-generation | `--ignore-eos` | same llama.cpp option; continue through EOS/stop tokens to the requested generation count |
 | CPU threads | `-t/--threads` | same; caps ZeroMoE's process-wide OpenMP team |
+| Physical prefill batch | `-ub/--ubatch-size` | same; overrides TOML `prefill_batch_tokens` when supplied; `1` selects the S=1 prefill parity path |
 | Sampling | `--temp`, `--top-p`, `--repeat-penalty`; TOML `temperature`, `top_p`, `repeat_penalty` | same llama.cpp option names |
 | System prompt | `--system-prompt` | same |
 | Single main GPU | `--main-gpu` | same for single-device recipes |
 | Log file and verbosity | `--log-file`, `--verbosity` | same |
+| Prompt logging | `--log-prompts-dir PATH` | same option name; writes one prompt-token-ID file per request for attention replay |
 | Server alias and key | `--alias`, `--api-key` | same; the key environment variable remains `ZEROMOE_API_KEY` |
 | Speculative MTP | `--spec-type`, `--spec-draft-model`, `--spec-draft-n-max` | same names; ZeroMoE currently supports `none` and `draft-mtp` |
 
@@ -89,17 +92,16 @@ For example, Qwen's old launch-time placement flags become:
 
 ```toml
 # Root settings, before [[gpus]]
-graph_device_expert_layers = 2      # 0 = no whole-layer block (global-pool recipe)
+graph_device_expert_layers = 2      # Qwen default 2; GLM/Ling default 0; 0 = shared-cache/global-pool placement
 graph_device_expert_trailing = false
 # Optional: cap Qwen CPU expert workers; 0 keeps available-thread selection.
-# graph_cpu_threads_decode = 10
 ```
 
 Qwen full-graph prefill/decode already default to enabled. The shipped
 `configs/qwen38-flash.toml` no longer requires its four historical launch
 flags. It retains its existing measured backend, hotset and memory settings.
 Whole-layer placement and partial hotset budgets remain separate concepts.
-`graph_device_expert_layers` is 2 by default; `0` is the explicit sentinel for
+`graph_device_expert_layers` defaults to 2 for Qwen and 0 for GLM/Ling; `0` is the explicit sentinel for
 "no whole-layer block" (the global-pool recipe), and an enabled block must be
 at least 2 layers. `graph_device_expert_trailing` defaults to false (leading
 block) and only affects placement when the layer count is nonzero.
@@ -168,8 +170,8 @@ Manual CMake and existing Make targets remain supported.
 ## Scope and maintenance
 
 This migration adds canonical TOML support for fields already in the shared
-MiMo/GLM/Ling resolver plus Qwen whole-layer placement and its shared CPU thread
-cap. It does not remove every environment variable, replace experimental
+MiMo/GLM/Ling graph resolver plus Qwen whole-layer placement. CPU thread count
+uses the shared `-t/--threads` option and is not a model-specific graph setting. It does not remove every environment variable, replace experimental
 backend selectors, implement execution profiles, or turn compile-time platform
 guards into runtime settings. Existing recipes and aliases remain compatible.
 Model equations, graph-failure behavior and memory planning are unchanged.

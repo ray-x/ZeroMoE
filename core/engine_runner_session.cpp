@@ -101,6 +101,7 @@ std::expected<void, std::string> EngineRunner::run_repl() {
   // normal request path (see core/bench_mode.hpp).
   zeromoe::bench::Session bench(zeromoe::bench::plan());
   if (bench.enabled()) {
+    engine.ignore_eos = true;
     const std::string err = bench.prepare(engine.prompt_cache, engine.model_file.architecture_config.vocab);
     if (!err.empty())
       return std::unexpected(err);

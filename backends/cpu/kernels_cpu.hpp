@@ -159,7 +159,7 @@ float dot_iq3_xxs_avx2_prototype(const uint8_t *block, const block_q8_K_local *y
 // quantized-activation path.  Kept as a separate opt-in symbol so GLM and
 // other model CPU paths remain unchanged.
 // Returns the effective team size used by Qwen's direct grouped kernels;
-// ZEROMOE_QWEN_CPU_THREADS is a Qwen-only diagnostic override.
+// Uses the process-wide -t/--threads limit.
 int qwen_cpu_grouped_threads();
 bool matmul_iq1_m_ggml_q8k(float *y, const float *x, const uint8_t *W_quantized,
                            int S, int I, int O);
@@ -238,8 +238,8 @@ bool matmul_qwen_q2_0_q2_0_fused(
     const float *x, const uint8_t *const *gate_weights,
     const uint8_t *const *up_weights, const uint8_t *const *down_weights,
     int n_matrices, int I, int gate_O, int down_O, int n_threads = 0);
-// Q2_0 AVX-512 VNNI is enabled by default when supported by the CPU.
-// ZEROMOE_Q2_0_DISABLE_VNNI=1 selects GGML's CPU dot instead.
+// Q2_0 AVX-512 VNNI is selected automatically when supported by the CPU;
+// otherwise the fused path uses GGML's CPU dot.
 bool q2_0_vnni_enabled();
 // The batched kernel additionally requires AVX-512 VBMI.
 bool q2_0_vbmi_enabled();

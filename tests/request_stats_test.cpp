@@ -156,7 +156,6 @@ int main(int argc, char **argv) {
     bool prompt_cache = true;
     CHECK(s.prepare(prompt_cache, 1000).empty());
     CHECK(!prompt_cache);
-    CHECK(std::string(std::getenv("ZEROMOE_TEACHER_FORCE_SKIP_SAMPLING")) == "1");
     const std::string dir = std::getenv("ZEROMOE_TEACHER_FORCE_REQUEST_DIR");
     std::string text;
     int ngen = 0, k = 0;

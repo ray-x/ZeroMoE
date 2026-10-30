@@ -17,7 +17,7 @@
 #      same "SURVEY: dedicated file" convention as survey_config.toml (GLM).
 #   3. max_new_tokens lowered to 120 as a config-level default; the actual
 #      run drives generation length via run_survey.py's --ngen flag
-#      combined with ZEROMOE_BENCH_IGNORE_STOP=1 (see
+#      combined with --ignore-eos (see
 #      generation_loop.hpp's bench_ignore_stop), which forces EXACTLY
 #      max_new_tokens output tokens per prompt instead of stopping at the
 #      model's own EOS/turn-boundary token. This is required because the

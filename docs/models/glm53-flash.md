@@ -10,12 +10,13 @@
 
 ```bash
 echo "<prompt>" | CUDA_VISIBLE_DEVICES=0 \
-  ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512 ZEROMOE_GLM5NEXT_CPU_THREADS=6 \
-  scripts/run_capped.sh -- ./build/zeromoe \
+  scripts/run_capped.sh -- ./build/zeromoe --threads 6 \
   --config configs/bench/glm53flash_AJ_IQ2XXS_wholelayer8_cpu.toml --temp 0 --predict 150 --force-start
 ```
 
 The registered GLM5Next graph is the default CUDA path; there is no layered-path environment switch.
+Prefill graph batches default to 2048 tokens. Set llama.cpp-compatible `-ub/--ubatch-size N` or TOML
+`prefill_batch_tokens = N` to choose a different batch limit.
 
 ## Frozen baseline
 

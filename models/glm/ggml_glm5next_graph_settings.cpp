@@ -81,29 +81,9 @@ int pilot_prefetch_k() {
   return k;
 }
 
-// ZEROMOE_GLM5NEXT_PILOT_LOOKAHEAD=k (prefetch-only mode): layer l predicts the cold experts of layer l+k (using layer l+k's
-// router on layer l's FFN input) so the read has k layers of lead time. Staging copies keep k=1 (the ring has two sets).
-int pilot_lookahead() {
-  static const int k = [] {
-    const char *v = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PILOT_LOOKAHEAD");
-    int want = v && v[0] ? std::max(1, std::min(4, std::atoi(v))) : 1;
-    if (want > 1) {
-      if (zeromoe::graphsettings::active_settings().tun.pilot_copy.value != 0)
-        want = 1;
-    }
-    return want;
-  }();
-  return k;
-}
-
-// ZEROMOE_GLM5NEXT_PILOT_MIN_SCORE=x: only prefetch pilot candidates whose router score is >= x.
-float pilot_min_score() {
-  static const float v = [] {
-    return (float)zeromoe::graphcfg::atof_or("ZEROMOE_GLM5NEXT_PILOT_MIN_SCORE", -1e30f);
-  }();
-  return v;
-}
-
+// Staged copies need the next layer ready for its compute graph. In prefetch-only mode,
+// depth two is the measured best setting; depth three increased misses/stall time.
+int pilot_lookahead() { return pilot_copy_on() ? 1 : 2; }
 bool dynamic_cache_enabled() {
   static const bool enabled = [] {
     return zeromoe::graphsettings::active_settings().tun.dynamic_cache.value != 0;
@@ -116,15 +96,9 @@ bool route_stats_enabled() {
          Logger::instance().would_log(LogLevel::DEBUG);
 }
 
-int env_device_expert_layers() {
-  const char *v = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_GRAPH_PRELOAD_LAYERS");
-  if (!v || !v[0])
-    return 0;
-  char *end = nullptr;
-  long n = std::strtol(v, &end, 10);
-  if (end == v || *end != '\0' || n <= 0)
-    return 0;
-  return static_cast<int>(std::min<long>(n, 45));
+int configured_device_expert_layers() {
+  return static_cast<int>(
+      zeromoe::graphsettings::active_settings().tun.device_expert_layers.value);
 }
 
 bool type_ok(GGUFType type) {
@@ -233,8 +207,8 @@ bool gpu_assist_layer_ok(const FullGraph &g, int layer) {
 } // namespace glm5next_graph
 
 bool ling_full_graph_enabled() {
-  // Ling's full graph is the default.  ZEROMOE_LING_NATIVE_GRAPH still selects
-  // the cache-backed implementation over the shared GLM5Next graph.
+  // Ling's cache-backed native/hybrid graph experiments were retired; use
+  // the shared GLM5Next graph implementation.
   return true;
 }
 

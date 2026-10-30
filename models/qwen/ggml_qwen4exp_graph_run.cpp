@@ -109,49 +109,52 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
       early.stage_target->verify(early.input, early.weights, early.ids, early.stage_ids);
     }
   }
-  const char *route_trace = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_ROUTE_TRACE");
-  if (route_trace && route_trace[0] && !g.early_ready.empty()) {
-    if (!g.early_route_trace) {
-      g.early_route_trace = std::make_unique<std::ofstream>(route_trace);
-      GGML_ASSERT(g.early_route_trace->is_open());
+  if (!g.early_ready.empty() &&
+      Logger::instance().would_log(LogLevel::DEBUG)) {
+    std::ostringstream route_records;
+    if (!g.early_ready_route_masks_logged) {
       for (int layer = 0; layer < g.n_layers; ++layer) {
         const auto entry = g.early_ready.find(layer);
         if (entry == g.early_ready.end()) continue;
-        auto &trace = *g.early_route_trace;
         const auto &mask = entry->second->cold_mask;
-        trace << "{\"kind\":\"layer\",\"layer\":" << layer
-              << ",\"expert_bytes\":" << entry->second->expert_bytes << ",\"cold_mask\":[";
+        route_records << "[EARLY-READY-ROUTE] {\"kind\":\"layer\",\"layer\":"
+                      << layer << ",\"expert_bytes\":"
+                      << entry->second->expert_bytes << ",\"cold_mask\":[";
         for (size_t e = 0; e < mask.size(); ++e)
-          trace << (e ? "," : "") << int(mask[e]);
-        trace << "]}\n";
+          route_records << (e ? "," : "") << int(mask[e]);
+        route_records << "]}\n";
       }
+      g.early_ready_route_masks_logged = true;
     }
-    auto &trace = *g.early_route_trace;
     for (int layer = 0; layer < g.n_layers; ++layer) {
       const auto entry = g.early_ready.find(layer);
       if (entry == g.early_ready.end()) continue;
       const auto &early = *entry->second;
-      trace << "{\"position\":" << pos_base << ",\"layer\":" << layer << ",\"ids\":[";
+      route_records << "[EARLY-READY-ROUTE] {\"position\":" << pos_base
+                    << ",\"layer\":" << layer << ",\"ids\":[";
       for (int k = 0; k < early.k; ++k)
-        trace << (k ? "," : "") << early.ids[k];
-      trace << "],\"cold\":[";
+        route_records << (k ? "," : "") << early.ids[k];
+      route_records << "],\"cold\":[";
       for (int k = 0; k < early.k; ++k)
-        trace << (k ? "," : "") << int(early.cold_mask[early.ids[k]]);
-      trace << "],\"epoch\":" << early.calls << ",\"stage_ids\":[";
+        route_records << (k ? "," : "")
+                      << int(early.cold_mask[early.ids[k]]);
+      route_records << "],\"epoch\":" << early.calls << ",\"stage_ids\":[";
       if (early.stage_target)
         for (int k = 0; k < early.k; ++k)
-          trace << (k ? "," : "") << early.stage_ids[k];
-      trace << "],\"prediction_layer\":" << early.prediction_layer << ",\"prediction\":[";
+          route_records << (k ? "," : "") << early.stage_ids[k];
+      route_records << "],\"prediction_layer\":" << early.prediction_layer
+                    << ",\"prediction\":[";
       if (early.prediction) {
         std::vector<int32_t> ids(early.k);
-        ggml_backend_tensor_get(early.prediction, ids.data(), 0, ids.size() * sizeof(int32_t));
+        ggml_backend_tensor_get(early.prediction, ids.data(), 0,
+                                ids.size() * sizeof(int32_t));
         for (int k = 0; k < early.k; ++k)
-          trace << (k ? "," : "") << ids[k];
+          route_records << (k ? "," : "") << ids[k];
       }
-      trace << "]}\n";
+      route_records << "]}\n";
     }
-    trace.flush();
-    GGML_ASSERT(trace.good());
+    const std::string records = route_records.str();
+    if (!records.empty()) LOG_DEBUG("%s", records.c_str());
   }
   for (const auto &entry : g.early_ready) {
     const auto &early = *entry.second;
@@ -398,7 +401,7 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
                             wide_n * sizeof(float));
   }
   g.decode_last_pos = pos_base;
-  g.decode_host_state_dirty = env_prefill_state_handoff_enabled();
+  g.decode_host_state_dirty = prefill_state_handoff_enabled();
 
   // The PLE hash window is host metadata, not numerical recurrent state. Keep
   // it current so a later graph disable/capacity growth can seed the layered
@@ -636,10 +639,9 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
 
 
   g.prefill_host_state_deferred =
-      env_prefill_state_handoff_enabled() &&
+      prefill_state_handoff_enabled() &&
       qwen4exp_full_graph_decode_enabled() && !engine.prompt_cache &&
-      !engine.mtp_enabled && engine.qwen4exp_partial_layer < 0 &&
-      engine.qwen4exp_gpu_stage_layers.empty() &&
+      !engine.mtp_enabled && engine.qwen4exp_gpu_stage_layers.empty() &&
       prepare_prefill_state_handoff(g);
   if (g.prefill_host_state_deferred) {
     LOG_INFO("[GGML-QWEN-FULL-STATE-HANDOFF] deferred GDN host readback; "
@@ -685,169 +687,6 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
     for (int i = start; i < S; ++i)
       engine.qwen4exp_ple_tok_hist.push_back(token_ids[i]);
     engine.qwen4exp_ple_next_pos = pos_base + S;
-  }
-  if (g.partial_layer_ids_out) {
-    // Phase 1 all-or-nothing partial-layer dispatch: this prompt's real
-    // layer-N routing, read back once per prefill. Coverage = fraction of
-    // this prompt's DISTINCT selected experts that fall inside the
-    // usage-ranked top-N pinned set (plan_partial_layer). Committing
-    // decode to the GPU-only path only when coverage clears the
-    // (default: 100%) threshold is what keeps build_moe_partial_gpu's
-    // silent-miss risk rare in practice, not just in theory -- see that
-    // function's own comment for what happens on the rare miss anyway.
-    const auto &c = engine.model_file.architecture_config;
-    const size_t n = static_cast<size_t>(c.topk) * static_cast<size_t>(S);
-    std::vector<int32_t> ids_host(n);
-    ggml_backend_tensor_get(g.partial_layer_ids_out, ids_host.data(), 0,
-                            n * sizeof(int32_t));
-    std::unordered_set<int32_t> used(ids_host.begin(), ids_host.end());
-    std::unordered_set<int> gpu_set(
-        engine.qwen4exp_partial_layer_gpu_ids.begin(),
-        engine.qwen4exp_partial_layer_gpu_ids.end());
-    size_t covered = 0;
-    for (int32_t id : used)
-      if (id >= 0 && gpu_set.count(id))
-        ++covered;
-    const double coverage =
-        used.empty() ? 1.0
-                     : static_cast<double>(covered) / static_cast<double>(used.size());
-    engine.qwen4exp_partial_layer_committed =
-        coverage >= engine.qwen4exp_partial_layer_min_coverage;
-    // Root-cause diagnostic (2026-09-18): last-prefill-token router picks,
-    // in the SAME format as legacy dispatch's own TRACE-ROUTER line
-    // (moe_router_service.cpp, "[TRACE l=<layer>] router picks: e<id> ...")
-    // -- for a fixed prompt, the last prefill token's input is IDENTICAL
-    // regardless of dispatch path (no generated-token drift can have
-    // contaminated it yet), so this is the one directly comparable,
-    // uncontaminated data point between the two paths. Diff this line
-    // against a legacy run's TRACE-ROUTER output (log_level=VERBOSE,
-    // verbosity-level TRACE-ROUTER output for the same prompt/layer to test
-    // [[qwen4exp-legacy-vs-fullgraph-routing-divergence]]'s BF16-router-
-    // precision hypothesis.
-    if (S > 0) {
-      // Cross-check: what raw probability does THIS SAME build_moe
-      // invocation's own probs_out assign to each id its own ids_out
-      // selected? If this doesn't match a plausible top-k-by-probability
-      // ranking, the divergence is internal to full-graph's own
-      // ids/probs pairing, not (only) a legacy-vs-full-graph difference.
-      std::vector<float> probs_host2;
-      if (g.partial_layer_probs_out) {
-        const size_t np2 =
-            static_cast<size_t>(c.n_experts) * static_cast<size_t>(S);
-        probs_host2.assign(np2, 0.0f);
-        ggml_backend_tensor_get(g.partial_layer_probs_out, probs_host2.data(),
-                                0, np2 * sizeof(float));
-      }
-      std::string picks;
-      for (int k = 0; k < c.topk; ++k) {
-        int32_t eid = ids_host[(S - 1) * c.topk + k];
-        picks += " e" + std::to_string(eid);
-        if (!probs_host2.empty()) {
-          const float *col2 =
-              probs_host2.data() + static_cast<size_t>(S - 1) * c.n_experts;
-          const float p = (eid >= 0 && eid < c.n_experts) ? col2[eid] : -1.0f;
-          picks += "(p=" + std::to_string(p) + ")";
-        }
-      }
-      LOG_INFO("[TRACE-ROUTER-FULLGRAPH l=%d] router picks (last prefill "
-               "token):%s\n",
-               engine.qwen4exp_partial_layer, picks.c_str());
-      // Root-cause diagnostic (2026-09-18), continued: dump full-graph's
-      // own top-20 by raw post-softmax probability for the same token, so
-      // a legacy pick NOT in full-graph's top-10 can be checked for
-      // "just outside, nearly tied" (rank ~11-20, close probability) vs
-      // "nowhere close" (rank in the hundreds) -- distinguishes a
-      // precision-flips-a-near-tie explanation from a genuinely different
-      // computation on one side.
-      if (g.partial_layer_probs_out) {
-        const size_t np = static_cast<size_t>(c.n_experts) * static_cast<size_t>(S);
-        std::vector<float> probs_host(np);
-        ggml_backend_tensor_get(g.partial_layer_probs_out, probs_host.data(), 0,
-                                np * sizeof(float));
-        const float *col = probs_host.data() +
-                           static_cast<size_t>(S - 1) * c.n_experts;
-        std::vector<int> order(c.n_experts);
-        for (int e = 0; e < c.n_experts; ++e)
-          order[e] = e;
-        std::partial_sort(order.begin(), order.begin() + std::min(20, c.n_experts),
-                          order.end(),
-                          [&](int a, int b) { return col[a] > col[b]; });
-        std::string top20;
-        for (int k = 0; k < std::min(20, c.n_experts); ++k)
-          top20 += " e" + std::to_string(order[k]) + "(p=" +
-                   std::to_string(col[order[k]]) + ")";
-        LOG_INFO("[TRACE-ROUTER-FULLGRAPH-TOP20 l=%d] last prefill token:%s\n",
-                 engine.qwen4exp_partial_layer, top20.c_str());
-      }
-      if (g.partial_layer_bias_out) {
-        std::vector<float> bias_host(static_cast<size_t>(c.n_experts));
-        ggml_backend_tensor_get(g.partial_layer_bias_out, bias_host.data(), 0,
-                                bias_host.size() * sizeof(float));
-        float bmin = bias_host[0], bmax = bias_host[0], bsum = 0.0f;
-        for (float v : bias_host) {
-          bmin = std::min(bmin, v);
-          bmax = std::max(bmax, v);
-          bsum += v;
-        }
-        LOG_INFO("[TRACE-ROUTER-FULLGRAPH-BIAS l=%d] exp_probs_b.bias: "
-                 "min=%.6f max=%.6f mean=%.6f (n=%d)\n",
-                 engine.qwen4exp_partial_layer, bmin, bmax,
-                 bsum / static_cast<float>(c.n_experts), c.n_experts);
-      }
-    }
-    // Router-confidence diagnostic: is this layer's routing genuinely
-    // peaked (real signal) or effectively near-uniform noise? A uniform
-    // distribution over n_experts would put EVERY token's top-1
-    // probability at 1/n_experts; a working router should sit well above
-    // that. Directly tests the "near-zero-collision selection" anomaly
-    // this whole check exists because of -- see
-    // qwen4exp-full-graph-decode-benchmark-baseline memory's follow-on
-    // note for the statistics that motivated it.
-    if (g.partial_layer_probs_out) {
-      const size_t np = static_cast<size_t>(c.n_experts) * static_cast<size_t>(S);
-      std::vector<float> probs_host(np);
-      ggml_backend_tensor_get(g.partial_layer_probs_out, probs_host.data(), 0,
-                              np * sizeof(float));
-      double top1_min = 1.0, top1_max = 0.0, top1_sum = 0.0;
-      for (int s = 0; s < S; ++s) {
-        float m = 0.0f;
-        const float *col = probs_host.data() + static_cast<size_t>(s) * c.n_experts;
-        for (int e = 0; e < c.n_experts; ++e)
-          m = std::max(m, col[e]);
-        top1_min = std::min(top1_min, static_cast<double>(m));
-        top1_max = std::max(top1_max, static_cast<double>(m));
-        top1_sum += m;
-      }
-      const double top1_mean = S > 0 ? top1_sum / S : 0.0;
-      const double uniform_baseline = 1.0 / static_cast<double>(c.n_experts);
-      LOG_INFO(
-          "[PARTIAL-LAYER-DIAG] layer=%d router top-1 confidence over %d "
-          "token(s): min=%.4f mean=%.4f max=%.4f (uniform/no-signal "
-          "baseline would be %.4f) -- %s\n",
-          engine.qwen4exp_partial_layer, S, top1_min, top1_mean, top1_max,
-          uniform_baseline,
-          top1_mean > uniform_baseline * 3.0
-              ? "routing looks peaked/real"
-              : "routing looks close to uniform -- possible router issue");
-    }
-    LOG_INFO(
-        "[PARTIAL-LAYER] layer=%d prefill routing: %zu distinct expert(s) "
-        "selected this prompt, %zu covered by the top-%d pinned set "
-        "(%.1f%% coverage, threshold %.1f%%) -- decode will run %s for "
-        "this layer\n",
-        engine.qwen4exp_partial_layer, used.size(), covered,
-        engine.qwen4exp_partial_layer_top_n, coverage * 100.0,
-        engine.qwen4exp_partial_layer_min_coverage * 100.0,
-        engine.qwen4exp_partial_layer_committed
-            ? "GPU-ONLY (committed)"
-            : "the normal CPU/GPU path (insufficient coverage)");
-  } else if (engine.qwen4exp_partial_layer >= 0 &&
-             !partial_prefill_capture_enabled()) {
-    LOG_INFO("[PARTIAL-LAYER] layer=%d prefill routing capture skipped "
-             "(Phase 2 routes per token; the capture would perturb prefill "
-             "numerics -- set ZEROMOE_QWEN4EXP_PARTIAL_LAYER_PREFILL_CAPTURE=1 "
-             "to force it)\n",
-             engine.qwen4exp_partial_layer);
   }
   const auto t_state_end = std::chrono::steady_clock::now();
   const auto ms = [](const auto &a, const auto &b) {

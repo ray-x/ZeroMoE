@@ -128,11 +128,7 @@ inline bool& moe_ggml_mul_mat_id_flag() {
   return v;
 }
 inline bool moe_ggml_mul_mat_id() {
-  static const bool env = [] {
-    const char *e = zeromoe::graphcfg::env("ZEROMOE_GGML_MUL_MAT_ID");
-    return e && e[0] == '1';
-  }();
-  return env || moe_ggml_mul_mat_id_flag();
+  return moe_ggml_mul_mat_id_flag();
 }
 inline void set_moe_ggml_mul_mat_id(bool v) { moe_ggml_mul_mat_id_flag() = v; }
 
@@ -144,11 +140,7 @@ inline void set_moe_ggml_mul_mat_id(bool v) { moe_ggml_mul_mat_id_flag() = v; }
 // fall back to the existing host shared-expert code.
 inline bool &moe_ggml_shared_expert_flag() { static bool v = false; return v; }
 inline bool moe_ggml_shared_expert() {
-  static const bool env = [] {
-    const char *e = zeromoe::graphcfg::env("ZEROMOE_GGML_SHARED_EXPERT");
-    return e && e[0] == '1';
-  }();
-  return env || moe_ggml_shared_expert_flag();
+  return moe_ggml_shared_expert_flag();
 }
 inline void set_moe_ggml_shared_expert(bool v) {
   moe_ggml_shared_expert_flag() = v;
@@ -163,17 +155,7 @@ inline void set_moe_ggml_shared_expert(bool v) {
 // and does not imply Qwen4Exp router semantics.
 inline bool &moe_ggml_gpu_router_flag() { static bool v = false; return v; }
 inline bool moe_ggml_gpu_router() {
-  // Unlike the older feature flags, this one needs an explicit `=0` escape
-  // hatch for performance A/B tests: the config setter may enable it for a
-  // Qwen profile, while a run can still compare the existing AVX-512 host
-  // router without making a temporary config copy.  The override is scoped
-  // to this Qwen-only feature; other model routers do not consult it.
-  static const int env_override = [] {
-    const char *e = zeromoe::graphcfg::env("ZEROMOE_GGML_GPU_ROUTER");
-    if (!e || !e[0]) return -1;
-    return e[0] == '1' ? 1 : 0;
-  }();
-  return env_override >= 0 ? env_override != 0 : moe_ggml_gpu_router_flag();
+  return moe_ggml_gpu_router_flag();
 }
 inline void set_moe_ggml_gpu_router(bool v) { moe_ggml_gpu_router_flag() = v; }
 
@@ -185,7 +167,7 @@ inline void set_moe_ggml_gpu_router(bool v) { moe_ggml_gpu_router_flag() = v; }
 // qwen4exp: same run, GPU 1 -> 10.22s prefill, GPU 0 -> 9.24s. Set this
 // explicitly (and leave the chosen card ~700 MB of headroom via its own
 // moe_cache_gb) rather than relying on the automatic choice.
-// ZEROMOE_GGML_MOE_DEVICE overrides both, for A/B without a config edit.
+// The moe_ggml_device TOML setting overrides automatic selection.
 inline int& moe_ggml_device_flag() {
   static int v = -1;
   return v;
@@ -208,13 +190,7 @@ inline bool& hc_ggml_flag() {
   static bool v = false;
   return v;
 }
-inline bool hc_ggml() {
-  static const bool env = [] {
-    const char *e = zeromoe::graphcfg::env("ZEROMOE_HC_GGML");
-    return e && e[0] == '1';
-  }();
-  return env || hc_ggml_flag();
-}
+inline bool hc_ggml() { return hc_ggml_flag(); }
 inline void set_hc_ggml(bool v) { hc_ggml_flag() = v; }
 
 // --- gdn_proj_ggml (EngineConfig, default OFF) ---------------------------
@@ -233,11 +209,7 @@ inline bool& gdn_proj_ggml_flag() {
   return v;
 }
 inline bool gdn_proj_ggml() {
-  static const bool env = [] {
-    const char *e = zeromoe::graphcfg::env("ZEROMOE_GDN_PROJ_GGML");
-    return e && e[0] == '1';
-  }();
-  return env || gdn_proj_ggml_flag();
+  return gdn_proj_ggml_flag();
 }
 inline void set_gdn_proj_ggml(bool v) { gdn_proj_ggml_flag() = v; }
 
@@ -249,11 +221,7 @@ inline bool& gdn_full_ggml_flag() {
   return v;
 }
 inline bool gdn_full_ggml() {
-  static const bool env = [] {
-    const char *e = zeromoe::graphcfg::env("ZEROMOE_GDN_FULL_GGML");
-    return e && e[0] == '1';
-  }();
-  return env || gdn_full_ggml_flag();
+  return gdn_full_ggml_flag();
 }
 inline void set_gdn_full_ggml(bool v) { gdn_full_ggml_flag() = v; }
 
@@ -275,18 +243,14 @@ inline void set_gdn_full_ggml(bool v) { gdn_full_ggml_flag() = v; }
 // Default OFF because it is a real PRECISION change, not just a speed one:
 // BF16 has ~8 mantissa bits, which is enough to flip a close greedy
 // argmax, so generated text can differ from the fused path (verified
-// coherent and on-topic, but not token-identical). ZEROMOE_EXPERT_BF16_
-// GEMM=1 still forces it on for A/B without touching a config.
+// coherent and on-topic, but not token-identical). The TOML
+// `moe_expert_bf16_gemm` key remains the explicit experiment switch.
 inline bool& moe_expert_bf16_gemm_flag() {
   static bool v = false;
   return v;
 }
 inline bool moe_expert_bf16_gemm() {
-  static const bool env = [] {
-    const char *e = zeromoe::graphcfg::env("ZEROMOE_EXPERT_BF16_GEMM");
-    return e && e[0] == '1';
-  }();
-  return env || moe_expert_bf16_gemm_flag();
+  return moe_expert_bf16_gemm_flag();
 }
 inline void set_moe_expert_bf16_gemm(bool v) { moe_expert_bf16_gemm_flag() = v; }
 

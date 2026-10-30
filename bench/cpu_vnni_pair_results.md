@@ -1,5 +1,7 @@
 # CPU VNNI MoE pair experiments
 
+> Historical reproduction note (2026-10-30): `ZEROMOE_Q2_0_DISABLE_VNNI` was removed. The old forced-fallback command below documents the original comparison and is no longer a supported runtime invocation.
+
 This note records the CPU dot-kernel experiments that informed the current
 scope. The only VNNI MoE signature retained for runtime use is
 `Q2_0 / Q2_0 / Q2_0`. The IQ4_NL and signed-Q8 VNNI candidates and the
@@ -60,20 +62,20 @@ formats are not.
 
 ## Re-running the retained comparison
 
-Build and run the isolated correctness/benchmark test:
+The isolated `ZEROMOE_TEST_ONLY_Q2_0_VNNI` selector is retired. The native
+harness now runs the Q2_0 dot, fused-route, and numerical checks in its normal
+suite:
 
 ```bash
-cmake --build build -j2 --target zeromoe_tests
-ZEROMOE_TEST_ONLY_Q2_0_VNNI=1 ./build/zeromoe_tests
+cmake --build build-cuda --target zeromoe_tests
+./build-cuda/zeromoe_tests
 ```
 
-VNNI is now the default on supported CPUs. To force the GGML fallback with the
-same test:
+VNNI is selected automatically when supported; other CPUs use the linked GGML
+dot. The historical forced-fallback invocation used
+`ZEROMOE_Q2_0_DISABLE_VNNI=1`; that runtime A/B override is also retired.
 
-```bash
-ZEROMOE_TEST_ONLY_Q2_0_VNNI=1 ZEROMOE_Q2_0_DISABLE_VNNI=1 ./build/zeromoe_tests
-```
 
-Unsupported CPUs always use the linked GGML dot. The focused test also checks
-the fused Qwen route and numerical agreement, but it is not a substitute for
-the configured model smoke test.
+## Worktree smoke timing (2026-10-30)
+
+On the same Xeon W-2235, the focused `ZEROMOE_TEST_ONLY_Q2_0_VNNI=1 build-cuda/zeromoe_tests` run reported exact output agreement and selected VNNI. Its built-in single-pass timing reported GGML 0.620-0.713 ms/pass and VNNI 1.711-1.789 ms/pass (38,400 rows, five threads). This is not a controlled replacement for the paired experiment above: it uses the current dirty ZeroMoE snapshot and pinned GGML build, and the harness timing is an unpaired smoke measurement. It conflicts with the older 1.54x VNNI win; do not treat either ratio as transferable without a matched repeat.

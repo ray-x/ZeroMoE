@@ -11,16 +11,27 @@ profile=${LING_USAGE_FILE:-$worktree/bench/ling/reference-audit/usage-hi-there-r
 # Empty by default: use an explicit prompt-matched profile for prefill pinning.
 prefill_profile=${LING_PREFILL_USAGE_FILE-}
 prompt_file=${LING_PROMPT_FILE:-$worktree/bench/ling/reference-audit/prompt.txt}
-context_size=${LING_CONTEXT_SIZE:-64}
+context_size=64
+thread_args=()
+while (($#)); do
+  case "$1" in
+    --ctx-size)
+      (($# >= 2)) || { echo "--ctx-size requires TOKENS" >&2; exit 2; }
+      context_size=$2; shift 2 ;;
+    --threads|-t)
+      (($# >= 2)) || { echo "--threads requires N" >&2; exit 2; }
+      thread_args+=(--threads "$2"); shift 2 ;;
+    *) echo "usage: $0 [--ctx-size TOKENS] [--threads N]" >&2; exit 2 ;;
+  esac
+done
 freeze_usage_stats=${LING_FREEZE_USAGE_STATS:-1}
 log=${LING_LOG:-/tmp/ling-reference-$(date -u +%Y%m%dT%H%M%S).log}
 config=$(mktemp /tmp/ling-reference-config.XXXXXX.toml)
-python3 - "$worktree/configs/bench/ling/reference-audit/config.toml" "$config" "$profile" "$prefill_profile" "$freeze_usage_stats" "$context_size" "$model" <<'CONFIG'
+python3 - "$worktree/configs/bench/ling/reference-audit/config.toml" "$config" "$profile" "$prefill_profile" "$freeze_usage_stats" "$model" <<'CONFIG'
 from pathlib import Path
 import json, os, re, sys
 pool=int(os.environ.get('LING_DDR_GIB','64')); cap=int(os.environ.get('LING_CAP_GIB','95'))
 stop=float(os.environ.get('LING_STOP_GIB','20'))
-cpu_threads=int(os.environ.get('LING_CPU_THREADS','10'))
 offload_pinned=float(os.environ.get('LING_OFFLOAD_PINNED','0.5'))
 gpu_assist=int(os.environ.get('LING_GPU_ASSIST','3'))
 assist2_slots=int(os.environ.get('LING_ASSIST2_SLOTS','1'))
@@ -35,16 +46,12 @@ assert early_ready in (0, 1), 'LING_EARLY_READY must be 0 or 1'
 assert 0.0 < gpu0_cache <= 8.0 and 0.0 < gpu1_cache <= 14.0, 'GPU cache requests must be in range (0,8] + (0,14] GiB'
 assert 0 <= pinned_vram_capacity <= 6000, 'LING_PINNED_VRAM_CAPACITY must be between 0 and 6000'
 s=Path(sys.argv[1]).read_text()
-model_path=Path(sys.argv[7]).resolve()
+model_path=Path(sys.argv[6]).resolve()
 s,n_model=re.subn(r'^model_path = .*$', 'model_path = '+json.dumps(str(model_path)), s, count=1, flags=re.M)
 assert n_model == 1, 'Expected one model_path entry'
-context_size=int(sys.argv[6])
-assert 64 <= context_size <= 131072, 'LING_CONTEXT_SIZE must be between 64 and 131072'
 s=re.sub(r'^pin_file = .*$', 'pin_file = '+json.dumps(str(Path(sys.argv[3]).resolve())), s, flags=re.M)
 s=re.sub(r'^prefill_pin_file = .*$', 'prefill_pin_file = '+json.dumps(str(Path(sys.argv[4]).resolve()) if sys.argv[4] else ''), s, flags=re.M)
 s=re.sub(r'^freeze_usage_stats = .*$', 'freeze_usage_stats = '+('true' if sys.argv[5].lower() not in ('0','false','no') else 'false'), s, flags=re.M)
-s,n_ctx=re.subn(r'^context_size = \d+$', 'context_size = '+str(context_size), s, flags=re.M)
-assert n_ctx == 1, f'Expected one context_size entry, got {n_ctx}'
 s=re.sub(r'^omp_max_threads = .*$', 'omp_max_threads = '+str(cpu_threads), s, flags=re.M)
 cache_values=iter((gpu0_cache, gpu1_cache))
 s,n_cache=re.subn(r'^moe_cache_gb = .*$', lambda _: 'moe_cache_gb = '+str(next(cache_values)), s, flags=re.M)
@@ -118,9 +125,6 @@ PY
 flock -u 9
 export ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL=1
 export ZEROMOE_FULL_GRAPH_USAGE_FILE="$profile"
-export ZEROMOE_GLM5NEXT_CPU_THREADS=${LING_CPU_THREADS:-10}
-prefill_op_offload=false
-[[ ${LING_PREFILL_OP_OFFLOAD:-0} == 1* ]] && prefill_op_offload=true
 graph_args=(
   --graph-offload-first-layer 4
   --graph-offload-model "$model"
@@ -131,35 +135,16 @@ graph_args=(
   --graph-offload-pin-dma true
   --graph-offload-async true
   --graph-dynamic-cache 0
-  --graph-gpu-assist "${LING_GPU_ASSIST:-3}"
+  --graph-gpu-assist-slots "${LING_GPU_ASSIST:-3}"
   --graph-gpu-assist2-slots "${LING_ASSIST2_SLOTS:-1}"
   --graph-early-ready "${LING_EARLY_READY:-1}"
-  --graph-prefill-op-offload "$prefill_op_offload"
 )
-# Ling's batched prefill needs the patched negative-id skip once the prompt
-# grows past the two-token smoke case: the valid-dummy fallback aliases many
-# tokens onto expert 0 and ggml's batched id compaction then over-runs that
-# expert's row range.  Keep the historical short-prompt behavior by default;
-# long-prompt runs (context > 64) opt into the patched path.  Override with
-# LING_BATCHED_NEGATIVE_SKIP=0/1 for an A/B.
-if [[ -n "${LING_BATCHED_NEGATIVE_SKIP:-}" ]]; then
-  export ZEROMOE_GLM5NEXT_BATCHED_NEGATIVE_SKIP="$LING_BATCHED_NEGATIVE_SKIP"
-elif (( context_size > 64 )); then
-  export ZEROMOE_GLM5NEXT_BATCHED_NEGATIVE_SKIP=1
-else
-  export ZEROMOE_GLM5NEXT_BATCHED_NEGATIVE_SKIP=0
-fi
-unset ZEROMOE_LING_NATIVE_GRAPH ZEROMOE_LING_HYBRID_CUDA_GRAPH ZEROMOE_LING_CPU_COLD_MISSES ZEROMOE_GLM5NEXT_GPU1_HOT_GIB ZEROMOE_GLM5NEXT_GPU1_HOT_USAGE ZEROMOE_FULL_GRAPH_RESIDENT_GB ZEROMOE_FULL_GRAPH_USE_RAM_CACHE ZEROMOE_LING_FULL_GRAPH_DDR_PREFETCH_GIB
+unset ZEROMOE_GLM5NEXT_GPU1_HOT_GIB ZEROMOE_FULL_GRAPH_RESIDENT_GB ZEROMOE_FULL_GRAPH_USE_RAM_CACHE
 prompt_sha256=$(sha256sum -- "$prompt_file" | awk '{print $1}')
-printf '[RUN] prompt_file=%s; prompt_sha256=%s; context=%s; ngen=32; temp=0; config=%s; usage=%s; DDR=%s GiB OffloadStore; GPU cache=%s+%s GiB; pinned VRAM slots=%s; pinned DDR fraction=%s; GPU assist slots=%s+%s; early-ready=%s; batched-negative-skip=%s; MoE tensors alias cache; CPU threads=%s\n' "$prompt_file" "$prompt_sha256" "$context_size" "$config" "$profile" "${LING_DDR_GIB:-64}" "${LING_GPU0_CACHE_GIB:-3.0}" "${LING_GPU1_CACHE_GIB:-12.5}" "${LING_PINNED_VRAM_CAPACITY:-3700}" "${LING_OFFLOAD_PINNED:-0.5}" "${LING_GPU_ASSIST:-3}" "${LING_ASSIST2_SLOTS:-1}" "${LING_EARLY_READY:-1}" "${ZEROMOE_GLM5NEXT_BATCHED_NEGATIVE_SKIP}" "${LING_CPU_THREADS:-10}"
+printf '[RUN] prompt_file=%s; prompt_sha256=%s; context=%s; ngen=32; temp=0; config=%s; usage=%s; DDR=%s GiB OffloadStore; GPU cache=%s+%s GiB; pinned VRAM slots=%s; pinned DDR fraction=%s; GPU assist slots=%s+%s; early-ready=%s; batched-negative-skip=automatic (per graph batch); MoE tensors alias cache; CPU thread control=--threads\n' "$prompt_file" "$prompt_sha256" "$context_size" "$config" "$profile" "${LING_DDR_GIB:-64}" "${LING_GPU0_CACHE_GIB:-3.0}" "${LING_GPU1_CACHE_GIB:-12.5}" "${LING_PINNED_VRAM_CAPACITY:-3700}" "${LING_OFFLOAD_PINNED:-0.5}" "${LING_GPU_ASSIST:-3}" "${LING_ASSIST2_SLOTS:-1}" "${LING_EARLY_READY:-1}"
 export ZEROMOE_GENERATED_TOKEN_FILE="${log%.log}.tokens"
 unset ZEROMOE_TEACHER_FORCE_TOKEN_FILE GGML_OP_OFFLOAD_MIN_BATCH
 if [[ -n "${LING_TOKEN_FILE:-}" ]]; then export ZEROMOE_TEACHER_FORCE_TOKEN_FILE="$LING_TOKEN_FILE"; fi
-if [[ "$freeze_usage_stats" =~ ^(0|false|no)$ ]]; then
-  export ZEROMOE_GLM5NEXT_PREFILL_ROUTE_CAPTURE=1
-else
-  unset ZEROMOE_GLM5NEXT_PREFILL_ROUTE_CAPTURE
-fi
 "$worktree/scripts/run_capped.sh" --limit-gb "${LING_CAP_GIB:-95}" "$bin" \
-  --verbosity 5 --config "$config" --predict 32 --temp 0 "${graph_args[@]}" < "$prompt_file"
+  "${thread_args[@]}" --verbosity 5 --config "$config" --ctx-size "$context_size" --predict 32 --temp 0 "${graph_args[@]}" < "$prompt_file"
 sed -n 's/.*\[MOE-ROUTE-TRACE\] //p' "$log" > "${log%.log}.routes"

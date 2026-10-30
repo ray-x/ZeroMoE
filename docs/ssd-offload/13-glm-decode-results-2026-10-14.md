@@ -154,8 +154,8 @@ The 5060 Ti's own kernels are ~3 ms/token, so most of the gain is the 3090 trunk
 At the time, `ZEROMOE_GLM5NEXT_WS_DUMP=1` printed the intermediate live-set peak at graph build; it now follows DEBUG verbosity (`--verbosity 5`). At S=128 the peak was 754 MiB, of
 which ~420 MiB were the 34 KDA layers' conv-input concats (`[S+3, 24576]` f32, 12.3 MiB each): the exported conv-history
 and state copies were expanded into the graph only at its end, which kept each layer's conv input and scan output live for
-the whole graph. Expanding them right after the layer (`ggml_build_forward_expand`, `ZEROMOE_GLM5NEXT_EARLY_STATE_EXPORT=0`
-turns it off) cut the live peak 754 -> 64 MiB and the workspace 0.83 -> 0.22 GiB at S=128 (6.5 -> ~0.8 MB/token).
+the whole graph. The historical `ZEROMOE_GLM5NEXT_EARLY_STATE_EXPORT=0` opt-out (retired 2026-10-29) disabled immediate expansion
+The measured early-expansion path cut the live peak 754 -> 64 MiB and the workspace 0.83 -> 0.22 GiB at S=128 (6.5 -> ~0.8 MB/token).
 The whole 805-token prompt now fits one graph (0.62 GiB): prefill **5.7 -> 21.1 tok/s** (38 s), same output start.
 Default `ZEROMOE_GLM5NEXT_PREFILL_CHUNK` is now 1024. Graph prefill is still opt-in
 (`ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL=1`) and needs the ggml-cuda with patch 0006 (`bench/build_native.sh`).

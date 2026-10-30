@@ -294,7 +294,7 @@ run_glm53flash() {
   echo "    metric: steady median from DEBUG token timing (steps >= 20); baseline 7.275, floor 6.98"
   echo "Explain the difference between CPU and GPU architecture in terms of parallelism, memory hierarchy and scheduling, in detail." \
     | env CUDA_VISIBLE_DEVICES=0 \
-        ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512 ZEROMOE_GLM5NEXT_CPU_THREADS=6 \
+        ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512 \
         \
         scripts/run_capped.sh -- "$BIN" --verbosity 5 \
         --config configs/bench/glm53flash_AJ_IQ2XXS_wholelayer8_cpu.toml \
@@ -312,10 +312,10 @@ run_ling31() {
   LING_DDR_GIB=72 LING_CAP_GIB=95 LING_STOP_GIB=20 \
   LING_GPU0_CACHE_GIB=3.0 LING_GPU1_CACHE_GIB=12.5 \
   LING_PINNED_VRAM_CAPACITY=3700 LING_OFFLOAD_PINNED=0.5 \
-  LING_GPU_ASSIST=3 LING_ASSIST2_SLOTS=1 LING_CPU_THREADS=10 \
+  LING_GPU_ASSIST=3 LING_ASSIST2_SLOTS=1 \
   LING_USAGE_FILE="$PWD/bench/ling/reference-audit/usage-hi-there-robust4.pin" \
   LING_LOG="$eng" LING_BIN="$BIN" \
-  bench/ling/reference-audit/run.sh > "$log" 2>&1 || rc=$?
+  bench/ling/reference-audit/run.sh --threads 10 > "$log" 2>&1 || rc=$?
   report ling31 "$(grab_rate "$eng")" "$rc" "$log" "$(grab_tokens "$eng")" 32
 }
 

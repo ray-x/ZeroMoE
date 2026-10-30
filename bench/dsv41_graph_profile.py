@@ -105,12 +105,13 @@ def main() -> None:
     if args.trace_layer is not None:
         trace_dir = output / "trace"
         trace_dir.mkdir(parents=True, exist_ok=True)
-        env["ZEROMOE_DEEPSEEK_V41_TRACE_DIR"] = str(trace_dir)
-        env["ZEROMOE_DEEPSEEK_V41_TRACE_LAYER"] = str(args.trace_layer)
-        env["ZEROMOE_DEEPSEEK_V41_TRACE_POS"] = str(args.trace_pos)
     print("starting model run", flush=True)
     command = [str(args.binary.resolve()), "--config", str(run_config),
                "--raw-prompt", "--predict", str(args.ngen)]
+    if args.trace_layer is not None:
+        command.extend(["--trace-dir", str(trace_dir),
+                        "--trace-layer", str(args.trace_layer),
+                        "--trace-pos", str(args.trace_pos)])
     proc = None
     emergency_stop = False
     started = time.monotonic()

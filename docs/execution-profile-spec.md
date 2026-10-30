@@ -128,9 +128,9 @@ exhaustive — the full list comes from `graph_config.hpp`'s `log_consulted()` o
 | `pilot_k` | `ZEROMOE_DSV41_PILOT_K` |
 | `pilot_prefetch` / `pilot_stage` / `pilot_copy` | `ZEROMOE_GLM5NEXT_PILOT_PREFETCH` / `_PILOT_STAGE` / `_PILOT_COPY` |
 | `predictor` (ridge/pilot) | `ZEROMOE_QWEN_EARLY_READY_RIDGE` + `pilot_ridge.hpp` |
-| `assist_slots` / `assist2` | `ZEROMOE_GLM5NEXT_ASSIST2_SLOTS` / `_ASSIST2_DEVICE` / `_ASSIST2_KEEP` |
+| `assist_slots` / `assist2` | `ZEROMOE_GLM5NEXT_ASSIST2_SLOTS` / `_ASSIST2_DEVICE` |
 | `pin_threshold` / `promote_hit_threshold` | `RAMSafetyManager` fields (hard-coded today) |
-| `moe` device / chunk pipeline | `ZEROMOE_GGML_MOE_DEVICE` / `ZEROMOE_GGML_CHUNK_PIPELINE` |
+| `moe` device / chunk execution | `moe_ggml_device` TOML key; experimental chunk pipeline removed |
 
 `graph_config.hpp`'s knob registry (`Registry::snapshot()`) is the natural migration path: it
 already records *which* knobs a run consults, so the profile can be populated by replaying a
@@ -216,3 +216,5 @@ bool rebaseline_profile(ExecutionProfile profile);              // gated rewrite
    only the fields it measured; the rest follow live defaults, guarded by `baseline_default_hash`, see §5).
    `contribute_profile` refuses on an existing key; re-tuning goes through `rebaseline_profile`, which only
    rewrites after the change passes the gate and its new baseline lands in `docs/models/`.
+
+The second-device assist path keeps one ready expert on the CPU while a copy runs; this reserve is fixed in code.
