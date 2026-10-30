@@ -10,11 +10,11 @@ proposal unless called out in the 2026-10-28 refresh below.
 The settings resolver and subsequent full-graph cleanup are integrated in the
 active checkout. The current scan uses `/home/ray/Projects/ZeroMoE/.worktrees/ling-env-cleanup`, branch
 `codex/ling-env-cleanup`, HEAD `0938cd4b36a01a2e0420b187043af4c600b8814c`, plus its working-tree changes. The production inventory reports
-120 environment names, 101 CLI settings,
-35 graph settings, 232 TOML settings,
+111 environment names, 107 CLI settings,
+41 graph settings, 232 TOML settings,
 7 compile-time macro names, 4 build-cache inputs,
 and 1 ZeroMoE-specific CMake option. A separate
-`test_environment` category lists 18 test-only selectors and fixture inputs; those are not runtime settings.
+`test_environment` category lists 17 test-only selectors and fixture inputs; those are not runtime settings.
 The companion JSON's `current_inventory` contains exact names and source locations.
 Its older `controls` array and most detailed per-control rows retain
 the four-worktree historical assessment; treat those recommendations as
@@ -2730,17 +2730,7 @@ These live env readers remain deferred under the explicit Qwen/GLM/MTP active-wo
 
 | Environment name | Current source | Reason held |
 | --- | --- | --- |
-| `ZEROMOE_MTP_GREEDY_FAST_PATH` | `core/generation_loop.hpp:1202` | deferred by active-work hold |
-| `ZEROMOE_MTP_PREFILL_OVERLAP` | `core/qwen4exp_graph_mtp.cpp:268` | deferred by active-work hold |
-| `ZEROMOE_PROMO_BURST` | `models/qwen/ggml_qwen4exp_graph_promote.cpp:49` | deferred by active-work hold |
-| `ZEROMOE_PROMO_CAP` | `models/qwen/ggml_qwen4exp_graph_promote.cpp:48` | deferred by active-work hold |
-| `ZEROMOE_PROMO_DECAY_EVERY` | `models/qwen/ggml_qwen4exp_graph_promote.cpp:52` | deferred by active-work hold |
-| `ZEROMOE_PROMO_FREQ_WEIGHT` | `models/qwen/ggml_qwen4exp_graph_promote.cpp:51` | deferred by active-work hold |
-| `ZEROMOE_PROMO_MIN_MISSES` | `models/qwen/ggml_qwen4exp_graph_promote.cpp:50` | deferred by active-work hold |
-| `ZEROMOE_QWEN4EXP_EXPERT_PROMOTION` | `core/engine_runner.cpp:355` | deferred by active-work hold |
-| `ZEROMOE_QWEN4EXP_PROBE_LAYER` | `models/qwen/ggml_qwen4exp_graph_build_moe.cpp:1109` | deferred by active-work hold |
-| `ZEROMOE_QWEN4EXP_ROUTE_IDS_DUMP` | `models/qwen/ggml_qwen4exp_graph_host_node.cpp:224` | deferred by active-work hold |
-| `ZEROMOE_TEST_GLM53_DIR` | `tests/native/tests_expert_cache.cpp:101; tests/native/tests_quant_proto.cpp:433` | deferred by active GLM-work hold; test fixture only |
+| (none) | - | All previously deferred Qwen/MTP/GLM controls were migrated or removed in this cleanup; see the removal-log subsection below. `ZEROMOE_QWEN4EXP_PROBE_LAYER` remains a documented tool-local diagnostic (full-graph onboarding doc). |
 
 
 ### 2026-10-30 — DeepSeek cache-graph test mode selector
@@ -2867,3 +2857,16 @@ Removed `ZEROMOE_TEACHER_FORCE_NLL`. Teacher-forced NLL is now computed and logg
 
 ### 2026-10-30 — stale references to removed names
 Removed dead assignments and comments left after earlier removals: the Qwen full-graph environment assignments in `tools/check_adaptive_placement_accuracy.py` (the gate now pins the TOML full-graph keys) and `tools/bench_qwen4exp_mtp_suite.py`; the `ZEROMOE_GLM5NEXT_PILOT_LOOKAHEAD` assignment in `bench/glm53/run_ab.sh`; the retired Qwen thread/early-ready exports and unsets in `configs/qwen4exp_q2_0_option_b_scheduler.env`; and the host-node pin comment in `models/qwen/ggml_qwen4exp_graph_settings.cpp`. Also corrected 74 audit rows whose `removal_status` still said `NOT STARTED` although their `review_decision` and current inventory already recorded the removal.
+
+### 2026-10-30 — Promo and MTP controls become typed Qwen settings
+| Control | Surface | Evidence | Change |
+| --- | --- | --- | --- |
+| `ZEROMOE_PROMO_CAP`, `_BURST`, `_MIN_MISSES`, `_FREQ_WEIGHT`, `_DECAY_EVERY` | environment | `PromotionConfig` already carried these as typed constants; the env reads were the only runtime override. | Added `graph_promo_cap`, `graph_promo_burst`, `graph_promo_min_misses`, `graph_promo_freq_weight`, `graph_promo_decay_every` to the shared graph settings, claimed by Qwen only, with defaults 12/20/2/4096/16000000. `promotion_init` now reads `active_settings().tun`. |
+| `ZEROMOE_MTP_PREFILL_OVERLAP` | environment | The reader only checked `=1`; the guard already decides whether overlap engages. | Added `graph_mtp_prefill_overlap` (default 0) and read it in `qwen4exp_graph_mtp_prefill_begin`. `tools/bench_qwen4exp_mtp_suite.py` now passes `--graph-mtp-prefill-overlap`. |
+| `ZEROMOE_MTP_GREEDY_FAST_PATH` | environment | The fast path is the safe default at temperature 0 and has no measured downside. | Removed the env switch; the direct argmax path is always used when `temperature <= 0`. |
+| `ZEROMOE_QWEN4EXP_EXPERT_PROMOTION` | environment alias | TOML `expert_promotion` is the canonical control and is already resolved in `EngineRunner`. | Removed the environment override; `config.expert_promotion` is authoritative. |
+| `ZEROMOE_QWEN4EXP_ROUTE_IDS_DUMP` | environment | It was an optional route-ID capture with no runtime effect. | Removed the capture and its file handle; existing dumps remain usable offline. |
+| `ZEROMOE_TEST_GLM53_DIR` | test environment | Fixture path is test-only and was the last `ZEROMOE_TEST_*` env used by the GLM native tests. | Migrated to `zeromoe_tests --glm53-dir <path>` (also `--glm53-dir=<path>`). |
+| `ZEROMOE_GLM5NEXT_PREFILL_CPU_THREADS`, `ZEROMOE_GLM5NEXT_CPU_THREADS` | environment | GLM now uses the shared process-wide `--threads` option; prefill is capped at `min(threads, 6)`. | `bench/glm_gsqrco_pool.sh` now passes `--threads` and no longer exports the removed names. |
+
+Inventory: environment 120 -> 111, CLI 101 -> 107, graph settings 35 -> 41, test environment 18 -> 17. Rebuilt CUDA `zeromoe`; provenance check pending commit.

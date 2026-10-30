@@ -1,6 +1,7 @@
 #include "qwen4exp_graph_mtp.hpp"
 
 #include "engine.hpp"
+#include "graph_settings_global.hpp"
 #include "logger.hpp"
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
@@ -265,10 +266,8 @@ class GraphWindowTarget final : public SpecTarget {
 void qwen4exp_graph_mtp_prefill_begin(StreamingEngine &engine) {
   if (!engine.qwen4exp_mtp_prefetch_requested) return;
   engine.qwen4exp_mtp_prefetch_requested = false;
-  const char *overlap_env = std::getenv("ZEROMOE_MTP_PREFILL_OVERLAP");
-  if (!overlap_env || overlap_env[0] != '1') {
-    if (overlap_env)
-      LOG_INFO("[MTP-GRAPH-PREFETCH] disabled by ZEROMOE_MTP_PREFILL_OVERLAP=0\n");
+  if (zeromoe::graphsettings::active_settings().tun.mtp_prefill_overlap.value == 0) {
+    LOG_INFO("[MTP-GRAPH-PREFETCH] disabled by graph_mtp_prefill_overlap=0\n");
     return;
   }
   if (engine.qwen4exp_mtp_prefetch_state ||

@@ -7,6 +7,7 @@
 // promoted expert on the GPU once its copy has landed (evict now, resident after the copy).
 
 #include "ggml_qwen4exp_graph_internal.hpp"
+#include "graph_settings_global.hpp"
 #include "moe_partial_route.hpp"
 #include "nvtx_range.hpp"
 #include <algorithm>
@@ -43,13 +44,14 @@ bool promotion_init(FullGraph &g) {
     ++hot_layers;
   }
   if (hot_layers == 0) return false;
+  const auto &tun = zeromoe::graphsettings::active_settings().tun;
   PromotionConfig cfg;
   cfg.enabled = g.engine->qwen4exp_expert_promotion >= 2;
-  if (const char *v = std::getenv("ZEROMOE_PROMO_CAP")) cfg.cap = std::atoi(v);
-  if (const char *v = std::getenv("ZEROMOE_PROMO_BURST")) cfg.burst_extra = std::atoi(v);
-  if (const char *v = std::getenv("ZEROMOE_PROMO_MIN_MISSES")) cfg.min_misses = std::atoi(v);
-  if (const char *v = std::getenv("ZEROMOE_PROMO_FREQ_WEIGHT")) cfg.freq_weight = std::strtoull(v, nullptr, 10);
-  if (const char *v = std::getenv("ZEROMOE_PROMO_DECAY_EVERY")) cfg.decay_every = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+  cfg.cap = static_cast<int>(tun.promo_cap.value);
+  cfg.burst_extra = static_cast<int>(tun.promo_burst.value);
+  cfg.min_misses = static_cast<int>(tun.promo_min_misses.value);
+  cfg.freq_weight = static_cast<uint64_t>(tun.promo_freq_weight.value);
+  cfg.decay_every = static_cast<uint32_t>(tun.promo_decay_every.value);
   g.promo = std::make_unique<ExpertPromotionPolicy>(cfg, c.n_experts, slots);
   if (cudaSetDevice(g.device) != cudaSuccess ||
       cudaStreamCreateWithFlags(&g.promo_stream, cudaStreamNonBlocking) != cudaSuccess ||

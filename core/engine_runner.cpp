@@ -353,8 +353,7 @@ std::expected<void, std::string> EngineRunner::apply_engine_config() {
       engine.qwen4exp_gpu_stage_layers.end());
   engine.qwen4exp_track_router_usage = config.qwen4exp_track_router_usage;
   {
-    std::string mode = config.expert_promotion;
-    if (const char *env = std::getenv("ZEROMOE_QWEN4EXP_EXPERT_PROMOTION")) mode = env;
+    const std::string &mode = config.expert_promotion;
     const bool mtp_graph = config.mtp_graph && config.mtp_enabled;
     engine.qwen4exp_expert_promotion = zeromoe::graph::resolve_expert_promotion_mode(mode, mtp_graph);
     static const char *const level_names[] = {"off", "observe", "on"};

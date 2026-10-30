@@ -1185,9 +1185,7 @@ const bool token_loop_diag_enabled =
                     return true;
                 };
             zeromoe::graph::SpecGreedy mtp_greedy;
-            const char *greedy_fast_env = std::getenv("ZEROMOE_MTP_GREEDY_FAST_PATH");
-            const bool greedy_fast_enabled = !greedy_fast_env || greedy_fast_env[0] != '0';
-            if (temperature <= 0.0f && greedy_fast_enabled) {
+            if (temperature <= 0.0f) {
                 mtp_greedy = [&](std::span<const float> step_logits,
                                  const std::vector<int> &context, int &token) {
                     token = zeromoe::graph::detail::greedy_argmax_with_repetition_penalty(

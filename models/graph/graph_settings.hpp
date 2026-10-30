@@ -110,6 +110,14 @@ struct GraphSettings {
   Resolved<std::string> offload_mirror, offload_store, offload_model;
   Resolved<double> offload_ddr_gib;        // < 0 = auto
   Resolved<std::string> offload_usage_file;
+  // Qwen4Exp adaptive expert promotion (docs/design/expert-promotion.md).
+  Resolved<long> promo_cap;          // promotions per committed token
+  Resolved<long> promo_burst;        // extra promotions per step during the burst window
+  Resolved<long> promo_min_misses;   // misses before an expert becomes a promotion candidate
+  Resolved<long> promo_freq_weight;  // eviction-score weight for hit counts
+  Resolved<long> promo_decay_every;  // halve all hit counts after this many hits
+  // Qwen4Exp graph-native MTP: overlap the draft setup with prompt prefill.
+  Resolved<long> mtp_prefill_overlap;
 };
 
 // Diagnostics: never hashed, never drift-checked.
@@ -217,6 +225,18 @@ inline const std::vector<Field<long>> &long_fields() {
       {"gpu_assist2_slots", ZEROMOE_SETTINGS_REF(tun.gpu_assist2_slots), 1, Parse::IntAtoi,
        claims_for(F::Glm, F::MiMo2),
        {}, false},
+      {"promo_cap", ZEROMOE_SETTINGS_REF(tun.promo_cap), 12, Parse::IntStrict,
+       claims_for(F::Qwen), {}, false},
+      {"promo_burst", ZEROMOE_SETTINGS_REF(tun.promo_burst), 20, Parse::IntStrict,
+       claims_for(F::Qwen), {}, false},
+      {"promo_min_misses", ZEROMOE_SETTINGS_REF(tun.promo_min_misses), 2, Parse::IntStrict,
+       claims_for(F::Qwen), {}, false},
+      {"promo_freq_weight", ZEROMOE_SETTINGS_REF(tun.promo_freq_weight), 4096, Parse::IntStrict,
+       claims_for(F::Qwen), {}, false},
+      {"promo_decay_every", ZEROMOE_SETTINGS_REF(tun.promo_decay_every), 16000000, Parse::IntStrict,
+       claims_for(F::Qwen), {}, false},
+      {"mtp_prefill_overlap", ZEROMOE_SETTINGS_REF(tun.mtp_prefill_overlap), 0, Parse::FlagOn,
+       claims_for(F::Qwen), {}, false},
       {"preflight_strict", ZEROMOE_SETTINGS_REF(diag.preflight_strict), 0, Parse::FlagOn,
        kClaimAll, {}, true},
   };
@@ -279,6 +299,8 @@ inline bool valid_integer(const std::string &name, long n) {
   if (name == "prefill_min_batch") return n > 0 && n <= 1000000;
   if (name == "offload_pinned_pct") return n >= 0 && n <= 100;
   if (name == "gpu_assist2_slots") return n >= 0 && n <= 8;
+  // Default is 16,000,000: "effectively never" for a session, but still a uint32 knob.
+  if (name == "promo_decay_every") return n >= 0 && n <= 4294967295L;
   return n >= 0 && n <= 1048576;
 }
 
@@ -342,6 +364,12 @@ inline const char *meaning(const std::string &name) {
       {"offload_model", "GLM/Ling model source used by expert offload."},
       {"offload_ddr_gib", "Host expert offload budget in GiB, or \"auto\". Separate from VRAM and pinned fractions."},
       {"offload_usage_file", "Historical expert-routing counts used to choose the hot set."},
+      {"promo_cap", "Qwen4Exp adaptive expert promotion: promotions per committed token. Higher values react faster but copy more."},
+      {"promo_burst", "Qwen4Exp adaptive expert promotion: extra promotions per step during the burst window at the start of a request."},
+      {"promo_min_misses", "Qwen4Exp adaptive expert promotion: misses before an expert becomes a promotion candidate."},
+      {"promo_freq_weight", "Qwen4Exp adaptive expert promotion: eviction-score weight for an expert's hit count; higher keeps frequently used experts longer."},
+      {"promo_decay_every", "Qwen4Exp adaptive expert promotion: halve all hit counts after this many hits; the default effectively disables decay within a session."},
+      {"mtp_prefill_overlap", "Qwen4Exp graph-native MTP: overlap draft setup with prompt prefill when free VRAM allows. Off by default."},
       {"usage_record_file", "Diagnostic route-survey output path; empty disables recording. Excluded from default hashes."},
       {"preflight_strict", "Fail on graph health/performance findings rather than only warning. Does not weaken safety checks."},
   };

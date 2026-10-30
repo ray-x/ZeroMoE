@@ -1,6 +1,6 @@
 # Qwen4Exp MTP shared handoff
 
-Updated 2026-10-28. Refresh the current HEAD and worktree list before using any
+Updated 2026-10-30. Promo and MTP prefill-overlap controls are now typed Qwen graph settings (`graph_promo_*`, `graph_mtp_prefill_overlap`); `ZEROMOE_MTP_GREEDY_FAST_PATH`, `ZEROMOE_QWEN4EXP_EXPERT_PROMOTION`, and `ZEROMOE_QWEN4EXP_ROUTE_IDS_DUMP` were removed. Refresh the current HEAD and worktree list before using any
 binary or citing a result.
 
 ## v0.0.1 baseline: plain decode and MTP (2026-10-28, locally measured)

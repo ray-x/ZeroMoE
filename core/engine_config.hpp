@@ -468,7 +468,7 @@ struct EngineConfig {
   // Adaptive promotion of missed experts into the static per-layer VRAM set (docs/design/expert-promotion.md).
   // "auto" (default): on when graph-native MTP is on, off otherwise. "on": swap. "observe": count misses, never swap
   // (frozen set, for A/B and validation). "off": static set. An explicit value always wins over MTP.
-  // Environment override: ZEROMOE_QWEN4EXP_EXPERT_PROMOTION=auto|off|observe|on. Replaces qwen4exp_expert_promotion.
+  // Canonical TOML key: expert_promotion = "auto" | "off" | "observe" | "on". The environment alias was removed.
   std::string expert_promotion = "auto";
 
   // prompt_cache: reuse the previous request's end-of-prompt state when the
