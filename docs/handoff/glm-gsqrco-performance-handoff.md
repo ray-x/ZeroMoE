@@ -145,6 +145,45 @@ proven). Next step: run the launcher repeatedly (`hunt.sh`-style loop) until it 
 
 ---------------------------------------------------------------------------------------------------------------------
 
+## 2.5 Measured decode timeline (2026-10-30, 3090 + 5060 Ti, from the node-level Nsight trace of another session)
+
+Source: `/home/ray/Projects/ZeroMoE/build_glm_results/2026-10-30-b6d190-glm-node-trace/retry/` (98 decode tokens, 4158 `lane.run` ranges, 465,902
+kernels). Scripts: `bench/glm_nsys_lane_breakdown.py`, `bench/glm_nsys_gpu1_branch.py`. The profiler stretches the token to 87.9 ms (70.8 ms un-instrumented),
+so scale the figures below by about 0.8. Medians over tokens 20-90.
+
+| phase of one token | ms | share | what is running |
+|---|---|---|---|
+| CPU lane waits for the 3090 (attention + router of the layer) | 17.2 | 20% | 3090 busy 86%, 5060 Ti idle |
+| **CPU lane computes the cold experts and uploads the result** | **47.2** | **54%** | **3090 busy 6.7% (3.2 ms), 5060 Ti 0%: both GPUs idle** |
+| between lane ranges: GPU combine, 5060 Ti hot experts, next layer start | 23.7 | 27% | 3090 busy 17.6%, 5060 Ti 12%; 18.3 ms in the 42 layers + ~5 ms token tail (LM head, sampling, sync) |
+
+Device utilisation per token: 3090 kernels 22.2 ms (25% of wall), 5060 Ti kernels 2.9 ms (3%), CPU lane busy 54%. The three devices work one after
+another, not at the same time. A layer cannot start before the previous layer's experts (cold ones included) are done, so one token's layers cannot be
+pipelined; parallelism exists only inside a layer.
+
+One layer between two lane ranges (median 489 us, layer 20 of token 50 as an example):
+`0 us` upload cold outputs (131 KB H2D, 13 us) -> small 3090 kernels (40-60 us) -> hidden state 3090 -> host -> 5060 Ti (16 KB, two copies, ~35 us + wait) ->
+`171-232 us` **5060 Ti computes its hot experts (3 matvecs of ~16 us + small kernels, ~65 us)** -> result 5060 Ti -> host -> 3090 (131 KB, two copies) ->
+`379-435 us` 3090 combine (`moe_weighted_reduction`), HC post, rms_norm, next layer's first projection. Of the 489 us: 90 us before the 5060 Ti hop starts,
+**211 us the 5060 Ti branch including both host-staged hops**, 186 us on the 3090 afterwards. GPU peer-to-peer is **not supported** between the cards
+(`nvidia-smi topo -p2p r`: NS), so the hops via host memory stay.
+
+**What can run in parallel (3090, 5060 Ti, CPU) and what it is worth**
+
+| overlap | status | estimate |
+|---|---|---|
+| 5060 Ti hot experts **concurrently with** the CPU cold experts of the same layer (both only need the router ids/weights + hidden state, available before the CPU lane starts; today the 5060 Ti branch runs after the lane) | not done; an attempt (`e45e92d`, reverted `e5967f9`) failed parity and gave non-finite values: it needs the ids/hidden state/weights copied into independent buffers because the scheduler recycles the originals | 8.8 ms of 87.9 per token on the critical path (7.1 ms un-instrumented), about 10% -> ~64 ms = ~15.6 tok/s |
+| 5060 Ti reduces its own experts first and returns one 16 KB vector instead of 8 x 16 KB | not done | ~10-20 us per layer, 0.4-0.8 ms |
+| 3090 post-lane chain (~110 small kernels/layer, 1-5 us each, launch-latency bound; 85 scheduler splits stop CUDA-graph capture around the host node) | not done | ~1-2 ms |
+| token tail (LM head, logits readback, sampling, next-token launch) ~5 ms | not done | ~1-2 ms |
+| the 3090 attention of layer L+1 with the CPU cold experts of layer L | **impossible without changing numerics**: it needs layer L's output | 0 |
+| the CPU phase itself (47 ms, 54%) | memory bound; nothing left to overlap with | only fewer cold experts per token (ranking) shrinks it |
+
+All the exact overlaps together are worth about 9-12 ms per token (about 16-17 tok/s). 20 tok/s (50 ms) also needs the CPU phase to fall from ~38 ms
+(un-instrumented) to about 25 ms, i.e. roughly a third fewer cold experts, which overlap cannot give.
+
+---------------------------------------------------------------------------------------------------------------------
+
 ## 3. Overlapping GPU and CPU work
 
 ### 3.1 The idea
