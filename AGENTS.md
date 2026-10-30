@@ -65,11 +65,22 @@ continue profiling; do not stop at coherent output or graph-gate success.
   rebuild a matched reference before accepting performance.
 - In a copied GGML build tree, verify the generated `GGML_COMMIT` reports the
   pinned/upstream GGML revision, not the enclosing ZeroMoE repository commit.
-- Enforce a user-set absolute decode target with `--minimum-tps` in addition
-  to the default relative llama.cpp ratio. A model remains in progress until
-  both applicable thresholds pass on repeatable steady-state measurements.
+- Record any user-set absolute decode target before implementation. Enforce it
+  with `--minimum-tps` in the first matched performance check and all final
+  checks, alongside the default relative llama.cpp ratio. Keep the model in
+  progress until both applicable thresholds pass on repeatable steady-state
+  measurements.
 - Keep model-specific equations and state in the adapter; reuse `GraphCore`,
   shared routed-MoE builders, placement, cache, and offload strategies.
+- Select comparison profiles from the user's explicit reference and verified
+  model lineage/topology. A user-identified fine-tune may use its base family
+  as a starting performance and runtime-settings reference, but transfer only
+  settings shown to apply. This is not a universal family rule: do not use
+  Qwen as the default reference for GLM or unrelated families. Record the
+  reference rationale and material differences before tuning. Before the first
+  long performance run, compare resolved settings against that reference and
+  account for material differences in hardware placement, CPU lane/thread
+  count, host source/pinning, graph policy, context, and batching.
 
 The authoritative design and memory-fallback contract is in
 [`docs/design/full-graph-model-onboarding.md`](docs/design/full-graph-model-onboarding.md).
