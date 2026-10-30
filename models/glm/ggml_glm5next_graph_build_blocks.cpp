@@ -6,6 +6,7 @@
 
 #include "ggml_glm5next_graph_impl.hpp"
 #include "graph_config.hpp"
+#include "graph_settings_global.hpp"
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
 
@@ -46,7 +47,7 @@ ggml_tensor *hc_pre(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
   ggml_tensor *flat_norm = ggml_rms_norm(ctx, flat, c.eps);
   ggml_tensor *mixes = ggml_mul_mat(ctx, fn, flat_norm);
   if (g.engine->family_ops.family == ModelFamily::DeepSeek_V41 &&
-      zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_NATIVE_F32_GRAPH"))
+      zeromoe::graphsettings::active_settings().tun.native_f32_graph.value != 0)
     ggml_prec_set_src(mixes, GGML_PREC_F32, 1);
 
   ggml_tensor *scale_pre = ggml_view_1d(ctx, scale, 1, 0);
