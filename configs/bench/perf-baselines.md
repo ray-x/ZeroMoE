@@ -29,7 +29,7 @@ Both files hold the same model: 313.327 B parameters, 1383 tensors, 45 layers (3
 | CPU expert kernel | AVX-512 IQ2_XXS dot (patch 0009) | ggml stock AVX2 Q2_K dot |
 | decode, dual GPU | **70.1 ms = 14.3 tok/s** | **70.8 ms = 14.1 tok/s** |
 | decode, 3090 only | 6.5-8.5 tok/s (whole-layer) | 10.7 tok/s, needs re-measuring |
-| code the decode number was measured on | 2026-10-15/16, `build_native`, ggml fork `~/work/ggml-iq2xxs` + patches 0006-0008, 15.0 GiB hot on the 5060 Ti, `GPU1_MIN_LAYER=31`, AJ-fitted ranking | 2026-10-30, master `b7d6bd1`, ggml `8baabd53b` + patches 0001-0017, 14.2 GiB hot, shipped ranking |
+| code the decode number was measured on | 2026-10-15/16: record commit `04994e5` (the 70.1 ms row is dated 10-15, just before it; the exact binary commit was not recorded), `build_native`, ggml fork `~/work/ggml-iq2xxs` + patches 0006-0008, 15.0 GiB hot on the 5060 Ti, `GPU1_MIN_LAYER=31`, AJ-fitted ranking | 2026-10-30: master `b7d6bd1e027c` (binary stamped clean, source snapshot `f3ef9739`), ggml llama.cpp `8baabd53b` + patches 0001-0017 + host-node 0001-0003 (manifest `bc15a892`), 14.2 GiB hot, shipped ranking |
 | prefill | 243-272 tok/s (800-5100 token prompts, batched graph prefill) | 20-31 tok/s (20-104 token prompts; not comparable) |
 
 **The two decode columns were measured on different code**, so 70.1 vs 70.8 ms is not a controlled comparison (code, ggml, hot-set size and
@@ -37,7 +37,7 @@ ranking all differ). A same-binary AJ run is recorded below when it finishes. Th
 agreement 77%, mean KL 0.35). The GSQ-RCO file reads 34.5% more expert bytes per token; its CPU kernel is a different, less optimised one.
 
 ## GLM-5.3-Flash (AJ IQ2_XXS), dual GPU
-**Model file:** `GLM-5.3-Flash-AJ-IQ2_XXS-0000{1,2}-of-00002.gguf`, IQ2_XXS/IQ2_S experts, 87.35 GB (81.35 GiB), 2.230 bpw. **Code:** older (2026-10-15/16), see the table above.
+**Model file:** `GLM-5.3-Flash-AJ-IQ2_XXS-0000{1,2}-of-00002.gguf`, IQ2_XXS/IQ2_S experts, 87.35 GB (81.35 GiB), 2.230 bpw. **Code:** record commit `04994e5` (2026-10-16), older ggml fork; see the table above.
 
 
 Config: `configs/testing/glm53flash_AJ_IQ2XXS_spread_offload.toml` (`moe_cache_gb = 15.0`, `context_size = 8192`), recipe env
@@ -58,7 +58,7 @@ Prefetch ring on (2 sets, drain, chunk 2), DDR pool 60-76 GiB, batch default 204
 | prefill, before this work | 159 tok/s (5.05 s) | 2026-10-14 | for the record |
 
 ## GLM-5.3-Flash (GSQ-RCO 3.0-bit, Q2_K/Q3_K/Q4_K), offload pool 88 GiB, 0 SSD misses
-**Model file:** `GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf`, Q2_K/Q3_K/Q4_K experts, 117.48 GB (109.41 GiB), 3.000 bpw. **Code:** master `b7d6bd1` and later (earlier rows: branch builds of 2026-10-29, noted per row).
+**Model file:** `GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf`, Q2_K/Q3_K/Q4_K experts, 117.48 GB (109.41 GiB), 3.000 bpw. **Code (version hash):** master `b7d6bd1e027c` (clean stamp) for the 2026-10-30 rows; the 2026-10-29 rows ran on branch builds `ce4c313` / `58c1ab9` (`glm-lane-diag`, same GLM code plus the since-removed dense host-copy release), ggml `8baabd53b` + patches 0001-0017 + host-node 0001-0003 throughout.
 
 
 Config and recipe: `docs/models/glm53-flash.md` (GSQ-RCO section). 100 tokens, `--temp 0`, palindrome prompt; steady decode =
@@ -81,7 +81,7 @@ tokens 21-99 `FULL-DECODE-TIME`. Box load 12-14 from other jobs during the runs 
 
 
 Config: `configs/bench/qwen38-flash-q2_0-mtp.toml` (global Option-B hot set of 13,000 experts, `expert_promotion = "on"`, context 1536; the plain rows set `spec_type = "none"`
-and drop the MTP keys), `CUDA_VISIBLE_DEVICES=0`, 6-thread graph CPU team (the default), 10 OpenMP threads, MTP draft Q4_K_M checkpoint with 3 draft tokens. Source `ea2b200`
+and drop the MTP keys), `CUDA_VISIBLE_DEVICES=0`, 6-thread graph CPU team (the default), 10 OpenMP threads, MTP draft Q4_K_M checkpoint with 3 draft tokens. Source `ea2b200` (tag `v0.0.1` = `40b83bf`)
 (master `197cdfa` + `swap-b`, plus two compile fixes to master), ggml `8baabd53b` + `patches/ggml` 0001-0017 + `patches/ggml-host-node`, CUDA 13.3, driver 610.57.04, sm_86, GCC 16.2. Measured 2026-10-28, tok/s.
 Artifacts (exact TOML, prompts, command, stdout, engine logs, manifest): `build_mtp_results/2026-10-28-ea2b200-mtp-suite/ (MTP), 2026-10-28-ea2b200-plain-suite/ (plain); the same suites on the previous build are in 2026-10-28-1950bee-*-suite/, and 2026-10-28-1950bee-mtp-suite-promotion-off/ is an invalid first attempt kept for the record`.
 
