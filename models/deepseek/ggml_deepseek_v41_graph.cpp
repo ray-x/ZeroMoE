@@ -1039,6 +1039,7 @@ void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
   // The native F32 kernel writes zero for a negative route ID without
   // reading an expert. The ordinary GGML path uses held dummy slots because
   // its older kernels require nonnegative IDs.
+  const bool skip_masked_routes = v41_native_f32();
   std::vector<std::vector<int>> dummy(site.pools.size());
   for (size_t b = 0; b < site.pools.size(); ++b) {
     const auto &pool = site.pools[b];
