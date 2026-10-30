@@ -87,7 +87,7 @@ neighbour compiled: **never quote a number without the contamination report** (t
 |---|---|---|
 | pool 88 GiB (the cold set is ~88 GiB) instead of 80 / auto 67.9 | removes ~70 ms/token of SSD waits: 5.3 -> 10.7 tok/s on the 3090 | `graph_offload_ddr_gib` |
 | 10 CPU threads for the **decode** lane (was 6) | lane compute 45.7 -> 39.9 ms: 13.0 -> 14.2 tok/s on the 3090 + 5060 Ti | `ggml_glm5next_graph_decode.cpp` |
-| prefill threads independent of the decode setting (6) | 10 prefill threads grew host memory ~16 GiB after seeding and tripped the watchdog | `ggml_glm5next_graph.cpp`, `ZEROMOE_GLM5NEXT_PREFILL_CPU_THREADS` |
+| prefill threads independent of the decode setting (6) | 10 prefill threads grew host memory ~16 GiB after seeding and tripped the watchdog | `ggml_glm5next_graph.cpp`; since the 2026-10-30 env cleanup the env var is gone and both counts come from `omp_max_threads` (prefill = min(it, 6)) |
 | ~~dense host copies freed once the decode graph holds them~~ | **removed 2026-10-30**: it zeroed attention/logits for every request after the first (found with a 6-prompt session) | see the warning in `docs/models/glm53-flash.md` |
 | 5060 Ti holds 14.2 GiB of hot experts | 10.7 -> 13.0-14.2 tok/s | `ZEROMOE_GLM5NEXT_GPU1_HOT_GIB=14.2` |
 
@@ -236,6 +236,21 @@ two pieces of work do not depend on each other. Candidates (to be validated by t
 
 So A and B are the exact ones; C/D are not. The honest expectation: A+B can shave part of the 21 ms wait and the ~10 ms tail; they
 cannot touch the ~40 ms CPU part (that needs fewer bytes, section 1.5).
+
+### 3.1b Parity harness for the overlap change: determinism of the unchanged build (measured 2026-10-30)
+
+Two runs of the unchanged build (master `b7d6bd1`, 3090 + 5060 Ti, pool 88, prompt "The capital of France is", the same 8 teacher-forced tokens, logits dumped per step with
+`ZEROMOE_DECODE_LOGITS_DUMP`, compared with `bench/cmp_decode_logits.py`):
+
+| prefill | run 1 vs run 2 |
+|---|---|
+| layered (default) | **not reproducible**: cosine 0.992 at step 0, 0.92-0.95 at steps 1-7, max abs 1.8-7.8, top-1 flips at step 1 (13 vs 624) |
+| full-graph (`ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL=1`) | **bitwise identical on all 8 steps** |
+
+So a parity test of the overlap change must use the full-graph prefill and then requires bitwise-equal logits (any difference is a real change). With the layered prefill
+the unchanged build differs from itself by as much as the earlier overlap attempt `e45e92d` differed from its parent (cosine 0.86-0.98), so that attempt's recorded
+"parity failure" cannot be attributed to the reorder (probable cause of the layered noise: experts placed on the GPU or CPU depending on upload timing; the two kernels quantize
+activations differently). The earlier revert was based on evidence that could not distinguish a bug from noise; the NaN diagnostic seen once in that attempt was a separate symptom.
 
 ### 3.2 Data we have
 

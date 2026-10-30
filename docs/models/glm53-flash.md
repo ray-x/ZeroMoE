@@ -68,7 +68,7 @@ files is not equivalent (teacher-forced top-1 agreement 77%, mean KL 0.35, see t
   fits, `vram_cache_full_layer_prefix = 0`, no GPU assist, `ram_pinned_budget_gb = 16`).
 - Launcher: `bench/glm_gsqrco_pool.sh TAG [POOL_GIB] [prompt]` from the repo root. It waits for a quiet box, sets
   `CUDA_VISIBLE_DEVICES`, `ZEROMOE_GLM5NEXT_GPU1_HOT_GIB=14.2` (hot experts on the 5060 Ti; `CVD=0` runs the 3090 alone), `ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512`,
-  `ZEROMOE_GLM5NEXT_PREFILL_CPU_THREADS=6`, runs under `scripts/run_capped.sh --limit-gb 118`, watches MemAvailable at 1 Hz
+  `omp_max_threads = 10` in the config (decode CPU lane = that value, prefill = min(that, 6)), runs under `scripts/run_capped.sh --limit-gb 118`, watches MemAvailable at 1 Hz
   (stops the engine below 6 GiB) and prints the steady decode rate and the lane breakdown. `CVD=0` runs the 3090 alone.
 - Run: `--temp 0 --predict 100 --force-start`, prompt "Write a Python function that checks whether a string is a palindrome,
   and explain it.", `--graph-offload-usage-file docs/ssd-offload/data/glm53flash_usage_combined_old_plus_survey5.txt`
@@ -99,9 +99,10 @@ graph_offload_ddr_gib = 88      # the cold set is ~88 GiB; 80 leaves ~2 SSD miss
 Lane at 14.2 tok/s: wait 21 ms + CPU cold-expert compute 39 ms per token. Measured with the box partly loaded (load 12-14 from
 other jobs), so these are slight underestimates.
 
-Changes behind these numbers: decode CPU lane defaults to 10 threads (was 6); the prefill graph's thread count no longer
-follows `ZEROMOE_GLM5NEXT_CPU_THREADS` (10 prefill threads grew host memory by ~16 GiB right after pool seeding and tripped the
-memory watchdog; prefill stays at 6, override with `ZEROMOE_GLM5NEXT_PREFILL_CPU_THREADS`); the early-ready lane names
+Changes behind these numbers: decode CPU lane defaults to 10 threads (was 6); the prefill graph's thread count is capped at 6
+(10 prefill threads grew host memory by ~16 GiB right after pool seeding and tripped the memory watchdog). Since the environment-surface cleanup of
+2026-10-30 both counts come from `omp_max_threads` (decode = that value, prefill = min(that, 6)); the `ZEROMOE_GLM5NEXT_CPU_THREADS` and
+`ZEROMOE_GLM5NEXT_PREFILL_CPU_THREADS` variables no longer exist; the early-ready lane names
 the cause (layer, call, input hidden state, weights) before aborting on a non-finite router weight.
 
 ### Ranking matched to this model file (2026-10-30, in-sample)
