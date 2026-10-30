@@ -138,6 +138,16 @@ struct GraphSettings {
   Resolved<long> gpu_prefill;
   Resolved<long> cache_moe_graph;
   Resolved<long> cache_moe_decode;
+  Resolved<long> cache_moe_async_upload;
+  Resolved<long> cache_moe_cpu_cold;
+  Resolved<long> full_graph_decode;
+  Resolved<long> pilot_k;
+  Resolved<long> pilot_cold_k;
+  Resolved<long> pilot_gate;
+  Resolved<double> pilot_ddr_threshold;
+  Resolved<double> pilot_vram_threshold;
+  Resolved<long> pilot_gate_min_samples;
+  Resolved<long> pilot_promote_mode;
 };
 
 // Diagnostics: never hashed, never drift-checked.
@@ -276,17 +286,33 @@ inline const std::vector<Field<long>> &long_fields() {
       {"prefill_device_state", ZEROMOE_SETTINGS_REF(tun.prefill_device_state), 1, Parse::FlagUnlessOff,
        claims_for(F::Qwen), {}, false},
       {"outproj_gpu", ZEROMOE_SETTINGS_REF(tun.outproj_gpu), 1, Parse::FlagUnlessOff,
-       claims_for(F::Other), {}, false},
+       claims_for(Family::Other), {}, false},
       {"native_f32_graph", ZEROMOE_SETTINGS_REF(tun.native_f32_graph), 0, Parse::FlagOn,
-       claims_for(F::Other), {}, false},
+       claims_for(Family::Other), {}, false},
       {"decode_gpu_hc", ZEROMOE_SETTINGS_REF(tun.decode_gpu_hc), 1, Parse::FlagUnlessOff,
-       claims_for(F::Other), {}, false},
+       claims_for(Family::Other), {}, false},
       {"gpu_prefill", ZEROMOE_SETTINGS_REF(tun.gpu_prefill), 0, Parse::FlagOn,
-       claims_for(F::Other), {}, false},
+       claims_for(Family::Other), {}, false},
       {"cache_moe_graph", ZEROMOE_SETTINGS_REF(tun.cache_moe_graph), 0, Parse::FlagOn,
-       claims_for(F::Other), {}, false},
+       claims_for(Family::Other), {}, false},
       {"cache_moe_decode", ZEROMOE_SETTINGS_REF(tun.cache_moe_decode), 0, Parse::FlagOn,
-       claims_for(F::Other), {}, false},
+       claims_for(Family::Other), {}, false},
+      {"cache_moe_async_upload", ZEROMOE_SETTINGS_REF(tun.cache_moe_async_upload), 0, Parse::FlagOn,
+       claims_for(Family::Other), {}, false},
+      {"cache_moe_cpu_cold", ZEROMOE_SETTINGS_REF(tun.cache_moe_cpu_cold), 0, Parse::FlagOn,
+       claims_for(Family::Other), {}, false},
+      {"full_graph_decode", ZEROMOE_SETTINGS_REF(tun.full_graph_decode), 1, Parse::FlagUnlessOff,
+       claims_for(Family::Other), {}, false},
+      {"pilot_k", ZEROMOE_SETTINGS_REF(tun.pilot_k), 0, Parse::IntStrict,
+       claims_for(Family::Other), {}, false},
+      {"pilot_cold_k", ZEROMOE_SETTINGS_REF(tun.pilot_cold_k), 0, Parse::IntStrict,
+       claims_for(Family::Other), {}, false},
+      {"pilot_gate", ZEROMOE_SETTINGS_REF(tun.pilot_gate), 1, Parse::FlagUnlessOff,
+       claims_for(Family::Other), {}, false},
+      {"pilot_gate_min_samples", ZEROMOE_SETTINGS_REF(tun.pilot_gate_min_samples), 30, Parse::IntStrict,
+       claims_for(Family::Other), {}, false},
+      {"pilot_promote_mode", ZEROMOE_SETTINGS_REF(tun.pilot_promote_mode), 0, Parse::IntStrict,
+       claims_for(Family::Other), {}, false},
       {"preflight_strict", ZEROMOE_SETTINGS_REF(diag.preflight_strict), 0, Parse::FlagOn,
        kClaimAll, {}, true},
   };
@@ -302,6 +328,10 @@ inline const std::vector<Field<double>> &real_fields() {
        claims_for(Family::Glm), {}, false},
       {"offload_probation_fraction", ZEROMOE_SETTINGS_REF(tun.offload_probation_fraction), 0.25, Parse::RealOrAuto,
        claims_for(Family::Glm), {}, false},
+      {"pilot_ddr_threshold", ZEROMOE_SETTINGS_REF(tun.pilot_ddr_threshold), 0.5, Parse::RealOrAuto,
+       claims_for(Family::Other), {}, false},
+      {"pilot_vram_threshold", ZEROMOE_SETTINGS_REF(tun.pilot_vram_threshold), 0.9, Parse::RealOrAuto,
+       claims_for(Family::Other), {}, false},
       {"soft_pin_gib", ZEROMOE_SETTINGS_REF(tun.soft_pin_gib), 6.0, Parse::RealOrAuto,
        claims_for(Family::Qwen), {}, false},
   };
@@ -354,6 +384,10 @@ inline bool valid_integer(const std::string &name, long n) {
   if (name == "alloc_floor_mib") return n >= 0 && n <= 4096;
   if (name == "storage_timeout_ms") return n >= 0 && n <= 30000;
   if (name == "ring_spin_us") return n >= 0 && n <= 1000;
+  if (name == "pilot_k") return n >= 0 && n <= 16;
+  if (name == "pilot_cold_k") return n >= 0 && n <= 8;
+  if (name == "pilot_gate_min_samples") return n >= 1 && n <= 1000000;
+  if (name == "pilot_promote_mode") return n >= 0 && n <= 2;
   // Default is 16,000,000: "effectively never" for a session, but still a uint32 knob.
   if (name == "promo_decay_every") return n >= 0 && n <= 4294967295L;
   return n >= 0 && n <= 1048576;
@@ -426,6 +460,16 @@ inline const char *meaning(const std::string &name) {
       {"batch_d2d_unpack", "Qwen decode fast path: batch VRAM-cache D2D copies and unpack with one scatter kernel."},
       {"shared_cpu_oracle", "Force Qwen shared experts to run on the CPU oracle for validation (default off)."},
       {"device_route", "Qwen device-side routing experiment (default off)."},
+      {"cache_moe_async_upload", "DeepSeek cache-MoE async upload (default off)."},
+      {"cache_moe_cpu_cold", "DeepSeek cache-MoE CPU cold path (default off)."},
+      {"full_graph_decode", "DeepSeek full-graph decode (on unless set to 0)."},
+      {"pilot_k", "DeepSeek decode pilot k (0 disables)."},
+      {"pilot_cold_k", "DeepSeek decode pilot cold k (0 disables)."},
+      {"pilot_gate", "DeepSeek pilot gate (on unless set to 0)."},
+      {"pilot_ddr_threshold", "DeepSeek pilot DDR threshold (0..1)."},
+      {"pilot_vram_threshold", "DeepSeek pilot VRAM threshold (0..1)."},
+      {"pilot_gate_min_samples", "DeepSeek pilot gate minimum samples."},
+      {"pilot_promote_mode", "DeepSeek pilot promote mode: 0 off, 1 main, 2 active."},
       {"adaptive_policy", "Qwen adaptive completion policy (default off)."},
       {"prefill_device_state", "Qwen prefill device-state inputs (on unless set to 0)."},
       {"outproj_gpu", "DeepSeek V4.1 grouped out-projection on GPU (on unless set to 0)."},

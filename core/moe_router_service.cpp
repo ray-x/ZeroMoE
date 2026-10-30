@@ -1521,18 +1521,16 @@ if (moe_ggml_gpu_router() && qwen_prefill_gpu_router &&
         if (S == 1 &&
             engine.family_ops.family == ModelFamily::DeepSeek_V41) {
           static const int pilot_k = [] {
-            const char *e = zeromoe::graphcfg::env("ZEROMOE_DSV41_PILOT_K");
-            const int k = e ? std::atoi(e) : 0;
-            return std::min(std::max(k, 0), 16);
+            const long k = zeromoe::graphsettings::active_settings().tun.pilot_k.value;
+            return static_cast<int>(std::min(std::max(k, 0L), 16L));
           }();
           // Cold-only candidate ranking (GLM-5.3-Flash lesson): rank the
           // non-resident experts directly instead of taking the top-k
           // overall and hoping some are cold. 0 keeps the historical
           // top-k-overall behavior for A/B.
           static const int cold_k = [] {
-            const char *e = zeromoe::graphcfg::env("ZEROMOE_DSV41_PILOT_COLD_K");
-            const int k = e ? std::atoi(e) : 0;
-            return std::min(std::max(k, 0), 8);
+            const long k = zeromoe::graphsettings::active_settings().tun.pilot_cold_k.value;
+            return static_cast<int>(std::min(std::max(k, 0L), 8L));
           }();
           const int target = layer_idx + 1;
           if ((pilot_k > 0 || cold_k > 0) && target < c.n_layers) {
@@ -1641,20 +1639,17 @@ if (moe_ggml_gpu_router() && qwen_prefill_gpu_router &&
               // check below one layer later. Before min_samples, keep the
               // old allow-all behavior so a cold start is not starved.
               static const bool gate_enabled = [] {
-                const char *e = zeromoe::graphcfg::env("ZEROMOE_DSV41_PILOT_GATE");
-                return !e || std::atoi(e) != 0;
+                return zeromoe::graphsettings::active_settings().tun.pilot_gate.value != 0;
               }();
               static const double ddr_threshold = [] {
-                const char *e = zeromoe::graphcfg::env("ZEROMOE_DSV41_PILOT_DDR_THRESHOLD");
-                return e ? std::atof(e) : 0.50;
+                return zeromoe::graphsettings::active_settings().tun.pilot_ddr_threshold.value;
               }();
               static const double vram_threshold = [] {
-                const char *e = zeromoe::graphcfg::env("ZEROMOE_DSV41_PILOT_VRAM_THRESHOLD");
-                return e ? std::atof(e) : 0.90;
+                return zeromoe::graphsettings::active_settings().tun.pilot_vram_threshold.value;
               }();
               static const int gate_min_samples = [] {
-                const char *e = zeromoe::graphcfg::env("ZEROMOE_DSV41_PILOT_GATE_MIN_SAMPLES");
-                return e ? std::max(std::atoi(e), 1) : 30;
+                const long v = zeromoe::graphsettings::active_settings().tun.pilot_gate_min_samples.value;
+                return static_cast<int>(std::max(v, 1L));
               }();
               const int active_fill_k =
                   std::min(kk, speculative_active_layer_max_k_value());
@@ -1662,11 +1657,7 @@ if (moe_ggml_gpu_router() && qwen_prefill_gpu_router &&
               // The historical active-layer path is kept for A/B only: at
               // 77-90% predicted accuracy it is net-negative on decode.
               static const int promote_mode = [] {
-                const char *e = zeromoe::graphcfg::env("ZEROMOE_DSV41_PILOT_PROMOTE_MODE");
-                if (!e || !*e) return 0;
-                if (!std::strcmp(e, "main")) return 1;
-                if (!std::strcmp(e, "active")) return 2;
-                return 0;
+                return static_cast<int>(zeromoe::graphsettings::active_settings().tun.pilot_promote_mode.value);
               }();
               // Two different populations, exactly as the docs:
               //   hints are judged by fetch-worthy precision;

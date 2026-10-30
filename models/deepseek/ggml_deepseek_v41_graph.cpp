@@ -756,7 +756,7 @@ void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
     }
   } ram_pins(*ram, (size_t)c.n_experts);
   const bool async_upload = !site.cpu_cold_graph &&
-      zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_CACHE_MOE_ASYNC_UPLOAD");
+      zeromoe::graphsettings::active_settings().tun.cache_moe_async_upload.value != 0;
   std::vector<ExpertLocation *> pending_locations((size_t)c.n_experts, nullptr);
   std::vector<ExpertLocation *> held_locations((size_t)c.n_experts, nullptr);
   site.cpu_experts.clear();
@@ -1170,7 +1170,7 @@ ggml_tensor *build_v41_cache_moe(FullGraph &g, ggml_tensor *cur, int layer,
   site->g = &g; site->layer = layer; site->tokens = token_ids;
   site->decode_pos = decode_pos;
   site->cpu_cold_graph = g.decode_mode && g.S == 1 &&
-      zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_CACHE_MOE_CPU_COLD");
+      zeromoe::graphsettings::active_settings().tun.cache_moe_cpu_cold.value != 0;
   for (int vi : topo.vault_gpus) {
     auto &dev = topo.devices[(size_t)vi];
     if (!dev.expert_cache_pool) continue;
