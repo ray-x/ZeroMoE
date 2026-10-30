@@ -94,17 +94,9 @@ bool env_layer_timing_verbose() {
 // all bounded service slots. The staged path is opt-in, so this deadline does
 // not affect the production early-ready profile.
 std::chrono::milliseconds env_storage_wait_timeout() {
-  constexpr long kDefaultMs = 100;
   constexpr long kMaximumMs = 30000;
-  const char *value =
-      zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_STORAGE_TIMEOUT_MS");
-  if (!value || !value[0])
-    return std::chrono::milliseconds(kDefaultMs);
-  char *end = nullptr;
-  const long parsed = std::strtol(value, &end, 10);
-  if (end == value || *end != '\0' || parsed < 0)
-    return std::chrono::milliseconds(kDefaultMs);
-  return std::chrono::milliseconds(std::min(parsed, kMaximumMs));
+  const long ms = zeromoe::graphsettings::active_settings().tun.storage_timeout_ms.value;
+  return std::chrono::milliseconds(std::clamp(ms, 0L, kMaximumMs));
 }
 
 bool env_adaptive_completion_policy_enabled() {
