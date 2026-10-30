@@ -7,6 +7,7 @@
 #include "memory_guard.hpp"
 #include "perf_timer.hpp"
 #include "graph_config.hpp"
+#include "graph_settings_global.hpp"
 
 #include <algorithm>
 #include <array>
@@ -200,7 +201,7 @@ bool GgmlRouterRunner::build_graph(int layer) {
   ggml_set_output(route.ids);
   ggml_set_output(route.weights);
   static const bool compare_logits = [] {
-    return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN_ROUTER_COMPARE");
+    return zeromoe::graphsettings::active_settings().tun.router_compare.value != 0;
   }();
   if (compare_logits) ggml_set_output(route.logits);
   ggml_set_name(route.ids, "qwen4exp_router_ids");

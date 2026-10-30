@@ -1068,8 +1068,7 @@ if (moe_ggml_gpu_router() && qwen_prefill_gpu_router &&
         // This deliberately downloads one [D] row and repeats the host
         // projection/top-k; it is never part of the production path.
         static const bool compare_qwen_router = [] {
-          const char *e = zeromoe::graphcfg::env("ZEROMOE_QWEN_ROUTER_COMPARE");
-          return e && e[0] == '1';
+          return zeromoe::graphsettings::active_settings().tun.router_compare.value != 0;
         }();
         if (compare_qwen_router && gpu_router_handled && S == 1 &&
             engine.family_ops.family == ModelFamily::Qwen4Exp &&
