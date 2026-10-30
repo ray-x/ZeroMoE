@@ -51,6 +51,7 @@ pilot_vram_threshold=0.9
 ple_row_cache=1
 prefill_chunk=0
 prefill_device_state=1
+prefill_gpu1=1
 prefill_min_batch=64
 prefill_offload_min_tokens=256
 prefill_op_offload=-1

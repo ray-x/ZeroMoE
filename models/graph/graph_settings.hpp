@@ -105,6 +105,7 @@ struct GraphSettings {
   Resolved<long> dynamic_cache;                          // bool, off by default
   Resolved<long> pilot_stage;
   Resolved<long> pilot_prefetch;
+  Resolved<long> prefill_gpu1;
   Resolved<long> gpu_assist2_slots;
   Resolved<double> offload_pinned_fraction;
   Resolved<double> offload_probation_fraction;
@@ -257,6 +258,8 @@ inline const std::vector<Field<long>> &long_fields() {
       {"pilot_stage", ZEROMOE_SETTINGS_REF(tun.pilot_stage), 0, Parse::IntStrict,
        claims_for(F::Glm), {}, false},
       {"pilot_prefetch", ZEROMOE_SETTINGS_REF(tun.pilot_prefetch), 0, Parse::IntStrict,
+       claims_for(F::Glm), {}, false},
+      {"prefill_gpu1", ZEROMOE_SETTINGS_REF(tun.prefill_gpu1), 1, Parse::FlagUnlessOff,
        claims_for(F::Glm), {}, false},
       {"gpu_assist2_slots", ZEROMOE_SETTINGS_REF(tun.gpu_assist2_slots), 1, Parse::IntAtoi,
        claims_for(F::Glm, F::MiMo2),
@@ -454,6 +457,7 @@ inline const char *meaning(const std::string &name) {
       {"dynamic_cache", "Experimental GLM dynamic expert cache rather than the fixed validated placement."},
       {"pilot_stage", "GLM pilot staging depth K (0 disables)."},
       {"pilot_prefetch", "GLM pilot prefetch depth (0 disables; effective depth is at least pilot_stage)."},
+      {"prefill_gpu1", "Use second GPU during GLM prefill (on unless set to 0)."},
       {"offload_pinned_fraction", "Pinned fraction of the GLM/Ling host offload pool (0..1), not a GiB budget."},
       {"offload_probation_fraction", "GLM/Ling segmented-cache probation fraction (0..1); applies to the segmented policy."},
       {"offload_policy", "GLM/Ling host cache policy: \"lru\" or \"seg\". Keep the measured recipe unless benchmarking."},

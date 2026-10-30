@@ -333,7 +333,7 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   const bool ling_cache_alias =
       g->engine->family_ops.family == ModelFamily::BailingMoE3;
   if (ling_cache_alias ||
-      zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_PREFILL_GPU1", 1) != 0)
+      zeromoe::graphsettings::active_settings().tun.prefill_gpu1.value != 0)
     for (const auto &pl : g->partial_experts)
       if (!pl.hot1.empty()) {
         g->gpu1 = static_cast<ggml_backend_t>(ggml_shared_backend(second_gpu_device(g->device)));
