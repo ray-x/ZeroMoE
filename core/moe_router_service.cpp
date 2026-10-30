@@ -1,5 +1,6 @@
 #include "active_layer_upload_workers.hpp"
 #include "graph_config.hpp"
+#include "graph_settings_global.hpp"
 #include "async_prefetcher.hpp"
 #include "cpu_expert_executor.hpp"
 #include "gpu_expert_executor.hpp"
@@ -150,8 +151,7 @@ void moe_pipeline_internal::qwen4exp_record_pilot_fetch_start(int layer_idx) {
 
 static bool qwen4exp_device_route_enabled() {
   static const bool enabled = [] {
-    const char *e = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_DEVICE_ROUTE");
-    return e && e[0] == '1';
+    return zeromoe::graphsettings::active_settings().tun.device_route.value != 0;
   }();
   return enabled;
 }
