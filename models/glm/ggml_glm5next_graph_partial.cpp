@@ -6,6 +6,7 @@
 
 #include <future>
 #include "graph_config.hpp"
+#include "graph_settings_global.hpp"
 #include "ggml_glm5next_graph_impl.hpp"
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
@@ -422,9 +423,9 @@ bool configure_partial_experts(FullGraph &g) {
   if (g.engine->family_ops.family != ModelFamily::BailingMoE3 &&
       g.partial_expert_residency &&
       ggml_shared_backend(second_gpu_device(g.device))) {
-    const char *gh = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_GPU1_HOT_GIB");
-    if (gh && gh[0])
-      assign_gpu1_hot(g, std::atof(gh));
+    const double gh = zeromoe::graphsettings::active_settings().tun.gpu1_hot_gib.value;
+    if (gh > 0.0)
+      assign_gpu1_hot(g, gh);
   }
   return true;
 }

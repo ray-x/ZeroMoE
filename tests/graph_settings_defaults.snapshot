@@ -13,6 +13,7 @@ device_route=0
 dynamic_cache=0
 early_ready=-1
 full_graph_decode=1
+gpu1_hot_gib=0
 gpu_assist2_slots=1
 gpu_assist_slots=0
 gpu_prefill=0

@@ -159,8 +159,8 @@ int gpu_assist2_device(int core_device) {
     if (v && v[0])
       return std::atoi(v);
     int n = 0;
-    const char *hot1 = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_GPU1_HOT_GIB");
-    return cudaGetDeviceCount(&n) == cudaSuccess && n >= 2 && hot1 && hot1[0] ? second_gpu_device(core_device) : -1;
+    const bool hot1 = zeromoe::graphsettings::active_settings().tun.gpu1_hot_gib.value > 0.0;
+    return cudaGetDeviceCount(&n) == cudaSuccess && n >= 2 && hot1 ? second_gpu_device(core_device) : -1;
   }();
   return d;
 }

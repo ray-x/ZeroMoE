@@ -107,6 +107,7 @@ struct GraphSettings {
   Resolved<long> pilot_prefetch;
   Resolved<long> prefill_gpu1;
   Resolved<long> cpu_lm_head;
+  Resolved<double> gpu1_hot_gib;
   Resolved<long> gpu_assist2_slots;
   Resolved<double> offload_pinned_fraction;
   Resolved<double> offload_probation_fraction;
@@ -346,6 +347,8 @@ inline const std::vector<Field<double>> &real_fields() {
        claims_for(Family::Other), {}, false},
       {"soft_pin_gib", ZEROMOE_SETTINGS_REF(tun.soft_pin_gib), 6.0, Parse::RealOrAuto,
        claims_for(Family::Qwen), {}, false},
+      {"gpu1_hot_gib", ZEROMOE_SETTINGS_REF(tun.gpu1_hot_gib), 0.0, Parse::RealOrAuto,
+       claims_for(Family::Glm), {}, false},
   };
   return t;
 }
@@ -461,6 +464,7 @@ inline const char *meaning(const std::string &name) {
       {"pilot_stage", "GLM pilot staging depth K (0 disables)."},
       {"pilot_prefetch", "GLM pilot prefetch depth (0 disables; effective depth is at least pilot_stage)."},
       {"prefill_gpu1", "Use second GPU during GLM prefill (on unless set to 0)."},
+      {"gpu1_hot_gib", "GLM hot-expert budget on the second GPU, in GiB (0 disables)."},
       {"cpu_lm_head", "Keep GLM output norm/weight on CPU (low-VRAM fallback; default off)."},
       {"cpu_lm_head", "Keep GLM output norm/weight on CPU (low-VRAM fallback; default off)."},
       {"offload_pinned_fraction", "Pinned fraction of the GLM/Ling host offload pool (0..1), not a GiB budget."},
