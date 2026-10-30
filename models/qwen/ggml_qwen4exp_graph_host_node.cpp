@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include "ggml_qwen4exp_graph_internal.hpp"
+#include "graph_settings_global.hpp"
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
 
@@ -280,7 +281,7 @@ bool qwen4exp_host_node_timing_enabled() {
 } // namespace qwen4exp_graph
 
 extern "C" bool zeromoe_qwen4exp_cpu_offload_coordination_enabled() {
-  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_HOST_NODE");
+  return zeromoe::graphsettings::active_settings().tun.host_node.value != 0;
 }
 
 extern "C" void zeromoe_qwen4exp_host_node_cpu_wait() {

@@ -73,7 +73,7 @@ bool env_layer_timing_enabled() {
 // configured CPU MoE nodes with the fused CPY markers; an unset variable must
 // retain the proven scheduler-split path byte-for-byte.
 bool env_qwen4exp_host_node_enabled() {
-  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_HOST_NODE");
+  return zeromoe::graphsettings::active_settings().tun.host_node.value != 0;
 }
 
 // One-shot diagnostic (2026-09-19): dumps EVERY node the scheduler visits

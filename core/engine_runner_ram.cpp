@@ -3,6 +3,7 @@
 // a former local became an EngineRunner member of the same name.
 #include "engine_runner.hpp"
 #include "graph_config.hpp"
+#include "graph_settings_global.hpp"
 #include "execution_policy.hpp"
 
 #include <limits>
@@ -254,9 +255,8 @@ std::expected<void, std::string> EngineRunner::init_ram_tier() {
       graph_ram_full_layers.push_back(layer);
       // Qwen full-graph CPU layers use compact gate/up/down views; keep the
 // duplicate-free arena layout fixed for all supported Qwen graph layers.
-const char *host_node_env =
-          zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_HOST_NODE");
-      const bool host_node_enabled = host_node_env && host_node_env[0] == '1';
+      const bool host_node_enabled =
+          zeromoe::graphsettings::active_settings().tun.host_node.value != 0;
       // The legacy scheduler CPUOffload path still uses the single-stride
       // runner, so retain its interleaved arena. The opt-in host-node path
       // now supports independent projection strides and can use the compact

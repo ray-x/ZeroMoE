@@ -3,6 +3,7 @@
 #pragma once
 #include <cuda_runtime.h>
 #include "graph_config.hpp"
+#include "graph_settings_global.hpp"
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -935,8 +936,9 @@ public:
             // burns a logical CPU the 12-thread OpenMP team needs, stalling every barrier: measured 18.2 vs 22.6
             // tok/s (+24%) with a blocking wait (see tests/option_b_split_reverify_howto.md section 16). An explicit
             // ZEROMOE_CUDA_SCHEDULE still wins; every other mode keeps Auto.
-            const char * host_node_env = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_HOST_NODE");
-            if ((!schedule_env || !schedule_env[0]) && host_node_env && std::strcmp(host_node_env, "1") == 0)
+            const bool host_node_enabled =
+                zeromoe::graphsettings::active_settings().tun.host_node.value != 0;
+            if ((!schedule_env || !schedule_env[0]) && host_node_enabled)
                 schedule_env = "blocking";
             unsigned schedule_flags = cudaDeviceScheduleAuto;
             const char * schedule_name = "auto";
