@@ -27,6 +27,7 @@ offload_usage_file=
 phase_cache_mib=0
 phase_cache_reserve_mib=512
 pilot_copy=1
+ple_row_cache=1
 prefill_chunk=0
 prefill_min_batch=64
 prefill_offload_min_tokens=256

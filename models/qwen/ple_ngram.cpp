@@ -28,6 +28,7 @@
 
 #include "engine.hpp"
 #include "graph_config.hpp"
+#include "graph_settings_global.hpp"
 #include "dense_dispatch.hpp"
 #include "kquant_dequant.hpp"
 #include "ple_hash.hpp" // the REAL n-gram hash (pure, unit-tested)
@@ -118,8 +119,7 @@ std::atomic<uint64_t> g_ple_row_cache_misses{0};
 
 bool ple_row_cache_enabled() {
   static const bool enabled = [] {
-    const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PLE_ROW_CACHE");
-    return !v || v[0] != '0';
+    return zeromoe::graphsettings::active_settings().tun.ple_row_cache.value != 0;
   }();
   return enabled;
 }
