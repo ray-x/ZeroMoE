@@ -84,7 +84,7 @@ neighbour compiled: **never quote a number without the contamination report** (t
    GiB of MemAvailable; the guard stops at 10).
 5. **A restructured Q2_K kernel** (rows in flight, fewer scalar ops per block): ceiling ~1.6x on the CPU part, realistic far less;
    needs a same-input trace if float summation order changes. Low priority after the failed `ilv2`.
-6. A bigger 3090 expert cache (12.4 -> ~14 GB): +1.5% hot experts, ~1 ms/token, and the arena must still fit. Cheap but tiny.
+6. ~~A bigger 3090 expert cache / 5060 Ti hot set~~ **measured 2026-10-30, closed**: 5060 Ti hot 14.2 -> 15.0 GiB and 3090 cache 12.4 -> 13.4 GB gave 69.7 -> 68.9 ms (-0.8 ms, inside noise); the dense arena still fits with 1 GB more cache.
 
 Not a lever on this box: more CPU threads past 10 (12 gives nothing: DRAM bound), GPU assist, dense trunk on the 5060 Ti (measured
 worse on 2026-10-13).
