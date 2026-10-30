@@ -110,6 +110,9 @@ struct GraphSettings {
   Resolved<std::string> offload_mirror, offload_store, offload_model;
   Resolved<double> offload_ddr_gib;        // < 0 = auto
   Resolved<std::string> offload_usage_file;
+  // Soft pin tier for split expert arenas (decode only): GiB of the last layers'
+  // experts kept in separately freeable buffers so prefill can reclaim them.
+  Resolved<double> soft_pin_gib;
   // Qwen4Exp adaptive expert promotion (docs/design/expert-promotion.md).
   Resolved<long> promo_cap;          // promotions per committed token
   Resolved<long> promo_burst;        // extra promotions per step during the burst window
@@ -252,6 +255,8 @@ inline const std::vector<Field<double>> &real_fields() {
        claims_for(Family::Glm), {}, false},
       {"offload_probation_fraction", ZEROMOE_SETTINGS_REF(tun.offload_probation_fraction), 0.25, Parse::RealOrAuto,
        claims_for(Family::Glm), {}, false},
+      {"soft_pin_gib", ZEROMOE_SETTINGS_REF(tun.soft_pin_gib), 6.0, Parse::RealOrAuto,
+       claims_for(Family::Qwen), {}, false},
   };
   return t;
 }
@@ -364,6 +369,7 @@ inline const char *meaning(const std::string &name) {
       {"offload_model", "GLM/Ling model source used by expert offload."},
       {"offload_ddr_gib", "Host expert offload budget in GiB, or \"auto\". Separate from VRAM and pinned fractions."},
       {"offload_usage_file", "Historical expert-routing counts used to choose the hot set."},
+      {"soft_pin_gib", "GiB of split expert arenas kept in separately freeable soft-pin buffers so prefill can reclaim them; 0 disables. Currently Qwen full-graph decode; intended to generalize to other families."},
       {"promo_cap", "Qwen4Exp adaptive expert promotion: promotions per committed token. Higher values react faster but copy more."},
       {"promo_burst", "Qwen4Exp adaptive expert promotion: extra promotions per step during the burst window at the start of a request."},
       {"promo_min_misses", "Qwen4Exp adaptive expert promotion: misses before an expert becomes a promotion candidate."},

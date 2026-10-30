@@ -1648,10 +1648,7 @@ bool deepseek_v41_full_graph_prepare(StreamingEngine &engine, int S,
   g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(g->device));
   g->cpu = ggml_backend_cpu_init();
   if (g->cpu) {
-    const char *threads =
-        zeromoe::graphcfg::env("ZEROMOE_DEEPSEEK_V41_CPU_THREADS");
-    ggml_backend_cpu_set_n_threads(g->cpu,
-                                   threads ? std::max(1, std::atoi(threads)) : 6);
+    ggml_backend_cpu_set_n_threads(g->cpu, engine.omp_max_threads);
   }
   if (!g->cuda || !g->cpu)
     return false;

@@ -81,7 +81,7 @@ decode default to the graph; placement uses TOML `graph_device_expert_layers` /
 | --- | --- | --- |
 | `ZEROMOE_QWEN_GRAPH_REGISTER` | on for Qwen | Pin (register) the host expert arenas. Pinned copies run at about 10.6 GB/s against about 4.9 GB/s pageable, which cuts the per-request decode setup from about 3.9 s to 2.0 s. Set `0` to keep the arenas pageable, for machines where the pinned budget is too small. `ZEROMOE_QWEN_GRAPH_NO_REGISTER=1` also disables it. |
 | `ZEROMOE_QWEN4EXP_PHASE2_ALLOW_RISKY_ALLOC` | Removed 2026-10-30 | Phase-2 decode now always enforces the free-VRAM estimate plus 768 MiB margin before compact-arena allocation. |
-| `ZEROMOE_QWEN_SOFT_PIN_GIB` | `6` | Size, in GiB, of the expert tier that a prefill can release. Only that tier is re-uploaded after the prefill, so a second request's setup is about 0.4–0.7 s for 700–1,700-token prompts. `0` disables the tier. The tier is capped at half the split payload. |
+| `ZEROMOE_QWEN_SOFT_PIN_GIB` | Removed 2026-10-30 | Use TOML `graph_soft_pin_gib` or `--graph-soft-pin-gib`; default 6 GiB. Size of the expert tier that a prefill can release; `0` disables it. Currently Qwen full-graph decode, intended to generalize. |
 | `ZEROMOE_MEM_GUARD_FLOOR_MB` | 10240 | Experiment-only override for the MemAvailable stop floor (in MB); values below 8192 are ignored. The shipped long-prompt GLM recipe sets 16384, which raises the current 10 GiB default. |
 | `ZEROMOE_DENSE_SCRATCH_RESERVE_MB` | `256` | Reserve, in MB, for dense-layer scratch memory before the VRAM budget checks run. Non-positive or malformed values fall back to 256. Read in `core/attention_layer.cpp`. |
 
