@@ -144,6 +144,21 @@ bool dense_weight_bind(FullGraph &g, ggml_tensor *t,
   if (err != cudaSuccess) {
     LOG_ERROR("[GGML-GLM5NEXT-FULL] dense upload failed name=%s: %s\n",
               name.c_str(), cudaGetErrorString(err));
+    {
+      int dev = -1;
+      cudaGetDevice(&dev);
+      cudaPointerAttributes da{}, sa{};
+      const cudaError_t de = cudaPointerGetAttributes(&da, addr);
+      cudaGetLastError();
+      const cudaError_t se = cudaPointerGetAttributes(&sa, src);
+      cudaGetLastError();
+      LOG_ERROR("[GGML-GLM5NEXT-FULL] dense upload diag: dev=%d src=%p "
+                "src_bytes=%zu dst=%p off=%zu capacity=%zu alloc=%zu "
+                "dst_attr=%s type=%d dev=%d | src_attr=%s type=%d dev=%d\n",
+                dev, src, src_bytes, addr, off, owner->arena.capacity,
+                alloc_size, cudaGetErrorString(de), (int)da.type, da.device,
+                cudaGetErrorString(se), (int)sa.type, sa.device);
+    }
     return false;
   }
   owner->arena.used = off + alloc_size;
@@ -172,6 +187,10 @@ ggml_tensor *resident_tensor(FullGraph &g, ggml_context *ctx,
 ggml_tensor *resident_tensor_uncached(FullGraph &g, ggml_context *ctx,
                                       const std::string &name) {
   const QuantizedTensor *q = resident(*g.engine, name);
+  if (q && !q->host_ptr && graph_dense_weight_name(name))
+    // Host copy was released after an earlier graph uploaded it; read it
+    // from the model file again.
+    return load_full_weight(g, ctx, name, false);
   if (!q || !type_ok(q->meta.type))
     return nullptr;
   std::vector<int64_t> shape;

@@ -2745,20 +2745,16 @@ void test_exl3_mul1_matmul() {
     assert(std::sqrt(quantized_error / std::max(exact_energy, 1e-20)) < 0.03);
 
     const auto predecoded = exl3_mul1_predecode_q8(matrix);
-    assert(predecoded.size() ==
-           static_cast<size_t>(input_features) * output_features);
-    const Exl3Mul1Q8MatrixView q8_matrix{
-        predecoded.data(), suh.data(), svh.data(), bias.data(),
-        input_features, output_features};
+    assert(predecoded.size() == static_cast<size_t>(input_features) * output_features);
+#if defined(__linux__) && defined(__x86_64__)
+    const Exl3Mul1Q8MatrixView q8_matrix{predecoded.data(), suh.data(),     svh.data(),
+                                         bias.data(),       input_features, output_features};
     std::vector<float> q8_output(2 * output_features);
     const Exl3Mul1Q8BatchItem q8_items[] = {
         {q8_matrix, input.data(), q8_output.data()},
-        {q8_matrix, input.data() + input_features,
-         q8_output.data() + output_features}};
-    // The predecoded-Q8 batch is an x86 VNNI kernel with no scalar fallback:
-    // it returns false by design elsewhere, so there is nothing to compare on
-    // arm64 or on an x86 host without AVX-512 VNNI. The predecode itself is
-    // portable and is still checked above.
+        {q8_matrix, input.data() + input_features, q8_output.data() + output_features}};
+    // The predecoded-Q8 batch has no portable fallback. Check the kernel on
+    // Linux x86 with VNNI; the predecode above is checked on every platform.
     if (exl3_cpu_vnni_available()) {
       assert(exl3_mul1_q8_matmul_batch(q8_items, 2));
       double predecoded_error = 0.0;
@@ -2768,6 +2764,7 @@ void test_exl3_mul1_matmul() {
       }
       assert(std::sqrt(predecoded_error / std::max(exact_energy, 1e-20)) < 0.04);
     }
+#endif
 
     std::vector<uint8_t> packed = exl3_mul1_pack_matrix(matrix);
     assert(!packed.empty());

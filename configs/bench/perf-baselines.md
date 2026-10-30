@@ -7,7 +7,42 @@ produced it. Any measurement more than 5% below its baseline is reported to the 
 Hardware: RTX 3090 (24 GB, PCIe Gen3 x16) + RTX 5060 Ti (16 GB, PCIe Gen3 x8), Xeon W-2235, 125 GB RAM, zram swap only.
 Tokens are the engine's own tokenizer counts; prefill figures are the engine's `[PREFILL-DONE]` line.
 
-## GLM-5.3-Flash (AJ IQ2_XXS), dual GPU
+## Model files behind the numbers
+
+Rule: every performance record names its model file (name, quant, size, bits per weight) and the code it ran on. Size, bpw and the
+quant mix are computed from the GGUF headers (`file bytes * 8 / parameters`, parameters from the tensor shapes), not from file names.
+
+### GLM-5.3-Flash: AJ IQ2_XXS vs GSQ-RCO 3.0-bit (verified 2026-10-30)
+
+Both files hold the same model: 313.327 B parameters, 1383 tensors, 45 layers (34 KDA + 11 DSA), 288 experts per MoE layer.
+
+| | AJ IQ2_XXS | GSQ-RCO 3.0-bit |
+|---|---|---|
+| file | `/home/ray/vllm-workspace/GLM-5.3-Flash/GLM-5.3-Flash-AJ-IQ2_XXS-0000{1,2}-of-00002.gguf` (NVMe) | `/data/sda/models/glm53flash/GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf` (SATA SSD) |
+| size | **87.35 GB (81.35 GiB)**, 2 shards | **117.48 GB (109.41 GiB)**, 1 file |
+| average bits per weight | **2.230** | **3.000** |
+| parameters / tensors | 313.327 B / 1383 | 313.327 B / 1383 |
+| experts | IQ2_XXS 91.0%, IQ2_S 6.2% | Q2_K 83.3%, Q3_K 6.9%, Q4_K 6.9% |
+| non-expert tensors | Q6_K 8.63 B params, Q8_0 0.20 B | Q8_0 8.43 B params, BF16 0.32 B |
+| expert bytes | 79.7 GB | 107.2 GB (1.345x) |
+| placement | whole-layer (3090 + CPU), no offload pool | offload pool 88 GiB, 14.2 GiB hot on the 5060 Ti |
+| CPU expert kernel | AVX-512 IQ2_XXS dot (patch 0009) | ggml stock AVX2 Q2_K dot |
+| decode, 3090 + 5060 Ti | **70.1 ms = 14.3 tok/s** | **70.8 ms = 14.1 tok/s** |
+| decode, 3090 only | 6.5-8.5 tok/s (whole-layer) | 10.7 tok/s, needs re-measuring |
+| code the decode number was measured on | 2026-10-15/16: record commit `04994e5` (the 70.1 ms row is dated 10-15, just before it; the exact binary commit was not recorded), `build_native`, ggml fork `~/work/ggml-iq2xxs` + patches 0006-0008, 15.0 GiB hot on the 5060 Ti, `GPU1_MIN_LAYER=31`, AJ-fitted ranking | 2026-10-30: master `b7d6bd1e027c` (binary stamped clean, source snapshot `f3ef9739`), ggml llama.cpp `8baabd53b` + patches 0001-0017 + host-node 0001-0003 (manifest `bc15a892`), 14.2 GiB hot, shipped ranking |
+| **same-binary decode, 3090 + 5060 Ti** (master `b7d6bd1e027c`, same flags, same 6 prompts, 550 decode tokens, 14.2 GiB hot on the 5060 Ti, offload pool 88 GiB, shipped ranking, 2026-10-30) | **75.4 ms = 13.26 tok/s** (mean load 4.8, min 56.2 GiB available) | **70.8 ms = 14.13 tok/s** (mean load 13.1, min 30.8 GiB available) |
+| prefill | 243-272 tok/s (800-5100 token prompts, batched graph prefill) | 20-31 tok/s (20-104 token prompts; not comparable) |
+
+**The "decode, 3090 + 5060 Ti" row was measured on different code for the two files**, so 70.1 vs 70.8 ms is not a controlled comparison (code, ggml,
+hot-set size, placement, prompt and ranking all differ). The controlled row is the "same-binary decode" row: on identical code, flags and prompts AJ
+is **4.6 ms slower** (75.4 vs 70.8 ms, one run each, within about 3 ms run-to-run noise of a tie) although it reads 26% fewer expert bytes; the 70.1 ms
+record is not reproduced on the current code with these prompts (it used one prompt, tokens 16-32, whole-layer placement, a ranking fitted to that
+prompt). The AJ run used the offload pool too (pool 88 holds all of AJ's experts), not the whole-layer placement of the old record. The files are also different models (teacher-forced top-1
+agreement 77%, mean KL 0.35). The GSQ-RCO file reads 34.5% more expert bytes per token; its CPU kernel is a different, less optimised one.
+
+## GLM-5.3-Flash (AJ IQ2_XXS), 3090 + 5060 Ti
+**Model file:** `GLM-5.3-Flash-AJ-IQ2_XXS-0000{1,2}-of-00002.gguf`, IQ2_XXS/IQ2_S experts, 87.35 GB (81.35 GiB), 2.230 bpw. **Code:** record commit `04994e5` (2026-10-16), older ggml fork; see the table above.
+
 
 Config: `configs/testing/glm53flash_AJ_IQ2XXS_spread_offload.toml` (`moe_cache_gb = 15.0`, `context_size = 8192`), recipe env
 `bench/glm_recipe_env.sh` (`CUDA_VISIBLE_DEVICES=0,1`, `GPU1_HOT_GIB=15.0`, `GPU1_MIN_LAYER=31`, `CPU_THREADS=10`, ranking
@@ -26,10 +61,33 @@ Prefetch ring on (2 sets, drain, chunk 2), DDR pool 60-76 GiB, batch default 204
 | decode, tokens 16-32 | 70.1 ms/token | 2026-10-15 | `moe_cache_gb` 15.8 -> 15.0: 70.7 (+0.9%) |
 | prefill, before this work | 159 tok/s (5.05 s) | 2026-10-14 | for the record |
 
+## GLM-5.3-Flash (GSQ-RCO 3.0-bit, Q2_K/Q3_K/Q4_K), offload pool 88 GiB, 0 SSD misses
+**Model file:** `GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf`, Q2_K/Q3_K/Q4_K experts, 117.48 GB (109.41 GiB), 3.000 bpw. **Code (version hash):** master `b7d6bd1e027c` (clean stamp) for the 2026-10-30 rows; the 2026-10-29 rows ran on branch builds `ce4c313` / `58c1ab9` (`glm-lane-diag`, same GLM code plus the since-removed dense host-copy release), ggml `8baabd53b` + patches 0001-0017 + host-node 0001-0003 throughout.
+
+
+Config and recipe: `docs/models/glm53-flash.md` (GSQ-RCO section). 100 tokens, `--temp 0`, palindrome prompt; steady decode =
+tokens 21-99 `FULL-DECODE-TIME`. Box load 12-14 from other jobs during the runs (slight underestimate). Branch commit `58c1ab9`.
+
+| metric | baseline | date | notes |
+|---|---|---|---|
+| decode, 3090 + 5060 Ti (14.2 GiB hot), 10 decode threads | **70.5-71.1 ms/token = 14.1-14.2 tok/s** | 2026-10-29 | lane wait 21 + compute 39 ms; 3 runs |
+| decode, same, via `bench/glm_gsqrco_pool.sh` (6 attempts) | **70.8 ms = 14.12-14.13 tok/s** (2 runs); 72.3 / 76.4 ms = 13.8 / 13.1 (neighbour compile + python at the same time); 85.7 ms = 11.7 (heavy compile); 1 crash | 2026-10-29 | the shared host makes single runs noisy: quote the best clean run and the spread. Crash: `cudaMemcpyAsync ... invalid argument` in `ggml_backend_cuda_buffer_set_tensor` right after prefill (open, see docs/models/glm53-flash.md) |
+| decode, same, 6 threads | 76.9 ms = 13.0 tok/s | 2026-10-29 | |
+| decode, same + K-quant GPU assist | 90.7 ms = 11.0 tok/s | 2026-10-29 | worse, assist off |
+| decode, 3090 only, 6 threads | 93.8 ms = 10.7 tok/s | 2026-10-29 | 15.7 GiB MemAvailable minimum |
+| decode, 3090 + 5060 Ti, 6 pilot prompts, current ranking (A) | 70.8 ms = 14.13 tok/s (550 tokens) | 2026-10-30 | fixed binary (master `b7d6bd1`), full-graph prefill on, box otherwise quiet (`python` only) |
+| decode, same prompts, ranking = base + the GSQ-RCO pilot counts (B) | **63.1 ms = 15.84 tok/s** (+11%) | 2026-10-30 | **IN-SAMPLE**: the ranking was built from these same 6 prompts, so this is an upper bound for unseen prompts, not a general result. Cold routes 54% -> ~41% (offline model predicted ~61 ms). `GLM_RANKING=<mix file>` in the launcher; file built by `bench/make_mix_ranking.py` from `docs/ssd-offload/data/glm53flash_gsqrco_pilot6_usage_decode.txt` |
+| decode, 3090 + 5060 Ti, 6 pilot prompts, resident-expert headroom (550 tokens, shipped ranking, 3 clean runs, 0 contaminated samples each; master `b7d6bd1e027c`) | baseline 14.2 GiB hot on the 5060 Ti + 12.4 GB 3090 cache: **69.7 ms = 14.35 tok/s**; 15.0 GiB hot: 70.1 ms = 14.26 tok/s; 15.0 GiB hot + 13.4 GB 3090 cache: 68.9 ms = 14.51 tok/s | 2026-10-30 | **no measurable gain** (best case -0.8 ms, inside run-to-run noise): about +3% resident experts do not move decode. An earlier attempt at the same three configurations was discarded: a neighbour's CUDA compile overlapped every run and moved the baseline itself from 70.8 to 75.1 ms |
+| decode, 3090 + 5060 Ti, 6 pilot prompts, Q2_K dot **stock AVX2 vs AVX512-VNNI two-blocks-in-flight** (550 tokens, same binary master `b7d6bd1e027c`, private libggml-cpu built twice from one source tree with identical flags, 4 clean runs, 0 contaminated samples) | stock 69.0 / 69.4 ms (14.48 / 14.41 tok/s); patched 70.9 / 71.2 ms (14.10 / 14.04 tok/s) | 2026-10-30 | **no gain, 1.9 ms slower** (alternating stock, patched, stock, patched; stopped after two rounds). The kernel is bit-exact and 1.11x faster in the standalone microbenchmark (`bench/q2k_dot_bench.cpp`), but not in the engine, consistent with the lane being bound by memory access and thread sync rather than the dot's instruction count; other agents saw no gain from AVX/VNNI Q2_K either. Not adopted |
+| Q2_K x Q8_K CPU dot, stock AVX2 vs 512-bit (`bench/q2k_dot_bench.cpp`) | 8.3 vs 8.2 GB/s (1 thread), 30.0 vs 29.9 (6), 37.5 vs 38.1 (10); bit-exact | 2026-10-29 | no gain from a wider kernel; DRAM read limit on this box is ~60 GB/s (6-12 threads), the dot reaches ~63% of it |
+| decode, 3090 only, pool 80 | 190 ms = 5.3 tok/s (5.8 with assist) | 2026-10-29 | ~2 SSD misses/token |
+
 ## Qwen 3.8 Flash Next (GSQ-RCO Q2_0), single 3090, plain decode and MTP (v0.0.1 baseline)
+**Model file:** `Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-0000{1,2}-of-00002.gguf` (`/home/ray/vllm-workspace/qwen3.8-flash-next/Q2_0/`), Q2_0 experts (68.3% of 176.944 B params), IQ4_NL non-expert (28.9%), 66.42 GB (61.86 GiB), 3.003 bpw. MTP draft: `mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf` (1.9 GB).
+
 
 Config: `configs/bench/qwen38-flash-q2_0-mtp.toml` (global Option-B hot set of 13,000 experts, `expert_promotion = "on"`, context 1536; the plain rows set `spec_type = "none"`
-and drop the MTP keys), `CUDA_VISIBLE_DEVICES=0`, 6-thread graph CPU team (the default), 10 OpenMP threads, MTP draft Q4_K_M checkpoint with 3 draft tokens. Source `ea2b200`
+and drop the MTP keys), `CUDA_VISIBLE_DEVICES=0`, 6-thread graph CPU team (the default), 10 OpenMP threads, MTP draft Q4_K_M checkpoint with 3 draft tokens. Source `ea2b200` (tag `v0.0.1` = `40b83bf`)
 (master `197cdfa` + `swap-b`, plus two compile fixes to master), ggml `8baabd53b` + `patches/ggml` 0001-0017 + `patches/ggml-host-node`, CUDA 13.3, driver 610.57.04, sm_86, GCC 16.2. Measured 2026-10-28, tok/s.
 Artifacts (exact TOML, prompts, command, stdout, engine logs, manifest): `build_mtp_results/2026-10-28-ea2b200-mtp-suite/ (MTP), 2026-10-28-ea2b200-plain-suite/ (plain); the same suites on the previous build are in 2026-10-28-1950bee-*-suite/, and 2026-10-28-1950bee-mtp-suite-promotion-off/ is an invalid first attempt kept for the record`.
 
@@ -52,6 +110,8 @@ Without promotion (the old default, `qwen4exp_expert_promotion = "off"`; pass 1 
 +4% (leetcode) to +104% (story): +7% palindrome, +19% review, +39% B-tree, +61% math. The key is now `expert_promotion` and defaults to `auto`: on when MTP is on, off otherwise (plain decode needs `"on"` to reproduce the plain rows above).
 
 ## Qwen 3.8 Flash (UD-IQ1_M), single 3090
+**Model file:** `Qwen3.8-Flash-Next-UD-IQ1_M-0000{1,2,3}-of-00003.gguf` (`/home/ray/vllm-workspace/qwen3.8-flash-next/UD-IQ1_M/`), experts IQ4_NL/IQ1_M/IQ2_XXS (22.8% of 176.944 B params each), IQ4_NL non-expert (28.9%), 74.54 GB (69.42 GiB), **3.370 bpw** by the header count (older notes say 1.75 bpw, which is not the file average).
+
 
 Config: `configs/testing/qwen4exp_3090_only.toml` (`moe_cache_gb = 11.5`, `context_size = 8192`), env as in the Qwen decode
 harness: `ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ..._FULL_GRAPH_DECODE=1 ..._GRAPH_PRELOAD_LAYERS=0 ..._GRAPH_PRELOAD_TRAILING=1

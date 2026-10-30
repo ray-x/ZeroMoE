@@ -89,6 +89,22 @@ ggml_tensor *load_full_weight(FullGraph &g, ggml_context *ctx,
       MemoryGuard::release_host_bytes(required);
   } else if (dense_weight) {
     ok = dense_weight_bind(g, t, name, p, bytes);
+    if (ok) {
+      // The dense owner now holds the weight on the device; the DDR read
+      // buffer would only stay resident (~9 GiB for GSQ-RCO) beside the
+      // offload pool.
+      for (size_t i = g.owned.size(); i-- > 0;) {
+        if (g.owned[i].ptr != p)
+          continue;
+        MemoryGuard::release_host_bytes(g.owned[i].reservation_bytes);
+        std::free(p);
+        g.owned.erase(g.owned.begin() + (std::ptrdiff_t)i);
+        break;
+      }
+      g.host_weight_bytes += bytes;
+      ggml_set_name(t, name.c_str());
+      return t;
+    }
   } else {
     ok = bind_host(g, t, p, required, GGML_BACKEND_BUFFER_USAGE_WEIGHTS) !=
          nullptr;

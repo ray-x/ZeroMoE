@@ -271,9 +271,11 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(g->device));
   g->cpu = ggml_backend_cpu_init();
   if (g->cpu) {
-    // The same --threads value controls graph CPU workers for every family.
-    ggml_backend_cpu_set_n_threads(
-        g->cpu, engine.omp_max_threads);
+    // Decode follows the shared --threads limit. Prefill keeps the measured
+    // six-worker cap: ten prefill threads grew anonymous memory by ~16 GiB
+    // after pool seeding and tripped the memory watchdog on the 12-core box.
+    const int prefill_threads = std::min(engine.omp_max_threads, 6);
+    ggml_backend_cpu_set_n_threads(g->cpu, prefill_threads);
   }
   if (!g->cuda || !g->cpu)
     return false;

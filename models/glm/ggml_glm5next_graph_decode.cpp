@@ -200,6 +200,7 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(g->device));
   g->cpu = ggml_backend_cpu_init();
   if (g->cpu) {
+    // The shared --threads limit controls the decode lane's CPU workers.
     ggml_backend_cpu_set_n_threads(
         g->cpu, engine.omp_max_threads);
   }

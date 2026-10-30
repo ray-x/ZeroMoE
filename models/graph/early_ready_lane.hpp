@@ -12,6 +12,9 @@
 // Owned by the graph builder of whichever model uses it (Qwen4Exp Option-B,
 // GLM5NEXT SSD offload). Optional extras (next-layer prediction, VRAM staging)
 // are Qwen-only and left null elsewhere.
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
 #include "cuda_raii.hpp"
 #include "nvtx_range.hpp"
 #include "graph_config.hpp"
@@ -527,6 +530,41 @@ struct EarlyReadyLane {
     return strategy->state(inv) == zeromoe::graph::ColdMoEStrategy::State::Ready;
   }
 
+  // Failure path of the router-weight check in run(): says whether the non-finite weight was already on the device
+  // (the input hidden state is then usually non-finite too, i.e. an earlier layer produced NaN/Inf) or only a stale
+  // read of the pinned buffer (finite after a full stream sync), then aborts.
+  [[noreturn]] void report_nonfinite_weights(int bad, int n_rows) {
+    size_t input_bad = 0;
+    float lo = 0.0f, hi = 0.0f;
+    bool seen = false;
+    const size_t n_in = static_cast<size_t>(d) * n_tok;
+    for (size_t j = 0; j < n_in; ++j) {
+      const float v = input[j];
+      if (!std::isfinite(v)) { ++input_bad; continue; }
+      if (!seen) { lo = hi = v; seen = true; }
+      lo = std::min(lo, v);
+      hi = std::max(hi, v);
+    }
+    std::fprintf(stderr,
+                 "[EARLY-READY-DIAG] non-finite router weight: layer=%d call=%llu n_tok=%d k=%d row=%d/%d "
+                 "position=%d expected_pos=%d\n",
+                 trace_layer, static_cast<unsigned long long>(calls), n_tok, k, bad, n_rows, *position, expected_pos);
+    std::fprintf(stderr, "[EARLY-READY-DIAG] input hidden state: %zu/%zu non-finite, finite range [%g, %g]\n", input_bad,
+                 n_in, lo, hi);
+    std::fprintf(stderr, "[EARLY-READY-DIAG] weights as read:");
+    for (int i = 0; i < std::min(n_rows, 24); ++i) std::fprintf(stderr, " %g", weights[i]);
+    std::fprintf(stderr, "\n[EARLY-READY-DIAG] ids as read:");
+    for (int i = 0; i < std::min(n_rows, 24); ++i) std::fprintf(stderr, " %d", ids[i]);
+    std::fprintf(stderr, "\n");
+    const cudaError_t sync = producer_stream ? cudaStreamSynchronize(producer_stream) : cudaSuccess;
+    std::fprintf(stderr, "[EARLY-READY-DIAG] full stream sync: %s; weight[%d] after sync = %g (%s)\n",
+                 cudaGetErrorString(sync), bad, weights[bad],
+                 std::isfinite(weights[bad]) ? "FINITE: the read was too early (race)" : "still non-finite: it is on the device");
+    std::fflush(stderr);
+    GGML_ABORT("early-ready router weight is not finite (layer %d, call %llu)", trace_layer,
+               static_cast<unsigned long long>(calls));
+  }
+
   void run() {
     GGML_ASSERT(!completed);
     ZE_NVTX("lane.run");
@@ -564,7 +602,7 @@ struct EarlyReadyLane {
     const int n_rows = k * n_tok;
     for (int i = 0; i < n_rows; ++i) {
       GGML_ASSERT(ids[i] >= 0 && ids[i] < n_experts);
-      GGML_ASSERT(std::isfinite(weights[i]));
+      if (!std::isfinite(weights[i])) report_nonfinite_weights(i, n_rows);
       cold_count += cpu_mask[ids[i]] != 0.0f;
     }
     const cudaError_t tail = cudaStreamQuery(producer_stream);
