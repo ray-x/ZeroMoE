@@ -7,30 +7,38 @@ produced it. Any measurement more than 5% below its baseline is reported to the 
 Hardware: RTX 3090 (24 GB, PCIe Gen3 x16) + RTX 5060 Ti (16 GB, PCIe Gen3 x8), Xeon W-2235, 125 GB RAM, zram swap only.
 Tokens are the engine's own tokenizer counts; prefill figures are the engine's `[PREFILL-DONE]` line.
 
-## GLM-5.3-Flash model files compared (verified from the GGUF headers, 2026-10-30)
+## Model files behind the numbers
 
-Both files hold the same model: 313.327 B parameters, 1383 tensors, 45 layers (34 KDA + 11 DSA), 288 experts per MoE layer. Size and
-bits per weight were computed from the files themselves (`bytes * 8 / parameters` from the tensor shapes).
+Rule: every performance record names its model file (name, quant, size, bits per weight) and the code it ran on. Size, bpw and the
+quant mix are computed from the GGUF headers (`file bytes * 8 / parameters`, parameters from the tensor shapes), not from file names.
+
+### GLM-5.3-Flash: AJ IQ2_XXS vs GSQ-RCO 3.0-bit (verified 2026-10-30)
+
+Both files hold the same model: 313.327 B parameters, 1383 tensors, 45 layers (34 KDA + 11 DSA), 288 experts per MoE layer.
 
 | | AJ IQ2_XXS | GSQ-RCO 3.0-bit |
 |---|---|---|
-| file | `GLM-5.3-Flash-AJ-IQ2_XXS-0000{1,2}-of-00002.gguf` | `GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf` |
-| size | **87.35 GB = 81.35 GiB** (2 shards, 87,346,006,560 B) | **117.48 GB = 109.41 GiB** (1 file, 117,481,680,096 B) |
+| file | `/home/ray/vllm-workspace/GLM-5.3-Flash/GLM-5.3-Flash-AJ-IQ2_XXS-0000{1,2}-of-00002.gguf` (NVMe) | `/data/sda/models/glm53flash/GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf` (SATA SSD) |
+| size | **87.35 GB (81.35 GiB)**, 2 shards | **117.48 GB (109.41 GiB)**, 1 file |
 | average bits per weight | **2.230** | **3.000** |
-| routed experts | IQ2_XXS 285.1 B params (91.0%) + IQ2_S 19.3 B (6.2%) | Q2_K 260.9 B (83.3%) + Q3_K 21.7 B (6.9%) + Q4_K 21.7 B (6.9%) |
-| non-expert tensors | Q6_K 8.63 B (embedding + head), Q8_0 0.20 B | Q8_0 8.43 B, BF16 0.32 B |
-| expert bytes | 79.7 GB | 107.2 GB (**1.345x**, same ratio as the whole file) |
-| placement on this box | whole-layer (3090 + CPU), no offload pool | offload pool of 88 GiB (cold set), 14.2 GiB of hot experts on the 5060 Ti |
+| parameters / tensors | 313.327 B / 1383 | 313.327 B / 1383 |
+| experts | IQ2_XXS 91.0%, IQ2_S 6.2% | Q2_K 83.3%, Q3_K 6.9%, Q4_K 6.9% |
+| non-expert tensors | Q6_K 8.63 B params, Q8_0 0.20 B | Q8_0 8.43 B params, BF16 0.32 B |
+| expert bytes | 79.7 GB | 107.2 GB (1.345x) |
+| placement | whole-layer (3090 + CPU), no offload pool | offload pool 88 GiB, 14.2 GiB hot on the 5060 Ti |
 | CPU expert kernel | AVX-512 IQ2_XXS dot (patch 0009) | ggml stock AVX2 Q2_K dot |
-| decode, dual GPU | **70.1 ms/token = 14.3 tok/s** (2026-10-15, below) | **70.8 ms/token = 14.1 tok/s** (2026-10-30, section after next) |
-| decode, 3090 only | 6.5-8.5 tok/s whole-layer (7.26 documented, `docs/GLM5.3-Flash-baseline.md`) | 10.7 tok/s at pool 88 (2026-10-29, measured with the since-removed host-copy release; **needs re-measuring**, see `docs/models/glm53-flash.md`) |
-| prefill | 243-272 tok/s on 800-5100 token prompts (batched graph prefill, 2026-10-15/16) | 20-31 tok/s on 20-104 token prompts (2026-10-30; short prompts, not comparable) |
-| the two are not the same model | | teacher-forced top-1 agreement with AJ 77%, mean KL 0.35 (handoff doc of 2026-10-11) |
+| decode, dual GPU | **70.1 ms = 14.3 tok/s** | **70.8 ms = 14.1 tok/s** |
+| decode, 3090 only | 6.5-8.5 tok/s (whole-layer) | 10.7 tok/s, needs re-measuring |
+| code the decode number was measured on | 2026-10-15/16, `build_native`, ggml fork `~/work/ggml-iq2xxs` + patches 0006-0008, 15.0 GiB hot on the 5060 Ti, `GPU1_MIN_LAYER=31`, AJ-fitted ranking | 2026-10-30, master `b7d6bd1`, ggml `8baabd53b` + patches 0001-0017, 14.2 GiB hot, shipped ranking |
+| prefill | 243-272 tok/s (800-5100 token prompts, batched graph prefill) | 20-31 tok/s (20-104 token prompts; not comparable) |
 
-The GSQ-RCO file reads 34.5% more expert bytes per token and still decodes at the same dual-GPU speed, because its experts are a different
-quant with a different CPU kernel (IQ2_XXS has the AVX-512 patch, Q2_K runs ggml's stock path), so per-byte efficiency differs.
+**The two decode columns were measured on different code**, so 70.1 vs 70.8 ms is not a controlled comparison (code, ggml, hot-set size and
+ranking all differ). A same-binary AJ run is recorded below when it finishes. The files are also different models (teacher-forced top-1
+agreement 77%, mean KL 0.35). The GSQ-RCO file reads 34.5% more expert bytes per token; its CPU kernel is a different, less optimised one.
 
 ## GLM-5.3-Flash (AJ IQ2_XXS), dual GPU
+**Model file:** `GLM-5.3-Flash-AJ-IQ2_XXS-0000{1,2}-of-00002.gguf`, IQ2_XXS/IQ2_S experts, 87.35 GB (81.35 GiB), 2.230 bpw. **Code:** older (2026-10-15/16), see the table above.
+
 
 Config: `configs/testing/glm53flash_AJ_IQ2XXS_spread_offload.toml` (`moe_cache_gb = 15.0`, `context_size = 8192`), recipe env
 `bench/glm_recipe_env.sh` (`CUDA_VISIBLE_DEVICES=0,1`, `GPU1_HOT_GIB=15.0`, `GPU1_MIN_LAYER=31`, `CPU_THREADS=10`, ranking
@@ -50,6 +58,8 @@ Prefetch ring on (2 sets, drain, chunk 2), DDR pool 60-76 GiB, batch default 204
 | prefill, before this work | 159 tok/s (5.05 s) | 2026-10-14 | for the record |
 
 ## GLM-5.3-Flash (GSQ-RCO 3.0-bit, Q2_K/Q3_K/Q4_K), offload pool 88 GiB, 0 SSD misses
+**Model file:** `GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf`, Q2_K/Q3_K/Q4_K experts, 117.48 GB (109.41 GiB), 3.000 bpw. **Code:** master `b7d6bd1` and later (earlier rows: branch builds of 2026-10-29, noted per row).
+
 
 Config and recipe: `docs/models/glm53-flash.md` (GSQ-RCO section). 100 tokens, `--temp 0`, palindrome prompt; steady decode =
 tokens 21-99 `FULL-DECODE-TIME`. Box load 12-14 from other jobs during the runs (slight underestimate). Branch commit `58c1ab9`.
@@ -67,6 +77,8 @@ tokens 21-99 `FULL-DECODE-TIME`. Box load 12-14 from other jobs during the runs 
 | decode, 3090 only, pool 80 | 190 ms = 5.3 tok/s (5.8 with assist) | 2026-10-29 | ~2 SSD misses/token |
 
 ## Qwen 3.8 Flash Next (GSQ-RCO Q2_0), single 3090, plain decode and MTP (v0.0.1 baseline)
+**Model file:** `Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-0000{1,2}-of-00002.gguf` (`/home/ray/vllm-workspace/qwen3.8-flash-next/Q2_0/`), Q2_0 experts (68.3% of 176.944 B params), IQ4_NL non-expert (28.9%), 66.42 GB (61.86 GiB), 3.003 bpw. MTP draft: `mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf` (1.9 GB).
+
 
 Config: `configs/bench/qwen38-flash-q2_0-mtp.toml` (global Option-B hot set of 13,000 experts, `expert_promotion = "on"`, context 1536; the plain rows set `spec_type = "none"`
 and drop the MTP keys), `CUDA_VISIBLE_DEVICES=0`, 6-thread graph CPU team (the default), 10 OpenMP threads, MTP draft Q4_K_M checkpoint with 3 draft tokens. Source `ea2b200`
@@ -92,6 +104,8 @@ Without promotion (the old default, `qwen4exp_expert_promotion = "off"`; pass 1 
 +4% (leetcode) to +104% (story): +7% palindrome, +19% review, +39% B-tree, +61% math. The key is now `expert_promotion` and defaults to `auto`: on when MTP is on, off otherwise (plain decode needs `"on"` to reproduce the plain rows above).
 
 ## Qwen 3.8 Flash (UD-IQ1_M), single 3090
+**Model file:** `Qwen3.8-Flash-Next-UD-IQ1_M-0000{1,2,3}-of-00003.gguf` (`/home/ray/vllm-workspace/qwen3.8-flash-next/UD-IQ1_M/`), experts IQ4_NL/IQ1_M/IQ2_XXS (22.8% of 176.944 B params each), IQ4_NL non-expert (28.9%), 74.54 GB (69.42 GiB), **3.370 bpw** by the header count (older notes say 1.75 bpw, which is not the file average).
+
 
 Config: `configs/testing/qwen4exp_3090_only.toml` (`moe_cache_gb = 11.5`, `context_size = 8192`), env as in the Qwen decode
 harness: `ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ..._FULL_GRAPH_DECODE=1 ..._GRAPH_PRELOAD_LAYERS=0 ..._GRAPH_PRELOAD_TRAILING=1
