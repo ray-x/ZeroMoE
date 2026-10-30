@@ -28,7 +28,7 @@ Both files hold the same model: 313.327 B parameters, 1383 tensors, 45 layers (3
 | placement | whole-layer (3090 + CPU), no offload pool | offload pool 88 GiB, 14.2 GiB hot on the 5060 Ti |
 | CPU expert kernel | AVX-512 IQ2_XXS dot (patch 0009) | ggml stock AVX2 Q2_K dot |
 | decode, 3090 + 5060 Ti | **70.1 ms = 14.3 tok/s** | **70.8 ms = 14.1 tok/s** |
-| decode, 3090 only | 6.5-8.5 tok/s (whole-layer) | 10.7 tok/s, needs re-measuring |
+| decode, 3090 only | 6.5-8.5 tok/s (whole-layer) | 10.7 tok/s (2026-10-29, with the since-removed release; **not re-measured cleanly**: pool 84 runs of 2026-10-30 were contaminated by compile load, 9.42 and 8.11 tok/s, invalid) |
 | code the decode number was measured on | 2026-10-15/16: record commit `04994e5` (the 70.1 ms row is dated 10-15, just before it; the exact binary commit was not recorded), `build_native`, ggml fork `~/work/ggml-iq2xxs` + patches 0006-0008, 15.0 GiB hot on the 5060 Ti, `GPU1_MIN_LAYER=31`, AJ-fitted ranking | 2026-10-30: master `b7d6bd1e027c` (binary stamped clean, source snapshot `f3ef9739`), ggml llama.cpp `8baabd53b` + patches 0001-0017 + host-node 0001-0003 (manifest `bc15a892`), 14.2 GiB hot, shipped ranking |
 | **same-binary decode, 3090 + 5060 Ti** (master `b7d6bd1e027c`, same flags, same 6 prompts, 550 decode tokens, 14.2 GiB hot on the 5060 Ti, offload pool 88 GiB, shipped ranking, 2026-10-30) | **75.4 ms = 13.26 tok/s** (mean load 4.8, min 56.2 GiB available) | **70.8 ms = 14.13 tok/s** (mean load 13.1, min 30.8 GiB available) |
 | prefill | 243-272 tok/s (800-5100 token prompts, batched graph prefill) | 20-31 tok/s (20-104 token prompts; not comparable) |

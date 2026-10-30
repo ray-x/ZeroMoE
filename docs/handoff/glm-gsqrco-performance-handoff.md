@@ -13,7 +13,7 @@ comparison with the AJ IQ2_XXS file (87.35 GB, 2.230 bpw): `configs/bench/perf-b
 | shipped settings, clean runs, 6 pilot prompts, 550 tokens | **69.0-70.9 ms = 14.1-14.5 tok/s** | best clean run 68.9 ms (14.51); first-session single prompt 70.5-71.1 ms |
 | shipped + ranking matched to the pilot prompts | 63.1 ms = 15.84 tok/s | **in-sample** (ranking built from the same 6 prompts): an upper bound, not a general gain |
 | AJ IQ2_XXS, same binary, same prompts | 75.4 ms = 13.26 tok/s | the 70.1 ms record of 2026-10-15 was a different binary, prompt and placement and is not reproduced |
-| 3090 only | not re-measured (the 10.7 tok/s of 2026-10-29 needs a smaller pool or more memory than is safe, see the GLM page); pool 84 gave 9.42 tok/s in one run contaminated by compile load, min 20.7 GiB available | pending |
+| 3090 only | not re-measured (the 10.7 tok/s of 2026-10-29 needs a smaller pool or more memory than is safe, see the GLM page); two pool-84 runs (about 1 SSD miss per token) gave 9.42 and 8.11 tok/s but both were contaminated by compile load (63 and 711 samples): **no valid 3090-only speed**; memory is valid: min 19.6-20.7 GiB available at pool 84, so pool 88 should leave ~15 GiB | not re-run by decision |
 
 **Changes on master from this work**
 - decode CPU lane 10 threads by default; prefill thread count independent (6); pool 88 GiB recipe, config `configs/bench/glm53flash_gsqrco_offload_pool.toml`, launcher
