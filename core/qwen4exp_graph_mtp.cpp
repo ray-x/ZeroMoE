@@ -346,8 +346,8 @@ bool qwen4exp_graph_mtp_run(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
   // build (which needs a safety floor of free VRAM), the build is declined, and
   // the target silently runs in a different configuration with different
   // numerics. Build it now, exactly as the ordinary loop does before step 0.
-  const char *window_env = std::getenv("ZEROMOE_QWEN4EXP_MTP_WINDOW");
-  const bool use_window = !(window_env && window_env[0] == '0') && max_draft >= 1 &&
+  const bool use_window = zeromoe::graphsettings::active_settings().tun.mtp_window.value != 0 &&
+                          max_draft >= 1 &&
                           max_draft + 1 <= 8 &&
                           engine.family_ops.family == ModelFamily::Qwen4Exp;
   const int window = use_window ? max_draft + 1 : 1;

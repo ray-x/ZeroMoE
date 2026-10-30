@@ -139,6 +139,7 @@ struct GraphSettings {
   Resolved<long> adaptive_policy;
   Resolved<long> prefill_device_state;
   Resolved<long> host_node;
+  Resolved<long> mtp_window;
   Resolved<long> outproj_gpu;
   Resolved<long> native_f32_graph;
   Resolved<long> decode_gpu_hc;
@@ -303,6 +304,8 @@ inline const std::vector<Field<long>> &long_fields() {
       {"prefill_device_state", ZEROMOE_SETTINGS_REF(tun.prefill_device_state), 1, Parse::FlagUnlessOff,
        claims_for(F::Qwen), {}, false},
       {"host_node", ZEROMOE_SETTINGS_REF(tun.host_node), 0, Parse::FlagOn,
+       claims_for(F::Qwen), {}, false},
+      {"mtp_window", ZEROMOE_SETTINGS_REF(tun.mtp_window), 1, Parse::FlagUnlessOff,
        claims_for(F::Qwen), {}, false},
       {"outproj_gpu", ZEROMOE_SETTINGS_REF(tun.outproj_gpu), 1, Parse::FlagUnlessOff,
        claims_for(Family::Other), {}, false},
@@ -503,6 +506,7 @@ inline const char *meaning(const std::string &name) {
       {"adaptive_policy", "Qwen adaptive completion policy (default off)."},
       {"prefill_device_state", "Qwen prefill device-state inputs (on unless set to 0)."},
       {"host_node", "Qwen host-node mode (default off)."},
+      {"mtp_window", "Qwen graph-native MTP multi-token window (on unless set to 0)."},
       {"outproj_gpu", "DeepSeek V4.1 grouped out-projection on GPU (on unless set to 0)."},
       {"native_f32_graph", "DeepSeek V4.1 native F32 graph precision mode (default off)."},
       {"decode_gpu_hc", "DeepSeek V4.1 decode hyper-connections on GPU (on unless set to 0)."},

@@ -20,6 +20,7 @@ gpu_prefill=0
 host_node=0
 lane_with_gpu1=1
 mtp_prefill_overlap=0
+mtp_window=1
 native_f32_graph=0
 offload_async=0
 offload_byte_cap=0
