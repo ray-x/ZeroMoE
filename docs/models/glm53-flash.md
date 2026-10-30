@@ -133,8 +133,9 @@ Gotchas:
   (the layered prefill and the legacy logits path read `attn_k_b`/`attn_v_b`/`output.weight` from host memory: zeroed attention, zero
   logits, output `!`); the benchmarks sent one prompt per session, so it went unnoticed until a 6-prompt session failed on prompt 2.
   With the copies kept, expect about 8.7 GiB lower MemAvailable than the figures below: 3090 + 5060 Ti at pool 88 about 17-21 GiB (above the
-  10 GiB guard), 3090 only pool 88 about 7 GiB (**below the guard: the 10.7 tok/s 3090-only figure needs a smaller pool or a graph-only
-  prefill; not re-measured**). Any change that frees host memory must be validated with a session of at least two prompts.
+  10 GiB guard), 3090 only: **measured 19.6 and 20.7 GiB minimum MemAvailable at pool 84** with the host copies kept (two runs, 2026-10-30), so pool 88 should leave
+  about 15 GiB (above the guard); my earlier estimate of 7 GiB was wrong. Pool 88 on the 3090 alone was not run again after the release was removed, and the two
+  pool-84 decode figures (9.42 and 8.11 tok/s, about 1 SSD miss per token) were taken under heavy compile load (63 and 711 contaminated samples), so they are not valid speeds. Any change that frees host memory must be validated with a session of at least two prompts.
 - Pool 88 peaks at ~104 GiB anonymous memory on the 3090-only run (15.7 GiB available, guard 10 GiB) and ~89-92 GiB with the
   5060 Ti holding 14.2 GiB of experts (29 GiB available). Run it only on a quiet box: another job using ~10 GiB trips the
   watchdog. Skipping the dense host copies at startup does NOT work: the layer-by-layer prefill builds its MLA caches from

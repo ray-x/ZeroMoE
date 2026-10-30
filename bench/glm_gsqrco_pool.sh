@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # GLM-5.3-Flash GSQ-RCO offload-pool run (the config behind the 14.1-14.2 tok/s dual-GPU baseline).
 #   usage: bench/glm_gsqrco_pool.sh TAG [POOL_GIB=88] [prompt-file]     run from the repo root
-#   extra: MOE_CACHE_GB (3090 expert cache GB)  GLM_RANKING (usage file for every hot-set/seeding decision)  ZEROMOE_BIN (engine binary, default ./build/zeromoe)  NGEN (tokens per prompt, default 100)  GLM_EXTRA_TOML (lines added to the
+#   extra: GLM_EXTRA_ARGS (more engine arguments, e.g. --raw-prompt)  MOE_CACHE_GB (3090 expert cache GB)  GLM_RANKING (usage file for every hot-set/seeding decision)  ZEROMOE_BIN (engine binary, default ./build/zeromoe)  NGEN (tokens per prompt, default 100)  GLM_EXTRA_TOML (lines added to the
 #          root of the config)  GLM_EXTRA_ENV (VAR=val ... for the engine)  a prompt file may hold several lines (one prompt each)
 #   env:   GLM_MODEL=/path/to/GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf (required)   CVD=0,1 (default; 0 = 3090 only)   GPU1_HOT_GIB=14.2   CPUT (decode CPU threads, default 10)   PREFILL_THREADS=6
 # Refuses to start unless the GPUs are idle, no other model run is active, the load average is under 3 and 100 GiB are free:
@@ -42,7 +42,7 @@ ENVV="LD_PRELOAD=$TAG.abort_bt.so CUDA_LOG_FILE=$TAG.cudalog CUDA_VISIBLE_DEVICE
 [ "$CVD" = "0" ] || ENVV="$ENVV ZEROMOE_GLM5NEXT_GPU1_HOT_GIB=$HOT"
 [ -z "${CPUT:-}" ] || ENVV="$ENVV ZEROMOE_GLM5NEXT_CPU_THREADS=$CPUT"
 [ -z "${GLM_EXTRA_ENV:-}" ] || ENVV="$ENVV $GLM_EXTRA_ENV"
-nohup bash -c "$ENVV timeout 2400 scripts/run_capped.sh --limit-gb 118 -- $BIN --config $TAG.toml --temp 0 --predict $NGEN \
+nohup bash -c "$ENVV timeout 2400 scripts/run_capped.sh --limit-gb 118 -- $BIN --config $TAG.toml --temp 0 --predict $NGEN ${GLM_EXTRA_ARGS:-} \
   --force-start --graph-offload-usage-file $RANK < $TAG.in > $TAG.out 2>&1; echo rc=\$? >> $TAG.out" > /dev/null 2>&1 &
 echo "t_s,avail_gib,used_gib,load,other_cpu_hogs" > "$TAG.mem.csv"; T0=$(date +%s)
 while true; do
