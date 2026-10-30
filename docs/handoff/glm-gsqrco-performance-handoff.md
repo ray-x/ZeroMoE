@@ -185,6 +185,31 @@ proven). Next step: run the launcher repeatedly (`hunt.sh`-style loop) until it 
 
 ---------------------------------------------------------------------------------------------------------------------
 
+## 2.4b Pinned-host-memory race in the RAM-tier slab pin (found and fixed 2026-10-30)
+
+A 2,313-token prompt on GSQ-RCO (3090 + 5060 Ti, pool 88) aborted with `CUDA error: invalid argument` in a device-to-host copy; the CUDA driver log said
+**"Copy is larger than memobj size, for destination operand"** (`cuMemcpyDtoHAsync`, `CUDA_ERROR_INVALID_VALUE`), next to `cudaHostRegister declined ... already mapped`. An
+`LD_PRELOAD` tracer (`bench/hostreg_trace.c`: records every `cudaHostRegister`/`cudaHostUnregister` range with a call stack, reports `free()` of memory inside a live
+registration and registrations refused as already registered) logged **203 frees of still-registered memory and 198 refused registrations**, all on 14,155,776-byte (13.5 MiB expert
+slab) ranges registered by `StreamingEngine::ensure_slab_capacity` on the prefetcher's worker threads.
+
+Cause: `ensure_slab_capacity` installed the new buffer under `deferred_slab_free_mutex`, released the mutex, then registered `slot.slab_buffer` (not the buffer it had installed)
+and set `slot.slab_pinned = true` without checking that the slot still owned it. A concurrent regrow or release unregisters only `if (slot.slab_pinned)`, so it could free the buffer
+while the registration was alive. The registration stayed on freed memory that `malloc` handed out again (or covered a range shorter than the buffer in use), and a later copy
+into such a block failed. This is probably also the cause of the intermittent `cudaMemcpyAsync ... invalid argument` aborts seen earlier (3 of ~15 launcher runs); the pool-pinning,
+deferred-unregister and registered-source theories recorded above did not explain them.
+
+Fix (`core/engine.hpp`): register the buffer this call installed; commit the flag under the mutex only if the slot still owns that buffer (otherwise unregister it); mark the
+slot with `slab_pin_target` while a registration is in flight so a regrow/release defers its free (the drain waits for the marker). Verified on the same prompt: **0 tracer
+events (was 401), no "memobj" error**; teacher-forced logits **bitwise identical** to the pre-fix binary on all 8 steps; 6-prompt decode **70.8 ms = 14.13 tok/s** (pre-fix 69.8-70.9 ms).
+Not re-run on the Qwen family, which shares this code path (the change adds one short lock per slab registration).
+
+**Still open (separate problem)**: the same 2,313-token prompt then fails with a GPU `CUDA_ERROR_OUT_OF_MEMORY` in `ggml_cuda_mul_mat_q` (`mmq.cu:257`) during the second graph-prefill
+chunk. The 3090 is ~93% full (12.4 GB expert cache + 8.96 GiB dense arena + the graph workspace; peak 22.7 of 24.6 GiB) and the GLM prefill planner (`ggml_glm5next_graph.cpp`,
+margin 0.15 GiB, constants measured on the AJ file) leaves too little for the matmul scratch. With the 3090 cache reduced by 1.5 GB (10.9 GB) the prompt completed, but at **7.6 tok/s
+prefill** (304 s for 2,313 tokens; cold experts run on the CPU because GLM has no `prefill_op_offload` default, unlike Qwen), and with `graph_prefill_op_offload = true` it ran out of memory
+again (3090 peak 24.1 of 24.6 GiB). Making full-graph prefill the GLM default (like the other families) is therefore held back until the planner has a real margin and long prompts pass.
+
 ## 2.5 Measured decode timeline (2026-10-30, 3090 + 5060 Ti, from the node-level Nsight trace of another session)
 
 Source: `/home/ray/Projects/ZeroMoE/build_glm_results/2026-10-30-b6d190-glm-node-trace/retry/` (98 decode tokens, 4158 `lane.run` ranges, 465,902
