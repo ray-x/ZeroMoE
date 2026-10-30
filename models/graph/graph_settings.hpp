@@ -103,6 +103,8 @@ struct GraphSettings {
   Resolved<long> early_ready;              // -1 = on when the layer has overlap work, 0 off, 1 forced
   Resolved<long> split_load, lane_with_gpu1, pilot_copy;  // bool, on by default
   Resolved<long> dynamic_cache;                          // bool, off by default
+  Resolved<long> pilot_stage;
+  Resolved<long> pilot_prefetch;
   Resolved<long> gpu_assist2_slots;
   Resolved<double> offload_pinned_fraction;
   Resolved<double> offload_probation_fraction;
@@ -252,6 +254,10 @@ inline const std::vector<Field<long>> &long_fields() {
        claims_for(F::Glm), {}, false},
       {"dynamic_cache", ZEROMOE_SETTINGS_REF(tun.dynamic_cache), 0, Parse::FlagOn,
        claims_for(F::Glm), {}, false},
+      {"pilot_stage", ZEROMOE_SETTINGS_REF(tun.pilot_stage), 0, Parse::IntStrict,
+       claims_for(F::Glm), {}, false},
+      {"pilot_prefetch", ZEROMOE_SETTINGS_REF(tun.pilot_prefetch), 0, Parse::IntStrict,
+       claims_for(F::Glm), {}, false},
       {"gpu_assist2_slots", ZEROMOE_SETTINGS_REF(tun.gpu_assist2_slots), 1, Parse::IntAtoi,
        claims_for(F::Glm, F::MiMo2),
        {}, false},
@@ -381,6 +387,7 @@ inline bool valid_integer(const std::string &name, long n) {
   if (name == "prefill_min_batch") return n > 0 && n <= 1000000;
   if (name == "offload_pinned_pct") return n >= 0 && n <= 100;
   if (name == "gpu_assist2_slots") return n >= 0 && n <= 8;
+  if (name == "pilot_stage" || name == "pilot_prefetch") return n >= 0 && n <= 8;
   if (name == "alloc_floor_mib") return n >= 0 && n <= 4096;
   if (name == "storage_timeout_ms") return n >= 0 && n <= 30000;
   if (name == "ring_spin_us") return n >= 0 && n <= 1000;
@@ -445,6 +452,8 @@ inline const char *meaning(const std::string &name) {
       {"lane_with_gpu1", "Allow the GLM overlap lane alongside second-GPU expert work."},
       {"pilot_copy", "Allow GLM pilot-driven expert-copy staging."},
       {"dynamic_cache", "Experimental GLM dynamic expert cache rather than the fixed validated placement."},
+      {"pilot_stage", "GLM pilot staging depth K (0 disables)."},
+      {"pilot_prefetch", "GLM pilot prefetch depth (0 disables; effective depth is at least pilot_stage)."},
       {"offload_pinned_fraction", "Pinned fraction of the GLM/Ling host offload pool (0..1), not a GiB budget."},
       {"offload_probation_fraction", "GLM/Ling segmented-cache probation fraction (0..1); applies to the segmented policy."},
       {"offload_policy", "GLM/Ling host cache policy: \"lru\" or \"seg\". Keep the measured recipe unless benchmarking."},

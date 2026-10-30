@@ -49,8 +49,8 @@ bool offload_layer(int layer) {
 // ---------------------------------------------------------------------------
 int pilot_stage_k() {
   static const int k = [] {
-    const char *v = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PILOT_STAGE");
-    return v && v[0] ? std::max(0, std::min(8, std::atoi(v))) : 0;
+    const long v = zeromoe::graphsettings::active_settings().tun.pilot_stage.value;
+    return static_cast<int>(std::max(0L, std::min(8L, v)));
   }();
   return k;
 }
@@ -59,7 +59,7 @@ int pilot_stage_k() {
 // of the layer that needs them; only the first pilot_stage_k() resident ones are copied into the VRAM ring.
 bool pilot_prefetch_on() {
   static const bool on = [] {
-    return zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_PILOT_PREFETCH", 0) > 0;
+    return zeromoe::graphsettings::active_settings().tun.pilot_prefetch.value > 0;
   }();
   return on;
 }
@@ -75,8 +75,9 @@ bool pilot_copy_on() {
 
 int pilot_prefetch_k() {
   static const int k = [] {
-    const char *v = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PILOT_PREFETCH");
-    return std::max(pilot_stage_k(), v && v[0] ? std::max(0, std::min(8, std::atoi(v))) : 0);
+    const long v = zeromoe::graphsettings::active_settings().tun.pilot_prefetch.value;
+    const int prefetch = static_cast<int>(std::max(0L, std::min(8L, v)));
+    return std::max(pilot_stage_k(), prefetch);
   }();
   return k;
 }
