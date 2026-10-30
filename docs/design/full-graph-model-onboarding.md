@@ -8,6 +8,8 @@ This is the authoritative workflow for adding or changing a CUDA MoE family. It 
 
 Record the exact GGUF path, architecture identifier, quantization, layer count, expert count, top-k, shared-expert topology, attention/state types, and required tensor shapes. Do not infer compatibility from the model name or a shared `ModelFamily` label.
 
+Choose and record the comparison profile explicitly. Prefer a reference the user named, especially when the target is a fine-tune or derivative, then verify which runtime settings and performance assumptions are actually shared. Ornith is a Qwen fine-tune and Qwen3.8 is the requested performance reference, so Qwen3.8's effective placement, thread, and benchmark settings are relevant starting evidence for Ornith. This is lineage-specific, not a rule to use Qwen for every model: a GLM port should use a relevant GLM-family or user-designated reference. Never copy architecture-specific settings solely because two models share an engine or graph runtime. Record why the reference was selected and which differences prevent direct transfer.
+
 Trace the actual code path:
 
 1. `GGUFFile::load_header` reads model metadata and tensor locations.
@@ -79,9 +81,11 @@ For Qwen, `ZEROMOE_QWEN4EXP_PROBE_DUMP=<directory>` writes per-layer graph taps,
 
 ### 6. Benchmark only the validated graph path
 
+Before the first long performance run, compare the target's resolved settings with the selected reference: physical GPU and free VRAM, expert placement and arena capacity, host expert source and pinning, CPU graph lane/thread count, graph policy, context, and batching. Record effective values from startup logs and the exact launch environment, explain each material difference, and treat the reference as evidence rather than a settings recipe.
+
 Benchmark after the full-fit graph gate and teacher-forced parity checks. Use the same GGUF, physical GPU, context, active prompt length, generated token count, and thread count in ZeroMoE and llama.cpp. For ZeroMoE `zeromoe bench --bench-random-tg N`, decode starts from one prompt token; match it with llama-bench `-pg 1,N`. For prefill `--bench-random-pp P`, compare with llama-bench `-p P`.
 
-Without a user-set target, steady-state decode must reach at least 90% of llama.cpp. A user-set absolute floor must also pass via `--minimum-tps`. Keep the model in progress below either applicable threshold; a graph gate or coherent output is not a performance pass.
+Record any user-set absolute decode target before implementation and enforce it with `--minimum-tps` in the first matched performance check and all final checks. Without an absolute target, steady-state decode must reach at least 90% of llama.cpp. Keep the model in progress below either applicable threshold; a graph gate or coherent output is not a performance pass.
 
 Run the relative and absolute performance gate with the matching workload:
 

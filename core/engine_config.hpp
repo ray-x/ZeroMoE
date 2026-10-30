@@ -639,10 +639,12 @@ struct EngineConfig {
   // build_moe. Default 0.0 = feature off, identical to today's behavior.
   double qwen4exp_graph_expert_vram_budget_gb = 0.0;
 
-  // Option B: static power-law placement for one Qwen layer. The full
- // graph keeps selected experts in the permanent CUDA graph arena and
- // leaves complementary experts in the fixed-stride DDR arena. A negative
- // value disables the option; uncaptured experts remain on DDR/CPU.
+  // Option B: static power-law placement for one Qwen layer.  The full
+  // graph keeps the selected experts in a permanent CUDA graph arena and
+  // leaves the complementary experts in the fixed-stride DDR arena.  A
+  // value below zero disables the option; this is deliberately separate
+  // from the older partial-layer environment experiment, whose GPU-only
+  // path has different correctness semantics.
  int qwen4exp_option_b_layer = -1;
   int qwen4exp_option_b_top_n = 0;
   float qwen4exp_option_b_min_coverage = 0.80f;
