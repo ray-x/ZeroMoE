@@ -118,6 +118,12 @@ struct MoEExpertBlock {
     // before the buffer is free()'d/realloc'd (ensure_slab_capacity's own
     // grow path does this) -- freeing still-registered memory is UB.
     bool slab_pinned = false;
+    // The buffer whose cudaHostRegister is in flight (ensure_slab_capacity registers outside
+    // deferred_slab_free_mutex). While non-null, a regrow or release of this slot must defer the free instead of
+    // freeing, so the registration can still be undone or committed against the buffer it was taken on. It is
+    // cleared by the attempt that set it (by identity), never by a later one. Written only under
+    // deferred_slab_free_mutex.
+    const uint8_t* slab_pin_target = nullptr;
     // The slab is a fixed-stride slice of StreamingEngine::graph_ram_arenas,
     // not an individually-owned allocation.  Graph-backed layers keep every
     // expert slice alive for the complete graph execution; release_slab and
@@ -1739,6 +1745,7 @@ public:
             const auto& d = deferred_slab_frees[i];
             const MoEExpertBlock* o = d.owner;
             const bool still_busy = o && (o->ram_temp_pin_count > 0 || o->ram_loading ||
+                                          o->slab_pin_target != nullptr ||
                                           const_cast<MoEExpertBlock*>(o)->copy_still_pending());
             if (still_busy) {
                 deferred_slab_frees[w++] = d;   // keep waiting
@@ -1791,7 +1798,7 @@ public:
                 ram_pinned_bytes_used.fetch_sub(slot.slab_capacity, std::memory_order_relaxed);
             }
             const bool in_use = slot.ram_temp_pin_count > 0 || slot.ram_loading ||
-                                slot.copy_still_pending();
+                                slot.slab_pin_target != nullptr || slot.copy_still_pending();
             if (in_use) {
                 deferred_slab_frees.push_back({claimed, &slot, claimed_reservation});
                 perf().n_ram_slab_free_deferred.fetch_add(1, std::memory_order_relaxed);
@@ -1878,6 +1885,7 @@ public:
                     slot.host_reservation_bytes = 0;
                     const bool in_use = slot.ram_temp_pin_count > 0 ||
                                         slot.ram_loading ||
+                                        slot.slab_pin_target != nullptr ||
                                         slot.copy_still_pending();
                     // Unregister before free or deferral; unregister only
                     // removes the CUDA page lock, not the allocation.
@@ -1902,7 +1910,10 @@ public:
                 slot.slab_buffer = static_cast<uint8_t*>(nb);
                 slot.slab_capacity = total;
                 slot.host_reservation_bytes = ledgered ? total : 0;
+                slot.slab_pin_target =
+                    ram_pinned_budget_bytes > 0 ? static_cast<uint8_t*>(nb) : nullptr;
             }
+            uint8_t* const installed = static_cast<uint8_t*>(nb);
             if (claimed && !claimed_deferred) {
                 free(claimed);
                 MemoryGuard::release_host_bytes(claimed_reservation);
@@ -1914,19 +1925,40 @@ public:
                          total / 1e6, ms, claimed_reservation / 1e6);
             }
 
-            if (slot.slab_buffer && ram_pinned_budget_bytes > 0) {
+            if (ram_pinned_budget_bytes > 0) {
                 // Reserve first, register second -- a plain check-then-add
                 // would let concurrent callers (decode thread + prefetch
                 // workers) both pass the check and jointly overshoot.
+                // The registration is taken on `installed`, the buffer this call
+                // installed, never on whatever slot.slab_buffer holds by now, and the
+                // flag is committed under deferred_slab_free_mutex only if the slot
+                // still owns that buffer. Another thread may regrow or release the
+                // slot while the (slow) registration runs; before this check it could
+                // free the buffer with the flag still false, leaving a registration
+                // on freed memory that malloc later handed out again, which made a
+                // copy into a reused block fail with "Copy is larger than memobj size".
                 size_t prev = ram_pinned_bytes_used.fetch_add(total, std::memory_order_relaxed);
+                bool kept = false;
                 if (prev + total <= ram_pinned_budget_bytes) {
                     PERF_START(ram_slab_pin);
-                    cudaError_t perr = cudaHostRegister(slot.slab_buffer, total, cudaHostRegisterPortable);
+                    cudaError_t perr = cudaHostRegister(installed, total, cudaHostRegisterPortable);
                     PERF_END(ram_slab_pin, t_ram_slab_pin);
                     if (perr == cudaSuccess) {
-                        slot.slab_pinned = true;
-                        perf().n_ram_slab_pinned.fetch_add(1, std::memory_order_relaxed);
-                        perf().bytes_ram_slab_pinned.fetch_add((int64_t)total, std::memory_order_relaxed);
+                        {
+                            std::lock_guard<std::mutex> dg(deferred_slab_free_mutex);
+                            kept = slot.slab_buffer == installed && slot.slab_capacity == total &&
+                                   !slot.slab_pinned;
+                            if (kept) slot.slab_pinned = true;
+                        }
+                        if (kept) {
+                            perf().n_ram_slab_pinned.fetch_add(1, std::memory_order_relaxed);
+                            perf().bytes_ram_slab_pinned.fetch_add((int64_t)total, std::memory_order_relaxed);
+                        } else {
+                            // The slot moved on (regrown or released) while we registered:
+                            // undo the registration before its free is allowed to run.
+                            cudaHostUnregister(installed);
+                            ram_pinned_bytes_used.fetch_sub(total, std::memory_order_relaxed);
+                        }
                     } else {
                         ram_pinned_bytes_used.fetch_sub(total, std::memory_order_relaxed);
                         perf().n_ram_slab_pin_fail.fetch_add(1, std::memory_order_relaxed);
@@ -1952,6 +1984,11 @@ public:
                 } else {
                     ram_pinned_bytes_used.fetch_sub(total, std::memory_order_relaxed);
                     perf().n_ram_slab_pin_over_budget.fetch_add(1, std::memory_order_relaxed);
+                }
+                {
+                    // The pin attempt is over, committed or not: a pending free may proceed.
+                    std::lock_guard<std::mutex> dg(deferred_slab_free_mutex);
+                    if (slot.slab_pin_target == installed) slot.slab_pin_target = nullptr;
                 }
             }
         }
