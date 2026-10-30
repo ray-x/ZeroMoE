@@ -1,5 +1,6 @@
 #include "qwen_cpu_offload_ring.hpp"
 #include "graph_config.hpp"
+#include "graph_settings_global.hpp"
 
 #include "logger.hpp"
 #include "memory_guard.hpp"
@@ -24,13 +25,7 @@ namespace {
 
 int ring_spin_budget_us() {
   static const int budget = [] {
-    const char *value = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_RING_SPIN_US");
-    if (!value || !value[0])
-      return 0;
-    char *end = nullptr;
-    const long parsed = std::strtol(value, &end, 10);
-    if (end == value || *end != '\0' || parsed < 0)
-      return 0;
+    const long parsed = zeromoe::graphsettings::active_settings().tun.ring_spin_us.value;
     return static_cast<int>(std::min<long>(parsed, 1000));
   }();
   return budget;

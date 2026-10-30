@@ -125,6 +125,7 @@ struct GraphSettings {
   // (family-specific). Replaces the family-specific alloc-floor env knobs.
   Resolved<long> alloc_floor_mib;
   Resolved<long> storage_timeout_ms;
+  Resolved<long> ring_spin_us;
 };
 
 // Diagnostics: never hashed, never drift-checked.
@@ -248,6 +249,8 @@ inline const std::vector<Field<long>> &long_fields() {
        claims_for(F::Qwen, F::Glm), {}, false},
       {"storage_timeout_ms", ZEROMOE_SETTINGS_REF(tun.storage_timeout_ms), 100, Parse::IntStrict,
        claims_for(F::Qwen), {}, false},
+      {"ring_spin_us", ZEROMOE_SETTINGS_REF(tun.ring_spin_us), 0, Parse::IntStrict,
+       claims_for(F::Qwen), {}, false},
       {"preflight_strict", ZEROMOE_SETTINGS_REF(diag.preflight_strict), 0, Parse::FlagOn,
        kClaimAll, {}, true},
   };
@@ -314,6 +317,7 @@ inline bool valid_integer(const std::string &name, long n) {
   if (name == "gpu_assist2_slots") return n >= 0 && n <= 8;
   if (name == "alloc_floor_mib") return n >= 0 && n <= 4096;
   if (name == "storage_timeout_ms") return n >= 0 && n <= 30000;
+  if (name == "ring_spin_us") return n >= 0 && n <= 1000;
   // Default is 16,000,000: "effectively never" for a session, but still a uint32 knob.
   if (name == "promo_decay_every") return n >= 0 && n <= 4294967295L;
   return n >= 0 && n <= 1048576;
@@ -381,6 +385,7 @@ inline const char *meaning(const std::string &name) {
       {"offload_usage_file", "Historical expert-routing counts used to choose the hot set."},
       {"alloc_floor_mib", "Graph allocator admission floor in MiB (0 keeps the family default: 1024 for Qwen, 2048 for GLM)."},
       {"storage_timeout_ms", "Qwen storage-wait timeout in milliseconds for the staged graph path (0..30000)."},
+      {"ring_spin_us", "Qwen CPU offload ring spin budget in microseconds (0 disables spinning)."},
       {"soft_pin_gib", "GiB of split expert arenas kept in separately freeable soft-pin buffers so prefill can reclaim them; 0 disables. Currently Qwen full-graph decode; intended to generalize to other families."},
       {"promo_cap", "Qwen4Exp adaptive expert promotion: promotions per committed token. Higher values react faster but copy more."},
       {"promo_burst", "Qwen4Exp adaptive expert promotion: extra promotions per step during the burst window at the start of a request."},
