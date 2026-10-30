@@ -1,5 +1,6 @@
 #include "active_layer_upload_workers.hpp"
 #include "graph_config.hpp"
+#include "graph_settings_global.hpp"
 #include "async_prefetcher.hpp"
 #include "cpu_expert_executor.hpp"
 #include "gpu_expert_executor.hpp"
@@ -290,9 +291,7 @@ void run_qwen4exp_shared_host(StreamingEngine &engine, int layer_idx,
   const std::string up_name = prefix + "ffn_up_shexp.weight";
   const std::string gate_inp_name = prefix + "ffn_gate_inp_shexp.weight";
   const bool force_cpu_shared = [] {
-    const char *e = zeromoe::graphcfg::env("ZEROMOE_QWEN_SHARED_CPU_ORACLE");
-    return e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y' ||
-                 e[0] == 't' || e[0] == 'T');
+    return zeromoe::graphsettings::active_settings().tun.shared_cpu_oracle.value != 0;
   }();
   auto shared_dense_proj = [&](const std::string &wname, const float *x,
                                float *y, int in, int out) {

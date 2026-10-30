@@ -39,6 +39,7 @@ promo_decay_every=16000000
 promo_freq_weight=4096
 promo_min_misses=2
 ring_spin_us=0
+shared_cpu_oracle=0
 soft_pin_gib=6
 split_load=1
 storage_timeout_ms=100
