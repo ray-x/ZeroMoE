@@ -25,7 +25,7 @@ static unsigned char bloom[1 << 22]; /* one bit per (addr >> 20) hashed: fast re
 static int fd = -2, nlog = 0;
 static int (*real_reg)(void *, size_t, unsigned);
 static int (*real_unreg)(void *);
-static void (*real_free)(void *);
+extern void __libc_free(void *); /* glibc: avoids dlsym() (which allocates) inside free() before this library is initialised */
 static __thread int in_hook;
 static void logf_(const char *fmt, ...) {
   if (fd == -2) { const char *p = getenv("HOSTREG_TRACE"); fd = p ? open(p, O_WRONLY | O_CREAT | O_APPEND, 0644) : -1; }
@@ -39,7 +39,7 @@ static inline unsigned h_(uintptr_t a) { uintptr_t x = a >> 20; return (unsigned
 static void setbits(uintptr_t a, size_t n) { for (uintptr_t x = a >> 20; x <= (a + n - 1) >> 20; ++x) { unsigned h = h_(x << 20); bloom[h >> 3] |= 1u << (h & 7); } }
 static int maybe(uintptr_t a) { unsigned h = h_(a); return bloom[h >> 3] & (1u << (h & 7)); }
 __attribute__((constructor)) static void init(void) {
-  real_reg = dlsym(RTLD_NEXT, "cudaHostRegister"); real_unreg = dlsym(RTLD_NEXT, "cudaHostUnregister"); real_free = dlsym(RTLD_NEXT, "free");
+  real_reg = dlsym(RTLD_NEXT, "cudaHostRegister"); real_unreg = dlsym(RTLD_NEXT, "cudaHostUnregister");
   recs = calloc(MAXR, sizeof(Rec)); void *w[2]; backtrace(w, 2); /* warm up libgcc */
 }
 int cudaHostRegister(void *ptr, size_t size, unsigned flags) {
@@ -65,7 +65,6 @@ int cudaHostUnregister(void *ptr) {
   return r;
 }
 void free(void *p) {
-  if (!real_free) real_free = dlsym(RTLD_NEXT, "free");
   if (p && !in_hook && recs && maybe((uintptr_t)p)) {
     in_hook = 1; pthread_mutex_lock(&mu);
     for (size_t i = 0; i < nrec; ++i) if (recs[i].live && (uintptr_t)p >= recs[i].a && (uintptr_t)p < recs[i].a + recs[i].n) {
@@ -74,5 +73,5 @@ void free(void *p) {
       bt_(bt + 1, nbt - 1); logf_(" registered from:\n"); bt_(recs[i].bt, recs[i].nbt); break; }
     pthread_mutex_unlock(&mu); in_hook = 0;
   }
-  real_free(p);
+  __libc_free(p);
 }
