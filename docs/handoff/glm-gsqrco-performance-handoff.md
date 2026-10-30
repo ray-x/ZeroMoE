@@ -1,8 +1,42 @@
-# GLM-5.3-Flash GSQ-RCO: performance handoff (2026-10-29)
+# GLM-5.3-Flash GSQ-RCO: performance handoff (2026-10-29, status updated 2026-10-30)
+
+## Latest status (2026-10-30)
+
+Code: master `b7d6bd1e027c` and later (clean stamp; ggml llama.cpp `8baabd53b` + patches 0001-0017 + host-node 0001-0003). Model file:
+`GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf`, 117.48 GB (109.41 GiB), 3.000 bpw (Q2_K 83.3% / Q3_K 6.9% / Q4_K 6.9% of 313.327 B parameters). Full model-file
+comparison with the AJ IQ2_XXS file (87.35 GB, 2.230 bpw): `configs/bench/perf-baselines.md`.
+
+**Decode, 3090 + 5060 Ti (14.2 GiB hot experts on the 5060 Ti), pool 88 GiB, 0 SSD misses**
+
+| measurement | steady decode | note |
+|---|---|---|
+| shipped settings, clean runs, 6 pilot prompts, 550 tokens | **69.0-70.9 ms = 14.1-14.5 tok/s** | best clean run 68.9 ms (14.51); first-session single prompt 70.5-71.1 ms |
+| shipped + ranking matched to the pilot prompts | 63.1 ms = 15.84 tok/s | **in-sample** (ranking built from the same 6 prompts): an upper bound, not a general gain |
+| AJ IQ2_XXS, same binary, same prompts | 75.4 ms = 13.26 tok/s | the 70.1 ms record of 2026-10-15 was a different binary, prompt and placement and is not reproduced |
+| 3090 only | not re-measured (the 10.7 tok/s of 2026-10-29 needs a smaller pool or more memory than is safe, see the GLM page); pool 84 gave 9.42 tok/s in one run contaminated by compile load, min 20.7 GiB available | pending |
+
+**Changes on master from this work**
+- decode CPU lane 10 threads by default; prefill thread count independent (6); pool 88 GiB recipe, config `configs/bench/glm53flash_gsqrco_offload_pool.toml`, launcher
+  `bench/glm_gsqrco_pool.sh` (quiet-box gate, memory watchdog, contamination report, `GLM_RANKING`, `MOE_CACHE_GB`, `ZEROMOE_BIN`, CUDA error log, abort backtrace helper);
+- **bug fixed (`b7d6bd1`)**: the engine freed its dense host copies after the first decode graph, so every later request in a session ran with zeroed attention and zero
+  logits; removed (found with a 6-prompt session; earlier benchmarks sent one prompt);
+- full-graph prefill (`ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL=1`) works on this file at pool 88: 20-104 token prompts in 0.7-3.6 s instead of ~46 s for 20 tokens (opt-in, validated on 6 prompts);
+- survey tooling (`bench/make_survey_sets.py`, `bench/make_mix_ranking.py`), the pilot usage counts, the Q2_K dot benchmark, Nsight analysis scripts;
+- the early-ready lane names the cause (layer, call, hidden state, weights) before aborting on a non-finite router weight.
+
+**Levers measured and closed (clean runs, same binary and prompts)**: GPU assist (worse), skipping/freeing the dense host copies (broke later requests), Q2_K AVX512-VNNI dot
+(bit-exact, 1.9 ms slower: 70.9/71.2 vs 69.0/69.4 ms), more resident experts (5060 Ti 15.0 GiB + 3090 cache 13.4 GB: 68.9 vs 69.7 ms, noise), adaptive promotion (the
+graph-owned path cannot work in pool mode; the old replay says not worth building), pool pinning/flush theories for the pool-80 failures.
+
+**Where the time goes (Nsight, section 2.5)**: CPU waits for the 3090 20%, CPU cold experts 54% (both GPUs idle), GPU combine + 5060 Ti branch + token tail 27%.
+**Next:** run the 5060 Ti hot-expert branch concurrently with the CPU lane (about 7 ms, to ~15.6 tok/s) with its own copies of ids/hidden state and a same-input
+parity check first; re-measure the 3090 alone at pool 88; a held-out ranking check (needs a survey, not run by decision). **20 tok/s is not reached.**
+**Open:** the intermittent `cudaMemcpyAsync ... invalid argument` crash (3 of ~15 runs before the host-copy release was removed; none in the ~20 runs since).
+
+---------------------------------------------------------------------------------------------------------------------
 
 Goal that was set: GLM decode from ~10 tok/s toward ~20 tok/s (first recover the ~14 tok/s the project had before, on
-the 3090 first, then with the 5060 Ti). Result so far: **14.1 tok/s on the 3090 + 5060 Ti, 10.7 tok/s on the 3090 alone.** 20 tok/s has
-no measured path yet; sections 1 and 3 list what is left.
+the 3090 first, then with the 5060 Ti). Result when this document was first written: 14.1 tok/s on the 3090 + 5060 Ti, 10.7 tok/s on the 3090 alone (see the status above for the current numbers).
 
 Hardware and file: Xeon W-2235 (6 cores / 12 threads, AVX-512 + VNNI, 4-channel DDR4, ~60 GB/s measured read), 125 GB RAM,
 RTX 3090 (24 GB, PCIe 3.0 x16) + RTX 5060 Ti (16 GB, x8), model
