@@ -135,6 +135,8 @@ struct GraphSettings {
   Resolved<long> ple_row_cache;
   Resolved<long> batch_d2d_unpack;
   Resolved<long> shared_cpu_oracle;
+  Resolved<long> hc_async_readback;
+  Resolved<long> hc_disable_fused_post;
   Resolved<long> device_route;
   Resolved<long> adaptive_policy;
   Resolved<long> prefill_device_state;
@@ -299,6 +301,10 @@ inline const std::vector<Field<long>> &long_fields() {
       {"batch_d2d_unpack", ZEROMOE_SETTINGS_REF(tun.batch_d2d_unpack), 0, Parse::FlagOn,
        claims_for(F::Qwen), {}, false},
       {"shared_cpu_oracle", ZEROMOE_SETTINGS_REF(tun.shared_cpu_oracle), 0, Parse::FlagOn,
+       claims_for(F::Qwen), {}, false},
+      {"hc_async_readback", ZEROMOE_SETTINGS_REF(tun.hc_async_readback), 0, Parse::FlagOn,
+       claims_for(F::Qwen), {}, false},
+      {"hc_disable_fused_post", ZEROMOE_SETTINGS_REF(tun.hc_disable_fused_post), 0, Parse::FlagOn,
        claims_for(F::Qwen), {}, false},
       {"device_route", ZEROMOE_SETTINGS_REF(tun.device_route), 0, Parse::FlagOn,
        claims_for(F::Qwen), {}, false},
@@ -501,6 +507,8 @@ inline const char *meaning(const std::string &name) {
       {"ple_row_cache", "Cache PLE rows for repeated decode (on unless set to 0)."},
       {"batch_d2d_unpack", "Qwen decode fast path: batch VRAM-cache D2D copies and unpack with one scatter kernel."},
       {"shared_cpu_oracle", "Force Qwen shared experts to run on the CPU oracle for validation (default off)."},
+      {"hc_async_readback", "Qwen HC async readback (default off)."},
+      {"hc_disable_fused_post", "Disable Qwen fused HC post-combine (default off)."},
       {"device_route", "Qwen device-side routing experiment (default off)."},
       {"cache_moe_async_upload", "DeepSeek cache-MoE async upload (default off)."},
       {"cache_moe_cpu_cold", "DeepSeek cache-MoE CPU cold path (default off)."},

@@ -20,6 +20,7 @@
 // below ever touch hc_stream_buf.
 #include "engine.hpp"
 #include "graph_config.hpp"
+#include "graph_settings_global.hpp"
 #include "dense_dispatch.hpp"
 #include "dsv41_trace.hpp"
 #include "ggml_hc_backend.hpp"
@@ -920,8 +921,7 @@ bool qwen4exp_hc_post_combine_device(StreamingEngine &engine, int layer_idx,
   // stream mul/add/copy chain. The producer_event is intentionally required;
   // without it, stream 0 could race the shared GGML backend stream.
   static const bool disable_fused_post = [] {
-    const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN_HC_DISABLE_FUSED_POST");
-    return v && v[0] == '1';
+    return zeromoe::graphsettings::active_settings().tun.hc_disable_fused_post.value != 0;
   }();
   {
     const bool try_fused =

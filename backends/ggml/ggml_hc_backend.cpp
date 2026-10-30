@@ -4,6 +4,7 @@
 
 #include "ggml_moe_backend.hpp"  // ggml_shared_backend()
 #include "graph_config.hpp"
+#include "graph_settings_global.hpp"
 #include "logger.hpp"
 
 #include <algorithm>
@@ -94,7 +95,7 @@ uint64_t fnv64_bytes(const void *data, size_t bytes) {
 // their existing synchronization behavior even if they reuse this class.
 bool qwen_hc_async_readback() {
   static const bool enabled = [] {
-    return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN_HC_ASYNC_READBACK");
+    return zeromoe::graphsettings::active_settings().tun.hc_async_readback.value != 0;
   }();
   return enabled;
 }
