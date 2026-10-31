@@ -3,6 +3,7 @@
 // a former local became an EngineRunner member of the same name.
 #include "engine_runner.hpp"
 #include "graph_config.hpp"
+#include "graph_settings_global.hpp"
 
 std::expected<void, std::string> EngineRunner::offload_dense_tensors() {
   gpu.report_vram_usage("after expert cache setup");
@@ -202,8 +203,7 @@ std::expected<void, std::string> EngineRunner::offload_dense_tensors() {
   int gate_inp_scheduler_kept = 0;
   size_t gate_inp_bf16_bytes_used = 0, gate_inp_f32_equivalent_bytes = 0;
   const bool disable_router_bf16 = [] {
-    const char *value = zeromoe::graphcfg::env("ZEROMOE_DISABLE_ROUTER_BF16");
-    return value && value[0] == '1';
+    return zeromoe::graphsettings::active_settings().tun.disable_router_bf16.value != 0;
   }();
   // llama.cpp's CPU-MoE topology keeps the router projection on CUDA and moves only
   // the routed expert planes to the CPU.  The Qwen decode scheduler consumes
