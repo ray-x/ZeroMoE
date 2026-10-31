@@ -90,6 +90,8 @@ struct GraphSettings {
   Resolved<long> offload_pinned_pct;
   Resolved<long> offload_pin;              // bool
   Resolved<long> offload_async;            // bool
+  Resolved<long> offload_retarget;         // bool, default on
+  Resolved<long> offload_pin_transient;    // bool, default off
   Resolved<long> offload_first_layer;      // -1 = no offload tier
   Resolved<long> gpu_assist_slots;
   Resolved<long> use_gpu1;                 // bool
@@ -267,6 +269,10 @@ inline const std::vector<Field<long>> &long_fields() {
        claims_for(F::MiMo2), {}, false},
       {"offload_async", ZEROMOE_SETTINGS_REF(tun.offload_async), 0, Parse::FlagOn,
        claims_for(F::Glm), {}, false},
+      {"offload_retarget", ZEROMOE_SETTINGS_REF(tun.offload_retarget), 1, Parse::FlagUnlessOff,
+       kClaimAll, {}, false},
+      {"offload_pin_transient", ZEROMOE_SETTINGS_REF(tun.offload_pin_transient), 0, Parse::FlagOn,
+       kClaimAll, {}, false},
       {"offload_first_layer", ZEROMOE_SETTINGS_REF(tun.offload_first_layer), -1, Parse::IntAtoi,
        claims_for(F::Glm), {}, false},
       {"gpu_assist_slots", ZEROMOE_SETTINGS_REF(tun.gpu_assist_slots), 0, Parse::IntStrict,
@@ -566,6 +572,8 @@ inline const char *meaning(const std::string &name) {
       {"offload_pinned_pct", "MiMo host arena percentage backed by pinned RAM (0..100); raises nonpageable memory usage."},
       {"offload_pin", "Allow MiMo expert-arena pinning for DMA; false can reduce host-to-GPU bandwidth."},
       {"offload_async", "Overlap GLM/Ling offload reads rather than performing them synchronously."},
+      {"offload_retarget", "Offload page-reusing eviction (default on)."},
+      {"offload_pin_transient", "Pin transient offload experts (default off)."},
       {"offload_first_layer", "First GLM/Ling layer in the host offload tier; -1 leaves the tier disabled."},
       {"gpu_assist_slots", "Concurrent staging slots for host experts computed on GPU; consumes extra VRAM."},
       {"gpu_assist2_slots", "Second assist-ring staging slots (0..8); used by GLM and MiMo."},

@@ -20,6 +20,7 @@
 #include "quant_table.hpp"
 #include "expert_cache.hpp"
 #include "graph_config.hpp"
+#include "graph_settings_global.hpp"
 #include "logger.hpp"
 
 #include <array>
@@ -742,7 +743,7 @@ public:
 
   // Page-reusing eviction (see docs/offload-retarget.md). Default on: this class only exists when SSD offload is active.
   // ZEROMOE_OFFLOAD_RETARGET=0 restores madvise(DONTNEED) eviction.
-  bool retarget_ = graphcfg::flag_unless_off("ZEROMOE_OFFLOAD_RETARGET");
+  bool retarget_ = zeromoe::graphsettings::active_settings().tun.offload_retarget.value != 0;
 
   // Phase 1. The caller holds the arena lock exclusively. Bookkeeping only, no I/O.
   Plan begin(int layer, const int32_t *ids, int n, ExpertCache::Kind kind = ExpertCache::Kind::Demand) {
