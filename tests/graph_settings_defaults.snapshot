@@ -1,5 +1,6 @@
 adaptive_policy=0
 alloc_floor_mib=1024
+assist_device=-1
 batch_d2d_unpack=0
 cache_moe_async_upload=0
 cache_moe_cpu_cold=0

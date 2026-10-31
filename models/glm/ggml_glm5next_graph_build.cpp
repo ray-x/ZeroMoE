@@ -58,7 +58,10 @@ EarlyReadyLane *adopt_cold_lane(FullGraph &g, int layer,
           weak = s;
         return s;
       };
-      const int assist_dev = zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_ASSIST_DEVICE", g.device);
+      const int assist_dev = [&g] {
+        const long v = zeromoe::graphsettings::active_settings().tun.assist_device.value;
+        return v >= 0 ? static_cast<int>(v) : g.device;
+      }();
       std::shared_ptr<GpuAssistShared> shared = make_ring(shared_weak[0], assist_dev, gpu_assist_slots());
       std::shared_ptr<GpuAssistShared> shared2;
       const int assist2_dev = gpu_assist2_device(g.device);

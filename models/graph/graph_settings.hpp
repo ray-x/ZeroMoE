@@ -115,6 +115,7 @@ struct GraphSettings {
   Resolved<long> ingraph_moe;
   Resolved<long> pilot_stage;
   Resolved<long> pilot_prefetch;
+  Resolved<long> assist_device;
   Resolved<long> prefill_gpu1;
   Resolved<long> cpu_lm_head;
   Resolved<long> dsa_cpu_lane;
@@ -307,6 +308,8 @@ inline const std::vector<Field<long>> &long_fields() {
        claims_for(F::Glm), {}, false},
       {"pilot_prefetch", ZEROMOE_SETTINGS_REF(tun.pilot_prefetch), 0, Parse::IntStrict,
        claims_for(F::Glm), {}, false},
+      {"assist_device", ZEROMOE_SETTINGS_REF(tun.assist_device), -1, Parse::IntAtoi,
+       claims_for(F::Glm), {}, false},
       {"prefill_gpu1", ZEROMOE_SETTINGS_REF(tun.prefill_gpu1), 1, Parse::FlagUnlessOff,
        claims_for(F::Glm), {}, false},
       {"dsa_cpu_lane", ZEROMOE_SETTINGS_REF(tun.dsa_cpu_lane), 0, Parse::FlagOn,
@@ -493,6 +496,7 @@ inline bool valid_integer(const std::string &name, long n) {
   if (name == "early_ready_predict_layer") return n >= -1 && n <= 1000000;
   if (name == "graph_host_offset") return n >= 0 && n <= 4096;
   if (name == "sparse_decode_reserve") return n >= 0 && n <= 1000000;
+  if (name == "assist_device") return n >= -1 && n <= 1000;
   if (name == "prefill_ahead") return n >= 0 && n <= 1000;
   if (name == "pilot_k") return n >= 0 && n <= 16;
   if (name == "pilot_cold_k") return n >= 0 && n <= 8;
@@ -568,6 +572,8 @@ inline const char *meaning(const std::string &name) {
       {"dynamic_cache", "Experimental GLM dynamic expert cache rather than the fixed validated placement."},
       {"pilot_stage", "GLM pilot staging depth K (0 disables)."},
       {"pilot_prefetch", "GLM pilot prefetch depth (0 disables; effective depth is at least pilot_stage)."},
+      {"assist_device", "GLM assist device id (-1 uses trunk device)."},
+      {"assist_device", "GLM assist device id (-1 uses trunk device)."},
       {"prefill_gpu1", "Use second GPU during GLM prefill (on unless set to 0)."},
       {"dsa_cpu_lane", "GLM DSA CPU lane (default off)."},
       {"sparse_decode_reserve", "GLM sparse decode reserve in tokens; 0 always uses sparse selection."},
