@@ -497,8 +497,7 @@ class GlmDsaGraphModel final : public FullGraphModelBase<GlmDsaGraphModel> {
   void shutdown() const override { glm5next_full_graph_shutdown(); }
   int device_expert_layers() const override { return glm5next_full_graph_device_expert_layers(); }
   bool supports_cpu_lane() const override {
-    const char *v = zeromoe::graphcfg::env("ZEROMOE_GLM_DSA_CPU_LANE");
-    return v && v[0] == '1';
+    return zeromoe::graphsettings::active_settings().tun.dsa_cpu_lane.value != 0;
   }
 
   int max_prefill_tokens(const StreamingEngine &e) const override {

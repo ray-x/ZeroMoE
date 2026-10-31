@@ -107,6 +107,7 @@ struct GraphSettings {
   Resolved<long> pilot_prefetch;
   Resolved<long> prefill_gpu1;
   Resolved<long> cpu_lm_head;
+  Resolved<long> dsa_cpu_lane;
   Resolved<long> sparse_decode_reserve;
   Resolved<long> prefill_prefetch;
   Resolved<double> prefill_split;
@@ -275,6 +276,8 @@ inline const std::vector<Field<long>> &long_fields() {
       {"pilot_prefetch", ZEROMOE_SETTINGS_REF(tun.pilot_prefetch), 0, Parse::IntStrict,
        claims_for(F::Glm), {}, false},
       {"prefill_gpu1", ZEROMOE_SETTINGS_REF(tun.prefill_gpu1), 1, Parse::FlagUnlessOff,
+       claims_for(F::Glm), {}, false},
+      {"dsa_cpu_lane", ZEROMOE_SETTINGS_REF(tun.dsa_cpu_lane), 0, Parse::FlagOn,
        claims_for(F::Glm), {}, false},
       {"sparse_decode_reserve", ZEROMOE_SETTINGS_REF(tun.sparse_decode_reserve), 1024, Parse::IntStrict,
        claims_for(F::Glm), {}, false},
@@ -505,6 +508,7 @@ inline const char *meaning(const std::string &name) {
       {"pilot_stage", "GLM pilot staging depth K (0 disables)."},
       {"pilot_prefetch", "GLM pilot prefetch depth (0 disables; effective depth is at least pilot_stage)."},
       {"prefill_gpu1", "Use second GPU during GLM prefill (on unless set to 0)."},
+      {"dsa_cpu_lane", "GLM DSA CPU lane (default off)."},
       {"sparse_decode_reserve", "GLM sparse decode reserve in tokens; 0 always uses sparse selection."},
       {"prefill_prefetch", "GLM prefill prefetch: -1 auto (on with second GPU), 0 off, 1 on."},
       {"prefill_split", "GLM prefill split ratio between GPUs (0..1)."},
