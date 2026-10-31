@@ -5,6 +5,7 @@
 // declarations live in ggml_glm5next_graph_impl.hpp.
 
 #include "ggml_glm5next_graph_impl.hpp"
+#include "graph_settings_global.hpp"
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
 
@@ -232,8 +233,8 @@ size_t graph_host_live_bytes(const StreamingEngine &engine) {
 }
 
 std::string partial_usage_path(const FullGraph &g) {
-  const char *env = zeromoe::graphcfg::env("ZEROMOE_FULL_GRAPH_USAGE_FILE");
-  if (env && env[0])
+  const std::string &env = zeromoe::graphsettings::active_settings().tun.full_graph_usage_file.value;
+  if (!env.empty())
     return env;
   return g.engine->family_ops.family == ModelFamily::DeepSeek_V4
              ? ".zeromoe_ds4_usage_prefill"

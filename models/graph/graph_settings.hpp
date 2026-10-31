@@ -131,6 +131,7 @@ struct GraphSettings {
   Resolved<double> offload_ddr_gib;        // < 0 = auto
   Resolved<std::string> offload_usage_file;
   Resolved<std::string> route_tap;
+  Resolved<std::string> full_graph_usage_file;
   // Soft pin tier for split expert arenas (decode only): GiB of the last layers'
   // experts kept in separately freeable buffers so prefill can reclaim them.
   Resolved<double> soft_pin_gib;
@@ -439,6 +440,8 @@ inline const std::vector<Field<std::string>> &text_fields() {
        {}, false},
       {"route_tap", ZEROMOE_SETTINGS_REF(tun.route_tap), std::string(), Parse::Text,
        claims_for(Family::Glm), {}, false},
+      {"full_graph_usage_file", ZEROMOE_SETTINGS_REF(tun.full_graph_usage_file), std::string(), Parse::Text,
+       claims_for(Family::Glm), {}, false},
       {"usage_record_file", ZEROMOE_SETTINGS_REF(diag.usage_record_file), std::string(), Parse::Text,
        claims_for(Family::MiMo2, Family::Glm), {}, true},
       {"diag_dump_dir", ZEROMOE_SETTINGS_REF(diag.diag_dump_dir), std::string(), Parse::Text,
@@ -583,6 +586,7 @@ inline const char *meaning(const std::string &name) {
       {"offload_ddr_gib", "Host expert offload budget in GiB, or \"auto\". Separate from VRAM and pinned fractions."},
       {"offload_usage_file", "Historical expert-routing counts used to choose the hot set."},
       {"route_tap", "GLM route tap output file (empty disables)."},
+      {"full_graph_usage_file", "GLM full-graph usage file path (empty uses family default)."},
       {"alloc_floor_mib", "Graph allocator admission floor in MiB (0 keeps the family default: 1024 for Qwen, 2048 for GLM)."},
       {"storage_timeout_ms", "Qwen storage-wait timeout in milliseconds for the staged graph path (0..30000)."},
       {"ring_spin_us", "Qwen CPU offload ring spin budget in microseconds (0 disables spinning)."},
