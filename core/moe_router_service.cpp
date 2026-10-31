@@ -75,11 +75,12 @@ extern bool qwen4exp_copy_gdn_device_output_to_host(const void *device_output,
 // projection/input drift from top-k gather/normalization drift.
 static void dump_qwen_router_probs_diag(int layer, const float *data,
                                         int n_experts) {
-  const char *base = zeromoe::graphcfg::env("ZEROMOE_PREFILL_BOUNDARY_DUMP");
-  const char *layer_env = zeromoe::graphcfg::env("ZEROMOE_PREFILL_BOUNDARY_LAYER");
+  const std::string &base_setting = zeromoe::graphsettings::active_settings().diag.prefill_boundary_dump.value;
+  const char *base = base_setting.empty() ? nullptr : base_setting.c_str();
+  const int boundary_layer = static_cast<int>(
+      zeromoe::graphsettings::active_settings().diag.prefill_boundary_layer.value);
   if (!base || !data || n_experts <= 0 ||
-      (layer_env && std::atoi(layer_env) >= 0 &&
-       std::atoi(layer_env) != layer))
+      (boundary_layer >= 0 && boundary_layer != layer))
     return;
 
   // The unbatched parity harness invokes each layer once per prompt token.
@@ -951,7 +952,7 @@ bool MoeRouterService::route(MoePipelineContext &context) {
         std::memcpy(scratch.normed.data(), hidden_states,
                     S * D * sizeof(float));
       if (qwen_hc_route_input && layer_idx == 0 && S == 1 &&
-          zeromoe::graphcfg::env("ZEROMOE_PREFILL_BOUNDARY_DUMP")) {
+          !zeromoe::graphsettings::active_settings().diag.prefill_boundary_dump.value.empty()) {
         uint64_t hash = 1469598103934665603ULL;
         const auto *bytes = reinterpret_cast<const uint8_t *>(scratch.normed.data());
         for (size_t i = 0; i < (size_t)D * sizeof(float); ++i) {

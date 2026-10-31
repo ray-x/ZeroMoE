@@ -203,6 +203,10 @@ struct GraphSettings {
 struct DiagnosticSettings {
   Resolved<std::string> usage_record_file;  // survey mode: write per-expert route counts here at shutdown
   Resolved<std::string> diag_dump_dir;     // CPU graph boundary snapshot directory
+  Resolved<std::string> prefill_boundary_dump; // prefill boundary dump directory
+  Resolved<long> prefill_boundary_layer;     // -1 = all layers
+  Resolved<long> prefill_boundary_first_pos;
+  Resolved<long> prefill_boundary_last_pos;  // -1 = no upper bound
   Resolved<long> preflight_strict;         // bool: a preflight finding aborts instead of warning
 };
 
@@ -441,6 +445,12 @@ inline const std::vector<Field<long>> &long_fields() {
        claims_for(Family::Other), {}, false},
       {"preflight_strict", ZEROMOE_SETTINGS_REF(diag.preflight_strict), 0, Parse::FlagOn,
        kClaimAll, {}, true},
+      {"prefill_boundary_layer", ZEROMOE_SETTINGS_REF(diag.prefill_boundary_layer), 0, Parse::IntAtoi,
+       kClaimAll, {}, true},
+      {"prefill_boundary_first_pos", ZEROMOE_SETTINGS_REF(diag.prefill_boundary_first_pos), 0, Parse::IntStrict,
+       kClaimAll, {}, true},
+      {"prefill_boundary_last_pos", ZEROMOE_SETTINGS_REF(diag.prefill_boundary_last_pos), -1, Parse::IntAtoi,
+       kClaimAll, {}, true},
   };
   return t;
 }
@@ -491,6 +501,8 @@ inline const std::vector<Field<std::string>> &text_fields() {
        claims_for(Family::MiMo2, Family::Glm), {}, true},
       {"diag_dump_dir", ZEROMOE_SETTINGS_REF(diag.diag_dump_dir), std::string(), Parse::Text,
        claims_for(Family::Qwen), {}, true},
+      {"prefill_boundary_dump", ZEROMOE_SETTINGS_REF(diag.prefill_boundary_dump), std::string(), Parse::Text,
+       kClaimAll, {}, true},
       {"early_ready_stage_layer", ZEROMOE_SETTINGS_REF(tun.early_ready_stage_layer), std::string(), Parse::Text,
        claims_for(Family::Qwen), {}, false},
       {"early_ready_ridge", ZEROMOE_SETTINGS_REF(tun.early_ready_ridge), std::string(), Parse::Text,
@@ -535,6 +547,7 @@ inline bool valid_integer(const std::string &name, long n) {
   if (name == "alloc_floor_mib") return n >= 0 && n <= 4096;
   if (name == "storage_timeout_ms") return n >= 0 && n <= 30000;
   if (name == "ring_spin_us") return n >= 0 && n <= 1000;
+  if (name.starts_with("prefill_boundary_")) return n >= -1 && n <= 1000000;
   if (name == "early_ready_predict_layer") return n >= -1 && n <= 1000000;
   if (name == "graph_host_offset") return n >= 0 && n <= 4096;
   if (name == "sparse_decode_reserve") return n >= 0 && n <= 1000000;
@@ -698,6 +711,10 @@ inline const char *meaning(const std::string &name) {
       {"mtp_prefill_overlap", "Qwen4Exp graph-native MTP: overlap draft setup with prompt prefill when free VRAM allows. Off by default."},
       {"usage_record_file", "Diagnostic route-survey output path; empty disables recording. Excluded from default hashes."},
       {"diag_dump_dir", "Diagnostic CPU graph boundary snapshot directory; empty disables snapshots."},
+      {"prefill_boundary_dump", "Prefill boundary dump directory; empty disables."},
+      {"prefill_boundary_layer", "Prefill boundary dump layer (-1 = all)."},
+      {"prefill_boundary_first_pos", "Prefill boundary dump first position."},
+      {"prefill_boundary_last_pos", "Prefill boundary dump last position (-1 = no upper bound)."},
       {"preflight_strict", "Fail on graph health/performance findings rather than only warning. Does not weaken safety checks."},
   };
   const auto it = descriptions.find(name);

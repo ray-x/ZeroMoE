@@ -1,5 +1,6 @@
 #include "active_layer_upload_workers.hpp"
 #include "graph_config.hpp"
+#include "graph_settings_global.hpp"
 #include "async_prefetcher.hpp"
 #include "cpu_expert_executor.hpp"
 #include "gpu_expert_executor.hpp"
@@ -759,31 +760,25 @@ static double g_diag_decode_layer_input_ms = 0.0;
 // writes exact F32 rows for one selected layer and prompt position. It is
 // disabled by default and intended only for A/A diagnosis.
 static const char *prefill_boundary_dump_base() {
-  static const char *value = zeromoe::graphcfg::env("ZEROMOE_PREFILL_BOUNDARY_DUMP");
-  return value && *value ? value : nullptr;
+  static const std::string value = zeromoe::graphsettings::active_settings().diag.prefill_boundary_dump.value;
+  return value.empty() ? nullptr : value.c_str();
 }
 
 static int prefill_boundary_dump_last_pos() {
-  static const int value = [] {
-    const char *env = zeromoe::graphcfg::env("ZEROMOE_PREFILL_BOUNDARY_LAST_POS");
-    return env && *env ? std::atoi(env) : -1;
-  }();
+  static const int value = static_cast<int>(
+      zeromoe::graphsettings::active_settings().diag.prefill_boundary_last_pos.value);
   return value;
 }
 
 static int prefill_boundary_dump_first_pos() {
-  static const int value = [] {
-    const char *env = zeromoe::graphcfg::env("ZEROMOE_PREFILL_BOUNDARY_FIRST_POS");
-    return env && *env ? std::atoi(env) : 0;
-  }();
+  static const int value = static_cast<int>(
+      zeromoe::graphsettings::active_settings().diag.prefill_boundary_first_pos.value);
   return value;
 }
 
 static int prefill_boundary_dump_layer() {
-  static const int value = [] {
-    const char *env = zeromoe::graphcfg::env("ZEROMOE_PREFILL_BOUNDARY_LAYER");
-    return env && *env ? std::atoi(env) : 0;
-  }();
+  static const int value = static_cast<int>(
+      zeromoe::graphsettings::active_settings().diag.prefill_boundary_layer.value);
   return value;
 }
 

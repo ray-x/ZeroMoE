@@ -1,4 +1,5 @@
 #include "graph_config.hpp"
+#include "graph_settings_global.hpp"
 #include "ggml_qwen_shared_runner.hpp"
 #include "ggml_moe_graph_builder.hpp"
 #include "ggml_moe_internal.hpp"
@@ -906,7 +907,7 @@ bool GgmlQwenSharedRunner::copy_output_to_host(const void *combined_output,
                                                float *host_out) {
   if (!backend_ || !graph_ready_ || !combined_output || !host_out ||
       (combined_output != output_ && combined_output != overlap_combined_)) {
-    const char *diag = zeromoe::graphcfg::env("ZEROMOE_PREFILL_BOUNDARY_DUMP");
+    const bool diag = !zeromoe::graphsettings::active_settings().diag.prefill_boundary_dump.value.empty();
     if (diag) {
       LOG_ERROR("[GGML-SHARED-DIAG] output copy rejected backend=%d ready=%d "
                 "arg=%p output=%p overlap=%p host=%p\n",
@@ -922,7 +923,7 @@ bool GgmlQwenSharedRunner::copy_output_to_host(const void *combined_output,
       tensor->ne[0] != d_model_ || tensor->ne[1] < n_tokens_ ||
       tensor->nb[0] != sizeof(float) ||
       tensor->nb[1] != (size_t)d_model_ * sizeof(float)) {
-    const char *diag = zeromoe::graphcfg::env("ZEROMOE_PREFILL_BOUNDARY_DUMP");
+    const bool diag = !zeromoe::graphsettings::active_settings().diag.prefill_boundary_dump.value.empty();
     if (diag) {
       LOG_ERROR("[GGML-SHARED-DIAG] output tensor rejected data=%p type=%u "
                 "ne=%lld,%lld nb=%zu,%zu expected=%d,%d,%zu\n",

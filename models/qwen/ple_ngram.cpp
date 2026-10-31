@@ -63,20 +63,15 @@ bool ple_timing_enabled() {
 // the normal PLE path has no dependency on diagnostic plumbing.  The files
 // are only written when the existing prefill boundary dump is enabled.
 bool ple_diag_selected(int layer, int pos) {
-  static const char *base = zeromoe::graphcfg::env("ZEROMOE_PREFILL_BOUNDARY_DUMP");
-  static const int selected_layer = [] {
-    const char *v = zeromoe::graphcfg::env("ZEROMOE_PREFILL_BOUNDARY_LAYER");
-    return v && *v ? std::atoi(v) : 0;
-  }();
-  static const int first_pos = [] {
-    const char *v = zeromoe::graphcfg::env("ZEROMOE_PREFILL_BOUNDARY_FIRST_POS");
-    return v && *v ? std::atoi(v) : 0;
-  }();
-  static const int last_pos = [] {
-    const char *v = zeromoe::graphcfg::env("ZEROMOE_PREFILL_BOUNDARY_LAST_POS");
-    return v && *v ? std::atoi(v) : -1;
-  }();
-  return base && *base && (selected_layer < 0 || selected_layer == layer) &&
+  static const std::string base_setting = zeromoe::graphsettings::active_settings().diag.prefill_boundary_dump.value;
+  static const char *base = base_setting.empty() ? nullptr : base_setting.c_str();
+  static const int selected_layer = static_cast<int>(
+      zeromoe::graphsettings::active_settings().diag.prefill_boundary_layer.value);
+  static const int first_pos = static_cast<int>(
+      zeromoe::graphsettings::active_settings().diag.prefill_boundary_first_pos.value);
+  static const int last_pos = static_cast<int>(
+      zeromoe::graphsettings::active_settings().diag.prefill_boundary_last_pos.value);
+  return base && (selected_layer < 0 || selected_layer == layer) &&
          pos >= first_pos && pos <= last_pos;
 }
 
@@ -84,7 +79,7 @@ void ple_diag_dump(const char *label, int layer, int pos, const float *data,
                    size_t count) {
   if (!data || count == 0 || !ple_diag_selected(layer, pos))
     return;
-  const char *base = zeromoe::graphcfg::env("ZEROMOE_PREFILL_BOUNDARY_DUMP");
+  const char *base = zeromoe::graphsettings::active_settings().diag.prefill_boundary_dump.value.c_str();
   std::string path = std::string(base) + ".l" +
                      (layer < 10 ? "0" : "") + std::to_string(layer) +
                      ".p" + std::to_string(pos) + "." + label + ".f32";
