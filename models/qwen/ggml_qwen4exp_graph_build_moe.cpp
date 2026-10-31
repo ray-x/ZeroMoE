@@ -5,6 +5,7 @@
 // declarations live in ggml_qwen4exp_graph_internal.hpp.
 
 #include "ggml_qwen4exp_graph_internal.hpp"
+#include "graph_settings_global.hpp"
 
 #include <cstdlib>
 
@@ -855,11 +856,9 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         pl.remap_gpu = tab.remap_gpu; pl.remap_cpu = tab.remap_cpu;
         pl.mask_gpu = tab.mask_gpu;   pl.mask_cpu = tab.mask_cpu;
       }
-      const char *early_env = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_LAYER13");
-      const char *all_early_env = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT");
+      const bool early_all_split = zeromoe::graphsettings::active_settings().tun.early_ready_all_split.value != 0;
       const bool early_requested =
-          ((early_env && early_env[0] == '1' && layer == 13) ||
-           (!all_early_env || all_early_env[0] != '0')) &&
+          early_all_split &&
           g.decode_mode && g.S >= 1 &&
           g.S == 1;
       std::unique_ptr<EarlyReadyLane> early;
@@ -879,7 +878,8 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
           for (auto *table : early->gpu_tables)
             ggml_backend_sched_set_tensor_backend(g.sched, table, g.cuda);
         }
-        const char *stage = g.S == 1 ? zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_STAGE_LAYER") : nullptr;
+        const std::string early_stage_setting = g.S == 1 ? zeromoe::graphsettings::active_settings().tun.early_ready_stage_layer.value : std::string();
+        const char *stage = early_stage_setting.empty() ? nullptr : early_stage_setting.c_str();
         if (stage && g.split_gpu_expert_ids.count(layer - 1) &&
             (std::strcmp(stage, "all") == 0 || std::atoi(stage) == layer)) {
           if (!g.early_stage_shapes)
@@ -948,13 +948,14 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         early->gpu_input = fork;
         input3 = ggml_reshape_3d(ctx, fork, g.D, 1, g.S);
         ggml_build_forward_expand(g.graph, fork);
-        const char *predict = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_PREDICT");  // also for windows (lane on)
-        const char *target = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_PREDICT_LAYER");
-        const char *stage = g.S == 1 ? zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_STAGE_LAYER") : nullptr;
+        const bool predict = zeromoe::graphsettings::active_settings().tun.early_ready_predict.value != 0;
+        const long predict_layer = zeromoe::graphsettings::active_settings().tun.early_ready_predict_layer.value;
+        const bool predict_this_layer = predict_layer < 0 || predict_layer == layer + 1;
+        const std::string early_stage_setting2 = g.S == 1 ? zeromoe::graphsettings::active_settings().tun.early_ready_stage_layer.value : std::string();
+        const char *stage = early_stage_setting2.empty() ? nullptr : early_stage_setting2.c_str();
         const bool stage_next = stage &&
             (std::strcmp(stage, "all") == 0 || std::atoi(stage) == layer + 1);
-        const bool predict_this_layer = !target || std::atoi(target) == layer + 1;
-        if (((predict && predict[0] == '1' && predict_this_layer) || stage_next) &&
+        if (((predict && predict_this_layer) || stage_next) &&
             g.split_gpu_expert_ids.count(layer + 1)) {
           const std::string next = "blk." + std::to_string(layer + 1) + ".";
           auto *next_router = resident_tensor(g, ctx, next + "ffn_gate_inp.weight");

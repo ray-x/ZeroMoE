@@ -44,8 +44,9 @@ extern "C" int ggml_backend_sched_early_cpu_supported() __attribute__((weak));
 // ZEROMOE_QWEN_EARLY_READY_RIDGE; a missing/invalid file leaves the plain pilot.
 // The table format and loader are shared with GLM5NEXT via PilotRidgeTable.
 inline const PilotRidgeTable &qwen4exp_ridge() {
-  static const PilotRidgeTable table =
-      PilotRidgeTable::load("ZEROMOE_QWEN_EARLY_READY_RIDGE", "QWEN-RIDGE");
+  static const PilotRidgeTable table = PilotRidgeTable::load(
+      zeromoe::graphsettings::active_settings().tun.early_ready_ridge.value.c_str(),
+      "QWEN-RIDGE");
   return table;
 }
 
