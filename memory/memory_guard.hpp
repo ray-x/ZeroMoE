@@ -25,6 +25,7 @@
 
 #pragma once
 #include "graph_config.hpp"
+#include "graph_settings_global.hpp"
 
 #include <cstdlib>
 #include <algorithm>
@@ -148,7 +149,7 @@ public:
         if (running_.load()) return;
         stop_mb_ = effective_stop_limit_mb(stop_mb);
         // Experiment-only override (ZEROMOE_MEM_GUARD_FLOOR_MB): lets an A/B run use a lower host reserve than the 10 GiB default.
-        const long v = zeromoe::graphcfg::atol_or("ZEROMOE_MEM_GUARD_FLOOR_MB", -1);
+        const long v = zeromoe::graphsettings::active_settings().tun.mem_guard_floor_mb.value;
         if (v >= 8 * 1024) stop_mb_ = v;
         warn_mb_ = std::max(warn_mb, stop_mb_);
         poll_ms_ = poll_ms > 0 ? poll_ms : 500;

@@ -94,6 +94,7 @@ struct GraphSettings {
   Resolved<long> offload_pin_transient;    // bool, default off
   Resolved<long> offload_seed_par;
   Resolved<long> offload_transient_par;
+  Resolved<long> mem_guard_floor_mb;
   Resolved<long> offload_first_layer;      // -1 = no offload tier
   Resolved<long> gpu_assist_slots;
   Resolved<long> use_gpu1;                 // bool
@@ -279,6 +280,8 @@ inline const std::vector<Field<long>> &long_fields() {
       {"offload_seed_par", ZEROMOE_SETTINGS_REF(tun.offload_seed_par), 8, Parse::IntStrict,
        kClaimAll, {}, false},
       {"offload_transient_par", ZEROMOE_SETTINGS_REF(tun.offload_transient_par), 8, Parse::IntStrict,
+       kClaimAll, {}, false},
+      {"mem_guard_floor_mb", ZEROMOE_SETTINGS_REF(tun.mem_guard_floor_mb), -1, Parse::IntAtoi,
        kClaimAll, {}, false},
       {"offload_first_layer", ZEROMOE_SETTINGS_REF(tun.offload_first_layer), -1, Parse::IntAtoi,
        claims_for(F::Glm), {}, false},
@@ -530,6 +533,7 @@ inline bool valid_integer(const std::string &name, long n) {
   if (name == "graph_host_offset") return n >= 0 && n <= 4096;
   if (name == "sparse_decode_reserve") return n >= 0 && n <= 1000000;
   if (name == "assist_device") return n >= -1 && n <= 1000;
+  if (name == "mem_guard_floor_mb") return n == -1 || n >= 8192;
   if (name == "gpu1_min_layer") return n >= 0 && n <= 1000000;
   if (name == "gpu1_min_layer") return n >= 0 && n <= 1000000;
   if (name == "assist2_device") return n >= -1 && n <= 1000;
@@ -585,8 +589,7 @@ inline const char *meaning(const std::string &name) {
       {"offload_pin_transient", "Pin transient offload experts (default off)."},
       {"offload_seed_par", "Offload seed parallelism (default 8)."},
       {"offload_transient_par", "Offload transient read parallelism (default 8)."},
-      {"offload_seed_par", "Offload seed parallelism (default 8)."},
-      {"offload_transient_par", "Offload transient read parallelism (default 8)."},
+      {"mem_guard_floor_mb", "Memory guard stop floor in MB (-1 default; >=8192 overrides)."},
       {"offload_first_layer", "First GLM/Ling layer in the host offload tier; -1 leaves the tier disabled."},
       {"gpu_assist_slots", "Concurrent staging slots for host experts computed on GPU; consumes extra VRAM."},
       {"gpu_assist2_slots", "Second assist-ring staging slots (0..8); used by GLM and MiMo."},

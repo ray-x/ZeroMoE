@@ -45,6 +45,7 @@ hc_disable_fused_post=0
 host_node=0
 ingraph_moe=1
 lane_with_gpu1=1
+mem_guard_floor_mb=-1
 mtp_prefill_overlap=0
 mtp_window=1
 native_f32_graph=0
