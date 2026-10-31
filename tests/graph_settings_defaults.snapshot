@@ -81,3 +81,4 @@ sparse_decode_reserve=1024
 split_load=1
 storage_timeout_ms=100
 use_gpu1=1
+wuv_int8=0

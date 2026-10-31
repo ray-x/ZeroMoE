@@ -143,6 +143,7 @@ struct GraphSettings {
   Resolved<long> hc_async_readback;
   Resolved<long> hc_disable_fused_post;
   Resolved<long> router_compare;
+  Resolved<long> wuv_int8;
   Resolved<long> device_route;
   Resolved<long> adaptive_policy;
   Resolved<long> prefill_device_state;
@@ -324,6 +325,8 @@ inline const std::vector<Field<long>> &long_fields() {
        claims_for(F::Qwen), {}, false},
       {"adaptive_policy", ZEROMOE_SETTINGS_REF(tun.adaptive_policy), 0, Parse::FlagOn,
        claims_for(F::Qwen), {}, false},
+      {"wuv_int8", ZEROMOE_SETTINGS_REF(tun.wuv_int8), 0, Parse::FlagOn,
+       kClaimAll, {}, false},
       {"prefill_device_state", ZEROMOE_SETTINGS_REF(tun.prefill_device_state), 1, Parse::FlagUnlessOff,
        claims_for(F::Qwen), {}, false},
       {"host_node", ZEROMOE_SETTINGS_REF(tun.host_node), 0, Parse::FlagOn,
@@ -546,6 +549,7 @@ inline const char *meaning(const std::string &name) {
       {"pilot_gate_min_samples", "DeepSeek pilot gate minimum samples."},
       {"pilot_promote_mode", "DeepSeek pilot promote mode: 0 off, 1 main, 2 active."},
       {"adaptive_policy", "Qwen adaptive completion policy (default off)."},
+      {"wuv_int8", "WUV int8 persistent storage (default off)."},
       {"prefill_device_state", "Qwen prefill device-state inputs (on unless set to 0)."},
       {"host_node", "Qwen host-node mode (default off)."},
       {"mtp_window", "Qwen graph-native MTP multi-token window (on unless set to 0)."},

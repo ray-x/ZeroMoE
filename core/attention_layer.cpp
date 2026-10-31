@@ -1,5 +1,6 @@
 #include "cuda_manager.hpp"
 #include "graph_config.hpp"
+#include "graph_settings_global.hpp"
 #include "dense_dispatch.hpp"
 #include "dsv41_attention.hpp"
 #include "dsv41_trace.hpp"
@@ -115,8 +116,7 @@ void invalidate_glm5next_kda_gpu_states(StreamingEngine &engine) {
 // anti-aliasing check the S=1 test structurally cannot perform).
 static bool wuv_int8_enabled() {
   static const bool on = [] {
-    const char *e = zeromoe::graphcfg::env("ZEROMOE_WUV_INT8");
-    return e && e[0] == '1';
+    return zeromoe::graphsettings::active_settings().tun.wuv_int8.value != 0;
   }();
   return on;
 }
