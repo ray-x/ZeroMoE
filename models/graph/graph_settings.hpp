@@ -101,6 +101,9 @@ struct GraphSettings {
   Resolved<long> offload_seed_gpu1_hot;    // bool
   // GLM graph lane / staging switches.
   Resolved<long> early_ready;              // -1 = on when the layer has overlap work, 0 off, 1 forced
+  Resolved<long> early_ready_skip_all_hot;
+  Resolved<long> early_ready_async_output;
+  Resolved<long> early_ready_resident_tables;
   Resolved<long> split_load, lane_with_gpu1, pilot_copy;  // bool, on by default
   Resolved<long> dynamic_cache;                          // bool, off by default
   Resolved<long> pilot_stage;
@@ -268,6 +271,12 @@ inline const std::vector<Field<long>> &long_fields() {
        claims_for(F::Glm), {}, false},
       {"early_ready", ZEROMOE_SETTINGS_REF(tun.early_ready), -1, Parse::TriState,
        claims_for(F::Glm), {}, false},
+      {"early_ready_skip_all_hot", ZEROMOE_SETTINGS_REF(tun.early_ready_skip_all_hot), 0, Parse::FlagOn,
+       claims_for(F::Qwen), {}, false},
+      {"early_ready_async_output", ZEROMOE_SETTINGS_REF(tun.early_ready_async_output), 1, Parse::FlagUnlessOff,
+       claims_for(F::Qwen), {}, false},
+      {"early_ready_resident_tables", ZEROMOE_SETTINGS_REF(tun.early_ready_resident_tables), 1, Parse::FlagUnlessOff,
+       claims_for(F::Qwen), {}, false},
       {"split_load", ZEROMOE_SETTINGS_REF(tun.split_load), 1, Parse::FlagUnlessOff,
        claims_for(F::Glm), {}, false},
       {"lane_with_gpu1", ZEROMOE_SETTINGS_REF(tun.lane_with_gpu1), 1, Parse::FlagUnlessOff,
@@ -517,6 +526,9 @@ inline const char *meaning(const std::string &name) {
       {"offload_pin_dma", "Pin GLM/Ling host DMA storage: true, false or \"auto\" (when GPU assist is active)."},
       {"offload_seed_gpu1_hot", "Seed the GLM/Ling second-GPU hot set during startup."},
       {"early_ready", "GLM early-ready overlap lane: true, false or \"auto\" when the layer has overlap work."},
+      {"early_ready_skip_all_hot", "Qwen early-ready skip-all-hot (default off)."},
+      {"early_ready_async_output", "Qwen early-ready async output copy (default on)."},
+      {"early_ready_resident_tables", "Qwen early-ready resident tables (default on)."},
       {"split_load", "Allow GLM split expert-load scheduling; false changes the overlap strategy."},
       {"lane_with_gpu1", "Allow the GLM overlap lane alongside second-GPU expert work."},
       {"pilot_copy", "Allow GLM pilot-driven expert-copy staging."},

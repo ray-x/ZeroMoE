@@ -18,6 +18,7 @@
 #include "cuda_raii.hpp"
 #include "nvtx_range.hpp"
 #include "graph_config.hpp"
+#include "graph_settings_global.hpp"
 #include "logger.hpp"
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -243,14 +244,11 @@ struct EarlyReadyLane {
     expert_bytes = ggml_row_size(gate->type, gate->ne[0]) * gate->ne[1] +
                    (up ? ggml_row_size(up->type, up->ne[0]) * up->ne[1] : 0) +
                    ggml_row_size(down->type, down->ne[0]) * down->ne[1];
-    const char *skip = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_SKIP_ALL_HOT");
-    skip_all_hot = skip && skip[0] == '1';
-    const char *copy = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_ASYNC_OUTPUT");
+    skip_all_hot = zeromoe::graphsettings::active_settings().tun.early_ready_skip_all_hot.value != 0;
     // Accepted production profile (early-ready + immutable resident route tables +
     // asynchronous cold-output upload): on unless explicitly disabled with =0.
-    async_output_copy = !(copy && copy[0] == '0');
-    const char *tables = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_RESIDENT_TABLES");
-    resident_tables = !(tables && tables[0] == '0');
+    async_output_copy = zeromoe::graphsettings::active_settings().tun.early_ready_async_output.value != 0;
+    resident_tables = zeromoe::graphsettings::active_settings().tun.early_ready_resident_tables.value != 0;
     cold_mask.resize(n_experts);
     for (int e = 0; e < n_experts; ++e)
       cold_mask[e] = static_cast<const float *>(mask->data)[e] != 0.0f;
