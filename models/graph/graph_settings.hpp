@@ -125,6 +125,8 @@ struct GraphSettings {
   Resolved<double> prefill_split;
   Resolved<long> prefill_ahead;
   Resolved<double> gpu1_hot_gib;
+  Resolved<double> graph_pin_gb;
+  Resolved<double> graph_resident_gb;
   Resolved<long> gpu_assist2_slots;
   Resolved<double> offload_pinned_fraction;
   Resolved<double> offload_probation_fraction;
@@ -437,6 +439,10 @@ inline const std::vector<Field<double>> &real_fields() {
        claims_for(Family::Qwen), {}, false},
       {"gpu1_hot_gib", ZEROMOE_SETTINGS_REF(tun.gpu1_hot_gib), 0.0, Parse::RealOrAuto,
        claims_for(Family::Glm), {}, false},
+      {"graph_pin_gb", ZEROMOE_SETTINGS_REF(tun.graph_pin_gb), 0.0, Parse::RealOrAuto,
+       claims_for(Family::Glm), {}, false},
+      {"graph_resident_gb", ZEROMOE_SETTINGS_REF(tun.graph_resident_gb), 0.0, Parse::RealOrAuto,
+       claims_for(Family::Glm), {}, false},
       {"prefill_split", ZEROMOE_SETTINGS_REF(tun.prefill_split), 0.63, Parse::RealOrAuto,
        claims_for(Family::Glm), {}, false},
   };
@@ -594,6 +600,8 @@ inline const char *meaning(const std::string &name) {
       {"prefill_split", "GLM prefill split ratio between GPUs (0..1)."},
       {"prefill_ahead", "GLM prefill read-ahead layers (0 disables)."},
       {"gpu1_hot_gib", "GLM hot-expert budget on the second GPU, in GiB (0 disables)."},
+      {"graph_pin_gb", "GLM graph-RAM pin budget in GiB (0 uses engine default capped at 24)."},
+      {"graph_resident_gb", "GLM full-graph resident expert budget in GiB (0 disables)."},
       {"cpu_lm_head", "Keep GLM output norm/weight on CPU (low-VRAM fallback; default off)."},
       {"cpu_lm_head", "Keep GLM output norm/weight on CPU (low-VRAM fallback; default off)."},
       {"offload_pinned_fraction", "Pinned fraction of the GLM/Ling host offload pool (0..1), not a GiB budget."},

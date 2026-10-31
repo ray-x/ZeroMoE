@@ -1090,14 +1090,10 @@ bool preload_expert_source(FullGraph &g) {
   // registration failure stops the pass and leaves the remaining slices
   // pageable rather than retrying until the machine is under pressure.
   size_t pin_budget = g.engine->ram_pinned_budget_bytes;
-  const char *pin_env = zeromoe::graphcfg::env("ZEROMOE_FULL_GRAPH_PIN_GB");
-  if (pin_env && pin_env[0]) {
-    char *end = nullptr;
-    const double gb = std::strtod(pin_env, &end);
-    if (end != pin_env && *end == '\0' && gb >= 0.0) {
-      const double bytes = gb * 1024.0 * 1024.0 * 1024.0;
-      pin_budget = bytes >= (double)SIZE_MAX ? SIZE_MAX : (size_t)bytes;
-    }
+  const double pin_gb = zeromoe::graphsettings::active_settings().tun.graph_pin_gb.value;
+  if (pin_gb > 0.0) {
+    const double bytes = pin_gb * 1024.0 * 1024.0 * 1024.0;
+    pin_budget = bytes >= (double)SIZE_MAX ? SIZE_MAX : (size_t)bytes;
   } else if (pin_budget > 24ull * 1024ull * 1024ull * 1024ull) {
     pin_budget = 24ull * 1024ull * 1024ull * 1024ull;
   }

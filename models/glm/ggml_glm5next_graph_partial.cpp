@@ -262,7 +262,7 @@ bool configure_partial_experts_base(FullGraph &g) {
       g.engine->family_ops.family == ModelFamily::BailingMoE3)
     return false;
   const double requested_gb =
-      full_graph_resident_gb("ZEROMOE_FULL_GRAPH_RESIDENT_GB");
+      zeromoe::graphsettings::active_settings().tun.graph_resident_gb.value;
   if (requested_gb <= 0.0)
     return false;
   const auto &c = g.engine->model_file.architecture_config;
