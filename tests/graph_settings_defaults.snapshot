@@ -10,6 +10,7 @@ cache_moe_graph=0
 cpu_lm_head=0
 decode_gpu_hc=1
 decode_kv_capacity=2048
+dense_scratch_reserve_mb=256
 device_expert_layers=2
 device_expert_trailing=0
 device_route=0

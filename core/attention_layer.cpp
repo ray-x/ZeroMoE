@@ -435,8 +435,7 @@ static bool ensure_wuk_wuv_cached(StreamingEngine &engine, int layer_idx) {
 // (outproj 131 s of 400 s). ZEROMOE_DENSE_SCRATCH_RESERVE_MB raises it.
 static size_t dense_scratch_reserve_bytes() {
   static const size_t v = [] {
-    const char *e = zeromoe::graphcfg::env("ZEROMOE_DENSE_SCRATCH_RESERVE_MB");
-    const long mb = (e && e[0]) ? std::atol(e) : 256;
+    const long mb = zeromoe::graphsettings::active_settings().tun.dense_scratch_reserve_mb.value;
     return (size_t)(mb > 0 ? mb : 256) * 1024ULL * 1024ULL;
   }();
   return v;

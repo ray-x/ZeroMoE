@@ -95,6 +95,7 @@ struct GraphSettings {
   Resolved<long> offload_seed_par;
   Resolved<long> offload_transient_par;
   Resolved<long> mem_guard_floor_mb;
+  Resolved<long> dense_scratch_reserve_mb;
   Resolved<long> offload_first_layer;      // -1 = no offload tier
   Resolved<long> gpu_assist_slots;
   Resolved<long> use_gpu1;                 // bool
@@ -282,6 +283,8 @@ inline const std::vector<Field<long>> &long_fields() {
       {"offload_transient_par", ZEROMOE_SETTINGS_REF(tun.offload_transient_par), 8, Parse::IntStrict,
        kClaimAll, {}, false},
       {"mem_guard_floor_mb", ZEROMOE_SETTINGS_REF(tun.mem_guard_floor_mb), -1, Parse::IntAtoi,
+       kClaimAll, {}, false},
+      {"dense_scratch_reserve_mb", ZEROMOE_SETTINGS_REF(tun.dense_scratch_reserve_mb), 256, Parse::IntStrict,
        kClaimAll, {}, false},
       {"offload_first_layer", ZEROMOE_SETTINGS_REF(tun.offload_first_layer), -1, Parse::IntAtoi,
        claims_for(F::Glm), {}, false},
@@ -590,6 +593,7 @@ inline const char *meaning(const std::string &name) {
       {"offload_seed_par", "Offload seed parallelism (default 8)."},
       {"offload_transient_par", "Offload transient read parallelism (default 8)."},
       {"mem_guard_floor_mb", "Memory guard stop floor in MB (-1 default; >=8192 overrides)."},
+      {"dense_scratch_reserve_mb", "Dense scratch reserve in MB (default 256)."},
       {"offload_first_layer", "First GLM/Ling layer in the host offload tier; -1 leaves the tier disabled."},
       {"gpu_assist_slots", "Concurrent staging slots for host experts computed on GPU; consumes extra VRAM."},
       {"gpu_assist2_slots", "Second assist-ring staging slots (0..8); used by GLM and MiMo."},
