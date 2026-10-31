@@ -119,8 +119,10 @@ inline void dump_decode_logits_if_enabled(int step, const float *logits,
 // output-projection-only difference during llama.cpp parity checks.
 inline void dump_prefill_final_hidden_if_enabled(int step, const float *hidden,
                                                   size_t n) {
-    static const char *path = zeromoe::graphcfg::env("ZEROMOE_PREFILL_FINAL_HIDDEN_DUMP");
-    if (step != 0 || !path || !path[0] || !hidden || n == 0)
+    static const std::string path_setting =
+        zeromoe::graphsettings::active_settings().diag.prefill_final_hidden_dump.value;
+    const char *path = path_setting.empty() ? nullptr : path_setting.c_str();
+    if (step != 0 || !path || !hidden || n == 0)
         return;
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     if (out)
