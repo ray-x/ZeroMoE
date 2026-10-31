@@ -155,9 +155,9 @@ int second_gpu_device(int core_device) { return core_device == 0 ? 1 : 0; }
 int gpu_assist2_device(int core_device) {
   // Unset: use the non-core CUDA device when two devices are visible and the second GPU already holds a hot set; -1 turns it off.
   static const int d = [core_device] {
-    const char *v = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_ASSIST2_DEVICE");
-    if (v && v[0])
-      return std::atoi(v);
+    const long v = zeromoe::graphsettings::active_settings().tun.assist2_device.value;
+    if (v >= 0)
+      return static_cast<int>(v);
     int n = 0;
     const bool hot1 = zeromoe::graphsettings::active_settings().tun.gpu1_hot_gib.value > 0.0;
     return cudaGetDeviceCount(&n) == cudaSuccess && n >= 2 && hot1 ? second_gpu_device(core_device) : -1;
