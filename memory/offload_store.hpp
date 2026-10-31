@@ -657,9 +657,9 @@ public:
     // read into the slot skips the page fault and zero-fill (measured ~0.5 ms of CPU and ~20% of the read time per 7 MB expert), at
     // the price of a soft memory budget: freed slots are reclaimed under pressure, not immediately.
     static const int advice = [] {
-      const char *v = graphcfg::env("ZEROMOE_OFFLOAD_EVICT");
+      const std::string &v = zeromoe::graphsettings::active_settings().tun.offload_evict.value;
 #ifdef MADV_FREE
-      if (v && std::strcmp(v, "free") == 0) return static_cast<int>(MADV_FREE);
+      if (v == "free") return static_cast<int>(MADV_FREE);
 #endif
       return static_cast<int>(MADV_DONTNEED);
     }();

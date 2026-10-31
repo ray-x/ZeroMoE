@@ -51,6 +51,7 @@ native_f32_graph=0
 offload_async=0
 offload_byte_cap=0
 offload_ddr_gib=-1
+offload_evict=dontneed
 offload_first_layer=-1
 offload_mirror=
 offload_model=
