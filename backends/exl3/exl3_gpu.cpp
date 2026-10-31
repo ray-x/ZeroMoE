@@ -4,6 +4,7 @@
 #include "exl3_cuda.hpp"
 #include "exl3_format.hpp"
 #include "graph_config.hpp"
+#include "graph_settings_global.hpp"
 #include "logger.hpp"
 
 #include <cublas_v2.h>
@@ -143,7 +144,7 @@ struct Exl3GpuExecutor::Impl {
     pending_routed.reserve(256);
     external_routed_graphs.reserve(kMaxExternalRoutedGraphs);
     DeviceGuard guard(device);
-    const char *schedule_env = zeromoe::graphcfg::env("ZEROMOE_CUDA_SCHEDULE");
+    const char *schedule_env = zeromoe::graphsettings::active_settings().tun.cuda_schedule.value.c_str();
     if (schedule_env && schedule_env[0]) {
       unsigned schedule = cudaDeviceScheduleAuto;
       const char *name = "auto";

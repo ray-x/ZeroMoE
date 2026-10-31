@@ -143,6 +143,7 @@ struct GraphSettings {
   Resolved<std::string> route_tap;
   Resolved<std::string> full_graph_usage_file;
   Resolved<std::string> offload_evict;
+  Resolved<std::string> cuda_schedule;
   Resolved<std::string> gpu1_layers;
   Resolved<long> gpu1_min_layer;
   // Soft pin tier for split expert arenas (decode only): GiB of the last layers'
@@ -482,6 +483,8 @@ inline const std::vector<Field<std::string>> &text_fields() {
        claims_for(Family::Glm), {}, false},
       {"offload_evict", ZEROMOE_SETTINGS_REF(tun.offload_evict), std::string("dontneed"), Parse::Text,
        kClaimAll, {}, false},
+      {"cuda_schedule", ZEROMOE_SETTINGS_REF(tun.cuda_schedule), std::string("auto"), Parse::Text,
+       kClaimAll, {}, false},
       {"gpu1_layers", ZEROMOE_SETTINGS_REF(tun.gpu1_layers), std::string(), Parse::Text,
        claims_for(Family::Glm), {}, false},
       {"usage_record_file", ZEROMOE_SETTINGS_REF(diag.usage_record_file), std::string(), Parse::Text,
@@ -646,6 +649,7 @@ inline const char *meaning(const std::string &name) {
       {"route_tap", "GLM route tap output file (empty disables)."},
       {"full_graph_usage_file", "GLM full-graph usage file path (empty uses family default)."},
       {"offload_evict", "Offload eviction advice: dontneed (default) or free."},
+      {"cuda_schedule", "CUDA schedule mode: auto, blocking, or spin."},
       {"gpu1_layers", "GLM GPU1 expert layer range 'a-b' (empty disables)."},
       {"alloc_floor_mib", "Graph allocator admission floor in MiB (0 keeps the family default: 1024 for Qwen, 2048 for GLM)."},
       {"storage_timeout_ms", "Qwen storage-wait timeout in milliseconds for the staged graph path (0..30000)."},

@@ -8,6 +8,7 @@ cache_moe_cpu_cold=0
 cache_moe_decode=0
 cache_moe_graph=0
 cpu_lm_head=0
+cuda_schedule=auto
 decode_gpu_hc=1
 decode_kv_capacity=2048
 dense_scratch_reserve_mb=256

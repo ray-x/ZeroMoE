@@ -930,7 +930,7 @@ public:
             // primary full-graph path; ZEROMOE_CUDA_SCHEDULE=blocking
             // remains available for anyone who needs to A/B the legacy path
             // against the old default.
-            const char * schedule_env = zeromoe::graphcfg::env("ZEROMOE_CUDA_SCHEDULE");
+            const char * schedule_env = zeromoe::graphsettings::active_settings().tun.cuda_schedule.value.c_str();
             // Host-node mode (ZEROMOE_QWEN4EXP_HOST_NODE=1) runs the CPU MoE from a CUDA host callback while the
             // generation thread waits in cudaStreamSynchronize. With the Auto (spin) schedule that waiting thread
             // burns a logical CPU the 12-thread OpenMP team needs, stalling every barrier: measured 18.2 vs 22.6
