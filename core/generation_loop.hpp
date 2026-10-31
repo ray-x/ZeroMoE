@@ -1,6 +1,7 @@
 #pragma once
 #include "engine.hpp"
 #include "graph_config.hpp"
+#include "graph_settings_global.hpp"
 #include "full_graph_model.hpp"
 #include "tensor_trace.hpp"
 #include "nvtx_range.hpp"
@@ -94,8 +95,10 @@ inline void check_hidden_finite(const char* label, const float* data, size_t n) 
 // absolute logit delta instead of relying only on sampled text.
 inline void dump_decode_logits_if_enabled(int step, const float *logits,
                                           size_t n) {
-    static const char *path = zeromoe::graphcfg::env("ZEROMOE_DECODE_LOGITS_DUMP");
-    if (!path || !path[0] || !logits || n == 0)
+    static const std::string path_setting =
+        zeromoe::graphsettings::active_settings().diag.decode_logits_dump.value;
+    const char *path = path_setting.empty() ? nullptr : path_setting.c_str();
+    if (!path || !logits || n == 0)
         return;
 
     std::ofstream out(path, step == 0

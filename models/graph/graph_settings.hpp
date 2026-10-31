@@ -204,6 +204,7 @@ struct DiagnosticSettings {
   Resolved<std::string> usage_record_file;  // survey mode: write per-expert route counts here at shutdown
   Resolved<std::string> diag_dump_dir;     // CPU graph boundary snapshot directory
   Resolved<std::string> prefill_boundary_dump; // prefill boundary dump directory
+  Resolved<std::string> decode_logits_dump; // decode logits dump file
   Resolved<long> prefill_boundary_layer;     // -1 = all layers
   Resolved<long> prefill_boundary_first_pos;
   Resolved<long> prefill_boundary_last_pos;  // -1 = no upper bound
@@ -503,6 +504,8 @@ inline const std::vector<Field<std::string>> &text_fields() {
        claims_for(Family::Qwen), {}, true},
       {"prefill_boundary_dump", ZEROMOE_SETTINGS_REF(diag.prefill_boundary_dump), std::string(), Parse::Text,
        kClaimAll, {}, true},
+      {"decode_logits_dump", ZEROMOE_SETTINGS_REF(diag.decode_logits_dump), std::string(), Parse::Text,
+       kClaimAll, {}, true},
       {"early_ready_stage_layer", ZEROMOE_SETTINGS_REF(tun.early_ready_stage_layer), std::string(), Parse::Text,
        claims_for(Family::Qwen), {}, false},
       {"early_ready_ridge", ZEROMOE_SETTINGS_REF(tun.early_ready_ridge), std::string(), Parse::Text,
@@ -712,6 +715,7 @@ inline const char *meaning(const std::string &name) {
       {"usage_record_file", "Diagnostic route-survey output path; empty disables recording. Excluded from default hashes."},
       {"diag_dump_dir", "Diagnostic CPU graph boundary snapshot directory; empty disables snapshots."},
       {"prefill_boundary_dump", "Prefill boundary dump directory; empty disables."},
+      {"decode_logits_dump", "Decode logits dump file path; empty disables."},
       {"prefill_boundary_layer", "Prefill boundary dump layer (-1 = all)."},
       {"prefill_boundary_first_pos", "Prefill boundary dump first position."},
       {"prefill_boundary_last_pos", "Prefill boundary dump last position (-1 = no upper bound)."},
