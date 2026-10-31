@@ -1216,8 +1216,9 @@ bool publish_dynamic_uploads(FullGraph &g) {
 RouteTap &route_tap() {
   static RouteTap t = [] {
     RouteTap r;
-    if (const char *e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_ROUTE_TAP"))
-      r.path = e;
+    const std::string &p = zeromoe::graphsettings::active_settings().tun.route_tap.value;
+    if (!p.empty())
+      r.path = p;
     return r;
   }();
   return t;
