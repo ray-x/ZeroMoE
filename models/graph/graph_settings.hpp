@@ -92,6 +92,8 @@ struct GraphSettings {
   Resolved<long> offload_async;            // bool
   Resolved<long> offload_retarget;         // bool, default on
   Resolved<long> offload_pin_transient;    // bool, default off
+  Resolved<long> offload_seed_par;
+  Resolved<long> offload_transient_par;
   Resolved<long> offload_first_layer;      // -1 = no offload tier
   Resolved<long> gpu_assist_slots;
   Resolved<long> use_gpu1;                 // bool
@@ -273,6 +275,10 @@ inline const std::vector<Field<long>> &long_fields() {
       {"offload_retarget", ZEROMOE_SETTINGS_REF(tun.offload_retarget), 1, Parse::FlagUnlessOff,
        kClaimAll, {}, false},
       {"offload_pin_transient", ZEROMOE_SETTINGS_REF(tun.offload_pin_transient), 0, Parse::FlagOn,
+       kClaimAll, {}, false},
+      {"offload_seed_par", ZEROMOE_SETTINGS_REF(tun.offload_seed_par), 8, Parse::IntStrict,
+       kClaimAll, {}, false},
+      {"offload_transient_par", ZEROMOE_SETTINGS_REF(tun.offload_transient_par), 8, Parse::IntStrict,
        kClaimAll, {}, false},
       {"offload_first_layer", ZEROMOE_SETTINGS_REF(tun.offload_first_layer), -1, Parse::IntAtoi,
        claims_for(F::Glm), {}, false},
@@ -577,6 +583,10 @@ inline const char *meaning(const std::string &name) {
       {"offload_async", "Overlap GLM/Ling offload reads rather than performing them synchronously."},
       {"offload_retarget", "Offload page-reusing eviction (default on)."},
       {"offload_pin_transient", "Pin transient offload experts (default off)."},
+      {"offload_seed_par", "Offload seed parallelism (default 8)."},
+      {"offload_transient_par", "Offload transient read parallelism (default 8)."},
+      {"offload_seed_par", "Offload seed parallelism (default 8)."},
+      {"offload_transient_par", "Offload transient read parallelism (default 8)."},
       {"offload_first_layer", "First GLM/Ling layer in the host offload tier; -1 leaves the tier disabled."},
       {"gpu_assist_slots", "Concurrent staging slots for host experts computed on GPU; consumes extra VRAM."},
       {"gpu_assist2_slots", "Second assist-ring staging slots (0..8); used by GLM and MiMo."},

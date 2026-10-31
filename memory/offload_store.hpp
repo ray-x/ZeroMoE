@@ -927,8 +927,8 @@ public:
   // over several drives is read by all of them at once.
   void load_transient(int layer, const std::vector<int> &to_load, Ensure &r) {
     static const size_t par = [] {
-      const char *e = graphcfg::env("ZEROMOE_OFFLOAD_TRANSIENT_PAR");
-      return static_cast<size_t>(e ? std::max(1, std::atoi(e)) : 8);
+      const long v = zeromoe::graphsettings::active_settings().tun.offload_transient_par.value;
+      return static_cast<size_t>(std::max(1L, v));
     }();
     for (size_t i = 0; i < to_load.size(); i += par) {
       const std::vector<int> chunk(to_load.begin() + static_cast<std::ptrdiff_t>(i),
@@ -971,8 +971,7 @@ public:
   // is read by all of them at once.
   size_t populate_resident() {
     size_t failed = 0;
-    int par = 8;
-    if (const char *e = graphcfg::env("ZEROMOE_OFFLOAD_SEED_PAR")) par = std::max(1, std::atoi(e));
+    int par = std::max(1, static_cast<int>(zeromoe::graphsettings::active_settings().tun.offload_seed_par.value));
     const ExpertCache::Config &c = cache_.config();
     std::vector<int> batch;
     for (int L = c.first_layer; L < c.first_layer + c.n_layers; ++L) {
