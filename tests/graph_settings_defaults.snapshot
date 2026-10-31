@@ -28,6 +28,7 @@ early_ready_stage_layer=
 early_ready_stage_verify=0
 full_graph_decode=1
 full_graph_usage_file=
+full_graph_use_ram_cache=0
 gpu1_hot_gib=0
 gpu1_layers=
 gpu1_min_layer=0

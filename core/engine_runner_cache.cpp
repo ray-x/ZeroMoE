@@ -172,7 +172,7 @@ std::expected<void, std::string> EngineRunner::plan_expert_cache() {
   // their own source-ownership policy behind the explicit environment flag.
   graph_ram_cache =
       graph_mode &&
-      (zeromoe::graphcfg::env("ZEROMOE_FULL_GRAPH_USE_RAM_CACHE") != nullptr ||
+      (zeromoe::graphsettings::active_settings().tun.full_graph_use_ram_cache.value != 0 ||
        (graph_engine_caps(engine).ram_cache_with_preload &&
         config.ram_preload_all_experts) ||
        (engine.family_ops.family == ModelFamily::Qwen4Exp &&

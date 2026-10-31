@@ -181,6 +181,7 @@ struct GraphSettings {
   Resolved<long> cache_moe_async_upload;
   Resolved<long> cache_moe_cpu_cold;
   Resolved<long> full_graph_decode;
+  Resolved<long> full_graph_use_ram_cache;
   Resolved<long> pilot_k;
   Resolved<long> pilot_cold_k;
   Resolved<long> pilot_gate;
@@ -406,6 +407,8 @@ inline const std::vector<Field<long>> &long_fields() {
        claims_for(Family::Other), {}, false},
       {"full_graph_decode", ZEROMOE_SETTINGS_REF(tun.full_graph_decode), 1, Parse::FlagUnlessOff,
        claims_for(Family::Other), {}, false},
+      {"full_graph_use_ram_cache", ZEROMOE_SETTINGS_REF(tun.full_graph_use_ram_cache), 0, Parse::FlagOn,
+       kClaimAll, {}, false},
       {"pilot_k", ZEROMOE_SETTINGS_REF(tun.pilot_k), 0, Parse::IntStrict,
        claims_for(Family::Other), {}, false},
       {"pilot_cold_k", ZEROMOE_SETTINGS_REF(tun.pilot_cold_k), 0, Parse::IntStrict,
@@ -628,6 +631,7 @@ inline const char *meaning(const std::string &name) {
       {"cache_moe_async_upload", "DeepSeek cache-MoE async upload (default off)."},
       {"cache_moe_cpu_cold", "DeepSeek cache-MoE CPU cold path (default off)."},
       {"full_graph_decode", "DeepSeek full-graph decode (on unless set to 0)."},
+      {"full_graph_use_ram_cache", "Force legacy RAM cache in graph mode (default off)."},
       {"pilot_k", "DeepSeek decode pilot k (0 disables)."},
       {"pilot_cold_k", "DeepSeek decode pilot cold k (0 disables)."},
       {"pilot_gate", "DeepSeek pilot gate (on unless set to 0)."},
