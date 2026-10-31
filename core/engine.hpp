@@ -1,6 +1,7 @@
 #pragma once
 #include <unordered_set>
 #include "graph_config.hpp"
+#include "graph_settings_global.hpp"
 #include "gguf_loader.hpp"
 #include "direct_io.hpp"
 #include "io_uring_backend.hpp"
@@ -2895,13 +2896,8 @@ public:
             // allocated separately, so reproduce that host pointer phase by
             // default; the logical tensor layout is unchanged.  Set
             // ZEROMOE_QWEN_GRAPH_HOST_OFFSET=0 for the page-aligned A/B.
-            size_t host_offset = 32;
-            if (const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN_GRAPH_HOST_OFFSET")) {
-                char *end = nullptr;
-                const long parsed = std::strtol(v, &end, 10);
-                if (end != v && *end == '\0' && parsed >= 0 && parsed <= 4096)
-                    host_offset = static_cast<size_t>(parsed);
-            }
+            size_t host_offset = static_cast<size_t>(
+                zeromoe::graphsettings::active_settings().tun.graph_host_offset.value);
             const size_t allocation_bytes = bytes + host_offset;
             void *raw_ptr = nullptr;
             if (posix_memalign(&raw_ptr, alignment, allocation_bytes) != 0 || !raw_ptr) {

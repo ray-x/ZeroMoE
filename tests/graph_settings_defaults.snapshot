@@ -20,6 +20,7 @@ gpu1_hot_gib=0
 gpu_assist2_slots=1
 gpu_assist_slots=0
 gpu_prefill=0
+graph_host_offset=32
 hc_async_readback=0
 hc_disable_fused_post=0
 host_node=0

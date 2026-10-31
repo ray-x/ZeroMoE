@@ -149,6 +149,7 @@ struct GraphSettings {
   Resolved<long> adaptive_policy;
   Resolved<long> prefill_device_state;
   Resolved<long> host_node;
+  Resolved<long> graph_host_offset;
   Resolved<long> mtp_window;
   Resolved<long> partial_gate_up;
   Resolved<long> decode_kv_capacity;
@@ -334,6 +335,8 @@ inline const std::vector<Field<long>> &long_fields() {
        claims_for(F::Qwen), {}, false},
       {"host_node", ZEROMOE_SETTINGS_REF(tun.host_node), 0, Parse::FlagOn,
        claims_for(F::Qwen), {}, false},
+      {"graph_host_offset", ZEROMOE_SETTINGS_REF(tun.graph_host_offset), 32, Parse::IntStrict,
+       claims_for(F::Qwen), {}, false},
       {"mtp_window", ZEROMOE_SETTINGS_REF(tun.mtp_window), 1, Parse::FlagUnlessOff,
        claims_for(F::Qwen), {}, false},
       {"partial_gate_up", ZEROMOE_SETTINGS_REF(tun.partial_gate_up), 0, Parse::FlagOn,
@@ -448,6 +451,7 @@ inline bool valid_integer(const std::string &name, long n) {
   if (name == "alloc_floor_mib") return n >= 0 && n <= 4096;
   if (name == "storage_timeout_ms") return n >= 0 && n <= 30000;
   if (name == "ring_spin_us") return n >= 0 && n <= 1000;
+  if (name == "graph_host_offset") return n >= 0 && n <= 4096;
   if (name == "sparse_decode_reserve") return n >= 0 && n <= 1000000;
   if (name == "prefill_ahead") return n >= 0 && n <= 1000;
   if (name == "pilot_k") return n >= 0 && n <= 16;
@@ -556,6 +560,7 @@ inline const char *meaning(const std::string &name) {
       {"disable_router_bf16", "Disable Qwen router BF16 optimization (default off)."},
       {"prefill_device_state", "Qwen prefill device-state inputs (on unless set to 0)."},
       {"host_node", "Qwen host-node mode (default off)."},
+      {"graph_host_offset", "Qwen graph-RAM host pointer phase offset in bytes (default 32)."},
       {"mtp_window", "Qwen graph-native MTP multi-token window (on unless set to 0)."},
       {"partial_gate_up", "Qwen partial gate-up preload (default off)."},
       {"decode_kv_capacity", "Qwen full-graph decode KV capacity hint (default 2048)."},
