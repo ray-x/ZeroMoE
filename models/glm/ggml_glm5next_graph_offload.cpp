@@ -342,8 +342,9 @@ bool prefetch_prepare(FullGraph &g, OffloadState &o) {
     return false;
   // On by default when the second GPU takes part (the ring is split between the two links); off for a single GPU, where the
   // ring would not fit next to the 3090's expert pool.
-  const char *want = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PREFILL_PREFETCH");
-  if (!(want ? std::atoi(want) != 0 : g.gpu1 != nullptr) || g.decode_mode || g.S < 64 || !g.cuda)
+  const long pref = zeromoe::graphsettings::active_settings().tun.prefill_prefetch.value;
+  const bool want_prefetch = pref < 0 ? (g.gpu1 != nullptr) : (pref != 0);
+  if (!want_prefetch || g.decode_mode || g.S < 64 || !g.cuda)
     return false;
   const auto &c = g.engine->model_file.architecture_config;
   auto ring = std::make_unique<PrefetchRing>();
@@ -352,9 +353,7 @@ bool prefetch_prepare(FullGraph &g, OffloadState &o) {
   // ZEROMOE_GLM5NEXT_PREFILL_SPLIT, default 0.63), so both links copy at once and each GPU needs less buffer.
   const bool two = g.gpu1 != nullptr;
   ring->n_parts = two ? 2 : 1;
-  double ratio = 0.63;
-  if (const char *e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PREFILL_SPLIT"))
-    ratio = std::atof(e);
+  double ratio = zeromoe::graphsettings::active_settings().tun.prefill_split.value;
   if (ratio <= 0.0 || ratio >= 1.0)
     ratio = 1.0;
   if (!two)
@@ -518,9 +517,9 @@ bool prefetch_ring_was_built() {
 bool prefetch_ring_candidate(int S, bool decode_mode, int device) {
   if (decode_mode || S < 64 || g_prefetch_suppress || S >= g_ring_fail_s)
     return false;
-  const char *want = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PREFILL_PREFETCH");
-  if (want)
-    return std::atoi(want) != 0;
+  const long pref = zeromoe::graphsettings::active_settings().tun.prefill_prefetch.value;
+  if (pref >= 0)
+    return pref != 0;
   return second_gpu_device(device) >= 0;
 }
 double prefetch_ring_main_gib() { return g_prefetch_main_gib; }
@@ -618,8 +617,8 @@ void offload_miss_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
     // Experts are read ahead (ZEROMOE_GLM5NEXT_PREFILL_AHEAD layers, default 2) while the GPU computes the layers
     // before this one; ZEROMOE_GLM5NEXT_PREFILL_AHEAD=0 loads each layer on the miss node, as before.
     static const int ahead = [] {
-      const char *e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PREFILL_AHEAD");
-      return e ? std::max(0, std::atoi(e)) : 2;
+      const long v = zeromoe::graphsettings::active_settings().tun.prefill_ahead.value;
+      return static_cast<int>(std::max(0L, v));
     }();
     static std::map<int, std::future<int>> pending;
     static std::mutex pending_mu;

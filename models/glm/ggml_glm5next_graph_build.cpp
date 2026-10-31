@@ -258,8 +258,8 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   int split_at = 0;
   if (!g.decode_mode && g.S >= 64 && g.gpu1 && offload_layer(layer) && !gate_up && ge && ue && de) {
     static const double ratio = [] {
-      const char *e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PREFILL_SPLIT");
-      return e ? std::atof(e) : 1.0;
+      const double v = zeromoe::graphsettings::active_settings().tun.prefill_split.value;
+      return v > 0.0 && v < 1.0 ? v : 1.0;
     }();
     if (const PartialExpertLayer *pl = partial_layer(g, layer); pl && ratio > 0.0 && ratio < 1.0 && pl->cold.size() >= 16) {
       std::vector<int> sorted(pl->cold.begin(), pl->cold.end());

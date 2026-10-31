@@ -108,6 +108,9 @@ struct GraphSettings {
   Resolved<long> prefill_gpu1;
   Resolved<long> cpu_lm_head;
   Resolved<long> sparse_decode_reserve;
+  Resolved<long> prefill_prefetch;
+  Resolved<double> prefill_split;
+  Resolved<long> prefill_ahead;
   Resolved<double> gpu1_hot_gib;
   Resolved<long> gpu_assist2_slots;
   Resolved<double> offload_pinned_fraction;
@@ -274,6 +277,10 @@ inline const std::vector<Field<long>> &long_fields() {
        claims_for(F::Glm), {}, false},
       {"sparse_decode_reserve", ZEROMOE_SETTINGS_REF(tun.sparse_decode_reserve), 1024, Parse::IntStrict,
        claims_for(F::Glm), {}, false},
+      {"prefill_prefetch", ZEROMOE_SETTINGS_REF(tun.prefill_prefetch), -1, Parse::TriState,
+       claims_for(F::Glm), {}, false},
+      {"prefill_ahead", ZEROMOE_SETTINGS_REF(tun.prefill_ahead), 2, Parse::IntStrict,
+       claims_for(F::Glm), {}, false},
       {"cpu_lm_head", ZEROMOE_SETTINGS_REF(tun.cpu_lm_head), 0, Parse::FlagOn,
        claims_for(F::Glm), {}, false},
       {"gpu_assist2_slots", ZEROMOE_SETTINGS_REF(tun.gpu_assist2_slots), 1, Parse::IntAtoi,
@@ -374,6 +381,8 @@ inline const std::vector<Field<double>> &real_fields() {
        claims_for(Family::Qwen), {}, false},
       {"gpu1_hot_gib", ZEROMOE_SETTINGS_REF(tun.gpu1_hot_gib), 0.0, Parse::RealOrAuto,
        claims_for(Family::Glm), {}, false},
+      {"prefill_split", ZEROMOE_SETTINGS_REF(tun.prefill_split), 0.63, Parse::RealOrAuto,
+       claims_for(Family::Glm), {}, false},
   };
   return t;
 }
@@ -428,6 +437,7 @@ inline bool valid_integer(const std::string &name, long n) {
   if (name == "storage_timeout_ms") return n >= 0 && n <= 30000;
   if (name == "ring_spin_us") return n >= 0 && n <= 1000;
   if (name == "sparse_decode_reserve") return n >= 0 && n <= 1000000;
+  if (name == "prefill_ahead") return n >= 0 && n <= 1000;
   if (name == "pilot_k") return n >= 0 && n <= 16;
   if (name == "pilot_cold_k") return n >= 0 && n <= 8;
   if (name == "pilot_gate_min_samples") return n >= 1 && n <= 1000000;
@@ -493,6 +503,9 @@ inline const char *meaning(const std::string &name) {
       {"pilot_prefetch", "GLM pilot prefetch depth (0 disables; effective depth is at least pilot_stage)."},
       {"prefill_gpu1", "Use second GPU during GLM prefill (on unless set to 0)."},
       {"sparse_decode_reserve", "GLM sparse decode reserve in tokens; 0 always uses sparse selection."},
+      {"prefill_prefetch", "GLM prefill prefetch: -1 auto (on with second GPU), 0 off, 1 on."},
+      {"prefill_split", "GLM prefill split ratio between GPUs (0..1)."},
+      {"prefill_ahead", "GLM prefill read-ahead layers (0 disables)."},
       {"gpu1_hot_gib", "GLM hot-expert budget on the second GPU, in GiB (0 disables)."},
       {"cpu_lm_head", "Keep GLM output norm/weight on CPU (low-VRAM fallback; default off)."},
       {"cpu_lm_head", "Keep GLM output norm/weight on CPU (low-VRAM fallback; default off)."},
