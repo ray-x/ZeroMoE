@@ -112,6 +112,7 @@ struct GraphSettings {
   Resolved<std::string> early_ready_ridge;
   Resolved<long> split_load, lane_with_gpu1, pilot_copy;  // bool, on by default
   Resolved<long> dynamic_cache;                          // bool, off by default
+  Resolved<long> ingraph_moe;
   Resolved<long> pilot_stage;
   Resolved<long> pilot_prefetch;
   Resolved<long> prefill_gpu1;
@@ -264,6 +265,8 @@ inline const std::vector<Field<long>> &long_fields() {
        claims_for(F::MiMo2, F::Glm),
        {}, false},
       {"use_gpu1", ZEROMOE_SETTINGS_REF(tun.use_gpu1), 1, Parse::FlagUnlessOff,
+       claims_for(F::MiMo2), {}, false},
+      {"ingraph_moe", ZEROMOE_SETTINGS_REF(tun.ingraph_moe), 1, Parse::FlagUnlessOff,
        claims_for(F::MiMo2), {}, false},
       {"offload_thp", ZEROMOE_SETTINGS_REF(tun.offload_thp), 0, Parse::EqualsOne,
        claims_for(F::Glm), {}, false},
@@ -539,6 +542,7 @@ inline const char *meaning(const std::string &name) {
       {"gpu_assist_slots", "Concurrent staging slots for host experts computed on GPU; consumes extra VRAM."},
       {"gpu_assist2_slots", "Second assist-ring staging slots (0..8); used by GLM and MiMo."},
       {"use_gpu1", "Allow MiMo's second-GPU path when the configured topology provides one."},
+      {"ingraph_moe", "MiMo in-graph MoE (default on)."},
       {"offload_thp", "Request transparent huge pages for the GLM/Ling host expert arena."},
       {"offload_split_reads", "Use the GLM/Ling split expert-read path."},
       {"offload_byte_cap", "Account GLM/Ling offload-pool capacity in bytes rather than uniform slots."},

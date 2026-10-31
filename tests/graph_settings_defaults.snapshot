@@ -35,6 +35,7 @@ graph_register=0
 hc_async_readback=0
 hc_disable_fused_post=0
 host_node=0
+ingraph_moe=1
 lane_with_gpu1=1
 mtp_prefill_overlap=0
 mtp_window=1

@@ -135,7 +135,7 @@ ggml_tensor *weight(ModelState &m, const std::string &name) {
 // shared provider builds it from the engine's expert geometry.
 bool configure_ingraph_moe(StreamingEngine &e, ModelState &m) {
   namespace gc = zeromoe::graphcfg;
-  if (!gc::flag_unless_off("ZEROMOE_MIMO2_INGRAPH_MOE")) return false;
+  if (zeromoe::graphsettings::active_settings().tun.ingraph_moe.value == 0) return false;
   if (!g_topology) {
     LOG_ERROR("[MIMO2-GRAPH] in-graph MoE needs the VRAM expert cache (moe_cache_gb > 0)\n");
     throw std::runtime_error("no VRAM expert cache for in-graph MoE");
@@ -725,7 +725,7 @@ void set_inputs(Graph &g, int position, const int *ids) {
 
 bool mimo2_ingraph_moe_enabled() {
   return mimo2_full_graph_enabled() &&
-         zeromoe::graphcfg::flag_unless_off("ZEROMOE_MIMO2_INGRAPH_MOE");
+         zeromoe::graphsettings::active_settings().tun.ingraph_moe.value != 0;
 }
 
 bool mimo2_full_graph_enabled() {
