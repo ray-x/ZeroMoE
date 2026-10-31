@@ -2932,9 +2932,7 @@ public:
             // This is deliberately opt-in: locking the complete graph-RAM
             // set consumes the process's memlock allowance and should not be
             // enabled without an explicit host-memory budget.
-            const char *graph_mlock =
-                zeromoe::graphcfg::env("ZEROMOE_QWEN_GRAPH_MLOCK");
-            if (graph_mlock && std::atoi(graph_mlock) != 0) {
+            if (zeromoe::graphsettings::active_settings().tun.graph_mlock.value != 0) {
                 if (mlock(arena.allocation_base, arena.allocation_bytes) == 0) {
                     arena.mlocked = true;
                 } else if (layer == 0) {
@@ -2953,16 +2951,8 @@ public:
             // arenas (31.6 GiB for Qwen 3.8 Flash Q2_0) must fit the pinned
             // budget or the layer stays pageable.  ZEROMOE_QWEN_GRAPH_REGISTER=0
             // and the older ZEROMOE_QWEN_GRAPH_NO_REGISTER=1 turn it off.
-            const char * graph_register =
-                zeromoe::graphcfg::env("ZEROMOE_QWEN_GRAPH_REGISTER");
-            const char * graph_no_register =
-                zeromoe::graphcfg::env("ZEROMOE_QWEN_GRAPH_NO_REGISTER");
-            const bool graph_register_default =
-                family_ops.family == ModelFamily::Qwen4Exp;
             const bool graph_register_enabled =
-                (graph_register ? std::atoi(graph_register) != 0
-                                : graph_register_default) &&
-                !(graph_no_register && std::atoi(graph_no_register) != 0);
+                zeromoe::graphsettings::active_settings().tun.graph_register.value != 0;
             if (ram_pinned_budget_bytes > 0 && graph_register_enabled) {
                 const size_t previous =
                     ram_pinned_bytes_used.fetch_add(bytes, std::memory_order_relaxed);

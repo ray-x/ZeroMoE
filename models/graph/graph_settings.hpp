@@ -150,6 +150,8 @@ struct GraphSettings {
   Resolved<long> prefill_device_state;
   Resolved<long> host_node;
   Resolved<long> graph_host_offset;
+  Resolved<long> graph_mlock;
+  Resolved<long> graph_register;
   Resolved<long> mtp_window;
   Resolved<long> partial_gate_up;
   Resolved<long> decode_kv_capacity;
@@ -336,6 +338,10 @@ inline const std::vector<Field<long>> &long_fields() {
       {"host_node", ZEROMOE_SETTINGS_REF(tun.host_node), 0, Parse::FlagOn,
        claims_for(F::Qwen), {}, false},
       {"graph_host_offset", ZEROMOE_SETTINGS_REF(tun.graph_host_offset), 32, Parse::IntStrict,
+       claims_for(F::Qwen), {}, false},
+      {"graph_mlock", ZEROMOE_SETTINGS_REF(tun.graph_mlock), 0, Parse::FlagOn,
+       claims_for(F::Qwen), {}, false},
+      {"graph_register", ZEROMOE_SETTINGS_REF(tun.graph_register), 0, Parse::FlagOn,
        claims_for(F::Qwen), {}, false},
       {"mtp_window", ZEROMOE_SETTINGS_REF(tun.mtp_window), 1, Parse::FlagUnlessOff,
        claims_for(F::Qwen), {}, false},
@@ -561,6 +567,8 @@ inline const char *meaning(const std::string &name) {
       {"prefill_device_state", "Qwen prefill device-state inputs (on unless set to 0)."},
       {"host_node", "Qwen host-node mode (default off)."},
       {"graph_host_offset", "Qwen graph-RAM host pointer phase offset in bytes (default 32)."},
+      {"graph_mlock", "Qwen graph-RAM mlock (default off)."},
+      {"graph_register", "Qwen graph-RAM cudaHostRegister (default on for Qwen)."},
       {"mtp_window", "Qwen graph-native MTP multi-token window (on unless set to 0)."},
       {"partial_gate_up", "Qwen partial gate-up preload (default off)."},
       {"decode_kv_capacity", "Qwen full-graph decode KV capacity hint (default 2048)."},
@@ -646,6 +654,8 @@ inline const std::vector<Override> &family_overrides() {
        "the default (64) made every chunk after the first run as one-token steps (docs/design/model-family-framework.md s1)"},
       {Family::Qwen, "prefill_op_offload", 1,
        "preserve Qwen's measured host-expert prefill copy default; use graph_prefill_op_offload to disable"},
+      {Family::Qwen, "graph_register", 1,
+       "Qwen graph-RAM expert arenas are pinned by default"},
       {Family::Glm, "gpu_assist_slots", 3,
        "GPU assist of 3 slots is the measured setting for the GLM graph (docs/GLM5.3-Flash-baseline.md)"},
       {Family::Ling, "prefill_min_batch", 2,
