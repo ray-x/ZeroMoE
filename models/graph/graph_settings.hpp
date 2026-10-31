@@ -135,6 +135,7 @@ struct GraphSettings {
   Resolved<std::string> route_tap;
   Resolved<std::string> full_graph_usage_file;
   Resolved<std::string> gpu1_layers;
+  Resolved<long> gpu1_min_layer;
   // Soft pin tier for split expert arenas (decode only): GiB of the last layers'
   // experts kept in separately freeable buffers so prefill can reclaim them.
   Resolved<double> soft_pin_gib;
@@ -315,6 +316,8 @@ inline const std::vector<Field<long>> &long_fields() {
       {"assist2_device", ZEROMOE_SETTINGS_REF(tun.assist2_device), -1, Parse::IntAtoi,
        claims_for(F::Glm), {}, false},
       {"prefill_gpu1", ZEROMOE_SETTINGS_REF(tun.prefill_gpu1), 1, Parse::FlagUnlessOff,
+       claims_for(F::Glm), {}, false},
+      {"gpu1_min_layer", ZEROMOE_SETTINGS_REF(tun.gpu1_min_layer), 0, Parse::IntStrict,
        claims_for(F::Glm), {}, false},
       {"dsa_cpu_lane", ZEROMOE_SETTINGS_REF(tun.dsa_cpu_lane), 0, Parse::FlagOn,
        claims_for(F::Glm), {}, false},
@@ -503,6 +506,8 @@ inline bool valid_integer(const std::string &name, long n) {
   if (name == "graph_host_offset") return n >= 0 && n <= 4096;
   if (name == "sparse_decode_reserve") return n >= 0 && n <= 1000000;
   if (name == "assist_device") return n >= -1 && n <= 1000;
+  if (name == "gpu1_min_layer") return n >= 0 && n <= 1000000;
+  if (name == "gpu1_min_layer") return n >= 0 && n <= 1000000;
   if (name == "assist2_device") return n >= -1 && n <= 1000;
   if (name == "prefill_ahead") return n >= 0 && n <= 1000;
   if (name == "pilot_k") return n >= 0 && n <= 16;
@@ -582,6 +587,7 @@ inline const char *meaning(const std::string &name) {
       {"assist_device", "GLM assist device id (-1 uses trunk device)."},
       {"assist2_device", "GLM assist2 device id (-1 auto)."},
       {"prefill_gpu1", "Use second GPU during GLM prefill (on unless set to 0)."},
+      {"gpu1_min_layer", "GLM second GPU only holds hot experts of layers >= L."},
       {"dsa_cpu_lane", "GLM DSA CPU lane (default off)."},
       {"sparse_decode_reserve", "GLM sparse decode reserve in tokens; 0 always uses sparse selection."},
       {"prefill_prefetch", "GLM prefill prefetch: -1 auto (on with second GPU), 0 off, 1 on."},

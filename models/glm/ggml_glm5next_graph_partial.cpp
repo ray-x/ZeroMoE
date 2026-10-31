@@ -715,7 +715,7 @@ void assign_gpu1_hot(FullGraph &g, double gib) {
   // ZEROMOE_GLM5NEXT_GPU1_MIN_LAYER=L: the second GPU only holds hot experts of layers >= L. Pair it with a primary-GPU
   // ranking whose counts are zeroed for those layers (and pin_global_floor_per_layer = 0), so each layer's hot set lives on one
   // GPU and its trunk needs no cross-GPU hop. Measured +3% on held-out prompts (docs/ssd-offload/13-...).
-  const int gpu1_min_layer = zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_GPU1_MIN_LAYER", 0);
+  const int gpu1_min_layer = static_cast<int>(zeromoe::graphsettings::active_settings().tun.gpu1_min_layer.value);
   std::vector<StreamingEngine::UsageEntry> cand;
   for (const auto &e : entries)
     if (e.layer >= std::max(c.first_dense, gpu1_min_layer) && e.layer < c.n_layers && e.expert >= 0 &&
