@@ -234,7 +234,9 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
         });
   }
   if (g_phase_cache) g_phase_cache->bind(*g);
-  if (const char *e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_GPU1_LAYERS")) {
+  const std::string &gpu1_layers = zeromoe::graphsettings::active_settings().tun.gpu1_layers.value;
+  if (!gpu1_layers.empty()) {
+    const char *e = gpu1_layers.c_str();
     int a = -1, b = -2;
     if (std::sscanf(e, "%d-%d", &a, &b) == 2 && a >= 0 && b >= a) {
       g->gpu1 = static_cast<ggml_backend_t>(ggml_shared_backend(second_gpu_device(g->device)));

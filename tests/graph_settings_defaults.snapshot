@@ -29,6 +29,7 @@ early_ready_stage_verify=0
 full_graph_decode=1
 full_graph_usage_file=
 gpu1_hot_gib=0
+gpu1_layers=
 gpu_assist2_slots=1
 gpu_assist_slots=0
 gpu_prefill=0
