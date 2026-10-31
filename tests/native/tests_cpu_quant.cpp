@@ -401,8 +401,7 @@ bool test_qwen_q2_0_vnni_kernel() {
 
     // Exercise the actual direct Qwen dispatch with this measured all-Q2_0
     // signature. This is the opt-in CPU host route used by the smoke config.
-    setenv("ZEROMOE_QWEN_CPU_DIRECT_POOL", "1", 1);
-    setenv("ZEROMOE_QWEN_CPU_DIRECT_FUSED", "1", 1);
+    // Direct-dispatch toggles retired; exercise the default path.
     GgmlQwenCpuExpertRef ref{
         gate_ptrs[0], up_ptrs[0], down_ptrs[0],
         (size_t)FF * input_row_bytes, (size_t)FF * input_row_bytes,

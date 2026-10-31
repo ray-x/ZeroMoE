@@ -166,7 +166,9 @@ bool can_merge_gate_up(const GgmlQwenCpuExpertRef &ref,
 }
 
 bool qwen_cpu_direct_pool_env_enabled() {
-  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN_CPU_DIRECT_POOL");
+  // Experimental direct-dispatch path retired; keep the helper for ABI/tests
+  // but never enable it from configuration.
+  return false;
 }
 
 bool qwen_cpu_direct_timing_enabled() {
@@ -174,7 +176,7 @@ bool qwen_cpu_direct_timing_enabled() {
 }
 
 bool qwen_cpu_direct_fused_enabled() {
-  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN_CPU_DIRECT_FUSED");
+  return false;
 }
 
 // Direct workers must remain scheduler-free while a request is active, but a

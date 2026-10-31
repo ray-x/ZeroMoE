@@ -590,17 +590,7 @@ extern "C" bool zeromoe_qwen4exp_cuda_host_node_enqueue(
     return false;
 
   ctx->device_output = node->data;
-  const char *direct_pool_env =
-      zeromoe::graphcfg::env("ZEROMOE_QWEN_CPU_DIRECT_POOL");
-  const char *direct_fused_env =
-      zeromoe::graphcfg::env("ZEROMOE_QWEN_CPU_DIRECT_FUSED");
-  const bool direct_pool_requested =
-      direct_pool_env && direct_pool_env[0] == '1' &&
-      !(direct_fused_env && direct_fused_env[0] == '1');
-  if (direct_pool_requested &&
-      cudaLaunchHostFunc(stream, qwen4exp_cuda_host_node_arm_direct_workers,
-                         ctx) != cudaSuccess)
-    return false;
+  // Experimental direct-dispatch path retired.
   if (cudaEventRecord(ctx->d2h_start, stream) != cudaSuccess ||
       cudaMemcpyAsync(ctx->host_input, activation->data, ctx->input_bytes,
                       cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
