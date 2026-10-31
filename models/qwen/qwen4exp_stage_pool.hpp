@@ -2,6 +2,7 @@
 
 #include "cuda_raii.hpp"
 #include "graph_config.hpp"
+#include "graph_settings_global.hpp"
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -228,8 +229,7 @@ struct Qwen4ExpStagePool {
     device = dev; topk = k; slots = 2 * k; cold_mask = mask; this->backend = backend;
     service = shared_service;
     if (!service) return false;
-    const char *verify = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_STAGE_VERIFY");
-    verify_enabled = verify && verify[0] == '1';
+    verify_enabled = zeromoe::graphsettings::active_settings().tun.early_ready_stage_verify.value != 0;
     if (k <= 0 || k > 32) return false;
     source[0] = gate; source[1] = up; source[2] = down;
     for (int p = 0; p < 3; ++p) {

@@ -18,6 +18,7 @@ early_ready=-1
 early_ready_async_output=1
 early_ready_resident_tables=1
 early_ready_skip_all_hot=0
+early_ready_stage_verify=0
 full_graph_decode=1
 gpu1_hot_gib=0
 gpu_assist2_slots=1

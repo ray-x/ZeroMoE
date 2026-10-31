@@ -104,6 +104,7 @@ struct GraphSettings {
   Resolved<long> early_ready_skip_all_hot;
   Resolved<long> early_ready_async_output;
   Resolved<long> early_ready_resident_tables;
+  Resolved<long> early_ready_stage_verify;
   Resolved<long> split_load, lane_with_gpu1, pilot_copy;  // bool, on by default
   Resolved<long> dynamic_cache;                          // bool, off by default
   Resolved<long> pilot_stage;
@@ -276,6 +277,8 @@ inline const std::vector<Field<long>> &long_fields() {
       {"early_ready_async_output", ZEROMOE_SETTINGS_REF(tun.early_ready_async_output), 1, Parse::FlagUnlessOff,
        claims_for(F::Qwen), {}, false},
       {"early_ready_resident_tables", ZEROMOE_SETTINGS_REF(tun.early_ready_resident_tables), 1, Parse::FlagUnlessOff,
+       claims_for(F::Qwen), {}, false},
+      {"early_ready_stage_verify", ZEROMOE_SETTINGS_REF(tun.early_ready_stage_verify), 0, Parse::FlagOn,
        claims_for(F::Qwen), {}, false},
       {"split_load", ZEROMOE_SETTINGS_REF(tun.split_load), 1, Parse::FlagUnlessOff,
        claims_for(F::Glm), {}, false},
@@ -529,6 +532,7 @@ inline const char *meaning(const std::string &name) {
       {"early_ready_skip_all_hot", "Qwen early-ready skip-all-hot (default off)."},
       {"early_ready_async_output", "Qwen early-ready async output copy (default on)."},
       {"early_ready_resident_tables", "Qwen early-ready resident tables (default on)."},
+      {"early_ready_stage_verify", "Qwen early-ready stage verification (default off)."},
       {"split_load", "Allow GLM split expert-load scheduling; false changes the overlap strategy."},
       {"lane_with_gpu1", "Allow the GLM overlap lane alongside second-GPU expert work."},
       {"pilot_copy", "Allow GLM pilot-driven expert-copy staging."},
