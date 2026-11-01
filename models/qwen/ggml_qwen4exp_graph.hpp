@@ -36,6 +36,10 @@ int qwen4exp_full_graph_suggested_batch();
 // residency from the baseline's already-complete GPU layers.
 bool qwen4exp_full_graph_device_expert_trailing();
 
+// Bytes in the resident dense-weight manifest consumed by the shared Qwen
+// graph. The Qwen35MoE memory planner uses the same predicate as its arena.
+size_t qwen35moe_full_graph_dense_weight_bytes(const StreamingEngine &engine);
+
 // Build/rebuild the graph for a prompt shape.  This is intended to run before
 // the measured prefill window, just as llama.cpp builds its graph before execution.
 bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S,

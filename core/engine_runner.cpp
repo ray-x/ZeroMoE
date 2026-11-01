@@ -19,6 +19,7 @@ std::expected<void, std::string> EngineRunner::apply_graph_tuning() {
                         engine.model_file.architecture_config.n_experts > 0;
   engine.cuda_moe_graph_policy_applies = cuda_moe;
   if (!model) {
+    engine.graph_ram_register_default = false;
     if (cuda_moe) {
       const auto arch_it = engine.model_file.kv_string.find("general.architecture");
       const std::string architecture =
@@ -30,6 +31,8 @@ std::expected<void, std::string> EngineRunner::apply_graph_tuning() {
     }
     return {};
   }
+  engine.graph_ram_register_default =
+      model->engine_caps(engine).ram_cache_with_preload;
   const GraphRuntimeTuning tuning = model->runtime_tuning(engine);
   if (tuning.requires_preloaded_ddr_experts &&
       !config.ram_preload_all_experts) {
@@ -127,10 +130,15 @@ EngineRunner::resolve_cuda_moe_graph_policy() {
           std::string(model->name()) +
           " planner reported insufficient graph memory without a concrete required>available byte plan and reason; refusing layered fallback");
     }
-    if (model->graph_only()) {
+    const bool strict_graph_preflight =
+        zeromoe::graphsettings::active_settings().diag.preflight_strict.value != 0;
+    if (model->graph_only() || strict_graph_preflight) {
+      const std::string policy = model->graph_only()
+          ? " is graph-only and cannot fall back"
+          : " strict graph preflight forbids layered fallback";
       return std::unexpected(
-          std::string(model->name()) + " is graph-only, but its memory planner reports insufficient capacity: " +
-          plan.reason);
+          std::string(model->name()) + policy +
+          " for an insufficient full-graph memory plan: " + plan.reason);
     }
     engine.cuda_moe_layered_fallback_reason = plan.reason;
     LOG_WARN("[MOE-GRAPH-POLICY] family=%s policy=memory-fallback memory_plan=insufficient required_vram_bytes=%zu available_vram_bytes=%zu reason=%s\n",
@@ -352,6 +360,8 @@ std::expected<void, std::string> EngineRunner::apply_engine_config() {
                   engine.qwen4exp_gpu_stage_layers.end()),
       engine.qwen4exp_gpu_stage_layers.end());
   engine.qwen4exp_track_router_usage = config.qwen4exp_track_router_usage;
+  LOG_INFO("[CONFIG] qwen4exp_track_router_usage=%s\n",
+           engine.qwen4exp_track_router_usage ? "true" : "false");
   {
     const std::string &mode = config.expert_promotion;
     const bool mtp_graph = config.mtp_graph && config.mtp_enabled;

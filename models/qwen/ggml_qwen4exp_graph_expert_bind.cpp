@@ -610,6 +610,7 @@ ggml_tensor *build_split_gpu_tensor(FullGraph &g, ggml_context *ctx,
     src_ptrs.push_back(static_cast<const uint8_t *>(ptr) +
                        static_cast<size_t>(e) * stride);
   }
+
   if (!bind_device_expert_gather(g, t, src_ptrs, plane_bytes))
     return nullptr;
   if (g.decode_mode && g.expert_alloc_layer >= 0) {

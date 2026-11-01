@@ -391,8 +391,24 @@ void qwen4exp_scan_captured_graph_writes(FullGraph &g,
            kernel_param_scan_failures, overlapping_writes);
 }
 
+bool qwen_probe_dump_enabled_for_layer(int layer) {
+  if (!zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP")) {
+    return false;
+  }
+  const char *selected =
+      zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP_LAYER");
+  if (!selected || !selected[0]) {
+    return true;
+  }
+  char *end = nullptr;
+  const long selected_layer = std::strtol(selected, &end, 10);
+  return end != selected && *end == '\0' && selected_layer == layer;
+}
+
 void qwen_probe_dump(FullGraph &g) {
   const char *dir = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP");
+  if (!dir || !dir[0])
+    dir = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_ROUTED_ONLY_DIR");
   if (!dir || !dir[0] ||
     (g.probe_taps.empty() && g.layer_input_taps.empty() &&
       g.router_logits_taps.empty() && g.gdn_probe_taps.empty()))
@@ -428,6 +444,20 @@ void qwen_probe_dump(FullGraph &g) {
     std::ofstream out(path, std::ios::binary | std::ios::app);
     out.write(reinterpret_cast<const char *>(values.data()),
               static_cast<std::streamsize>(values.size() * sizeof(float)));
+    if (label.rfind("expert_", 0) == 0 ||
+        label.rfind("router_", 0) == 0) {
+      ggml_backend_t backend =
+          g.sched ? ggml_backend_sched_get_tensor_backend(g.sched, tensor)
+                  : nullptr;
+      const char *backend_name =
+          backend == g.cpu ? "CPU" : backend == g.cuda ? "CUDA" : "unknown";
+      std::ofstream meta(path + ".meta", std::ios::trunc);
+      meta << "backend=" << backend_name << '\n'
+           << "op=" << ggml_op_name(tensor->op) << '\n'
+           << "name=" << ggml_get_name(tensor) << '\n'
+           << "ne=" << tensor->ne[0] << ',' << tensor->ne[1] << ','
+           << tensor->ne[2] << ',' << tensor->ne[3] << '\n';
+    }
   }
   for (auto &[l, hidden] : g.layer_input_taps) {
     std::vector<float> values((size_t)ggml_nelements(hidden));

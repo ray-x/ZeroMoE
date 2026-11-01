@@ -113,6 +113,7 @@ def cmake_cache_values(build_dir: Path | None) -> dict[str, str]:
         "GGML_CUDA",
         "GGML_CUDA_GRAPHS",
         "GGML_OPENMP",
+        "ZEROMOE_GGML_COMMIT",
         "ZEROMOE_GGML_ROOT",
         "ZEROMOE_GGML_PREBUILT_DIR",
     )
@@ -180,6 +181,26 @@ def stamp(args: argparse.Namespace) -> int:
     cmake = cmake_cache_values(args.build_dir.resolve() if args.build_dir else None)
     patch_hash, patch_files = patch_manifest(repo)
     ggml_root = args.ggml_root.resolve() if args.ggml_root else None
+    detected_ggml_base = ggml_base_from(ggml_root, None)
+    configured_ggml_base = cmake.get("ZEROMOE_GGML_COMMIT", "")
+    if args.ggml_base:
+        ggml_base = args.ggml_base
+        ggml_base_source = "explicit"
+    elif detected_ggml_base != "unknown":
+        ggml_base = detected_ggml_base
+        ggml_base_source = "ggml-source"
+    elif configured_ggml_base:
+        ggml_base = configured_ggml_base
+        ggml_base_source = "cmake-cache"
+    else:
+        ggml_base = "unknown"
+        ggml_base_source = "unknown"
+    if configured_ggml_base and ggml_base != configured_ggml_base:
+        raise RuntimeError(
+            "GGML base mismatch: selected "
+            f"{ggml_base} from {ggml_base_source}, but CMakeCache pins "
+            f"{configured_ggml_base}"
+        )
     info = {
         "schema": 1,
         "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -188,7 +209,8 @@ def stamp(args: argparse.Namespace) -> int:
         "repo_root": str(repo),
         **snapshot,
         "build_notes": args.build_note,
-        "ggml_base": ggml_base_from(ggml_root, args.ggml_base),
+        "ggml_base": ggml_base,
+        "ggml_base_source": ggml_base_source,
         "ggml_root": str(ggml_root) if ggml_root else "unknown",
         "ggml_patch_manifest_sha256": patch_hash,
         "ggml_patch_files": patch_files,

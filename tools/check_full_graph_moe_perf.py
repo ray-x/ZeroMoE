@@ -25,8 +25,20 @@ def main() -> int:
     parser.add_argument("llama_bench_json", type=Path, help="llama-bench JSON output for a combined pp/tg run")
     parser.add_argument("--n-prompt", type=int, required=True)
     parser.add_argument("--n-gen", type=int, required=True)
+    parser.add_argument("--context", type=int, required=True,
+                        help="active context size in both engines")
+    parser.add_argument("--n-threads", type=int, required=True,
+                        help="effective decode CPU thread count in both engines")
+    parser.add_argument("--n-gpu-layers", type=int, required=True,
+                        help="llama.cpp dense layers on the GPU")
     parser.add_argument("--device", required=True,
                         help="llama-bench device name, e.g. CUDA1")
+    parser.add_argument(
+        "--n-cpu-moe",
+        type=int,
+        required=True,
+        help="expected llama-bench leading CPU-resident MoE layers",
+    )
     parser.add_argument(
         "--minimum-ratio", type=float, default=0.90,
         help="minimum ZeroMoE steady-state decode / llama.cpp decode rate (default: 0.90)",
@@ -70,6 +82,31 @@ def main() -> int:
             f"ZeroMoE decode prompt lengths {sorted(set(decode_prompt_lengths))} "
             f"do not match --n-prompt {args.n_prompt}"
         )
+    contexts = set()
+    backend_threads = set()
+    process_threads = set()
+    for line in lines:
+        context_match = re.search(r"\b(?:kv_capacity|context_size|n_ctx)=([0-9]+)\b", line)
+        if context_match:
+            contexts.add(int(context_match.group(1)))
+        thread_match = re.search(r"CPU backend configured(?: with)? ([0-9]+) threads\b", line)
+        if thread_match:
+            backend_threads.add(int(thread_match.group(1)))
+        omp_match = re.search(r"OMP max threads \(process-wide default\): ([0-9]+)\b", line)
+        if omp_match:
+            process_threads.add(int(omp_match.group(1)))
+    if not contexts:
+        return fail("ZeroMoE log has no active context/capacity value to match")
+    if contexts != {args.context}:
+        return fail(f"ZeroMoE context values {sorted(contexts)} do not match --context {args.context}")
+    effective_threads = backend_threads or process_threads
+    if not effective_threads:
+        return fail("ZeroMoE log has no effective CPU thread count to match")
+    if effective_threads != {args.n_threads}:
+        return fail(
+            f"ZeroMoE effective CPU thread counts {sorted(effective_threads)} "
+            f"do not match --n-threads {args.n_threads}"
+        )
     try:
         if gate.get("policy") != "required" or gate.get("memory_plan") != "fits":
             return fail("performance acceptance requires policy=required and memory_plan=fits")
@@ -96,6 +133,10 @@ def main() -> int:
             continue
         if row.get("n_prompt") != args.n_prompt or row.get("n_gen") != args.n_gen:
             continue
+        if int(row.get("n_depth", 0)) + args.n_prompt + args.n_gen != args.context:
+            continue
+        if int(row.get("n_threads", 0)) != args.n_threads:
+            continue
         try:
             avg_ts = float(row.get("avg_ts", 0.0))
         except (TypeError, ValueError):
@@ -104,12 +145,16 @@ def main() -> int:
             continue
         if args.device not in str(row.get("devices", "")):
             continue
-        if int(row.get("n_gpu_layers", 0)) <= 0 or int(row.get("n_cpu_moe", 0)) != 0:
+        if int(row.get("n_gpu_layers", 0)) != args.n_gpu_layers:
+            continue
+        if int(row.get("n_cpu_moe", 0)) != args.n_cpu_moe:
             continue
         candidates.append(row)
     if not candidates:
         return fail(
-            f"no llama-bench combined pp{args.n_prompt}+tg{args.n_gen} result found"
+            f"no llama-bench combined pp{args.n_prompt}+tg{args.n_gen} "
+            f"context={args.context} threads={args.n_threads} device={args.device} "
+            f"n_gpu_layers={args.n_gpu_layers} n_cpu_moe={args.n_cpu_moe} row found"
         )
     model_paths = {str(Path(row["model_filename"]).resolve()) for row in candidates}
     if len(model_paths) != 1:
@@ -123,7 +168,9 @@ def main() -> int:
     print(
         f"ZeroMoE full-graph steady decode: {zeromoe_tps:.2f} tok/s; "
         f"llama.cpp: {reference_tps:.2f} tok/s; ratio={ratio:.3f} "
-        f"(required >= {args.minimum_ratio:.3f})"
+        f"(required >= {args.minimum_ratio:.3f}; matched context={args.context}, "
+        f"threads={args.n_threads}, n_gpu_layers={args.n_gpu_layers}, "
+        f"n_cpu_moe={args.n_cpu_moe})"
     )
     if args.minimum_tps is not None:
         if args.minimum_tps <= 0:

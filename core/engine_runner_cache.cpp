@@ -196,6 +196,10 @@ const bool qwen_hybrid_graph_placement =
      qwen4exp_full_graph_decode_enabled()) ||
     (engine.family_ops.family == ModelFamily::Qwen &&
      engine.cuda_moe_full_graph_decode_required);
+const bool keep_qwen_graph_ddr_source =
+    graph_mode && graph_model &&
+    graph_engine_caps(engine).ram_cache_with_preload &&
+    config.ram_preload_all_experts;
 if (graph_mode && qwen_hybrid_graph_placement && graph_model) {
     const int n_layers =
         std::max(0, engine.model_file.architecture_config.n_layers);
@@ -205,7 +209,7 @@ if (graph_mode && qwen_hybrid_graph_placement && graph_model) {
         std::max(0, graph_model->device_expert_layers(engine)), n_layers);
     if (device_layers > 0) {
       engine.qwen_ram_vram_only_layers.assign((size_t)n_layers, 0);
-      const bool trailing = graph_model->device_expert_trailing();
+      const bool trailing = graph_model->device_expert_trailing(engine);
       const int first_layer = trailing ? n_layers - device_layers : 0;
       size_t vram_only_bytes = 0;
       int vram_only_layer_count = 0;
@@ -213,7 +217,8 @@ if (graph_mode && qwen_hybrid_graph_placement && graph_model) {
            ++layer) {
         if (is_cpu_affinity_layer(layer))
           continue;
-        engine.qwen_ram_vram_only_layers[(size_t)layer] = 1;
+        if (!keep_qwen_graph_ddr_source)
+          engine.qwen_ram_vram_only_layers[(size_t)layer] = 1;
         ++vram_only_layer_count;
         const size_t expert_bytes = engine.compute_expert_slab_bytes(layer);
         if (n_experts > 0 &&
@@ -222,14 +227,23 @@ if (graph_mode && qwen_hybrid_graph_placement && graph_model) {
                 SIZE_MAX - expert_bytes * (size_t)n_experts)
           vram_only_bytes += expert_bytes * (size_t)n_experts;
       }
-      LOG_STREAM_INFO()
-          << "[MOE-OWNERSHIP] full-graph device block [" << first_layer
-          << ", " << (first_layer + device_layers)
-          << ") marks " << vram_only_layer_count
-          << " non-CPU-affinity layer(s) as VRAM-only, approximately "
-          << (double)vram_only_bytes / (1024.0 * 1024.0 * 1024.0)
-          << " GiB; persistent DDR preload/graph-RAM exclusion applies "
-             "when those tiers are enabled\n";
+      if (keep_qwen_graph_ddr_source) {
+        LOG_INFO("[MOE-OWNERSHIP] full-graph device block [%d,%d) places "
+                 "%d layer(s) in VRAM (%.2f GiB); complete DDR graph-RAM "
+                 "source retained for offloaded expert paths and DMA\n",
+                 first_layer, first_layer + device_layers,
+                 vram_only_layer_count,
+                 (double)vram_only_bytes / (1024.0 * 1024.0 * 1024.0));
+      } else {
+        LOG_STREAM_INFO()
+            << "[MOE-OWNERSHIP] full-graph device block [" << first_layer
+            << ", " << (first_layer + device_layers)
+            << ") marks " << vram_only_layer_count
+            << " non-CPU-affinity layer(s) as VRAM-only, approximately "
+            << (double)vram_only_bytes / (1024.0 * 1024.0 * 1024.0)
+            << " GiB; persistent DDR preload/graph-RAM exclusion applies "
+               "when those tiers are enabled\n";
+      }
     }
   }
   // GLM5NEXT's device-resident expert layers (glm5next_full_graph's own

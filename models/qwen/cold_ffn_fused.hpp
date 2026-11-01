@@ -20,7 +20,9 @@
 //   w      [1, topk, S] f32 router weights
 //   remap  [1, E, 1]  i32 remap[e] = e when expert e is cold, -1 when it is resident on the GPU
 //   mask   [1, E, 1]  f32 1.0 when cold, 0.0 otherwise
-//   gate, up [D, FF, E] and down [FF, D, E] expert tensors in host memory (any strides, Q2_0)
+//   gate, up [D, FF, E] and down [FF, D, E] expert tensors in host memory.
+//   Supported weight types must have CPU dot kernels that share one activation
+//   quant type (for example Q2_0/Q8_0 or IQ3_XXS/Q8_K).
 // Output: [D, topk, S] f32, slot (k, t) = down(swiglu(gate x, up x)) * (w * mask) for a cold expert, else 0.
 
 #include "ggml.h"
@@ -31,13 +33,13 @@ namespace qwen4exp_cold {
 
 struct Context;  // opaque; owns scratch and the barrier, one per layer
 
-// True when every expert tensor is a type this op reproduces exactly (currently Q2_0 with Q8_0 activations)
-// and the shapes satisfy its alignment assumptions.
+// True when the expert tensors have CPU dot kernels sharing an activation
+// quant type and shapes satisfy the row/block alignment assumptions.
 bool supported(const ggml_tensor *gate, const ggml_tensor *up, const ggml_tensor *down, int topk, int n_tokens);
 
 // Builds the node. `ctx_owner` receives the scratch the node refers to and must outlive the graph.
 ggml_tensor *build(ggml_context *ctx, std::shared_ptr<Context> &ctx_owner, ggml_tensor *x, ggml_tensor *ids,
                    ggml_tensor *w, ggml_tensor *remap, ggml_tensor *mask, ggml_tensor *gate, ggml_tensor *up,
-                   ggml_tensor *down, int max_threads);
+ggml_tensor *down, int max_threads, int layer = -1);
 
 }  // namespace qwen4exp_cold

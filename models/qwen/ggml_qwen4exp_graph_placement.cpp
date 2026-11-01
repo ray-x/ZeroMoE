@@ -6,6 +6,8 @@
 
 #include "ggml_qwen4exp_graph_internal.hpp"
 
+#include <map>
+
 #if defined(ZEROMOE_USE_GGML_CUDA)
 
 using namespace qwen4exp_graph;
@@ -27,8 +29,9 @@ namespace qwen4exp_graph {
 void plan_expert_vram_split(FullGraph &g) {
   g.split_gpu_expert_ids.clear();
   if (g.engine && g.engine->family_ops.family == ModelFamily::Qwen &&
-      g.engine->cuda_moe_full_graph_decode_required)
-    return; // The fit planner owns the complete Qwen expert placement.
+      g.engine->cuda_moe_full_graph_decode_required &&
+      g.engine->qwen4exp_graph_expert_vram_budget_gb <= 0.0)
+    return; // Qwen's layer planner owns placement unless usage hotset is opted in.
   if (g.S != 1 && !g.decode_mode)
     return;
 
@@ -288,6 +291,26 @@ void plan_expert_vram_split(FullGraph &g) {
     return;
   }
 
+  // Usage snapshots normally contain one row per expert, but merge duplicates
+  // before ranking so the actual routed traffic and the reported coverage do
+  // not depend on file formatting.
+  std::map<std::pair<int, int>, uint64_t> merged_usage;
+  for (const auto &entry : eligible) {
+    auto &count = merged_usage[{entry.layer, entry.expert}];
+    count = entry.count > std::numeric_limits<uint64_t>::max() - count
+                ? std::numeric_limits<uint64_t>::max()
+                : count + entry.count;
+  }
+  eligible.clear();
+  eligible.reserve(merged_usage.size());
+  uint64_t total_usage = 0;
+  for (const auto &[key, count] : merged_usage) {
+    eligible.push_back({key.first, key.second, count});
+    total_usage = count > std::numeric_limits<uint64_t>::max() - total_usage
+                      ? std::numeric_limits<uint64_t>::max()
+                      : total_usage + count;
+  }
+
   // Single global priority queue over all (layer, expert, count) triples --
   // spends the fixed budget on the model's genuinely hottest experts first,
   // rather than splitting it evenly per layer. Stable tie-break by
@@ -308,6 +331,7 @@ void plan_expert_vram_split(FullGraph &g) {
   std::unordered_map<int, std::unordered_set<int>> chosen;
   size_t experts_placed = 0;
   size_t bytes_spent = 0;
+  uint64_t hot_usage = 0;
   for (const auto &e : eligible) {
     if (remaining_budget == 0)
       break;
@@ -320,6 +344,9 @@ void plan_expert_vram_split(FullGraph &g) {
     layer_set.insert(e.expert);
     remaining_budget -= cost;
     bytes_spent += cost;
+    hot_usage = e.count > std::numeric_limits<uint64_t>::max() - hot_usage
+                    ? std::numeric_limits<uint64_t>::max()
+                    : hot_usage + e.count;
     ++experts_placed;
   }
 
@@ -331,10 +358,15 @@ void plan_expert_vram_split(FullGraph &g) {
     std::sort(dst.begin(), dst.end()); // deterministic local-index order
   }
 
+  const double usage_coverage =
+      total_usage == 0
+          ? 0.0
+          : 100.0 * static_cast<double>(hot_usage) /
+                static_cast<double>(total_usage);
   LOG_INFO("[GGML-QWEN-FULL-SPLIT] budget=%.3f GiB spent=%.3f GiB across %zu "
-           "layer(s), %zu expert(s) total\n",
+           "layer(s), %zu expert(s), usage_coverage=%.2f%%\n",
            budget_gb, bytes_spent / (1024.0 * 1024.0 * 1024.0),
-           g.split_gpu_expert_ids.size(), experts_placed);
+           g.split_gpu_expert_ids.size(), experts_placed, usage_coverage);
 }
 
 size_t full_expert_source_bytes(const StreamingEngine &engine,

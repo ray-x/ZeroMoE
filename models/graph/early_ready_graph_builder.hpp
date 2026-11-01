@@ -50,7 +50,7 @@ inline std::unique_ptr<EarlyReadyLane> build_early_ready_graph_lane(
     return nullptr;
   }
 
-  auto lane = std::make_unique<EarlyReadyLane>();
+  auto lane = std::make_unique<EarlyReadyLane>(s.layer);
   lane->swiglu_clamp = s.swiglu_clamp;
   lane->swiglu_clamp_fused = s.swiglu_clamp_fused;
   const auto host_table = [&](ggml_tensor *src) -> ggml_tensor * {
