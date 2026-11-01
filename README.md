@@ -65,9 +65,9 @@ CUDA MoE models run through the shared full-graph runtime. Each supported GGUF a
 
 ## Model family support and benchmarks
 
-### Hardware setup
-- **CPU:** Xeon W-2235 (6 cores / 12 threads, AVX-512 with VNNI)
-- **RAM:** 125 GB DDR4
+### Hardware setup (A 7 years old workstation)
+- **CPU:** Xeon W-2235 (6 cores / 12 threads, AVX-512 with VNNI, released Q4 2019)
+- **RAM:** 128 GB DDR4 2933 MHz
 - **GPUs:** RTX 3090 (24 GB, PCIe Gen3 x16) + RTX 5060 Ti (16 GB, PCIe Gen3 x8)
 - **Storage:** NVMe + SATA SSDs (for offload), zram swap only
 - **Software:** Linux (CachyOS), CUDA 13.3, driver 610.57.04
