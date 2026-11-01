@@ -423,7 +423,8 @@ bool moe_pipeline_detail::qwen4exp_decode_ggml_path(
 // decode full graph must be an explicit model/config decision, not an
 // inherited process-wide experiment setting.
 static bool qwen4exp_decode_scheduler_enabled(const StreamingEngine &engine) {
-  return engine.qwen4exp_decode_scheduler;
+  (void)engine;
+  return false;
 }
 
 bool MoeRouterService::route(MoePipelineContext &context) {

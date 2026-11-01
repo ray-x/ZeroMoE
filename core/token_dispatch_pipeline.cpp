@@ -1055,8 +1055,7 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
         // Milestone B uses a dedicated pinned host/device result slot.  The
         // shared graph has already been submitted above, so its backend
         // stream is the exact compute stream that must consume the slot.
-        if (engine.qwen4exp_cpu_offload_event_fence &&
-            option_b_shared_started) {
+        if (false && option_b_shared_started) {
           auto &shared_runner =
               GgmlQwenSharedRunner::instance_for_layer(layer_idx);
           const int ring_device =

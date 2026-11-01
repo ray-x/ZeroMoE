@@ -320,7 +320,6 @@ std::expected<void, std::string> EngineRunner::apply_engine_config() {
   engine.qwen4exp_router_pilot_skip_prefetch_excluded_layers =
       config.qwen4exp_router_pilot_skip_prefetch_excluded_layers;
   engine.qwen4exp_decode_ggml_moe = config.qwen4exp_decode_ggml_moe;
-  engine.qwen4exp_decode_scheduler = config.qwen4exp_decode_scheduler;
   engine.qwen4exp_decode_device_hc = config.qwen4exp_decode_device_hc;
   engine.qwen4exp_decode_batch_stage = config.qwen4exp_decode_batch_stage;
     engine.qwen4exp_cpu_ggml_moe = config.qwen4exp_cpu_ggml_moe;
@@ -339,8 +338,6 @@ std::expected<void, std::string> EngineRunner::apply_engine_config() {
       std::unique(engine.qwen4exp_cpu_offload_layers.begin(),
                   engine.qwen4exp_cpu_offload_layers.end()),
       engine.qwen4exp_cpu_offload_layers.end());
-  engine.qwen4exp_cpu_offload_event_fence =
-      config.qwen4exp_cpu_offload_event_fence;
   engine.qwen4exp_cpu_offload_ring_slots =
       config.qwen4exp_cpu_offload_ring_slots;
   engine.qwen4exp_gpu_stage_enabled = config.qwen4exp_gpu_stage_enabled;
@@ -416,7 +413,7 @@ std::expected<void, std::string> EngineRunner::init_host_and_gpu() {
   ram_mgr.disk_batch_padding_evict_dup = config.disk_batch_padding_evict_dup;
   gpu.topology.active_layer_promote_threshold =
       std::max(1, config.active_layer_promote_hit_threshold);
-  gpu.topology.decode_promote_all_misses = config.decode_promote_all_misses;
+
   gpu.topology.speculative_active_layer_fill =
       config.speculative_promote_to_active_layer;
   // The CUDA runtime reports all physical adapters, but the TOML's

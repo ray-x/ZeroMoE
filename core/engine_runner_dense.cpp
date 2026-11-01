@@ -214,16 +214,8 @@ std::expected<void, std::string> EngineRunner::offload_dense_tensors() {
   // scoped to Qwen + CPU-affinity layers; all other models and the normal
   // Qwen path retain the existing BF16 optimization.
   auto qwen_scheduler_cpu_router = [&](const std::string &name) {
-    if (!config.qwen4exp_decode_scheduler ||
-        engine.family_ops.family != ModelFamily::Qwen4Exp ||
-        name.rfind("blk.", 0) != 0 ||
-        name.find("gate_inp.weight") == std::string::npos)
-      return false;
-    char *end = nullptr;
-    const long layer = std::strtol(name.c_str() + 4, &end, 10);
-    return end != name.c_str() + 4 && end && *end == '.' && layer >= 0 &&
-           layer < engine.model_file.architecture_config.n_layers &&
-           is_cpu_affinity_layer((int)layer);
+    (void)name;
+    return false;
   };
   for (auto &[name, tensor] : engine.resident_layers) {
     if (!tensor.host_ptr || name.find("gate_inp.weight") == std::string::npos)

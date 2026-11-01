@@ -607,16 +607,8 @@ bool exl3_ggml_bridge_requested(const FullGraph &g, int layer,
     model_path = g.engine->exl3_ggml_bridge_model_path;
     return true;
   }
-  const char *path = zeromoe::graphcfg::env("ZEROMOE_EXL3_GGML_BRIDGE_MODEL_PATH");
-  const char *layer_text = zeromoe::graphcfg::env("ZEROMOE_EXL3_GGML_BRIDGE_LAYER");
-  if (!path || !path[0] || !layer_text || !layer_text[0])
-    return false;
-  char *end = nullptr;
-  const long selected = std::strtol(layer_text, &end, 10);
-  if (end == layer_text || *end != '\0' || selected != layer)
-    return false;
-  model_path = path;
-  return true;
+  // Bridge configuration comes from the typed engine config only.
+  return false;
 }
 
 // Early-ready remains single-token only because the multi-token verify

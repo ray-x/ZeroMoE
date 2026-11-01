@@ -383,7 +383,6 @@ struct EngineConfig {
   // preloaded DDR arena may use one scheduler graph containing the CUDA
   // router and CPU MUL_MAT_ID expert path. Layers without a complete arena
   // retain the ordinary lazy-loading path; other model families ignore this.
-  bool qwen4exp_decode_scheduler = false;
   // Qwen4Exp-only decode handoff: keep the HC pre-mix result on the GGML
   // CUDA backend for the S==1 router and grouped MoE graph. This is separate
   // from qwen4exp_decode_ggml_moe so the latter can be benchmarked with the
@@ -399,7 +398,6 @@ struct EngineConfig {
   // the producer event is waited on by a reusable nonblocking CUDA copy
   // stream and the D2H copy lands in pinned staging memory before the CPU
   // consumer reads it. Off by default until the runtime A/B is validated.
-  bool qwen4exp_hc_async_readback = false;
   // Qwen-only S==1 router policy. The GPU router is useful for batched
   // prefill, but its graph launch/synchronization/readback boundary is slower
   // than the AVX-512 host router for decode on the RTX 3090. Keep this opt-in
@@ -443,7 +441,6 @@ struct EngineConfig {
   // Milestone B: queue the CPU result through a pinned host/device ring and
   // fence the shared CUDA stream on the copy event.  Milestone A remains the
   // default until the event protocol has been A/B validated.
-  bool qwen4exp_cpu_offload_event_fence = false;
   int qwen4exp_cpu_offload_ring_slots = 2;
 
   // GPU staging for host-resident decode layers: reuses the CUDA-graph
@@ -1560,8 +1557,7 @@ struct EngineConfig {
   // when its layer window closes (COPY-style, same-GPU victim), instead of only
   // those with a repeat hit -- which never happens in decode, leaving the main
   // cache frozen at its startup contents. See GpuTopology::
-  // decode_promote_all_misses. Off by default (A/B).
-  bool decode_promote_all_misses = false;
+  // (decode_promote_all_misses removed: off by default A/B experiment retired)
 
   // 2026-08-26: redirect DEPTH-1/ATTN-PILOT's speculative one-layer-ahead
   // RAM->VRAM promotion (ram_vram_promote_top_k/dynamic_layer,
@@ -2676,14 +2672,10 @@ inline bool EngineConfig::load(const std::string &path) {
       qwen4exp_router_pilot_skip_prefetch_excluded_layers);
   qwen4exp_decode_ggml_moe =
       doc.root.get_bool("qwen4exp_decode_ggml_moe", qwen4exp_decode_ggml_moe);
-  qwen4exp_decode_scheduler = doc.root.get_bool(
-      "qwen4exp_decode_scheduler", qwen4exp_decode_scheduler);
   qwen4exp_decode_device_hc = doc.root.get_bool(
       "qwen4exp_decode_device_hc", qwen4exp_decode_device_hc);
   qwen4exp_decode_batch_stage = doc.root.get_bool(
       "qwen4exp_decode_batch_stage", qwen4exp_decode_batch_stage);
-  qwen4exp_hc_async_readback = doc.root.get_bool(
-      "qwen4exp_hc_async_readback", qwen4exp_hc_async_readback);
   qwen4exp_cpu_ggml_moe =
       doc.root.get_bool("qwen4exp_cpu_ggml_moe", qwen4exp_cpu_ggml_moe);
   qwen4exp_cpu_strided_grouped = doc.root.get_bool(
@@ -2707,8 +2699,6 @@ inline bool EngineConfig::load(const std::string &path) {
       doc.root.get_bool("qwen4exp_cpu_offload", qwen4exp_cpu_offload);
   qwen4exp_cpu_offload_layers =
       doc.root.get_int_array("qwen4exp_cpu_offload_layers");
-  qwen4exp_cpu_offload_event_fence = doc.root.get_bool(
-      "qwen4exp_cpu_offload_event_fence", qwen4exp_cpu_offload_event_fence);
   qwen4exp_gpu_stage_enabled = doc.root.get_bool(
       "qwen4exp_gpu_stage_enabled", qwen4exp_gpu_stage_enabled);
   qwen4exp_gpu_stage_layers =
@@ -2934,8 +2924,6 @@ gdn_proj_ggml = doc.root.get_bool("gdn_proj_ggml", gdn_proj_ggml);
       doc.root.get_bool("use_active_layer_area", use_active_layer_area);
   active_layer_promote_hit_threshold = doc.root.get_int(
       "active_layer_promote_hit_threshold", active_layer_promote_hit_threshold);
-  decode_promote_all_misses =
-      doc.root.get_bool("decode_promote_all_misses", decode_promote_all_misses);
   speculative_promote_to_active_layer =
       doc.root.get_bool("speculative_promote_to_active_layer",
                         speculative_promote_to_active_layer);

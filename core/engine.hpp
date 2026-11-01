@@ -476,7 +476,6 @@ public:
     // cold-DDR CPU seam is eligible for a decode layer.
     bool qwen4exp_cpu_offload = false;
     std::vector<int> qwen4exp_cpu_offload_layers;
-        bool qwen4exp_cpu_offload_event_fence = false;
     int qwen4exp_cpu_offload_ring_slots = 2;
 
     // GPU staging for host-resident decode layers -- see
@@ -935,7 +934,6 @@ public:
     // Qwen-only full-graph CUDA-router + CPU-MUL_MAT_ID scheduler topology.
     // It is used only for complete immutable DDR arenas; lazy layers fall
     // back to the normal cache/dispatch path.
-    bool qwen4exp_decode_scheduler = false;
     // Qwen-only S==1 HC -> router/MoE device handoff. Kept separate from
     // the grouped decode switch for controlled correctness/performance A/B.
     bool qwen4exp_decode_device_hc = false;

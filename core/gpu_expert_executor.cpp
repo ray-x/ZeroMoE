@@ -314,31 +314,6 @@ bool expert_ffn_gpu_issue(GpuExpertScratch &scratch,
                          << "]\n";
   }
 
-  {
-    static std::atomic<bool> activation_dumped{false};
-    if (!activation_dumped.load(std::memory_order_relaxed)) {
-      const char *layer = zeromoe::graphcfg::env("ZEROMOE_DUMP_ACTIVATION_LAYER");
-      const char *expert = zeromoe::graphcfg::env("ZEROMOE_DUMP_ACTIVATION_EXPERT");
-      if (layer && expert && location->layer_idx == std::atoi(layer) &&
-          location->expert_id == std::atoi(expert)) {
-        bool expected = false;
-        if (activation_dumped.compare_exchange_strong(expected, true)) {
-          const char *configured =
-              zeromoe::graphcfg::env("ZEROMOE_DUMP_ACTIVATION_OUT");
-          const std::string path =
-              configured ? configured : "/tmp/real_activation.bin";
-          std::ofstream file(path, std::ios::binary);
-          file.write(reinterpret_cast<const char *>(input),
-                     static_cast<std::streamsize>(
-                         static_cast<size_t>(S) * D * sizeof(float)));
-          LOG_STREAM_VERBOSE()
-              << "[ACTIVATION-DUMP l=" << location->layer_idx
-              << " e=" << location->expert_id << "] wrote S=" << S
-              << " D=" << D << " floats to " << path << "\n";
-        }
-      }
-    }
-  }
 
   if (trace_gate("INPUT-TRACE-GPU")) {
     float minimum = input[0], maximum = input[0];

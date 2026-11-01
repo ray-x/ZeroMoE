@@ -936,26 +936,20 @@ int ubatch_size_cli = -1;
   set_moe_ggml_planar_copies(config.moe_ggml_planar_copies);
   set_moe_ggml_gpu_router(config.moe_ggml_gpu_router);
   set_moe_ggml_device(config.moe_ggml_device);
-  set_qwen_hc_async_readback(config.qwen4exp_hc_async_readback);
   LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp GGML shared expert: "
                     << (config.moe_ggml_shared_expert ? "ON" : "off")
                     << " (device routed+shared FFN)\n";
   LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp decode device HC handoff: "
                     << (config.qwen4exp_decode_device_hc ? "ON" : "off")
                     << " (Qwen S=1 only)\n";
-  LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp full graph decode scheduler: "
-                    << (config.qwen4exp_decode_scheduler ? "ON" : "off")
-                    << " (complete DDR arenas only; lazy layers use the "
-                       "legacy path)\n";
+
   LOG_STREAM_INFO() << "[CONFIG] Qwen CPU routed->device shared handoff: "
                     << (config.qwen4exp_cpu_shared_device ? "ON" : "off")
                     << " (CPU-affinity layers only; Qwen-only)\n";
   LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp decode batch RAM staging: "
                     << (config.qwen4exp_decode_batch_stage ? "ON" : "off")
                     << " (Qwen S=1 only; direct pinned-slab path otherwise)\n";
-  LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp async HC readback: "
-                    << (config.qwen4exp_hc_async_readback ? "ON" : "off")
-                    << " (pinned D2H staging; Qwen CPU-affinity path only)\n";
+
   set_hc_ggml(config.hc_ggml);
   set_gdn_proj_ggml(config.gdn_proj_ggml);
   set_gdn_full_ggml(config.gdn_full_ggml);
