@@ -93,9 +93,7 @@ a draft-KV rollback path. Not worth the complexity.
   68.5 +- 0.5 tok/s (5 alternating runs each). Not adopted.
 * **Threads:** the CPU team size matters more. Palindrome, 4 alternating runs per setting: 5 threads 68.6, 6 threads
   69.8 (+-0.3), 7 threads 63.8, 10 threads 67.9. Seven threads puts a worker on an SMT sibling of another and loses 8%.
-  The graph's CPU thread count now defaults to the physical core count (sysfs sibling groups) instead of
-  `hardware_concurrency() - 2`; `ZEROMOE_QWEN_CPU_THREADS` still overrides. Six prompts, 6 vs 10 threads: palindrome
-  +1.4, leet +1.5, math +1.0, review 0, btree -0.7, story -0.4 tok/s.
+  The MTP-specific alternating run favored six over ten threads for that batched-window workload. Keep that as an explicit workload override; generic full-graph CPU execution now inherits the affinity-based automatic thread policy. The Qwen 3.8 split baseline used ten graph CPU threads. Six prompts, 6 vs 10 threads: palindrome +1.4, leet +1.5, math +1.0, review 0, btree -0.7, story -0.4 tok/s.
 
 ## Fused hyper-connection ops (patches/ggml/0015)
 

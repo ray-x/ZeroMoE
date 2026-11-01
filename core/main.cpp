@@ -6,6 +6,7 @@
 #include "full_graph_model.hpp"
 #include "option_b_global_hot.hpp"
 #include "engine_config.hpp"
+#include "hardware_policy.hpp"
 #include "exl3_cpu.hpp"
 #include "exl3_model_loader.hpp"
 #include "exl3_decode.hpp"
@@ -261,7 +262,7 @@ void print_usage(bool all = false) {
          "(default: 0.7)\n"
       << "  --top-p <F>      Nucleus sampling top-p threshold (default: 0.90)\n"
       << "  --repeat-penalty <F> Repetition penalty (default: 1.0)\n"
-      << "  --main-gpu <ID>  CUDA device ID for single-GPU mode (default: 0)\n"
+      << "  --main-gpu <ID>  CUDA device ID for single-GPU mode (default: auto capacity/performance selection)\n"
       << "  --spec-type <none|draft-mtp>  Speculative decoding mode\n"
       << "  --spec-draft-model <path>     Optional external draft checkpoint\n"
       << "  --spec-draft-n-max <N>        Maximum draft tokens (default: 3)\n"
@@ -347,32 +348,22 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
     return {};
   }
 
-  // Process-wide default OpenMP team size -- MUST run before anything
-  // else, since every #pragma omp parallel for without its own
-  // num_threads() clause (attention_layer.cpp's dense/attention
-  // matmuls, kernels_cpu.cpp's CPU expert-fallback dequant+dot path,
-  // kquant_dequant.hpp's reference dequant) previously had NO cap at
-  // all, defaulting to OpenMP's own runtime default (every available
-  // core) with nothing to stop several of them running concurrently.
-  // A real run showed the OS itself become unresponsive to other
-  // commands from exactly this -- the CPU expert-fallback path alone
-  // (expert_ffn_cpu -> cpu_quant_matmul x3 per call, gate/up/down) can
-  // fire thousands of times per run, each burst spinning up to every
-  // core. omp_set_num_threads() only changes the DEFAULT for regions
-  // without their own explicit num_threads() clause -- ram_manager.hpp's
-  // Phase B disk-read loop (num_threads(expert_fetch_threads)) is
-  // unaffected and keeps using its own configured value regardless.
+  // Set a process-wide OpenMP default before any parallel region runs.
+  // Auto sizing uses ceil(80%) of CPUs in this process' affinity mask, so
+  // it adapts to the host/container instead of assuming a fixed core count.
+  // Explicit num_threads() regions such as the expert-fetch loop keep their
+  // own configured size.
   {
     int omp_cap =
         config.omp_max_threads > 0
             ? config.omp_max_threads
-            : std::max(1, (int)std::thread::hardware_concurrency() - 2);
+            : zeromoe::hardware::automatic_cpu_thread_count();
     omp_set_num_threads(omp_cap);
     LOG_STREAM_INFO() << "[CONFIG] OMP process-wide default team size: "
                       << omp_cap
                       << (config.omp_max_threads > 0
                               ? " (explicit)"
-                              : " (auto: hardware_concurrency-2)")
+                              : " (auto: at least 80% of affinity CPUs)")
                       << "\n";
     // attn_score_threads (dense_dispatch.hpp): dedicated override for
     // attention_layer.cpp's causal score loop specifically -- 0 (unset)
@@ -437,7 +428,7 @@ int main(int argc, char *argv[]) {
   int prefetch_worker_threads_cli = -1;
   int max_ctx = 4096;
   int max_new_tokens = 1024;
-  int gpu_id = 0;
+  int gpu_id = -1; // auto-select highest capacity/performance when unspecified
   int threads_cli = -1;
   bool gpu_cli_given = false;
   bool drop_pages = false;

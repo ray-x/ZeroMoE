@@ -4,6 +4,7 @@
 // declarations live in ggml_qwen4exp_graph_internal.hpp.
 
 #include "ggml_qwen4exp_graph_internal.hpp"
+#include <limits>
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
 
@@ -739,21 +740,59 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     if (!g)
       return false;
   }
+  const double usage_budget_gb = engine.qwen4exp_graph_expert_vram_budget_gb;
+  const bool usage_budget_enabled = usage_budget_gb > 0.0;
+  size_t split_experts = 0;
+  size_t split_bytes = 0;
+  for (const auto &[layer, ids] : g->split_gpu_expert_ids) {
+    if (ids.empty())
+      continue;
+    const size_t per_expert = engine.compute_expert_slab_bytes(layer);
+    if (per_expert == 0 ||
+        ids.size() > (std::numeric_limits<size_t>::max() - split_bytes) /
+                         per_expert) {
+      split_bytes = std::numeric_limits<size_t>::max();
+      break;
+    }
+    split_bytes += per_expert * ids.size();
+    split_experts += ids.size();
+  }
+  const long double budget_bytes_ld =
+      static_cast<long double>(usage_budget_gb) * 1024.0L * 1024.0L * 1024.0L;
+  const size_t usage_budget_bytes =
+      budget_bytes_ld > 0.0L &&
+              budget_bytes_ld <= static_cast<long double>(
+                                     std::numeric_limits<size_t>::max())
+          ? static_cast<size_t>(budget_bytes_ld)
+          : 0;
+  const bool split_placement_mismatch =
+      usage_budget_enabled
+          ? (split_experts == 0 || split_bytes > usage_budget_bytes)
+          : !g->split_gpu_expert_ids.empty();
   if (engine.family_ops.family == ModelFamily::Qwen &&
-      (g->device_expert_layers != c.n_layers ||
-       !g->split_gpu_expert_ids.empty())) {
-    LOG_ERROR("[QWEN35MOE-GRAPH] planner selected a full-fit run, but graph "
-              "placement is incomplete (device_layers=%d/%d split_layers=%zu); "
-              "refusing partial expert residency\n",
+      (g->device_expert_layers != engine.cuda_moe_graph_device_expert_layers ||
+       g->device_expert_trailing !=
+           engine.cuda_moe_graph_device_expert_trailing ||
+       split_placement_mismatch)) {
+    LOG_ERROR("[QWEN35MOE-GRAPH] built placement differs from the admitted "
+              "plan (built=%d/%d trailing=%d planned=%d trailing=%d "
+              "usage_budget_gib=%.3f split_layers=%zu split_experts=%zu "
+              "split_bytes=%zu)\n",
               g->device_expert_layers, c.n_layers,
-              g->split_gpu_expert_ids.size());
+              g->device_expert_trailing ? 1 : 0,
+              engine.cuda_moe_graph_device_expert_layers,
+              engine.cuda_moe_graph_device_expert_trailing ? 1 : 0,
+              usage_budget_gb, g->split_gpu_expert_ids.size(), split_experts,
+              split_bytes);
     return false;
   }
   if (engine.family_ops.family == ModelFamily::Qwen) {
     LOG_INFO("[QWEN35MOE-GRAPH] decode ready: expert_layers_on_gpu=%d/%d "
-             "experts_per_layer=%d expert_arena_bytes=%zu dense_arena_bytes=%zu "
-             "kv_capacity=%d; no CPU expert or layered decode path\n",
-             g->device_expert_layers, c.n_layers, c.n_experts,
+             "ddr_source_layers=%d trailing=%d experts_per_layer=%d "
+             "expert_arena_bytes=%zu dense_arena_bytes=%zu kv_capacity=%d\n",
+             g->device_expert_layers, c.n_layers,
+             c.n_layers - g->device_expert_layers,
+             g->device_expert_trailing ? 1 : 0, c.n_experts,
              g->expert.capacity, g->dense.capacity, g->kv_capacity);
   } else {
     LOG_INFO("[GGML-QWEN-FULL-DECODE] enabled: one scheduler submission per "

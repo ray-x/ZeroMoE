@@ -33,7 +33,7 @@ the default 90% steady-decode bar with:
 llama-bench -m /path/to/model.gguf -pg 16,400 -ngl 99 -dev CUDA1 \
     -mg 0 -sm none -t 10 -r 3 -o json > llama-bench.json
 python3 tools/check_full_graph_moe_perf.py <run.log> llama-bench.json \
-    --n-prompt 16 --n-gen 400 --device CUDA1
+    --n-prompt <p> --n-gen <g> --context <ctx> --n-threads <t> --n-gpu-layers <ngl> --n-cpu-moe <ncmoe> --device <device>
 ```
 
 The ZeroMoE gate uses time spent in graph decode replays and reports graph

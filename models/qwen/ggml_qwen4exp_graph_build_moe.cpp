@@ -5,6 +5,7 @@
 // declarations live in ggml_qwen4exp_graph_internal.hpp.
 
 #include "ggml_qwen4exp_graph_internal.hpp"
+#include "full_graph_boundary_probe.hpp"
 
 #include <cstdlib>
 
@@ -667,9 +668,63 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   const auto &c = g.engine->model_file.architecture_config;
   const moe_routed::RouterSpec rspec =
       family_router_spec(g.engine->family_ops.family, c, g.S);
+  const bool probe_dump = qwen_probe_dump_enabled_for_layer(layer);
+  const char *probe_dump_layer_text =
+      zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP_LAYER");
+  const bool explicit_dump_layer =
+      probe_dump_layer_text && probe_dump_layer_text[0];
+  const char *probe_layer_text =
+      zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_LAYER");
+  const int probe_layer = probe_layer_text ? std::atoi(probe_layer_text) : 0;
+  const bool capture_selected_dump =
+      probe_dump &&
+      (explicit_dump_layer || probe_layer < 0 || layer == probe_layer);
+  const bool capture_common_probe =
+      zeromoe::graph::full_graph_boundary_probe_enabled_for_layer(layer);  const bool capture_router =
+      g.engine->family_ops.family == ModelFamily::Qwen &&
+      (capture_selected_dump || capture_common_probe);
+  auto probe_router = [&](const char *label, ggml_tensor *value) {
+    if (!capture_router || !value || !g.graph)
+      return;
+    const std::string boundary = "router_" + std::string(label);
+    capture_full_graph_boundary(g, layer, boundary.c_str(), value);
+    if (!capture_selected_dump)
+      return;
+    const std::string name = "qwen35_router_" + std::string(label) + "_" +
+                             std::to_string(layer);
+    ggml_set_name(value, name.c_str());
+    ggml_set_output(value);
+    ggml_build_forward_expand(g.graph, value);
+    g.gdn_probe_taps.emplace_back(layer, "router_" + std::string(label),
+                                  value);
+  };
+  const bool capture_expert =
+      g.engine->family_ops.family == ModelFamily::Qwen &&
+      (capture_selected_dump || capture_common_probe);
+  auto probe_expert = [&](const char *label, ggml_tensor *value) {
+    if (!capture_expert || !value || !g.graph)
+      return;
+    const std::string boundary = "expert_" + std::string(label);
+    capture_full_graph_boundary(g, layer, boundary.c_str(), value);
+    if (!capture_selected_dump)
+      return;
+    const std::string name = "qwen35_expert_" + std::string(label) + "_" +
+                             std::to_string(layer);
+    ggml_set_name(value, name.c_str());
+    ggml_set_output(value);
+    ggml_build_forward_expand(g.graph, value);
+    g.gdn_probe_taps.emplace_back(layer, "expert_" + std::string(label),
+                                  value);
+  };
+  moe_routed::RouterGateNodes gate_nodes;
   ggml_tensor *probs = nullptr;
   if (!fixed_route_ids || !fixed_route_weights || probs_out)
-    probs = moe_routed::gate_probs(ctx, rspec, router, cur);
+    probs = moe_routed::gate_probs(ctx, rspec, router, cur,
+                                   capture_router ? &gate_nodes : nullptr);
+  if (capture_router) {
+    probe_router("logits", gate_nodes.logits);
+    probe_router("probs", gate_nodes.probs);
+  }
   if (probs_out)
     *probs_out = probs;
   ggml_tensor *ids = fixed_route_ids;
@@ -677,6 +732,10 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     ids = moe_routed::select_ids(ctx, rspec, probs, selection_bias);
   if (!ids)
     return nullptr;
+  if (capture_common_probe)
+    capture_full_graph_boundary(g, layer, "route_ids", ids);
+  if (capture_selected_dump)
+    probe_router("ids", ggml_cast(ctx, ids, GGML_TYPE_F32));
   if (!fixed_route_ids && g.decode_mode && g.stage_enabled &&
       layer == g.stage_layer) {
     if (!g.stage_route_ids) {
@@ -732,10 +791,22 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     *ids_out = ggml_cont(ctx, ids);
   }
   ggml_tensor *weights = fixed_route_weights;
+  moe_routed::RouteWeightNodes route_nodes;
   if (!weights)
-    weights = moe_routed::route_weights(ctx, rspec, probs, ids);
+    weights = moe_routed::route_weights(
+        ctx, rspec, probs, ids, capture_router ? &route_nodes : nullptr);
   if (!weights)
     return nullptr;
+  if (capture_router) {
+    probe_router("probs3", route_nodes.probs3);
+    probe_router("picked", route_nodes.picked);
+    probe_router("weights2", route_nodes.weights2);
+    probe_router("weights_sum", route_nodes.sum);
+    probe_router("weights_sum_clamped", route_nodes.sum_clamped);
+    probe_router("weights_norm", route_nodes.normalized);
+    probe_router("weights_scaled", route_nodes.scaled);
+    probe_router("weights_final", route_nodes.weights3);
+  }
   if (route_weights_out)
     *route_weights_out = weights;
   ggml_build_forward_expand(g.graph, weights);
@@ -898,20 +969,45 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       }
       const char *early_env = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_LAYER13");
       const char *all_early_env = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT");
+      // The terminal MoE's private CPU lane has no following scheduled
+      // boundary to trigger the early-ready callback. Keep it on the normal
+      // CPU graph path; all preceding split layers can still overlap cold
+      // expert work with their downstream GPU graph.
       const bool early_requested =
           ((early_env && early_env[0] == '1' && layer == 13) ||
-           (!all_early_env || all_early_env[0] != '0')) &&
+           (all_early_env && all_early_env[0] == '1')) &&
           g.decode_mode && g.S >= 1 &&
-          g.S == 1;
+          g.S == 1 && layer + 1 < g.n_layers;
       std::unique_ptr<EarlyReadyLane> early;
       ExpertSplitTables route_tab = tab;
       if (early_requested) {
         GGML_ASSERT(ggml_backend_sched_early_cpu_supported &&
                     ggml_backend_sched_early_cpu_supported() == 1);
         GGML_ASSERT(!g.layer_timing_enabled && g.early_ready.count(layer) == 0);
-        early = std::make_unique<EarlyReadyLane>();
+        early = std::make_unique<EarlyReadyLane>(layer);
+        const auto arch_it =
+            g.engine->model_file.kv_string.find("general.architecture");
+        const std::string architecture =
+            arch_it == g.engine->model_file.kv_string.end()
+                ? std::string("unknown")
+                : arch_it->second;
+        // Keep the default tied to the exact architecture profile. Qwen4Exp
+        // follows the measured Qwen3.8 setting; qwen35moe uses scheduler-managed
+        // synchronous output because the matched Ornith A/B was faster and
+        // retained producer work during CPU-lane execution. The environment
+        // override remains available for a per-run A/B. The explicit
+        // CPU-marker graph root below is required for async mode.
+        const bool async_output_default = architecture == "qwen4exp";
+        const char *async_output_override =
+            zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_ASYNC_OUTPUT");
         GGML_ASSERT(early->prepare(g.cpu, g.device, g.D, c.topk,
-                    gate_exps, up_exps, down_exps, tab.remap_cpu, tab.mask_cpu, g.S));
+                    gate_exps, up_exps, down_exps, tab.remap_cpu, tab.mask_cpu,
+                    g.S, async_output_default));
+        if (g.early_ready.empty()) {
+          LOG_INFO("[QWEN-EARLY-READY-PROFILE] architecture=%s async_output_copy=%d source=%s\n",
+                   architecture.c_str(), early->async_output_copy ? 1 : 0,
+                   async_output_override ? "environment" : "adapter default");
+        }
         if (early->resident_tables) {
           GGML_ASSERT(early->prepare_gpu_tables(g.cuda, ctx,
                       tab.remap_gpu, tab.remap_cpu, tab.mask_gpu, tab.mask_cpu));
@@ -1022,6 +1118,12 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         ggml_backend_sched_set_tensor_backend(g.sched, cold_weighted, g.cpu);
         if (early->async_output_copy) {
           early->cpu_marker = cold_weighted;
+          // The async GPU output is written by EarlyReadyLane::run() through
+          // an out-of-band copy stream, so it does not consume cold_weighted
+          // as a normal GGML source. Keep the CPU marker as an explicit graph
+          // root; otherwise the scheduler prunes its MAP_CUSTOM1 node and the
+          // lane never runs.
+          ggml_build_forward_expand(g.graph, early->cpu_marker);
           GGML_ASSERT(early->prepare_gpu_output(g.cuda, ctx));
           ggml_set_name(early->gpu_output,
                         ("qwen_early_ready_output_l" + std::to_string(layer)).c_str());
@@ -1038,6 +1140,12 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       hot_w.down = down_exps_gpu;
       const moe_routed::FfnNodes hot_ffn =
           moe_routed::expert_ffn(ctx, hot_w, input3, ids_gpu);
+      if (capture_expert) {
+        probe_expert("hot_gate", hot_ffn.gate);
+        probe_expert("hot_up", hot_ffn.up);
+        probe_expert("hot_act", hot_ffn.act);
+        probe_expert("hot_down", hot_ffn.down);
+      }
       ggml_tensor *experts_gpu = hot_ffn.down;
 
       ggml_tensor *hot_weighted = ggml_mul(ctx, experts_gpu, weights_gpu);
@@ -1051,11 +1159,18 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         stage_w.down = pool.weights[2];
         const moe_routed::FfnNodes stage_ffn =
             moe_routed::expert_ffn(ctx, stage_w, input3, early.stage_gpu_ids);
+        if (capture_expert) {
+          probe_expert("stage_gate", stage_ffn.gate);
+          probe_expert("stage_up", stage_ffn.up);
+          probe_expert("stage_act", stage_ffn.act);
+          probe_expert("stage_down", stage_ffn.down);
+        }
         auto *staged_weighted = ggml_mul(ctx, stage_ffn.down, ggml_mul(ctx, weights, early.stage_gpu_mask));
         if (pool.verify_enabled)
           GGML_ASSERT(pool.prepare_verification(staged_weighted, g.early_stage_pools.front().get()));
         hot_weighted = ggml_add(ctx, hot_weighted, staged_weighted);
       }
+      probe_expert("hot_weighted", hot_weighted);
       if (cold_weighted) {
         // Submit hot work before the independent private CPU marker.
         ggml_build_forward_expand(g.graph, hot_weighted);
@@ -1063,16 +1178,32 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         // One fused CPU node for supported cold branches.
         // Resident-expert routes and the recorded masks are read from the same host tables as below.
         ggml_tensor *fused = nullptr;
-        if (g.decode_mode && !g.stage_route_ids &&
+        const bool cold_fused_enabled =
+            zeromoe::graphcfg::flag_unless_off("ZEROMOE_QWEN4EXP_COLD_FUSED");
+        if (!cold_fused_enabled && g.decode_mode && !g.stage_route_ids) {
+          LOG_DEBUG("[GGML-QWEN-FULL-COLD-FUSED] layer=%d disabled by "
+                    "ZEROMOE_QWEN4EXP_COLD_FUSED=0; using stock cold graph\n",
+                    layer);
+        }
+        if (cold_fused_enabled && g.decode_mode && !g.stage_route_ids &&
             qwen4exp_cold::supported(gate_exps, up_exps, down_exps, c.topk, g.S)) {
           std::shared_ptr<qwen4exp_cold::Context> owner;
           fused = qwen4exp_cold::build(
               ctx, owner, input3, ggml_cont(ctx, ids),
               ggml_cont(ctx, weights), tab.remap_cpu, tab.mask_cpu, gate_exps, up_exps,
-              down_exps, g.cpu_threads);
+              down_exps, g.cpu_threads, layer);
           if (fused) {
+            const auto *cpu_traits = ggml_get_type_traits_cpu(gate_exps->type);
+            LOG_DEBUG("[GGML-QWEN-FULL-COLD-FUSED] layer=%d weights=%s/%s/%s "
+                      "activation=%s threads=%d\n",
+                      layer, ggml_type_name(gate_exps->type),
+                      ggml_type_name(up_exps->type),
+                      ggml_type_name(down_exps->type),
+                      ggml_type_name(cpu_traits->vec_dot_type), g.cpu_threads);
             g.cold_fused.push_back(std::move(owner));
             ggml_backend_sched_set_tensor_backend(g.sched, fused, g.cpu);
+            if (g.layer_timing_enabled)
+              g.layer_timing_layer_of[fused] = {layer, "moe_cold_fused"};
             cold_weighted = fused;
           }
         }
@@ -1083,10 +1214,17 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
           cold_w.down = down_exps;
           const moe_routed::FfnNodes cold_ffn =
               moe_routed::expert_ffn(ctx, cold_w, input3, ids_cpu);
+          if (capture_expert) {
+            probe_expert("cold_gate", cold_ffn.gate);
+            probe_expert("cold_up", cold_ffn.up);
+            probe_expert("cold_act", cold_ffn.act);
+            probe_expert("cold_down", cold_ffn.down);
+          }
           ggml_tensor *experts_cpu = cold_ffn.down;
           cold_weighted = ggml_mul(ctx, experts_cpu, weights_cpu);
         }
       }
+      probe_expert("cold_weighted", cold_weighted);
       experts = ggml_add(ctx, hot_weighted, cold_weighted);
     }
   }
@@ -1103,24 +1241,7 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     ew.down = down_exps;
     const moe_routed::FfnNodes ffn =
         moe_routed::expert_ffn(ctx, ew, input3, ids);
-    const char *probe_dump =
-        zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP");
-    const char *probe_layer_text =
-        zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_LAYER");
-    const int probe_layer = probe_layer_text ? std::atoi(probe_layer_text) : 0;
-    if (g.engine->family_ops.family == ModelFamily::Qwen &&
-        layer == probe_layer && probe_dump) {
-      auto probe_expert = [&](const char *label, ggml_tensor *value) {
-        if (!value || !g.graph)
-          return;
-        const std::string name = "qwen35_expert_" + std::string(label) + "_" +
-                                 std::to_string(layer);
-        ggml_set_name(value, name.c_str());
-        ggml_set_output(value);
-        ggml_build_forward_expand(g.graph, value);
-        g.gdn_probe_taps.emplace_back(layer, "expert_" + std::string(label),
-                                      value);
-      };
+    if (capture_expert) {
       // Select one layer so the diagnostic exposes projection arithmetic
       // without retaining every expert intermediate across the full graph.
       probe_expert("gate", ffn.gate);
@@ -1133,6 +1254,8 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     ggml_tensor *gate_up = ffn.gate_up; // only set on the fused path
     ggml_tensor *act = ffn.act;
     ggml_tensor *down = ffn.down;
+    probe_expert("down_preweight", down);
+    probe_expert("weights_preweight", weights);
     experts = ggml_mul(ctx, down, weights);
     if (g.layer_timing_enabled) {
       // See FullGraph::layer_timing_layer_of's own comment -- these are
@@ -1156,7 +1279,9 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     }
   }
 
+  probe_expert("weighted_slots", experts);
   ggml_tensor *out = moe_routed::sum_topk(ctx, experts, g.D, g.S, c.topk);
+  probe_expert("sum_topk", out);
   (void)layer;
   return out;
 }

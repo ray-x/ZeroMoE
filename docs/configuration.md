@@ -7,6 +7,15 @@ and change the paths, memory budgets, GPU topology and context size for your
 machine; keep its measured backend choices unless you are benchmarking. No
 "fast/balanced" preset silently changes numerical or memory policy.
 
+The starter's `[[gpus]].device_id = -1` asks the engine to auto-select the
+visible CUDA device with the strongest capacity/performance score (VRAM × SMs ×
+clock × compute capability). An explicit CUDA ordinal always overrides this.
+The selected device and score are logged; preflight failure does not silently
+move the model to a lower-capacity card. `omp_max_threads = 0` leaves CPU
+parallelism automatic: the process uses at least 80% of the logical CPUs allowed by its affinity mask
+(10 threads on this 12-logical-thread host). Record the effective process and graph-lane thread counts from the log for
+benchmark comparisons, and check load before running on a shared host.
+
 ```bash
 ./build/zeromoe --config configs/starter.toml --prompt "Hello"
 ```

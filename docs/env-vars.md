@@ -61,6 +61,12 @@ decode default to the graph; placement uses TOML `graph_device_expert_layers` /
 | `ZEROMOE_QWEN4EXP_PREFILL_OP_OFFLOAD` | `1` (default) | Run host-resident experts on the GPU during prefill, by copying the batch's experts across. `0` keeps them on the CPU. |
 | `ZEROMOE_QWEN_CPU_THREADS` | all OpenMP threads | Positive integer. Caps (never raises) the threads used for Qwen CPU expert work. |
 | `ZEROMOE_QWEN4EXP_HOST_NODE` | off | Use the host-node CPU/GPU schedule (`flag_on`). Measured in [runtime-settings.md](runtime-settings.md). |
+| `ZEROMOE_QWEN4EXP_LAYER_TIMING` | off | Enable CPU node timing and dispatch/barrier counters. It installs an evaluation callback that can split CUDA graph work and disable fused kernels; keep it off for correctness and performance baselines. |
+| `ZEROMOE_QWEN4EXP_LAYER_TIMING_VERBOSE` | off | Dump every scheduler node and backend for the first decode token. It is also invasive and can disable fused router/reduction kernels. Enable only for a separate diagnostic run, with `log_level = "DEBUG"` to see detailed records. `log_level = "DEBUG"` alone does not enable either timing callback. |
+| `ZEROMOE_QWEN4EXP_COLD_FUSED_TIMING` | off | Aggregate per-layer wall time, task count, and cold-route counts inside the fused CPU custom node. It does not install the scheduler evaluation callback or split CUDA graphs. Diagnostic only; do not use the timed run for throughput. |
+| `ZEROMOE_QWEN4EXP_PROBE_ROUTED_ONLY`, `ZEROMOE_QWEN4EXP_PROBE_ROUTED_ONLY_DIR` | off / unset | Test-only capture of final routed outputs without enabling the full intermediate probe set. Set `ZEROMOE_QWEN4EXP_PROBE_LAYER` to one layer; `-1` captures every layer. |
+| `ZEROMOE_QWEN4EXP_PROBE_DUMP_LAYER` | unset (all layers) | With `ZEROMOE_QWEN4EXP_PROBE_DUMP` enabled, retain intermediate and detailed expert diagnostic roots for only this layer. It overrides `ZEROMOE_QWEN4EXP_PROBE_LAYER` for the full-dump scope. Use for correctness isolation; graph probes can affect scheduling, so do not use their runs for performance measurements. |
+| `ZEROMOE_FULL_GRAPH_PROBE_DIR`, `ZEROMOE_FULL_GRAPH_PROBE_LAYER` | unset / all layers | Shared `GraphCore` boundary capture. Adapters register existing layer tensors; the writer saves raw values plus dtype/shape/stride/backend metadata. Diagnostic graph roots may affect scheduling; do not use these runs for performance. |
 | `ZEROMOE_CUDA_SCHEDULE` | `auto` (`blocking` when `ZEROMOE_QWEN4EXP_HOST_NODE=1`) | CUDA synchronisation: `auto`, `blocking` or `spin`. Other values select the default. |
 
 ### Qwen memory policy
@@ -74,16 +80,28 @@ decode default to the graph; placement uses TOML `graph_device_expert_layers` /
 
 ### Qwen early-ready lane (experimental)
 
-The default Qwen recipe (`configs/qwen38-flash.toml`) does not set any of these. They are experimental.
+The Qwen3.8 decode runner sets ALL_SPLIT=1, LAYER13=0, and
+QWEN_CPU_THREADS=10. ASYNC_OUTPUT is left unset, so the adapter default is
+used. The marker must be in the forward graph for the scheduler to run the CPU
+lane. Current Qwen graph construction roots that marker explicitly.
 
-| Variable | Used for |
-| --- | --- |
-| `ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT`, `ZEROMOE_QWEN_EARLY_READY_ASYNC_OUTPUT`, `ZEROMOE_QWEN_EARLY_READY_RESIDENT_TABLES`, `ZEROMOE_QWEN_EARLY_READY_LAYER13`, `ZEROMOE_QWEN_EARLY_READY_PREDICT`, `ZEROMOE_QWEN_EARLY_READY_SKIP_ALL_HOT` | Early-ready expert placement and output copy. Background and measurements: [the graph refactor worklog](option-b-graph-refactor-steps-2026-10-04.md). |
-| `ZEROMOE_QWEN_EARLY_READY_PREDICT_LAYER` | Restrict the pilot prediction to one target layer. Unset predicts for every split layer. |
-| `ZEROMOE_QWEN_EARLY_READY_RIDGE` | Path to a pilot ridge table. A missing or invalid file leaves the plain pilot. |
-| `ZEROMOE_QWEN_EARLY_READY_STAGE_LAYER`, `ZEROMOE_QWEN_EARLY_READY_STAGE_VERIFY` | Select stage layer (`all` or an integer) and enable output verification for the active staging checks. |
-| `ZEROMOE_QWEN_EARLY_READY_ROUTE_TRACE` | Log routing decisions of the early-ready lane. Diagnostic. |
-| `ZEROMOE_QWEN4EXP_PREFILL_STATE_HANDOFF` | Hand prefill recurrent state to decode without a copy. |
+| Variable | Meaning and default |
+|---|---|
+| ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT | Opt in to early-ready CPU lanes on every routed hot/cold split. Unset or 0 uses the regular split path. |
+| ZEROMOE_QWEN_EARLY_READY_LAYER13 | Opt in to layer 13 only when all-split is not enabled. |
+| ZEROMOE_QWEN_EARLY_READY_ASYNC_OUTPUT | Architecture default: on for `qwen4exp`, off for `qwen35moe`. Explicit 0 selects scheduler-managed synchronous output; explicit 1 selects the side-stream output copy. The defaults reflect their separate matched profiles; compare the exact architecture before changing them. |
+| ZEROMOE_EARLY_READY_ROUTE_BUNDLE_TRACE | Default off. When set to 1, logs top-k expert IDs and normalized weights per early-ready lane call for usage-survey diagnostics. Adds logging overhead; do not use for performance measurements. The terminal MoE layer without an early-ready lane is not included. |
+| ZEROMOE_QWEN_EARLY_READY_RESIDENT_TABLES | Keep immutable route tables resident on GPU; default on, explicit 0 disables. |
+| ZEROMOE_QWEN_EARLY_READY_PREDICT | Enable next-layer route prediction. Default off unless set to 1. |
+| ZEROMOE_QWEN_EARLY_READY_PREDICT_LAYER | Restrict prediction to one target layer; unset predicts the next split layer. |
+| ZEROMOE_QWEN_EARLY_READY_RIDGE | Path to an optional ridge correction table; missing or invalid files leave the plain predictor. |
+| ZEROMOE_QWEN_EARLY_READY_SKIP_ALL_HOT | Skip the CPU lane when all selected experts are resident; enable only after correctness/performance checks. |
+| ZEROMOE_QWEN_EARLY_READY_STAGE_LAYER, ZEROMOE_QWEN_EARLY_READY_STAGE_VERIFY | Select layer(s) for staged expert copies and route verification. |
+| ZEROMOE_QWEN_EARLY_READY_ROUTE_TRACE | Diagnostic path for lane route decisions. |
+
+Timing callbacks and probes change graph partitioning and are not performance
+settings. See the [scheduler overlap worklog](option-b-graph-refactor-steps-2026-10-04.md)
+and the [Qwen3.8-to-Ornith profile audit](handoff/qwen38-to-ornith-profile-transfer-2026-10-31.md).
 
 ## Expert offload (SSD and host memory)
 

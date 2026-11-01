@@ -55,7 +55,7 @@ constexpr double SLOW_CACHE_MUTEX_WAIT_MS = 50.0;
     } while (0)
 
 enum class GpuRole {
-    CoreEngine,   // Dense layers + KV cache + activation state (newest arch / lower VRAM)
+    CoreEngine,   // Dense layers + KV cache + activation state (auto capacity/performance rank)
     ExpertVault,  // MoE expert LRU cache (highest VRAM capacity)
     Unused
 };
@@ -67,6 +67,8 @@ struct GpuDevice {
     size_t available_vram = 0;
     int sm_major = 0;
     int sm_minor = 0;
+int multiprocessor_count = 0;
+int clock_rate_khz = 0;
     GpuRole role = GpuRole::Unused;
     cudaStream_t compute_stream = nullptr;
     cudaStream_t copy_stream = nullptr;
@@ -874,6 +876,9 @@ public:
             devices[i].available_vram = prop.totalGlobalMem; // will be reduced as we allocate
             devices[i].sm_major = prop.major;
             devices[i].sm_minor = prop.minor;
+            devices[i].multiprocessor_count = prop.multiProcessorCount;
+            (void)cudaDeviceGetAttribute(&devices[i].clock_rate_khz,
+                                         cudaDevAttrClockRate, i);
         }
 
         // Assign roles based on hardware profile
@@ -3321,17 +3326,20 @@ private:
                 if (best_core < 0) {
                     LOG_STREAM_WARN() << "[GPU] forced_core_device_id=" << forced_core_device_id
                               << " does not match any enumerated device -- falling back to "
-                                 "SM-architecture/VRAM auto-detect for CoreEngine assignment\n";
+                                 "capacity/performance auto-detect for CoreEngine assignment\n";
                 }
             }
             if (best_core < 0) {
                 best_core = selected[0];
                 for (size_t si = 1; si < selected.size(); ++si) {
                     int i = selected[si];
-                    bool newer = devices[i].sm_major > devices[best_core].sm_major;
-                    bool same_gen_less_vram = (devices[i].sm_major == devices[best_core].sm_major &&
-                                               devices[i].total_vram < devices[best_core].total_vram);
-                    if (newer || same_gen_less_vram) best_core = i;
+                    const auto score = [](const GpuDevice &dev) {
+                        return zeromoe::hardware::gpu_capacity_performance_score(
+                            dev.total_vram, dev.sm_major, dev.sm_minor,
+                            dev.multiprocessor_count, dev.clock_rate_khz);
+                    };
+                    if (score(devices[i]) > score(devices[best_core]))
+                        best_core = i;
                 }
             }
 

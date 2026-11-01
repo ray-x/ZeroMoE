@@ -6,6 +6,7 @@
 
 #include "ggml_qwen4exp_graph_internal.hpp"
 #include "graph_settings_global.hpp"
+#include "hardware_policy.hpp"
 #include <sched.h>
 #include <vector>
 #include <string>
@@ -66,9 +67,11 @@ bool env_device_expert_trailing() {
       .tun.device_expert_trailing.value != 0;
 }
 
-// Detailed graph timing follows the common DEBUG verbosity threshold.
+// CPU per-node timing installs a scheduler evaluation callback. That callback
+// can split CUDA graph work and disable fused MoE kernels, so DEBUG logging
+// alone must not enable it.
 bool env_layer_timing_enabled() {
-  return Logger::instance().would_log(LogLevel::DEBUG);
+  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_LAYER_TIMING");
 }
 
 // Phase 4 host-node integration is deliberately a separate opt-in from the
@@ -80,15 +83,12 @@ bool env_qwen4exp_host_node_enabled() {
 }
 
 // One-shot diagnostic (2026-09-19): dumps EVERY node the scheduler visits
-// (both CPU- and CUDA-backend, which layer_timing_eval_callback's normal
-// path skips entirely) for the FIRST decode token only, so the real
-// node/backend sequence around a CPU-dispatched MoE layer's boundary is
-// visible directly instead of guessed at from the undifferentiated
-// layer_timing_gap_ms_total bucket. See memory:
-// qwen4exp-phase2-gpu-branch-slower-than-cpu.md's own "not yet diagnosed"
-// note and the live investigation this answers.
+// (both CPU- and CUDA-backend) for the FIRST decode token. This is
+// intentionally opt-in: per-node callback timing splits CUDA graph work into
+// single-node submissions and can disable fused router/reduction kernels.
+// Keep it off for correctness baselines and performance measurements.
 bool env_layer_timing_verbose() {
-  return Logger::instance().would_log(LogLevel::DEBUG);
+  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_LAYER_TIMING_VERBOSE");
 }
 
 // Phase 1 "all-or-nothing" partial-layer GPU dispatch (see
@@ -230,29 +230,6 @@ void pin_host_node_threads(ggml_threadpool_params &p, int n_threads) {
            n_threads);
 }
 
-// Physical cores usable by this process: distinct hardware threads' sibling groups in sysfs, 0 when unknown.
-// The CPU side of the graph (cold experts, host-node ops) is a spin-synchronised team; a worker on an SMT sibling
-// of another worker only competes for the same core's vector ports, and a seventh thread on a 6-core part cost
-// 8% in the MTP window while 6 gained 3% over hardware_concurrency()-2 (Xeon W-2235, 6C/12T).
-static int physical_core_count() {
-  cpu_set_t allowed;
-  CPU_ZERO(&allowed);
-  if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0)
-    return 0;
-  std::vector<std::string> groups;
-  for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
-    if (!CPU_ISSET(cpu, &allowed))
-      continue;
-    std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/thread_siblings_list");
-    std::string list;
-    if (!std::getline(f, list))
-      return 0;
-    if (std::find(groups.begin(), groups.end(), list) == groups.end())
-      groups.push_back(list);
-  }
-  return static_cast<int>(groups.size());
-}
-
 int graph_cpu_threads() {
 #if defined(_OPENMP)
   const int available = std::max(1, omp_get_max_threads());
@@ -261,15 +238,14 @@ int graph_cpu_threads() {
   // OpenMP is disabled.  Using one thread here would make the non-OpenMP
   // build an accidental serial baseline and would also defeat the host-node
   // runner's shared-pool experiment.
-  const unsigned hw_threads = std::thread::hardware_concurrency();
-  const int available = std::max(
-      1, static_cast<int>(hw_threads == 0 ? 1 : hw_threads));
+  const int available = static_cast<int>(
+      zeromoe::hardware::available_logical_cpu_count());
 #endif
   const long cap = zeromoe::graphsettings::settings_for(zeromoe::graphsettings::Family::Qwen)
                        .tun.cpu_threads_decode.value;
   if (cap > 0) return static_cast<int>(std::min<long>(available, cap));
-  const int physical = physical_core_count();
-  return physical > 0 ? std::min(available, physical) : available;
+  return std::min(available,
+                  zeromoe::hardware::automatic_cpu_thread_count());
 }
 
 // REVERTED (2026-09-17): a prior commit defaulted this to false, reasoning

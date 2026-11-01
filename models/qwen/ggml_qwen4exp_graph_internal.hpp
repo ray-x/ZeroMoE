@@ -150,6 +150,10 @@ int layer_timing_parse_layer(const char *name);
 bool layer_timing_eval_callback(struct ggml_tensor *t, bool ask, void *user_data);
 void qwen4exp_scan_captured_graph_writes(FullGraph &g, const void *range_base, size_t range_bytes);
 void qwen_probe_dump(FullGraph &g);
+// When PROBE_DUMP_LAYER is set, graph-boundary diagnostics retain roots
+// only for that layer. With no selector, preserve the historical all-layer
+// PROBE_DUMP behavior.
+bool qwen_probe_dump_enabled_for_layer(int layer);
 void log_qwen_layout_tensor(const FullGraph &g, int layer, bool cpu_only, const char *role, const ggml_tensor *tensor);
 void dump_qwen_moe_layout(const FullGraph &g);
 void bind_host_expert_scheduler_backend(FullGraph &g, ggml_tensor *t);

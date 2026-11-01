@@ -7,6 +7,7 @@
 #include <future>
 #include "ggml_bailingmoe3_graph.hpp"
 #include "ggml_glm5next_graph_impl.hpp"
+#include "full_graph_boundary_probe.hpp"
 #include "early_ready_offload_strategy.hpp"
 #include "early_ready_graph_builder.hpp"
 #include "moe_block.hpp"
@@ -835,6 +836,7 @@ struct GlmFfn final : zeromoe::graph::FfnBlock {
       return nullptr;
     }
     cur = ggml_mul(g.ctx, ggml_rms_norm(g.ctx, cur, c.eps), fn);
+    capture_full_graph_boundary(g, l, "pre_moe_hidden", cur);
     ggml_build_forward_expand(g.graph, residual);
     ggml_build_forward_expand(g.graph, post);
     ggml_build_forward_expand(g.graph, comb);
@@ -866,6 +868,7 @@ struct GlmHcPlan final : zeromoe::graph::LayerPlan {
   // Returns the streams after layer l, or nullptr when the layer cannot be built.
   ggml_tensor *build_layer(ggml_tensor *res, int l) override {
     const auto &c = g.engine->model_file.architecture_config;
+    capture_full_graph_boundary(g, l, "block_input", res);
     // The graph owns a complete DDR source arena, so this is a coarse
     // per-layer admission point rather than a check on every tensor/alloc.
     // If the background guard sees the host watermark crossed, decline the
@@ -894,7 +897,9 @@ struct GlmHcPlan final : zeromoe::graph::LayerPlan {
     ggml_tensor *attn_out = attn.build(cur, l);
     if (!attn_out)
       return nullptr;
+    capture_full_graph_boundary(g, l, "attention_output", attn_out);
     res = g.dsa_plain ? ggml_add(g.ctx, residual, attn_out) : hc_post(g, g.ctx, attn_out, residual, post, comb);
+    capture_full_graph_boundary(g, l, "post_attention_hidden", res);
     if (g.decode_mode && layer_timing_env())
       g.layer_marks[res] = {l, 0};
 
@@ -926,7 +931,9 @@ struct GlmHcPlan final : zeromoe::graph::LayerPlan {
     ggml_tensor *ffn_out = ffn.build(cur, l);
     if (!ffn_out)
       return nullptr;
+    capture_full_graph_boundary(g, l, "ffn_output", ffn_out);
     res = g.dsa_plain ? ggml_add(g.ctx, residual, ffn_out) : hc_post(g, g.ctx, ffn_out, residual, post, comb);
+    capture_full_graph_boundary(g, l, "block_output", res);
     if (g.decode_mode && layer_timing_env())
       g.layer_marks[res] = {l, 1};
     if (l >= c.first_dense && (l == c.first_dense || l + 1 == g.n_layers ||

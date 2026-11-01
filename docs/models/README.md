@@ -43,7 +43,9 @@ The consolidated measurements and benchmark-only profiles are in
 
 ## In progress
 
-None. Qwen3.6-35B-A3B has passed full-graph execution, teacher-forced parity, and the decode performance gates; it is listed with the accepted model profiles above.
+Qwen3.6-35B-A3B has passed full-graph execution, teacher-forced parity, and the decode performance gates; it is listed with the accepted model profiles above.
+
+Ornith 1.5 122B (`qwen35moe`) is in progress. Full-graph execution and teacher-forced parity pass. The corrected Qwen-affinity 3090 profile selected 19 GPU / 29 CPU layers and measured 18.62 tok/s decode; it remains below the user's 28 tok/s split target. The matched same-GGUF llama.cpp and 42 tok/s Ornith-specific hotset results are pending. See [`ornith-1.5-122b.md`](ornith-1.5-122b.md) and the [timing/profile audit](../../build_mtp_results/2026-10-29-ornith-122b-perf-5060ti/ornith-qwen38-timing-and-profile-audit.md).
 
 The bands are deliberately wide (≈±15 %) because the models are **not bit-deterministic** under
 near-tie routing and single-run decode spread is real (e.g. Qwen 24.6–28.7 tok/s). A regression is

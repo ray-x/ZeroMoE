@@ -484,6 +484,7 @@ std::expected<void, std::string> EngineRunner::run_repl() {
 std::expected<void, std::string> EngineRunner::shutdown_and_report() {
   const FullGraphModel *graph_model = engine.family_ops.graph_model;
   std::string graph_gate_failure;
+  std::string usage_failure;
   if (engine.cuda_moe_graph_policy_applies) {
     const double graph_decode_run_ms =
         static_cast<double>(engine.full_graph_decode_run_ns) / 1.0e6;
@@ -518,6 +519,16 @@ std::expected<void, std::string> EngineRunner::shutdown_and_report() {
   // driver teardown and cudaFree aborts.
   if (engine.family_ops.graph_model)
     engine.family_ops.graph_model->shutdown();
+  const uint64_t tracked_usage_tokens =
+      engine.qwen4exp_usage_tracked_tokens.load(std::memory_order_relaxed);
+  if (config.qwen4exp_track_router_usage && tracked_usage_tokens == 0) {
+    usage_failure =
+        "router usage tracking was requested but no routed-ID callbacks ran; no valid survey was produced";
+    LOG_ERROR("[USAGE] %s\n", usage_failure.c_str());
+  } else if (config.qwen4exp_track_router_usage) {
+    LOG_INFO("[USAGE] router survey captured %llu decode tokens\n",
+             static_cast<unsigned long long>(tracked_usage_tokens));
+  }
   // Phase A write this run's routing-frequency histogram so
   // the NEXT run's startup preload (above) has real data to work from.
   // Best-effort, matches dump_usage's own contract (a failed write just
@@ -604,5 +615,7 @@ std::expected<void, std::string> EngineRunner::shutdown_and_report() {
     return std::unexpected(request_failure);
   if (!graph_gate_failure.empty())
     return std::unexpected(graph_gate_failure);
+  if (!usage_failure.empty())
+    return std::unexpected(usage_failure);
   return {};
 }

@@ -25,6 +25,7 @@
 #include "qwen4exp_stage_pool.hpp"
 #include "moe_routed_ggml.hpp"
 #include "pilot_ridge.hpp"
+#include <cstdlib>
 #include "cold_moe_strategy.hpp"  // the lane's strategy view (adapter-first migration)
 #include <functional>
 #include <cstdint>
@@ -65,6 +66,33 @@ inline void log_moe_route_trace_record(int layer, const int32_t *ids, int count)
   for (int i = 0; i < count; ++i)
     route += " " + std::to_string(ids[i]);
   LOG_DEBUG("%s\n", route.c_str());
+}
+
+// Survey-only route bundle. Marginal per-expert counts lose top-k
+// co-occurrence, which can determine whether a layer skips its CPU lane or
+// dispatches one or more cold experts. This records bundles only when opted
+// in; it does not install a scheduler evaluation callback or alter the graph.
+inline void log_moe_route_bundle_record(int layer, uint64_t call,
+                                        int32_t position,
+                                        const int32_t *ids,
+                                        const float *weights, int count) {
+  static const bool enabled = []() {
+    const char *value = std::getenv("ZEROMOE_EARLY_READY_ROUTE_BUNDLE_TRACE");
+    return value && value[0] == '1';
+  }();
+  if (!enabled || !ids || !weights || count <= 0)
+    return;
+  GGML_ASSERT(layer >= 0);
+  std::string row = "[MOE-ROUTE-BUNDLE] call=" + std::to_string(call) +
+                    " position=" + std::to_string(position) +
+                    " layer=" + std::to_string(layer) + " routes=";
+  for (int i = 0; i < count; ++i) {
+    if (i) row += ',';
+    row += std::to_string(ids[i]);
+    row += ':';
+    row += std::to_string(weights[i]);
+  }
+  LOG_INFO("%s\n", row.c_str());
 }
 
 struct EarlyReadyLane {
@@ -117,7 +145,10 @@ struct EarlyReadyLane {
   // Tokens per call: 1 for ordinary decode, S for an MTP verification window
   // (ids/weights are token-major [k, n_tok], the input is [d, n_tok]).
   int n_tok = 1;
-  int trace_layer = -1;  // layer index for the DEBUG route trace
+  int trace_layer;
+  explicit EarlyReadyLane(int layer_index) : trace_layer(layer_index) {
+    GGML_ASSERT(layer_index >= 0);
+  }
   bool completed = false;
   bool residency_ready = false;  // residency complete (owned experts resident, safe to compute) —
                                  // distinct from `completed`, which marks run() finished (§3.8)
@@ -161,12 +192,14 @@ struct EarlyReadyLane {
   // Separate gate/up/down expert tensors (Qwen4Exp).
   bool prepare(ggml_backend_t backend, int dev, int dim, int topk,
                ggml_tensor *gate, ggml_tensor *up, ggml_tensor *down,
-               ggml_tensor *remap, ggml_tensor *mask, int ntok = 1) {
+               ggml_tensor *remap, ggml_tensor *mask, int ntok = 1,
+               bool async_output_default = true) {
     moe_routed::ExpertWeights w;
     w.gate = gate;
     w.up = up;
     w.down = down;
-    return prepare(backend, dev, dim, topk, w, remap, mask, ntok);
+    return prepare(backend, dev, dim, topk, w, remap, mask, ntok,
+                   async_output_default);
   }
 
   // The host route tables (cpu_remap/cpu_mask, shared with the owner) changed between graph runs
@@ -226,7 +259,8 @@ struct EarlyReadyLane {
 
   bool prepare(ggml_backend_t backend, int dev, int dim, int topk,
                const moe_routed::ExpertWeights &w,
-               ggml_tensor *remap, ggml_tensor *mask, int ntok = 1) {
+               ggml_tensor *remap, ggml_tensor *mask, int ntok = 1,
+               bool async_output_default = true) {
     n_tok = ntok < 1 ? 1 : ntok;
     ggml_tensor *gate = w.gate_up ? w.gate_up : w.gate;
     ggml_tensor *up = w.gate_up ? nullptr : w.up;
@@ -243,9 +277,9 @@ struct EarlyReadyLane {
     const char *skip = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_SKIP_ALL_HOT");
     skip_all_hot = skip && skip[0] == '1';
     const char *copy = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_ASYNC_OUTPUT");
-    // Accepted production profile (early-ready + immutable resident route tables +
-    // asynchronous cold-output upload): on unless explicitly disabled with =0.
-    async_output_copy = !(copy && copy[0] == '0');
+    // The model adapter supplies a default validated for its exact GGUF
+    // architecture. An explicit environment value always overrides it.
+    async_output_copy = copy ? copy[0] != '0' : async_output_default;
     const char *tables = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_RESIDENT_TABLES");
     resident_tables = !(tables && tables[0] == '0');
     cold_mask.resize(n_experts);
@@ -540,6 +574,8 @@ struct EarlyReadyLane {
       GGML_ABORT("early-ready input event: %s", cudaGetErrorString(status));
     GGML_ASSERT(expected_pos < 0 || *position == expected_pos);
     log_moe_route_trace_record(trace_layer, ids, k);
+    log_moe_route_bundle_record(trace_layer, calls + 1, *position,
+                                ids, weights, k);
     if (stage_source)
       stage_source->request(calls + 1, prediction_ids, prediction_epoch, prediction_ready);
     if (stage_target) {

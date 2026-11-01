@@ -800,6 +800,9 @@ bool qwen4exp_full_graph_enabled() { return false; }
 bool qwen4exp_full_graph_decode_enabled() { return false; }
 void qwen4exp_full_graph_configure(bool, bool, bool) {}
 bool qwen4exp_full_graph_sync_state_to_host(StreamingEngine &) { return true; }
+size_t qwen35moe_full_graph_dense_weight_bytes(const StreamingEngine &) {
+  return 0;
+}
 int qwen4exp_full_graph_device_expert_layers() { return 0; }
 bool qwen4exp_full_graph_device_expert_trailing() { return false; }
 bool qwen4exp_full_graph_prepare(StreamingEngine &, int, int, const int *) {

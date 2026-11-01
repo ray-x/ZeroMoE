@@ -4,6 +4,7 @@
 // declarations live in ggml_qwen4exp_graph_internal.hpp.
 
 #include "ggml_qwen4exp_graph_internal.hpp"
+#include "full_graph_boundary_probe.hpp"
 #include "tensor_trace.hpp"
 #include "nvtx_range.hpp"
 
@@ -101,6 +102,10 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
   if (g.engine && g.engine->exl3_gpu_executor)
     (void)g.engine->exl3_gpu_executor->stats();
   qwen_probe_dump(g);
+  if (!dump_full_graph_boundary_taps(g)) {
+    LOG_ERROR("[GGML-QWEN-FULL] boundary probe dump failed after decode\n");
+    return false;
+  }
   for (const auto &entry : g.early_ready) {
     if (entry.second->stage_source)
       entry.second->stage_source->token_complete(entry.second->calls);
@@ -155,7 +160,20 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
   }
   for (const auto &entry : g.early_ready) {
     const auto &early = *entry.second;
-    GGML_ASSERT(early.completed);
+    if (!early.completed) {
+      size_t cold_experts = 0;
+      for (uint8_t cold : early.cold_mask)
+        cold_experts += cold != 0;
+      LOG_ERROR("[QWEN4EXP-EARLY-READY] scheduler did not complete lane "
+                "layer=%d calls=%llu early_calls=%llu cold_experts=%zu "
+                "all_hot_skips=%llu residency_ready=%d pos=%d\n",
+                entry.first, static_cast<unsigned long long>(early.calls),
+                static_cast<unsigned long long>(early.early_calls),
+                cold_experts,
+                static_cast<unsigned long long>(early.all_hot_skips),
+                early.residency_ready ? 1 : 0, early.expected_pos);
+      return false;
+    }
     if (early.calls % 32 == 0)
       LOG_INFO("[OPTION-B-EARLY-READY] calls=%llu early=%llu gpu_pending=%llu wait=%.2fus cpu=%.2fus layer=%d all_hot=%llu skipped=%llu uploads=%llu staged=%llu\n",
                (unsigned long long)early.calls,
@@ -597,6 +615,8 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
   if (g.engine && g.engine->exl3_gpu_executor)
     (void)g.engine->exl3_gpu_executor->stats();
   qwen_probe_dump(g);
+  if (!dump_full_graph_boundary_taps(g))
+    return fail("boundary probe dump failed");
   const auto t_sync_end = std::chrono::steady_clock::now();
   ggml_backend_tensor_get(g.output, hidden_states, 0,
                           static_cast<size_t>(g.D) * S * sizeof(float));

@@ -39,6 +39,7 @@
 - A coherent sample is only a smoke check, never onboarding acceptance.
 Compare teacher-forced pre-layer hidden states and routed expert IDs/weights
 with llama.cpp before accepting correctness.
+Comparator tools are correctness gates: they must exit nonzero at the first mismatching boundary and save a compact repro with the exact prompt/forced tokens. A successful process exit, nonempty report, or coherent output is not a parity pass. Zero generated tokens or zero graph replays is a no-op and must fail the run.
 - Treat llama.cpp's exact operation sequence as the initial executable
   specification, not just its algebraic equations. Record the reference source
   commit/path and map each block stage to the ZeroMoE tensor/op boundary,
@@ -53,10 +54,11 @@ thread count. Report prefill, graph build/upload, steady decode, and
 end-to-end rates separately. Keep the model in progress below that bar and
 continue profiling; do not stop at coherent output or graph-gate success.
 - Enforce the performance bar with
-`python3 tools/check_full_graph_moe_perf.py <zeromoe.log> <llama-bench.json> --n-prompt <n> --n-gen <n> --device <device>`.
-- Compare the exact decode workload: same GGUF, GPU, active prompt length,
-  generated token count, context, and thread count. The perf checker verifies
-  the ZeroMoE decode request's prompt length against the llama-bench row.
+`python3 tools/check_full_graph_moe_perf.py <zeromoe.log> <llama-bench.json> --n-prompt <n> --n-gen <n> --context <ctx> --n-threads <n> --n-gpu-layers <n> --n-cpu-moe <n> --device <device>`.
+- Compare the exact decode workload: same GGUF, physical GPU, prompt and
+  generated-token counts, context, effective graph CPU threads, and expert
+  placement. The checker validates context/threads from the ZeroMoE log and
+  GPU-layer/CPU-MoE/device/model fields against the llama-bench row.
 - Record both project commits, the shared upstream GGML base revision/version,
   ZeroMoE's applied GGML patch manifest, CUDA toolkit and driver, compiler, and
   native GPU code targets. Project-only patches are part of the implementation
@@ -68,8 +70,27 @@ continue profiling; do not stop at coherent output or graph-gate success.
 - Enforce a user-set absolute decode target with `--minimum-tps` in addition
   to the default relative llama.cpp ratio. A model remains in progress until
   both applicable thresholds pass on repeatable steady-state measurements.
+- Set and record the profile-specific absolute `--minimum-tps` before the
+  first matched performance run. Apply it to the first valid rate sample;
+  do not wait until the end of onboarding to discover the target was missed.
+- Before any long performance run on a new model, compare its effective
+  configuration with the nearest accepted profile using
+  `tools/compare_full_graph_profiles.py` and actual CLI/harness overrides.
+  Pass reference CLI/harness values with `--reference-override` and
+  candidate effective values from startup logs or hardware policy with
+  `--candidate-override`. These compare inputs do not replace live memory
+  planning or placement logs.
+  Save the report and review CPU-affinity layers, requested and planner-selected
+  device layers, graph CPU threads, expert hotset bytes/coverage, DDR preload,
+  and pinning. Treat unexplained differences as a profile-transfer failure;
+  do not spend a long run on a nominal layer count that resolves differently.
 - Keep model-specific equations and state in the adapter; reuse `GraphCore`,
   shared routed-MoE builders, placement, cache, and offload strategies.
+- For every distinct `(gate, up, down)` expert quantization tuple in the GGUF,
+  record which CPU/GPU/fused path actually executes it. A generic
+  `[QUANT] ... GPU-capable` line is not evidence that a fused cold-expert path
+  accepts the CPU dot type. Exercise each tuple with bit-exact fused-versus-
+  stock checks, and log which tuples select the fused path or its fallback.
 
 The authoritative design and memory-fallback contract is in
 [`docs/design/full-graph-model-onboarding.md`](docs/design/full-graph-model-onboarding.md).
@@ -98,3 +119,19 @@ The authoritative design and memory-fallback contract is in
   them read-only and preserve them; do not reset, overwrite, or silently mix
   their changes into a benchmark build. If such changes affect the target
   family, snapshot their exact diff hash and label the build as that snapshot.
+
+
+## Required timing attribution
+
+- Qwen timing callbacks that visit every GGML node are execution-invasive:
+  they can split a multi-node CUDA subgraph and disable fused top-k and
+  weighted-MoE reduction kernels. `log_level = "DEBUG"` alone must not enable
+  them. Keep `ZEROMOE_QWEN4EXP_LAYER_TIMING` and
+  `ZEROMOE_QWEN4EXP_LAYER_TIMING_VERBOSE` unset for correctness baselines and
+  performance acceptance runs. Enable them only in a separate diagnostic run,
+  record the fusion matcher results, and label its timing as instrumented.
+- Intermediate output taps can also change fusion when they materialize an
+  input to a fused operation. Compare normal routed outputs separately from
+  materialized per-op boundary traces; never treat those traces as the normal
+  execution path without an A/B that confirms the same kernels were selected.
+- For every model performance investigation, record four timing views: per-layer/per-op, GPU device work, CPU work, and request workflow. Split CPU execution from CPU scheduling/barrier/wait time. Measure CUDA kernel or graph-node duration on the device; an asynchronous scheduler callback only measures host submission. Include expert hot/cold route counts where they explain a layer's cost. Keep instrumented profiling separate from the uninstrumented throughput run. Missing GPU or per-layer attribution must be stated as a blocker to root-cause claims, not filled with an estimate.

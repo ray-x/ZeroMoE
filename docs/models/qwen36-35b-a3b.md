@@ -77,12 +77,17 @@ CUDA_VISIBLE_DEVICES=0,1 \
 ZEROMOE_QWEN_CPU_THREADS=10 \
 ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT=1 \
 build_qwen36_sm120/zeromoe \
-  --graph-device-expert-layers 0 --graph-device-expert-trailing 1 \
+  --graph-device-expert-layers 40 --graph-device-expert-trailing 1 \
   bench --config configs/bench/qwen36_35b_a3b_iq2m_5060_tg400.toml \
   --bench-random-pp 16 --bench-random-tg 400 --bench-reps 3 \
   --bench-warmup 1 --bench-seed 1 \
   --bench-out build_qwen36_sm120/results/qwen36_fullfit_normfix_context401.json
 ```
+
+`graph_device_expert_layers` is a placement cap in the Qwen memory planner. Set
+it to the target layer count (40 here) for this all-expert full-fit recipe; 0
+means keep the complete expert source in DDR. The historical measurement used
+0 while the planner ignored that setting and selected all 40 layers itself.
 
 Run the matching llama.cpp decode benchmark and both gates:
 
@@ -98,17 +103,15 @@ python3 tools/check_full_graph_moe_run.py \
 python3 tools/check_full_graph_moe_perf.py \
   build_qwen36_sm120/results/qwen36_fullfit_normfix_context401.log \
   build_llama_qwen36_sm120a_ref/results/qwen36_pg1_tg400.json \
-  --n-prompt 1 --n-gen 400 --device CUDA1 --minimum-tps 110
+  --n-prompt 1 --n-gen 400 --context 401 --n-threads 10 --n-gpu-layers 99 --n-cpu-moe 0 --device CUDA1 --minimum-tps 110
 ```
 
 ## Related checkpoints on the same architecture
 
-Ornith 1.5 (35B-A3B and 122B) reports `general.architecture = qwen35moe`, so it
-routes to this same `Qwen35MoEGraphModel` adapter. Neither checkpoint has been
-validated here: there is no captured gate log, teacher-forced parity run, or
-performance measurement for them, so they are not listed as supported.
-
-The 122B also cannot fit the validated full-fit policy on a 24 GiB + 16 GiB
-machine: its smallest published quantization is 40.4 GB (UD-IQ1_M), already
-larger than the 40 GiB of total VRAM before dense weights, KV/GDN state and
-workspace, and this adapter requires every expert layer to be device-resident.
+Ornith 1.5 122B reports `general.architecture = qwen35moe` and uses the same
+`Qwen35MoEGraphModel` adapter. It is being brought up with partial expert
+residency and complete DDR source arenas; it does not need the full-fit
+all-experts-on-device policy used by this Qwen3.6 checkpoint. Its current
+topology, memory-plan, and graph-prefill results are recorded in
+[`ornith-1.5-122b.md`](ornith-1.5-122b.md). It remains in progress until graph
+execution, teacher-forced parity, and matched performance gates pass.

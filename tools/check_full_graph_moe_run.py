@@ -74,6 +74,17 @@ def main() -> int:
         if args.require_full_graph_prefill:
             if cap_fields.get("prefill") != "1":
                 return fail("graph prefill is not enabled in [GRAPH-CAPS]")
+            prefill_fallbacks = [
+                line for line in lines
+                if "graph construction declined; using fallback" in line
+                or re.search(r"prefill graph declined.*falling back", line,
+                             re.IGNORECASE)
+            ]
+            if prefill_fallbacks:
+                return fail(
+                    "full-graph prefill fallback was recorded "
+                    f"({len(prefill_fallbacks)} fallback marker(s))"
+                )
             if graph_prefill_runs <= 0:
                 return fail("full-fit run recorded no successful full-graph prefill")
     else:

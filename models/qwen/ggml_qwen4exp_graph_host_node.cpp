@@ -219,6 +219,7 @@ void CUDART_CB qwen4exp_cuda_usage_track_callback(void *user_data) {
   const auto start = std::chrono::steady_clock::now();
   const bool hit_log = Logger::instance().would_log(LogLevel::DEBUG);
   const uint64_t token_idx = ctx->token_count++;
+  uint64_t valid_routes = 0;
   std::string hit_line;
   static FILE *ids_dump = [] {
     const char *path = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_ROUTE_IDS_DUMP");
@@ -233,6 +234,7 @@ void CUDART_CB qwen4exp_cuda_usage_track_callback(void *user_data) {
       if (expert < 0 || expert >= ctx->n_experts)
         continue; // defensive only -- real routing always produces valid ids
       ctx->engine->bump_route_freq(l, expert);
+      ++valid_routes;
       if (has_mask && ctx->hot_mask[l][expert])
         ++hits;
     }
@@ -247,6 +249,10 @@ void CUDART_CB qwen4exp_cuda_usage_track_callback(void *user_data) {
     }
     if (hit_log)
       hit_line += (has_mask ? std::to_string(hits) : std::string("-")) + ",";
+  }
+  if (valid_routes != 0) {
+    ctx->engine->qwen4exp_usage_tracked_tokens.fetch_add(
+        1, std::memory_order_relaxed);
   }
   if (ids_dump)
     std::fflush(ids_dump);

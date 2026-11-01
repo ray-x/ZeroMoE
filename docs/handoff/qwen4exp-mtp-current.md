@@ -27,7 +27,7 @@ What changed since the 2026-10-27 baseline below (53.5 wall / 57.7 steady on the
 - `patches/ggml/0016` Q2_0 VNNI dot with a 6-op weight unpack (bit-identical, 2.2x per thread): the largest single gain, +4 to +11 tok/s.
 - `patches/ggml/0015` fused hyper-connection CUDA kernels (bit-identical logits at S=1 and S=4): +1 to +3.
 - The draft head keeps its own rows after a verify instead of re-running a step per accepted token: +1 to +5, acceptance moves by -1.7 to +5.9 points depending on the prompt.
-- The greedy MTP token selector is vectorised: +3 on every prompt. The graph CPU team defaults to the physical core count: +1 to +2.
+- The greedy MTP token selector is vectorised: +3 on every prompt. The MTP profile uses a workload-specific six-thread CPU override: +1 to +2.
 - `patches/ggml/0017` (IQ3_XXS dot) does not affect this model (Q2_0 experts); it matters for IQ3_XXS recipes (see `configs/bench/perf-baselines.md`, Trial 25 follow-up).
 
 Tried and rejected (details in `docs/design/mtp-window-timeline.md`): draft count 2, 4 and 5 (3 is best on every prompt), CPU cold step as a CUDA host callback overlapping the GPU (-15%), fusing the routed-expert
@@ -283,3 +283,229 @@ used the VNNI branch or reached 41 GB/s.
 4. Continue profiling graph build and draft/target execution only after the
    batched path is output-equivalent. Leave the `ZeroMoE-wt-mtp2` refactor
    untouched.
+
+## Ornith 1.5 122B full-graph recovery (2026-10-29, locally measured)
+
+Owner/worktree: current Codex recovery task, `recovery/ornith-122b-offload` at ZeroMoE source `7d48e01de3ea2804ea6375b37858c23c909ad1d2`; uncommitted and not merged. This work ports GGUF architecture `qwen35moe` through `Qwen35MoEGraphModel` and the shared full-graph runtime. It is not Qwen3.6-35B support.
+
+Locally measured on RTX 5060 Ti, two CPU threads, 3-token raw prompt, 200 generated tokens, context 203, prefill chunk 8. Planner selected expert layers `[38,48)` for VRAM and retained all other experts in pinned DDR. Two runs passed `check_full_graph_moe_run.py --full-fit --require-full-graph-prefill`; each recorded one graph prefill, 199 decode graph replays, and zero layered or legacy expert dispatches. Per-run rates:
+
+| Run | Prefill | Request decode | Graph-gate decode | End-to-end request |
+|---|---:|---:|---:|---:|
+| 1 | 4.43 tok/s | 5.87 tok/s | 6.27 tok/s | 5.76 tok/s |
+| 2 | 4.72 tok/s | 5.98 tok/s | 6.39 tok/s | 5.86 tok/s |
+
+Teacher-forced comparisons against llama.cpp `src/models/qwen35moe.cpp` at `8baabd53b77d1c48c6ef8d3b620436292f3f6231` are bit-identical over 48 layers for pre-MoE hidden states, router probabilities, normalized routed weights, and ordered top-8 expert IDs. Details and artifacts are in `build_mtp_results/2026-10-29-ornith-122b-smoke-5060ti/` and `build_mtp_results/2026-10-29-ornith-122b-perf-5060ti/`.
+
+Performance reference status: an older three-repetition llama.cpp row measured 5.651 tok/s for the same GGUF, GPU, context, token counts, threads, and CPU/GPU expert placement (`-ngl 99 -ncmoe 38`). Both performance-checker ratios passed (1.110 and 1.130), but that binary has no source-worktree snapshot and the result remains provisional. A clean llama.cpp build from commit `8baabd53b77d1c48c6ef8d3b620436292f3f6231` was completed with matching `sm_120a` CUDA code target. Its benchmark could not load the GGUF because `/mnt/usb-ssd` is currently not mounted and the file is absent from the mounted model volumes checked. Do not treat the provisional ratio as final acceptance.
+
+Next action: reconnect `/mnt/usb-ssd` and wait until the RTX 3090 is idle. The 5060 Ti/2-thread 10-layer run is exploratory, not the target profile. Rebuild the updated worktree, collect an Ornith-specific router-usage survey, then measure (1) a trailing-22-layer/leading-26-CPU split at 10 threads against llama.cpp `-ngl 99 -ncmoe 26` with the 16-token/400-token workload (user target 28 tok/s), and (2) usage-ranked expert hotset on the 3090 with a model-byte budget and 10 threads (user target 42 tok/s). Keep the second target pending until effective hotset bytes and routing coverage are logged; do not copy Qwen3.8's raw 14,554 expert count to Ornith's larger IQ3_XXS expert footprint. Use context/thread/GPU-layer/CPU-MoE arguments with the performance checker for each matched run. Worktree owner: current `recovery/ornith-122b-offload` task. Artifacts: `build_mtp_results/2026-10-29-ornith-122b-perf-5060ti/`; model note: `docs/models/ornith-1.5-122b.md`.
+
+User-reported Qwen 3.8 Flash throughput figures are contextual only and were not used as llama.cpp reference measurements for this Ornith workload.
+
+## Ornith usage survey and VRAM hotset (2026-10-30)
+
+- Owner/worktree: current recovery task, branch `recovery/ornith-122b-offload`, project source `7d48e01de3ea2804ea6375b37858c23c909ad1d2` (dirty, unmerged). Binary SHA256 `6d428529ddcc17f80f8c1b87dccbec4fb04a95309d1e74e822008b207ada662e`; GGML base `8baabd53b77d1c48c6ef8d3b620436292f3f6231`.
+- Fixed the empty usage survey: the Qwen35 graph builder now passes routed IDs into the shared tap. Five prompts completed with 1,030 decode callbacks, 395,520 route selections, and 11,615 distinct `(layer, expert)` pairs across all 48 layers. Artifact: `build_mtp_results/2026-10-29-ornith-122b-perf-5060ti/ornith-usage-survey.txt`.
+- RTX 3090 usage-ranked placement selected 4,831 experts across all layers, spent 14.998 GiB, and covered 73.38% of surveyed route volume. A 24-token / 200-token generation measured 22.64 tok/s from first to last output, 27.59 graph steady replay tok/s, and 6.94 prefill tok/s. The full-fit graph gate passed with zero layered forwards and zero legacy expert dispatches. This is a placement check, not a matched llama.cpp comparison.
+- Early-ready all-split is opt-in as documented. The hotset check used `ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT=0`. The planner now labels this `usage-hotset-only` rather than reporting all-DDR placement.
+- Artifacts: `build_mtp_results/2026-10-29-ornith-122b-perf-5060ti/ornith-usage-survey-retry7-20261030.*` and `ornith-hotset15-retry4-20261030.*`; model note: `docs/models/ornith-1.5-122b.md`.
+- Next: build or repair a llama.cpp CUDA benchmark binary that enumerates this host's GPUs, then compare the same Ornith GGUF, 3090, context, prompt/generation lengths, and thread count. Keep onboarding in progress until the 90%-of-llama.cpp performance gate passes.
+
+## Ornith official survey and matched benchmark update (2026-10-30)
+
+- The standard `tests/moe_usage_survey/run_survey.py` runner had an `args.ngen`/`args.predict` typo; fixed it and used five repository prompt fixtures through the persistent harness. All five are `OK`. The official histogram contains 11,524 `(layer, expert)` pairs across all 48 layers and 405,504 route selections (1,056 callbacks; 8,448 per layer). File: `build_mtp_results/2026-10-30-ornith-122b-3090-match-24p200g10t/official-survey-5/ornith-usage-survey.txt`.
+- The official histogram's 15-GiB usage hotset selected 4,853 experts across 48 layers, spent 15.000 GiB, and covered 73.35% of that survey's traffic. Full-fit graph gate passed. Its single-prompt run overlapped high shared-host CPU load, so its 14.64 request / 16.58 steady tok/s rates are exploratory, not a performance acceptance measurement.
+- Matched workload already exercised on the earlier five-generic-prompt ranking: 24 prompt + 200 generation tokens, context 224, 10 threads, RTX 3090, `n_cpu_moe=31`. ZeroMoE's three-run graph steady rate was 21.97 tok/s. The prior llama-bench row averaged 13.67 tok/s and the checker passed 1.608x, but that binary embeds llama.cpp commit `3cf03257f`, not the current clean checkout commit `8baabd53b77d1c48c6ef8d3b620436292f3f6231`; keep the ratio provisional.
+- A fresh `llama-bench` build is running from clean llama.cpp commit `8baabd53b77d1c48c6ef8d3b620436292f3f6231`, CUDA target sm_86, on the same upstream GGML base. Build command/log and CMake/source provenance are in `build_mtp_results/2026-10-30-ornith-122b-3090-match-24p200g10t/`.
+- Next: finish the fresh reference build; run the exact `-pg 24,200 -t 10 -ngl 99 -ncmoe 31` reference row; rerun the ZeroMoE three-request workload against the official histogram when shared-host load is low; run `check_full_graph_moe_perf.py` with that fresh reference. Keep onboarding active until the matched 90% gate passes and the user-context 28/42 tok/s expectations are addressed.
+
+## Ornith latest acceptance and VRAM audit (2026-10-30)
+
+This section supersedes the earlier pending-reference notes above. The clean
+llama.cpp reference and official-histogram matched ZeroMoE runs now exist.
+
+- Owner/worktree: `recovery/ornith-122b-offload`, source commit
+  `7d48e01de3ea2804ea6375b37858c23c909ad1d2`, dirty and unmerged. Latest
+  checked ZeroMoE binary SHA256 is
+  `f769656f8109d12ecb4a3da89f6729ba157e15c4cd7d0d88955d7655c7c1a60b`;
+  `build_provenance.py check` passes. GGML base is
+  `8baabd53b77d1c48c6ef8d3b620436292f3f6231`; applied patch manifest SHA256
+  is `bc15a89242db58386ab4335048ea55bb15233f18c40fe23881802097fe1f4f71`.
+  ZeroMoE was built for sm_86 and sm_120a; the matched device is the sm_86
+  RTX 3090. Per-run build manifests are in `official-survey-5/`.
+- Fresh llama.cpp reference: clean commit
+  `8baabd53b77d1c48c6ef8d3b620436292f3f6231`, GGML 0.27.0, CUDA sm_86,
+  same GGML base, CUDA 13.3.73 and GNU toolchain. For the Ornith GGUF,
+  24 prompt + 200 generation tokens, context 224, 10 threads, CUDA0,
+  `-ngl 99 -ncmoe 31`, three-run steady decode averaged 15.726 tok/s
+  (samples 15.992, 16.385, 14.803). Reference build and raw JSON:
+  `llama-build-sm86-upstream8ba/`, `llama-bench-pg-upstream8ba.json`.
+- Official five-prompt usage survey: 1,056 decode callbacks, 405,504 route
+  selections, 11,524 distinct `(layer, expert)` pairs across 48 layers;
+  histogram at `official-survey-5/ornith-usage-survey.txt`.
+- Usage-ranked full-graph fit sweep:
+
+  | Hotset budget | Experts | Survey coverage | Planner required / available | Steady decode | Ratio vs llama.cpp |
+  | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 15.0 GiB | 4,853 | 73.35% | Fits | 20.63 tok/s | 1.312x |
+  | 16.25 GiB | 5,275 | 76.52% | 22.96 / 23.28 GiB | 21.33 tok/s | 1.357x |
+  | 16.5 GiB | 5,375 | 77.23% | 23.21 / 23.28 GiB | 20.99 tok/s | 1.335x |
+
+  Full-graph and performance checker outputs for 16.25 and 16.5 are saved
+  under `official-survey-5/`; all four pass. Each per-run build manifest is
+  present. The 16.25 and 16.5 binaries have different working-tree snapshot
+  hashes, although source commit, upstream GGML base, patch manifest,
+  toolchain, and GPU target agree; retain each run's own manifest when
+  comparing the budget profiles.
+- User absolute hotset target check: `check_full_graph_moe_perf.py --minimum-tps 42`
+  fails both current matched runs: 21.33 tok/s at 16.25 GiB and 20.99 tok/s
+  at 16.5 GiB. The default 90%-of-llama.cpp gate passes, but that does not
+  satisfy the user's Qwen3.8 hotset target. Logs: `official-survey-5/`
+  `official-hotset16_25-minimum42-gate.txt` and
+  `official-hotset16_5-minimum42-gate.txt`.
+- The separate 28 tok/s layer-split target remains unmet too: the corrected
+  19-GPU-layer / 29-CPU-layer profile measured 18.26–18.62 tok/s. The
+  16-prompt / 400-generation split workload has no matched same-GGUF llama.cpp
+  row yet.
+- Memory accounting correction: the dense graph arena is 4.35 GiB
+  (`4,669,931,520` bytes), not 6.7 GiB. The planner's roughly 6.7 GiB
+  fixed/non-hotset term also contains F32 KV/GDN state, its 2 GiB workspace
+  reserve, and 1% alignment. At the 16.5 GiB split the graph has about
+  1.99 GiB free and estimates about 1.70 GiB for the following prefill, so
+  only about 0.29 GiB remains beyond that shape's estimate. The 16.5 profile
+  is the tested aggressive ceiling; 16.25 leaves more margin. Their source
+  snapshot hashes differ, so the small decode-rate difference is not a strict
+  same-binary A/B.
+- Correctness evidence: llama.cpp and ZeroMoE teacher-forced hidden states,
+  router probabilities and normalized weights match bit-for-bit over 190
+  rows; ordered route IDs match 96/96 rows. GDN prefill-to-first-decode state
+  handoff matches bit-for-bit for 36/36 recurrent layers. The mapping and
+  caveats are in `docs/models/ornith-1.5-122b.md`.
+- Remaining validation scope: `ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT` was off
+  for accepted runs and remains an opt-in path; post-first-decode-step GDN
+  state is not included in the saved llama.cpp parity comparison. The model
+  work remains unmerged. User-reported Qwen3.8 rates are target context for
+  this port, while the same-GGUF llama.cpp ratio is a separate acceptance
+  gate.
+
+## Qwen3.8 speed-gap diagnosis for Ornith (2026-10-30)
+
+- The full Ornith GGUF is smaller (49.5 GB) than the documented Qwen3.8 Q2_0
+  shards (~99 GB), but this does not mean its routed workload is smaller.
+  Available Qwen3.8 sibling metadata (IQ3_XXS; same architecture dimensions)
+  reports hidden 2,560, 512 experts/layer, top-10, width 640. Ornith is
+  hidden 3,072, 256 experts/layer, top-8, width 1,024.
+- Gate/up/down shape counts estimate 3.62B active routed matrix weights per
+  Ornith token versus 2.36B for Qwen3.8, a 1.54x work ratio. Qwen's measured
+  28.66 tok/s split rate divided by 1.54 predicts 18.61 tok/s; corrected
+  Ornith split runs measured 18.26–18.62 tok/s. Active expert work explains
+  most of the layer-split gap, subject to the caveat that Qwen's Q2_0 GGUF and
+  original raw log are absent from this checkout.
+- Qwen's documented hotset held 14,554 expert records / 18.74 GiB and reached
+  about 42–43 tok/s. Ornith holds 5,375 / 16.498 GiB and its five-prompt
+  survey covers 77.23% of observed routes. The Qwen model note reports about
+  93% hotset route coverage. The survey corpora differ, so coverage is a
+  directional comparison. Larger Ornith expert records and higher active
+  work per token both contribute to the remaining hotset speed gap.
+- Ornith's 16.5 GiB hotset leaves only about 0.29 GiB beyond its measured
+  next-prefill estimate under the current memory plan. More expert VRAM
+  residency requires reducing other graph memory or changing the prefill
+  allocation lifecycle; raising the budget alone is not a valid fit.
+- The split-run timing audit shows graph setup (~82 ms) is negligible beside
+  repeated decode time (~21.5 s per 400 tokens). The current INFO-mode hotset
+  logs do not split cold-expert CPU time by layer/op. Once CUDA works again,
+  the next useful diagnostic is a DEBUG timing run on the 16.5 GiB profile,
+  followed by an uninstrumented measurement if a code change improves it.
+  Detailed saved analysis: `build_mtp_results/2026-10-29-ornith-122b-perf-5060ti/ornith-qwen38-timing-and-profile-audit.md`.
+- Current environment check: `/mnt/usb-ssd` is mounted and the Ornith GGUF is
+  readable, but `nvidia-smi` failed to communicate with the NVIDIA driver.
+  No new GPU run was started; retry the DEBUG timing run only after CUDA is
+  available.
+
+## Ornith cold expert CPU fusion tuning (2026-10-30)
+
+- Found a quant-specific path gap: `qwen4exp_cold::supported()` accepted only
+  Q2_0 weights / Q8_0 activations. Qwen3.8 Q2_0 could use the shared fused
+  cold-expert CPU node; Ornith IQ3_XXS/IQ2_S/IQ4_XS could not and instead used
+  separate gate, up, SwiGLU, and down `MUL_MAT_ID` nodes.
+- Generalized `models/qwen/cold_ffn_fused.cpp` to select per-tensor CPU dot
+  traits and a shared activation quant type. The Ornith IQ combinations use
+  Q8_K. The op now dispatches according to the kernel row contract: IQ kernels
+  use `nrc=1`; Q2_0 retains the patched four-row VNNI path when supported.
+- `cold_ffn_fused_test` passed 180 bit-exact cases against the stock GGML
+  chain: 60 Q2_0, 60 IQ3_XXS, and 60 mixed IQ2_S/IQ3_XXS/IQ4_XS cases. Each
+  set covers 5 thread counts, S=1/2/4, and four route masks. An initial IQ3
+  attempt using four-row dot calls failed; the code now follows GGML's
+  one-row IQ3 contract and all expanded cases pass.
+- Reconfigured the existing build tree to refresh its dirty-source snapshot,
+  rebuilt `zeromoe`, and passed `build_provenance.py check`. Latest binary:
+  SHA256 `65947859c774df82695c172199b7b981db009ddb47f1a8a8651cd8ecbbcf8a67`;
+  source snapshot SHA256
+  `c5672e44ab40695b672bcaf14c89a90f1ca6d87a275476df292bbb157d235888`;
+  GGML base and patch manifest unchanged.
+- No GPU decode result for this change: the NVIDIA driver still does not
+  answer `nvidia-smi`. CPU equivalence is proven; speedup is not. The complete
+  requested handoff is
+  [`ornith-122b-cold-expert-fusion-2026-10-30.md`](ornith-122b-cold-expert-fusion-2026-10-30.md).
+- Next: once CUDA is available and the 3090 is idle, use the prepared
+  `official-hotset16_5-cold-fused-debug.toml` profile in `official-survey-5/`
+  to confirm fused cold nodes are active and collect per-layer CPU timings,
+  then run an uninstrumented matched 3-request decode and rerun both
+  full-graph and llama.cpp performance gates. At the latest recheck,
+  `nvidia-smi` still failed and host load was 16.10 on 12 allowed CPUs; no
+  diagnostic or decode run was started.
+
+## Expanded Ornith fused-kernel coverage (2026-10-30)
+
+- The saved 48-layer quant inventory lists 13 gate/up/down weight triplets.
+  `tests/test_cold_ffn_fused.cpp` now includes all 13 model combinations plus
+  a Q2_0 control and one mixed-format case. The original three test cases
+  have 180 bit-exact passes; the 12 remaining model-specific combinations
+  compile but remain unrun.
+- A static set comparison of the saved `[QUANT]` inventory with the test
+  source found all 13 model triplets covered; the two extra test cases are
+  the Q2_0 control and the alternate mixed-format combination.
+- Those 72 cases use two CPU thread counts, S=1, and sparse/all/mixed cold
+  masks. Two more short checks use Ornith's actual D=3072/FF=1024 dimensions.
+  The latest host-load recheck was 15.76 on 12 allowed CPUs, so the remaining
+  CPU test was deferred to avoid competing with other sessions.
+- Current full test target rebuild command:
+  `cmake --build build_mtp_results/2026-10-29-ornith-122b-smoke-5060ti/build --target cold_ffn_fused_test -j1`.
+
+## Latest Ornith cold-fusion test update (2026-10-30)
+
+The expanded test fixture now quantizes IQ2_XXS/IQ1_S through
+`ggml_quantize_chunk` with a unit importance matrix. A low-priority smoke run
+(`cold_ffn_fused_test --smoke-ornith-types`) passed 14 cases bit-identically:
+all 12 model-specific quant triplets beyond the already-tested IQ3_XXS case,
+plus two Ornith actual-shape cases at `D=3072`, `FF=1024`, E=8, top-8. The
+updated output is saved in
+`build_mtp_results/2026-10-30-ornith-122b-3090-match-24p200g10t/official-survey-5/cold-fused-type-smoke-rerun.log`.
+The broader multithread/token/mask matrix still has 70 cases pending, and the
+full-model GPU timing remains outstanding because `nvidia-smi` still cannot
+reach the driver. The CPU test target compiles. The recovery worktree remains
+active and unmerged.
+
+## Ornith full CPU matrix rerun status (2026-10-30)
+
+The low-priority full `cold_ffn_fused_test` rerun completed its Q2_0 control
+(60/60 bit-exact), then was stopped with SIGINT when host load rose to 14.63
+on 12 allowed CPUs (exit 130). This is an interrupted shared-host run, not a
+kernel failure. The prior one-thread all-cold smoke passed all 14 pending
+quant/shape cases. The 70 remaining thread/token/mask cases await a quieter
+host; raw command, log, and exit status are under `official-survey-5/`.
+
+Latest probe: `nvidia-smi` still fails, and the clean matching
+`llama-bench --list-devices` reports no CUDA-capable device. Host load at the
+probe was 14.45 on 12 allowed CPUs. No GPU diagnostic was launched.
+
+## CUDA state diagnosis for Ornith follow-up (2026-10-30)
+
+Read-only checks: NVIDIA kernel module 610.57.04 is loaded and `/proc/driver`
+lists both GPUs with their device nodes present; `CUDA_VISIBLE_DEVICES` is
+unset. But `nvidia-smi` fails and the clean matching `llama-bench
+--list-devices` sees no CUDA device. No XID appeared in the searched boot
+journal lines. No shared-driver reset or device-node change was attempted.
+This is an external host CUDA state requirement for the pending DEBUG/GPU
+performance run, not a model startup fallback.

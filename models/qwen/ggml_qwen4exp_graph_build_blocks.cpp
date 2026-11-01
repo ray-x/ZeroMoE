@@ -5,6 +5,7 @@
 // declarations live in ggml_qwen4exp_graph_internal.hpp.
 
 #include "ggml_qwen4exp_graph_internal.hpp"
+#include "full_graph_boundary_probe.hpp"
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
 #include "qwen4exp_graph_ops.hpp"
@@ -68,8 +69,7 @@ ggml_tensor *build_gdn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                        ggml_tensor **state_out, ggml_tensor **hist_out) {
   ggml_tensor *qkv = ggml_mul_mat(ctx, w_qkv, cur);
   auto diag = [&](const char *label, ggml_tensor *value) {
-    if (!value || !g.graph ||
-        !zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP"))
+    if (!value || !g.graph || !qwen_probe_dump_enabled_for_layer(layer))
       return;
     const std::string name = "qwen35_" + std::string(label) + "_" +
                              std::to_string(layer);
@@ -198,6 +198,8 @@ ggml_tensor *build_gdn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                    ? state_raw
                    : ggml_cont(ctx, state_raw);
   diag("gdn_state_out", *state_out);
+  zeromoe::graph::capture_full_graph_boundary(g, layer, "gdn_state_out",
+                                              *state_out);
   ggml_tensor *norm = ggml_mul(
       ctx,
       ggml_rms_norm(ctx, core, g.engine->model_file.architecture_config.eps),
@@ -227,6 +229,8 @@ ggml_tensor *build_gdn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                       g.decode_mode
                   ? history_view
                   : ggml_cont(ctx, history_view);
+  zeromoe::graph::capture_full_graph_boundary(g, layer, "gdn_hist_out",
+                                              *hist_out);
   (void)layer;
   return out;
 }
@@ -239,8 +243,7 @@ ggml_tensor *build_full_attention(FullGraph &g, ggml_context *ctx,
                                   ggml_tensor **v_cache) {
   ggml_tensor *qfull = ggml_mul_mat(ctx, w_q, cur);
   auto diag = [&](const char *label, ggml_tensor *value) {
-    if (!value || !g.graph ||
-        !zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP"))
+    if (!value || !g.graph || !qwen_probe_dump_enabled_for_layer(layer))
       return;
     const std::string name = "qwen35_" + std::string(label) + "_" +
                              std::to_string(layer);
@@ -392,8 +395,7 @@ ggml_tensor *build_full_attention_decode(
       attention.rope_sections[i] = static_cast<int>(rope_c.rope_sections[i]);
   }
   auto diag = [&](const char *label, ggml_tensor *value) {
-    if (!value || !g.graph ||
-        !zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP"))
+    if (!value || !g.graph || !qwen_probe_dump_enabled_for_layer(layer))
       return;
     const std::string name = "qwen35_" + std::string(label) + "_" +
                              std::to_string(layer);

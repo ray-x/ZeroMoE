@@ -951,7 +951,9 @@ if (fam == ModelFamily::Qwen && arch0 == "qwen35moe") {
   for (int l = 0; l < c.n_layers; ++l)
     if (qwen35moe_is_gdn_layer(c, l))
       ++n_gdn;
-  if (n_gdn <= 0 || n_gdn >= c.n_layers) {
+  // Allow a single-layer fixture (layer 0) to load for correctness isolation;
+  // a real Ornith model always has both GDN and full-attention layers.
+  if (c.n_layers > 1 && (n_gdn <= 0 || n_gdn >= c.n_layers)) {
     LOG_STREAM_ERROR() << "[QWEN35MOE] layer map must contain both GDN and "
                        << "full-attention layers; got " << n_gdn << "/"
                        << c.n_layers << " GDN layers.\n";

@@ -1,4 +1,5 @@
 #pragma once
+#include <cerrno>
 #include <unordered_set>
 #include "graph_config.hpp"
 #include "gguf_loader.hpp"
@@ -486,6 +487,10 @@ public:
     // beats a per-layer host-node tap. Off by default: real per-token
     // overhead, only worth paying during a usage survey.
     bool qwen4exp_track_router_usage = false;
+    // Number of decode replay callbacks that actually harvested routed IDs
+    // this process. Kept separately from the persistent histogram so a
+    // survey cannot mistake old accumulated data for a successful new run.
+    std::atomic<uint64_t> qwen4exp_usage_tracked_tokens{0};
     // 0 = static hot set, 1 = observe (count misses only), 2 = promote (see EngineConfig).
     int qwen4exp_expert_promotion = 0;
 
@@ -714,6 +719,9 @@ public:
     // decode; only an explicit Insufficient plan permits layered fallback.
     bool cuda_moe_graph_policy_applies = false;
     bool cuda_moe_full_graph_decode_required = false;
+// Adapter capability resolved before RAM arena setup; DDR-backed full-graph
+// models use the shared pinned graph-RAM path by default within the pin budget.
+bool graph_ram_register_default = false;
     std::string cuda_moe_graph_memory_plan = "not-applicable";
     int cuda_moe_graph_device_expert_layers = 0;
     bool cuda_moe_graph_device_expert_trailing = false;
@@ -2923,8 +2931,8 @@ public:
                 }
             }
 
-            // Register the Qwen graph-RAM expert arena by default; other
-            // families keep it opt-in (ZEROMOE_QWEN_GRAPH_REGISTER=1).  The
+            // Register graph-RAM expert arenas by default when the adapter
+            // declares preloaded DDR expert storage; unrelated families stay opt-in.
             // CPU MUL_MAT_ID does not read faster from pinned memory, but the
             // decode split arena is re-uploaded from these arenas after every
             // prefill that needs its VRAM, and a pageable source copies at
@@ -2938,7 +2946,8 @@ public:
             const char * graph_no_register =
                 zeromoe::graphcfg::env("ZEROMOE_QWEN_GRAPH_NO_REGISTER");
             const bool graph_register_default =
-                family_ops.family == ModelFamily::Qwen4Exp;
+                family_ops.family == ModelFamily::Qwen4Exp ||
+                graph_ram_register_default;
             const bool graph_register_enabled =
                 (graph_register ? std::atoi(graph_register) != 0
                                 : graph_register_default) &&
@@ -2967,7 +2976,7 @@ public:
                 LOG_STREAM_INFO()
                     << "[GRAPH-RAM] expert-arena cudaHostRegister off; set "
                        "ZEROMOE_QWEN_GRAPH_REGISTER=1 to pin it (default "
-                       "for Qwen)\n";
+                       "for DDR-backed full-graph adapters)\n";
             }
 
             for (int expert = 0; expert < n_experts; ++expert) {
@@ -3334,6 +3343,26 @@ private:
             size_t idx = (size_t)e.layer * (size_t)ne + (size_t)e.expert;
             if (idx < merged.size()) merged[idx] = e.count;
         }
+        size_t nonzero_entries = 0;
+        for (size_t i = 0; i < histogram.size(); ++i) {
+            const uint64_t c = merged[i] + histogram[i].load(std::memory_order_relaxed);
+            if (c != 0) ++nonzero_entries;
+        }
+        if (nonzero_entries == 0) {
+            FILE* existing = std::fopen(path.c_str(), "r");
+            if (existing) {
+                const bool empty = std::fseek(existing, 0, SEEK_END) == 0 &&
+                                   std::ftell(existing) == 0;
+                std::fclose(existing);
+                if (empty && std::remove(path.c_str()) == 0) {
+                    LOG_WARN("[USAGE] removed stale zero-byte histogram %s\n",
+                             path.c_str());
+                }
+            }
+            LOG_WARN("[USAGE] no routing counts available; no histogram written to %s\n",
+                     path.c_str());
+            return;
+        }
         FILE* f = std::fopen(path.c_str(), "w");
         if (!f) { LOG_WARN("[USAGE] could not write %s\n", path.c_str()); return; }
         for (size_t i = 0; i < histogram.size(); ++i) {
@@ -3342,7 +3371,8 @@ private:
             std::fprintf(f, "%zu %zu %llu\n", i / (size_t)ne, i % (size_t)ne, (unsigned long long)c);
         }
         std::fclose(f);
-        LOG_INFO("[USAGE] wrote routing-frequency histogram -> %s (accumulated across sessions)\n", path.c_str());
+        LOG_INFO("[USAGE] wrote routing-frequency histogram -> %s (%zu experts, accumulated across sessions)\n",
+                 path.c_str(), nonzero_entries);
     }
 
 public:
@@ -3357,16 +3387,33 @@ public:
         uint64_t maxc = 0;
         if (path.empty()) return {out, maxc};
         FILE* f = std::fopen(path.c_str(), "r");
-        if (!f) return {out, maxc};
+        if (!f) {
+            const int open_error = errno;
+            if (path != ".zeromoe_usage") {
+                LOG_WARN("[USAGE] failed to open routing histogram path=%s errno=%d\n",
+                         path.c_str(), open_error);
+            }
+            return {out, maxc};
+        }
         char line[128];
+        size_t line_count = 0;
+        size_t malformed_lines = 0;
         while (std::fgets(line, sizeof(line), f)) {
+            ++line_count;
             int layer, expert; unsigned long long cnt;
             if (std::sscanf(line, "%d %d %llu", &layer, &expert, &cnt) == 3) {
                 out.push_back({layer, expert, (uint64_t)cnt});
                 if (cnt > maxc) maxc = cnt;
+            } else {
+                ++malformed_lines;
             }
         }
         std::fclose(f);
+        if (out.empty() && line_count > 0) {
+            LOG_WARN("[USAGE] routing histogram has no parseable rows path=%s "
+                     "lines=%zu malformed=%zu\n",
+                     path.c_str(), line_count, malformed_lines);
+        }
         return {out, maxc};
     }
 };

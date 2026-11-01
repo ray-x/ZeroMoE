@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include "ggml_qwen4exp_graph_internal.hpp"
+#include "full_graph_boundary_probe.hpp"
 #include "zm_hc.hpp"
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
@@ -12,6 +13,36 @@
 using namespace qwen4exp_graph;
 
 namespace qwen4exp_graph {
+
+// Both the Qwen35 block builder and the shared Qwen4Exp block builder use
+// build_moe(). Keep their decode route-tap handoff identical so usage
+// surveys and route-based promotion see the real router IDs for every layer.
+static bool append_decode_route_ids(FullGraph &g, int layer,
+                                    ggml_tensor *route_ids) {
+  const int topk = g.engine->model_file.architecture_config.topk;
+  if (!route_ids || route_ids->type != GGML_TYPE_I32 ||
+      route_ids->ne[0] != topk) {
+    LOG_ERROR("[QWEN4EXP-ROUTE-TAP] missing or invalid IDs at layer=%d "
+              "type=%d ne0=%lld expected_topk=%d\n",
+              layer, route_ids ? static_cast<int>(route_ids->type) : -1,
+              static_cast<long long>(route_ids ? route_ids->ne[0] : 0), topk);
+    return false;
+  }
+  ggml_tensor *ids_cont = ggml_cont(g.ctx, route_ids);
+  if (!ids_cont) {
+    LOG_ERROR("[QWEN4EXP-ROUTE-TAP] failed to make IDs contiguous at layer=%d\n",
+              layer);
+    return false;
+  }
+  g.usage_track_ids = g.usage_track_ids
+                          ? ggml_concat(g.ctx, g.usage_track_ids, ids_cont, 0)
+                          : ids_cont;
+  if (!g.usage_track_ids) {
+    LOG_ERROR("[QWEN4EXP-ROUTE-TAP] failed to append IDs at layer=%d\n", layer);
+    return false;
+  }
+  return true;
+}
 
 // Qwen3.5/Qwen3.6 MoE uses the same GDN/full-attention and routed expert
 // operators as Qwen4Exp, but has the standard transformer residual layout:
@@ -21,15 +52,28 @@ namespace qwen4exp_graph {
 static ggml_tensor *build_qwen35moe_graph_layer(FullGraph &g,
                                                 ggml_tensor *res,
                                                 int layer) {
-  if (!g.engine || !res || layer < 0 || layer >= g.n_layers)
+  const auto fail_layer_build = [&](int source_line) -> ggml_tensor * {
+    LOG_ERROR("[QWEN35MOE-GRAPH] layer build failed at source line %d layer=%d S=%d decode=%d\n",
+              source_line, layer, g.S, g.decode_mode ? 1 : 0);
     return nullptr;
+  };
+  if (!g.engine || !res || layer < 0 || layer >= g.n_layers)
+    return fail_layer_build(__LINE__);
 
   const bool decode = g.decode_mode;
   const auto &c = g.engine->model_file.architecture_config;
   const std::string p = "blk." + std::to_string(layer) + ".";
   auto probe = [&](const char *label, ggml_tensor *value) {
-    if (!value || !g.graph ||
-        !zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP"))
+    capture_full_graph_boundary(g, layer, label, value);
+    const bool probe_all = qwen_probe_dump_enabled_for_layer(layer);
+    const char *probe_layer_text =
+        zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_LAYER");
+    const int probe_layer = probe_layer_text ? std::atoi(probe_layer_text) : 0;
+    const bool probe_routed_only =
+        zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_ROUTED_ONLY") != nullptr &&
+        std::string(label) == "moe_routed" &&
+        (probe_layer < 0 || layer == probe_layer);
+    if (!value || !g.graph || (!probe_all && !probe_routed_only))
       return;
     const std::string name = "qwen35_" + std::string(label) + "_" +
                              std::to_string(layer);
@@ -40,11 +84,12 @@ static ggml_tensor *build_qwen35moe_graph_layer(FullGraph &g,
   };
   ggml_tensor *attn_norm = resident_tensor(g, g.ctx, p + "attn_norm.weight");
   if (!attn_norm)
-    return nullptr;
+    return fail_layer_build(__LINE__);
   ggml_tensor *attn_in = ggml_mul(
       g.ctx, ggml_rms_norm(g.ctx, res, c.eps), attn_norm);
   if (!attn_in)
-    return nullptr;
+    return fail_layer_build(__LINE__);
+  capture_full_graph_boundary(g, layer, "attention_input", attn_in);
 
   ggml_tensor *attn_out = nullptr;
   if (qwen35moe_is_gdn_layer(c, layer)) {
@@ -59,7 +104,7 @@ static ggml_tensor *build_qwen35moe_graph_layer(FullGraph &g,
     ggml_tensor *out = resident_tensor(g, g.ctx, p + "ssm_out.weight");
     if (!qkv || !gate || !alpha || !beta || !dt || !a || !conv || !norm ||
         !out)
-      return nullptr;
+      return fail_layer_build(__LINE__);
 
     const int hist = g.d_conv - 1;
     ggml_tensor *hist_in = nullptr;
@@ -72,7 +117,7 @@ static ggml_tensor *build_qwen35moe_graph_layer(FullGraph &g,
           g, GGML_TYPE_F32, {g.gdn_hd, g.gdn_hd, g.Hv_gdn, 1},
           "qwen35_gdn_state");
       if (!hist_in || !state_in)
-        return nullptr;
+        return fail_layer_build(__LINE__);
       g.gdn_hist_storage.push_back(hist_in);
       g.gdn_state_storage.push_back(state_in);
     } else {
@@ -86,7 +131,7 @@ static ggml_tensor *build_qwen35moe_graph_layer(FullGraph &g,
           static_cast<size_t>(g.gdn_hd) * g.gdn_hd * g.Hv_gdn * sizeof(float),
           "qwen35_prefill_gdn_state");
       if (!hist_in || !state_in)
-        return nullptr;
+        return fail_layer_build(__LINE__);
       g.gdn_hist_inputs.push_back(static_cast<float *>(hist_in->data));
       g.gdn_state_inputs.push_back(static_cast<float *>(state_in->data));
     }
@@ -97,7 +142,7 @@ static ggml_tensor *build_qwen35moe_graph_layer(FullGraph &g,
                          dt, a, conv, norm, out, hist_in, state_in,
                          &state_out, &hist_out);
     if (!attn_out || !state_out || !hist_out)
-      return nullptr;
+      return fail_layer_build(__LINE__);
     if (decode) {
       const int64_t state_elements =
           static_cast<int64_t>(g.gdn_hd) * g.gdn_hd * g.Hv_gdn;
@@ -108,7 +153,7 @@ static ggml_tensor *build_qwen35moe_graph_layer(FullGraph &g,
       ggml_tensor *state_update =
           ggml_cpy(g.ctx, state_out, state_cache_view);
       if (!state_update)
-        return nullptr;
+        return fail_layer_build(__LINE__);
       g.gdn_state_updates.push_back(state_update);
       // Put the state-cache CPY directly after GDN's output views. ggml-cuda
       // can then fuse the snapshot write into GATED_DELTA_NET instead of
@@ -129,7 +174,7 @@ static ggml_tensor *build_qwen35moe_graph_layer(FullGraph &g,
     ggml_tensor *wkn = dense_weight(g, g.ctx, layer, "attn_k_norm.weight");
     ggml_tensor *wo = dense_weight(g, g.ctx, layer, "attn_output.weight");
     if (!wq || !wk || !wv || !wqn || !wkn || !wo)
-      return nullptr;
+      return fail_layer_build(__LINE__);
     if (decode) {
       ggml_tensor *k_cache = new_device_state_tensor(
           g, GGML_TYPE_F32, {g.hd, g.kv_capacity * g.Hkv},
@@ -138,7 +183,7 @@ static ggml_tensor *build_qwen35moe_graph_layer(FullGraph &g,
           g, GGML_TYPE_F32, {g.hd, g.kv_capacity * g.Hkv},
           "qwen35_decode_kv_v");
       if (!k_cache || !v_cache)
-        return nullptr;
+        return fail_layer_build(__LINE__);
       g.kv_state_k.push_back(k_cache);
       g.kv_state_v.push_back(v_cache);
       attn_out = build_full_attention_decode(
@@ -149,20 +194,20 @@ static ggml_tensor *build_qwen35moe_graph_layer(FullGraph &g,
       attn_out = build_full_attention(g, g.ctx, attn_in, layer, wq, wk, wv,
                                       wqn, wkn, wo, &k_cache, &v_cache);
       if (!k_cache || !v_cache)
-        return nullptr;
+        return fail_layer_build(__LINE__);
       g.kv_k.push_back(k_cache);
       g.kv_v.push_back(v_cache);
     }
     if (!attn_out)
-      return nullptr;
+      return fail_layer_build(__LINE__);
     g.kv_layers.push_back(layer);
   }
   probe("attn_output", attn_out);
 
-  if (zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP")) {
+  if (qwen_probe_dump_enabled_for_layer(layer)) {
     ggml_tensor *tap_attn = ggml_cont(g.ctx, attn_out);
     if (!tap_attn)
-      return nullptr;
+      return fail_layer_build(__LINE__);
     ggml_set_name(tap_attn,
                   ("qwen35_attn_out_" + std::to_string(layer)).c_str());
     ggml_set_output(tap_attn);
@@ -170,38 +215,18 @@ static ggml_tensor *build_qwen35moe_graph_layer(FullGraph &g,
   }
 
   res = ggml_add(g.ctx, res, attn_out);
+  capture_full_graph_boundary(g, layer, "attn_residual", res);
   ggml_tensor *ffn_norm =
       resident_tensor(g, g.ctx, p + "post_attention_norm.weight");
   if (!ffn_norm)
-    return nullptr;
+    return fail_layer_build(__LINE__);
   ggml_tensor *ffn_in =
       ggml_mul(g.ctx, ggml_rms_norm(g.ctx, res, c.eps), ffn_norm);
   ggml_tensor *router = resident_tensor(g, g.ctx, p + "ffn_gate_inp.weight");
   ggml_tensor *bias = nullptr;
   if (!ffn_in || !router)
-    return nullptr;
-
-  if (zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP")) {
-    ggml_tensor *tap_x = ggml_cont(g.ctx, ffn_in);
-    ggml_tensor *tap_logits = ggml_mul_mat(g.ctx, router, ffn_in);
-    ggml_tensor *tap_probs = tap_logits ? ggml_soft_max(g.ctx, tap_logits)
-                                        : nullptr;
-    if (!tap_x || !tap_logits || !tap_probs)
-      return nullptr;
-    ggml_set_name(tap_x, ("qwen35_ffn_input_" + std::to_string(layer)).c_str());
-    ggml_set_name(tap_logits,
-                  ("qwen35_router_logits_" + std::to_string(layer)).c_str());
-    ggml_set_name(tap_probs,
-                  ("qwen35_router_probs_" + std::to_string(layer)).c_str());
-    ggml_set_output(tap_x);
-    ggml_set_output(tap_logits);
-    ggml_set_output(tap_probs);
-    ggml_build_forward_expand(g.graph, tap_x);
-    ggml_build_forward_expand(g.graph, tap_logits);
-    ggml_build_forward_expand(g.graph, tap_probs);
-    g.probe_taps.emplace_back(layer, tap_x, tap_probs);
-    g.router_logits_taps.emplace_back(layer, tap_logits);
-  }
+    return fail_layer_build(__LINE__);
+  capture_full_graph_boundary(g, layer, "pre_moe_hidden", ffn_in);
 
   SplitExpertWeight gate =
       expert_weight_split(g, g.ctx, layer, "ffn_gate_exps.weight");
@@ -210,12 +235,11 @@ static ggml_tensor *build_qwen35moe_graph_layer(FullGraph &g,
   SplitExpertWeight down =
       expert_weight_split(g, g.ctx, layer, "ffn_down_exps.weight");
   if (!gate.cpu || !up.cpu || !down.cpu)
-    return nullptr;
-  if (g.engine->family_ops.family == ModelFamily::Qwen &&
-      (!graph_expert_projection_resident(g, layer, "ffn_gate_exps.weight") ||
-       !graph_expert_projection_resident(g, layer, "ffn_up_exps.weight") ||
-       !graph_expert_projection_resident(g, layer, "ffn_down_exps.weight")))
-    return nullptr;
+    return fail_layer_build(__LINE__);
+  // expert_weight_split() selects the planned device arena or DDR source.
+  // A whole-layer VRAM tensor is carried in `.cpu` during prefill too; `.gpu`
+  // is reserved for the split-decode gather path, so do not use it to infer
+  // whole-layer placement here.
   const bool split = gate.gpu && up.gpu && down.gpu;
   const std::vector<int> *split_ids = nullptr;
   if (split) {
@@ -223,22 +247,40 @@ static ggml_tensor *build_qwen35moe_graph_layer(FullGraph &g,
     if (ids != g.split_gpu_expert_ids.end() && !ids->second.empty())
       split_ids = &ids->second;
   }
-  const bool probe_moe =
-      zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP") != nullptr;
+  const bool probe_moe = qwen_probe_dump_enabled_for_layer(layer) ||
+                         zeromoe::graph::full_graph_boundary_probe_enabled_for_layer(layer);
+  const bool route_tap_enabled =      decode && (g.engine->qwen4exp_track_router_usage ||
+                 g.engine->qwen4exp_expert_promotion > 0);
   ggml_tensor *route_ids = nullptr;
   ggml_tensor *route_weights = nullptr;
+  ggml_tensor *route_probs = nullptr;
+  ggml_tensor **route_ids_out =
+      (probe_moe || route_tap_enabled) ? &route_ids : nullptr;
   ggml_tensor *moe = build_moe(
       g, g.ctx, ffn_in, layer, router, bias, gate.cpu, up.cpu, down.cpu,
       split ? gate.gpu : nullptr, split ? up.gpu : nullptr,
       split ? down.gpu : nullptr, split_ids, nullptr,
-      probe_moe ? &route_ids : nullptr, nullptr, false,
+      route_ids_out, probe_moe ? &route_probs : nullptr, false,
       nullptr, nullptr, probe_moe ? &route_weights : nullptr);
   if (!moe)
-    return nullptr;
+    return fail_layer_build(__LINE__);
+  if (qwen_probe_dump_enabled_for_layer(layer) && route_probs) {
+    // Keep diagnostic reads on the production FFN input and router
+    // probabilities. build_moe exposes the probabilities already used for
+    // selection; do not recompute a second router graph for the probe.
+    ggml_set_output(ffn_in);
+    ggml_build_forward_expand(g.graph, ffn_in);
+    ggml_set_output(route_probs);
+    ggml_build_forward_expand(g.graph, route_probs);
+    g.probe_taps.emplace_back(layer, ffn_in, route_probs);
+  }
+  if (route_tap_enabled &&
+      !append_decode_route_ids(g, layer, route_ids))
+    return fail_layer_build(__LINE__);
   probe("moe_routed", moe);
-  if (probe_moe && route_ids)
+  if (qwen_probe_dump_enabled_for_layer(layer) && route_ids)
     probe("route_ids", ggml_cast(g.ctx, route_ids, GGML_TYPE_F32));
-  if (probe_moe && route_weights)
+  if (qwen_probe_dump_enabled_for_layer(layer) && route_weights)
     probe("route_weights", route_weights);
 
   if (c.n_expert_shared > 0) {
@@ -251,11 +293,11 @@ static ggml_tensor *build_qwen35moe_graph_layer(FullGraph &g,
     ggml_tensor *shared_scalar =
         resident_tensor(g, g.ctx, p + "ffn_gate_inp_shexp.weight");
     if (!shared_gate || !shared_up || !shared_down)
-      return nullptr;
+      return fail_layer_build(__LINE__);
     ggml_tensor *shared = build_shared(g, g.ctx, ffn_in, layer, shared_gate,
                                        shared_up, shared_down, shared_scalar);
     if (!shared)
-      return nullptr;
+      return fail_layer_build(__LINE__);
     probe("moe_shared", shared);
     moe = ggml_add(g.ctx, moe, shared);
   }
@@ -266,6 +308,11 @@ static ggml_tensor *build_qwen35moe_graph_layer(FullGraph &g,
 }
 
 bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
+  const auto fail_graph_build = [&](int source_line) {
+    LOG_ERROR("[GGML-QWEN-FULL] graph build failed at source line %d S=%d pos_base=%d decode=%d\n",
+              source_line, g.S, g.pos_base, g.decode_mode ? 1 : 0);
+    return false;
+  };
   g_qwen4exp_build_graph_retry_smaller_expert_layers = false;
   zeromoe::graph::ZmHcScope zm_hc_scope(g.decode_mode);  // decode graphs run the hyper-connection chain on the GPU
   // Timing split (2026-09-17): full-graph decode's FIRST call pays a real
@@ -305,18 +352,18 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
              (double)kTensorContextBytes / (1024.0 * 1024.0),
              (double)MemoryGuard::reserved_host_bytes() / 1.0e9,
              (double)MemoryGuard::host_budget_bytes() / 1.0e9);
-    return false;
+    return fail_graph_build(__LINE__);
   }
   g.context_reservation_bytes = kTensorContextBytes;
   g.ctx = ggml_init(ip);
   if (!g.ctx) {
     MemoryGuard::release_host_bytes(g.context_reservation_bytes);
     g.context_reservation_bytes = 0;
-    return false;
+    return fail_graph_build(__LINE__);
   }
   g.graph = ggml_new_graph_custom(g.ctx, kGraphSize, false);
   if (!g.graph)
-    return false;
+    return fail_graph_build(__LINE__);
 
   if (g.engine->family_ops.family == ModelFamily::Qwen) {
     // Standard Qwen uses one [D,S] residual stream. Keeping HC=1 as an
@@ -360,7 +407,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
   }
   if (!g.input || !g.positions || !g.attn_mask ||
       (g.decode_mode && !g.decode_indices))
-    return false;
+    return fail_graph_build(__LINE__);
   auto *pos = static_cast<int32_t *>(g.positions->data);
   auto *mask = static_cast<ggml_fp16_t *>(g.attn_mask->data);
   for (int i = 0; i < g.S; ++i) {
@@ -404,7 +451,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     // CPU/GPU split that llama.cpp has around model.input_embed/hc_init.
     res = ggml_cont(g.ctx, res);
     if (!res)
-      return false;
+      return fail_graph_build(__LINE__);
     ggml_set_name(res, "qwen_full_llama_cpp_cpu_prologue");
     g.topology_cpu_prologue = res;
     if (g.sched) {
@@ -426,19 +473,21 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
   // a single flush marker after the loop reads the whole buffer once.
   const bool usage_track_enabled =
       g.decode_mode && g.engine->qwen4exp_track_router_usage;
+  if (g.decode_mode && g.engine->qwen4exp_track_router_usage) {
+    LOG_INFO("[QWEN4EXP-USAGE-TRACK] requested for decode graph\n");
+  }
   // Expert promotion reads the same ids tap, but straight from the device after each run (no host
   // callback): it needs the routed ids of every layer and token, nothing else.
   const bool promo_tap = g.decode_mode && g.engine->qwen4exp_expert_promotion > 0;
   const bool ids_tap = usage_track_enabled || promo_tap;
   for (int l = 0; l < g.n_layers; ++l) {
     const std::string p = "blk." + std::to_string(l) + ".";
+    capture_full_graph_boundary(g, l, "block_input", res);
     if (g.engine->family_ops.family == ModelFamily::Qwen) {
-      if (const char *probe_dir =
-              zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP");
-          probe_dir && probe_dir[0]) {
+      if (qwen_probe_dump_enabled_for_layer(l)) {
         ggml_tensor *layer_input = ggml_cont(g.ctx, res);
         if (!layer_input)
-          return false;
+          return fail_graph_build(__LINE__);
         ggml_set_name(layer_input, ("qwen35_layer_input_" +
                                     std::to_string(l)).c_str());
         ggml_set_output(layer_input);
@@ -447,12 +496,12 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       }
       res = build_qwen35moe_graph_layer(g, res, l);
       if (!res)
-        return false;
+        return fail_graph_build(__LINE__);
       continue;
     }
     if (qwen4exp_is_ple_layer(c, l)) {
       if (!ple_embedding)
-        return false;
+        return fail_graph_build(__LINE__);
       g.ple_embedding =
           host_input(g, g.ctx, GGML_TYPE_F32,
                      {c.ple_n_embd_per_layer * c.ple_n_heads, g.S},
@@ -460,7 +509,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
                          c.ple_n_heads * g.S * sizeof(float),
                      "qwen_full_ple_embedding");
       if (!g.ple_embedding)
-        return false;
+        return fail_graph_build(__LINE__);
       std::memcpy(g.ple_embedding->data, ple_embedding->data(),
                   ple_embedding->size() * sizeof(float));
       g.ple_layer = l;
@@ -479,7 +528,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       ggml_tensor *ple_conv =
           resident_tensor(g, g.ctx, p + "ple_conv1d.weight");
       if (!ple_key || !ple_value || !ple_nk || !ple_nq || !ple_nc || !ple_conv)
-        return false;
+        return fail_graph_build(__LINE__);
       ggml_tensor *pk = ggml_mul_mat(g.ctx, ple_key, g.ple_embedding);
       ggml_tensor *pv = ggml_mul_mat(g.ctx, ple_value, g.ple_embedding);
       auto group_norm = [&](ggml_tensor *x, ggml_tensor *w) {
@@ -524,7 +573,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
             "qwen_full_ple_history");
       }
       if (!ph)
-        return false;
+        return fail_graph_build(__LINE__);
       if (!g.decode_mode)
         g.ple_hist_input = static_cast<float *>(ph->data);
       if (!g.decode_mode &&
@@ -583,7 +632,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
   hup = resident_tensor(g, g.ctx, p + "hc_attn_up.weight");
   hinj = resident_tensor(g, g.ctx, p + "hc_attn_inject.weight");
   if (!hn || !hdn || !hup || !hinj)
-    return false;
+    return fail_graph_build(__LINE__);
   ggml_tensor *attn_in =
       hc_mix(g, g.ctx, res, hn, hdn, hup, hinj, &inject);
   ggml_tensor *attn_out = nullptr;
@@ -598,7 +647,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     ggml_tensor *nm = resident_tensor(g, g.ctx, p + "ssm_norm.weight");
     ggml_tensor *oo = resident_tensor(g, g.ctx, p + "ssm_out.weight");
     if (!qkv || !zg || !al || !be || !dt || !aa || !cv || !nm || !oo)
-      return false;
+      return fail_graph_build(__LINE__);
     const int hist = g.d_conv - 1;
     ggml_tensor *hi = nullptr;
     ggml_tensor *si = nullptr;
@@ -622,7 +671,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
           "qwen_full_gdn_state");
     }
     if (!hi || !si)
-      return false;
+      return fail_graph_build(__LINE__);
     if (g.decode_mode) {
       g.gdn_hist_updates.push_back(nullptr);
       g.gdn_state_updates.push_back(nullptr);
@@ -665,7 +714,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     ggml_tensor *wkn = dense_weight(g, g.ctx, l, "attn_k_norm.weight");
     ggml_tensor *wo = dense_weight(g, g.ctx, l, "attn_output.weight");
     if (!wq || !wk || !wv || !wqn || !wkn || !wo)
-      return false;
+      return fail_graph_build(__LINE__);
     if (g.decode_mode) {
       ggml_tensor *k_cache = new_device_state_tensor(
           g, GGML_TYPE_F32, {g.hd, g.kv_capacity * g.Hkv},
@@ -674,7 +723,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
           g, GGML_TYPE_F32, {g.hd, g.kv_capacity * g.Hkv},
           "qwen_full_decode_kv_v");
       if (!k_cache || !v_cache)
-        return false;
+        return fail_graph_build(__LINE__);
       g.kv_state_k.push_back(k_cache);
       g.kv_state_v.push_back(v_cache);
       attn_out = build_full_attention_decode(
@@ -685,7 +734,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       attn_out = build_full_attention(g, g.ctx, attn_in, l, wq, wk, wv, wqn,
                                       wkn, wo, &k_cache, &v_cache);
       if (!k_cache || !v_cache)
-        return false;
+        return fail_graph_build(__LINE__);
       g.kv_k.push_back(k_cache);
       g.kv_v.push_back(v_cache);
     }
@@ -702,16 +751,16 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     hup = resident_tensor(g, g.ctx, p + "hc_ffn_up.weight");
     hinj = resident_tensor(g, g.ctx, p + "hc_ffn_inject.weight");
     if (!hn || !hdn || !hup || !hinj)
-      return false;
+      return fail_graph_build(__LINE__);
     ggml_tensor *ffn_in =
         hc_mix(g, g.ctx, res, hn, hdn, hup, hinj, &inject);
     if (!ffn_in)
-      return false;
+      return fail_graph_build(__LINE__);
     ggml_tensor *router = resident_tensor(g, g.ctx, p + "ffn_gate_inp.weight");
     ggml_tensor *bias = resident_tensor(g, g.ctx, p + "exp_probs_b.bias");
     if (!router)
-      return false;
-    if (zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP")) {
+      return fail_graph_build(__LINE__);
+    if (qwen_probe_dump_enabled_for_layer(l)) {
       ggml_tensor *tap_x = ggml_cont(g.ctx, ffn_in);
       ggml_tensor *tap_p = ggml_soft_max(g.ctx, ggml_mul_mat(g.ctx, router, ffn_in));
       ggml_set_output(tap_x);
@@ -759,7 +808,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
         ids_tap ? &layer_ids_for_usage : partial_ids_out;
     if (!moe) {
       if (g.exl3_bridge_failed)
-        return false;
+        return fail_graph_build(__LINE__);
       const auto t_wlookup_start = std::chrono::steady_clock::now();
       SplitExpertWeight ge =
           expert_weight_split(g, g.ctx, l, "ffn_gate_exps.weight");
@@ -776,7 +825,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
                   "layer=%d gate=%p up=%p down=%p\n",
                   l, static_cast<void *>(ge.cpu), static_cast<void *>(ue.cpu),
                   static_cast<void *>(de.cpu));
-        return false;
+        return fail_graph_build(__LINE__);
       }
       // v1 scope: uniform M across gate/up/down for a layer -- only treat
       // this as a real split if ALL THREE projections' gpu tensor succeeded
@@ -792,8 +841,8 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
                       nullptr, nullptr);
     }
     if (g.exl3_bridge_failed)
-      return false;
-    if (ids_tap && layer_ids_for_usage) {
+      return fail_graph_build(__LINE__);
+    if (ids_tap) {
       // Ordinary device-side accumulation -- ggml_concat inherits CUDA
       // placement from layer_ids_for_usage's argsort_top_k ancestor, no
       // manual backend pin needed (unlike the host-node CPY markers, this
@@ -801,10 +850,8 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       // defensive-robustness convention build_qwen4exp_host_node's
       // route_ids already uses, even though decode S==1 rows never hit the
       // argsort-view-stride pitfall that convention guards against.
-      ggml_tensor *ids_cont = ggml_cont(g.ctx, layer_ids_for_usage);
-      g.usage_track_ids = g.usage_track_ids
-                              ? ggml_concat(g.ctx, g.usage_track_ids, ids_cont, 0)
-                              : ids_cont;
+      if (!append_decode_route_ids(g, l, layer_ids_for_usage))
+        return fail_graph_build(__LINE__);
     }
     ggml_tensor *sg =
         resident_tensor(g, g.ctx, p + "ffn_gate_inp_shexp.weight");
@@ -843,8 +890,19 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     ggml_set_output(g.usage_track_ids);
     ggml_build_forward_expand(g.graph, g.usage_track_ids);
   }
+  const int expected_usage_ids = c.topk * g.n_layers;
+  if (usage_track_enabled &&
+      (!g.usage_track_ids || g.usage_track_ids->type != GGML_TYPE_I32 ||
+       g.usage_track_ids->ne[0] != expected_usage_ids)) {
+    LOG_ERROR("[QWEN4EXP-USAGE-TRACK] invalid routed-ID tensor: tensor=%s type=%d ne0=%lld expected=%d\n",
+              g.usage_track_ids ? "present" : "missing",
+              g.usage_track_ids ? static_cast<int>(g.usage_track_ids->type) : -1,
+              static_cast<long long>(g.usage_track_ids ? g.usage_track_ids->ne[0] : 0),
+              expected_usage_ids);
+    return fail_graph_build(__LINE__);
+  }
   if (usage_track_enabled && g.usage_track_ids) {
-    const int total_ids = c.topk * g.n_layers;
+    const int total_ids = expected_usage_ids;
     auto usage_ctx = std::make_unique<Qwen4ExpUsageTrackContext>();
     usage_ctx->engine = g.engine;
     usage_ctx->n_layers = g.n_layers;
@@ -884,12 +942,12 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
                  "topk=%d total_ids=%d\n",
                  g.n_layers, c.topk, total_ids);
       } else {
-        LOG_WARN("[QWEN4EXP-USAGE-TRACK] marker construction failed; usage "
-                 "tracking disabled for this graph\n");
+        LOG_ERROR("[QWEN4EXP-USAGE-TRACK] marker construction failed; refusing an untracked survey graph\n");
+        return fail_graph_build(__LINE__);
       }
     } else {
-      LOG_WARN("[QWEN4EXP-USAGE-TRACK] pinned host buffer allocation "
-               "failed; usage tracking disabled for this graph\n");
+      LOG_ERROR("[QWEN4EXP-USAGE-TRACK] pinned host buffer allocation failed; refusing an untracked survey graph\n");
+      return fail_graph_build(__LINE__);
     }
   }
 
@@ -904,7 +962,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
         resident_tensor(g, g.ctx, "output_norm.weight");
     ggml_tensor *out_weight = resident_tensor(g, g.ctx, "output.weight");
     if (!out_norm || !out_weight)
-      return false;
+      return fail_graph_build(__LINE__);
     ggml_tensor *lm_in = ggml_mul(
         g.ctx,
         ggml_rms_norm(g.ctx, g.output,
@@ -918,7 +976,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     ggml_tensor *od = resident_tensor(g, g.ctx, "output_hc_down.weight");
     ggml_tensor *ou = resident_tensor(g, g.ctx, "output_hc_up.weight");
     if (!on || !od || !ou)
-      return false;
+      return fail_graph_build(__LINE__);
     g.final_streams = res;
     g.output = hc_mix(g, g.ctx, res, on, od, ou, nullptr, nullptr);
     if (!g.decode_mode || g.engine->qwen4exp_wide_export) {
@@ -945,7 +1003,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       ggml_tensor *out_weight =
           resident_tensor(g, g.ctx, "output.weight");
       if (!out_weight)
-        return false;
+        return fail_graph_build(__LINE__);
       g.logits = ggml_mul_mat(g.ctx, out_weight, lm_in);
       ggml_set_output(g.logits);
       ggml_build_forward_expand(g.graph, g.logits);
@@ -1129,7 +1187,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
           static_cast<double>(unbound_static_bytes) /
               (1024.0 * 1024.0 * 1024.0),
           misplaced_host_weights);
-      return false;
+      return fail_graph_build(__LINE__);
     }
 
     size_t free_b = 0, total_b = 0;
@@ -1187,7 +1245,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
                   g_qwen4exp_suggested_batch > 0
                       ? ("; a batch of " + std::to_string(g_qwen4exp_suggested_batch) + " tokens fits").c_str()
                       : "");
-        return false;
+        return fail_graph_build(__LINE__);
       }
       g_qwen4exp_suggested_batch = 0;
     }
@@ -1215,7 +1273,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       if (err == cudaSuccess && g.device_expert_layers > 0 &&
           g.engine->family_ops.family != ModelFamily::Qwen)
         g_qwen4exp_build_graph_retry_smaller_expert_layers = true;
-      return false;
+      return fail_graph_build(__LINE__);
     }
   }
   const double t_construction_ms = std::chrono::duration<double, std::milli>(
@@ -1231,7 +1289,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     producer->second->stage_source = entry.second->stage_target;
   }
   if (!ggml_backend_sched_alloc_graph(g.sched, g.graph))
-    return false;
+    return fail_graph_build(__LINE__);
   const double t_alloc_ms = std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() -
                                 t_alloc_start)

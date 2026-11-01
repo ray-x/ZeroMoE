@@ -45,6 +45,12 @@ struct HostAllocation {
   size_t reservation_bytes = 0;
 };
 
+struct GraphBoundaryTap {
+  int layer = -1;
+  std::string stage;
+  ggml_tensor *tensor = nullptr;
+};
+
 // One bump-allocated device buffer (dense weights, routed experts or decode
 // state).  `buffer` is owned by whoever created it; a graph that borrows the
 // arena of another graph keeps its own view and must not free it.
@@ -117,6 +123,7 @@ struct GraphCore {
   std::vector<HostAllocation> owned;
   std::vector<ggml_backend_buffer_t> host_buffers;
   std::vector<void *> host_inputs;
+  std::vector<GraphBoundaryTap> boundary_taps;
   size_t host_weight_bytes = 0;
   size_t host_pinned_bytes = 0;
   size_t host_pin_failures = 0;
@@ -195,6 +202,7 @@ struct GraphCore {
       if (b)
         ggml_backend_buffer_free(b);
     host_buffers.clear();
+    boundary_taps.clear();
     if (ctx) {
       ggml_free(ctx);
       ctx = nullptr;

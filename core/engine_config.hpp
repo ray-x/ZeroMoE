@@ -5,6 +5,7 @@
 #include "logger.hpp"
 #include "resident_memory_policy.hpp"
 #include "graph_settings_config.hpp"
+#include "gpu_selection.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -20,7 +21,7 @@
 
 // Per-GPU configuration
 struct GpuConfig {
-  int device_id = -1;        // nvidia-smi GPU index
+  int device_id = -1;        // -1 auto-selects; otherwise nvidia-smi/CUDA ordinal
   std::string name;          // Human label, e.g. "NVIDIA GeForce RTX 3090"
   std::string role;          // "dense", "moe", "dense+moe"
   std::string model_path;    // GGUF file/dir for this GPU (optional override)
@@ -2049,7 +2050,7 @@ struct EngineConfig {
   // yet GPU-usable" experts falling back to CPU (see perf_timer.hpp's
   // n_cpu_fallback_just_promoted), each burst spinning up to every core,
   // three times, completely uncoordinated with whatever else was
-  // running. 0 = auto (hardware_concurrency() - 2, floor 1) -- leaves
+// 0 = auto: ceil(80% of CPUs allowed by process affinity, floor 1).
   // headroom for the OS and any other process by default rather than
   // requiring every deployment to work out its own safe number; set
   // explicitly to override. Applied once via omp_set_num_threads() at
@@ -3075,6 +3076,62 @@ inline bool EngineConfig::validate() {
     hw_count = 0;
   }
 
+  // An unspecified device_id (-1) selects the best available adapter by a
+  // capacity/performance proxy: VRAM bytes * SM count * core clock * compute
+  // capability. This favors a card that can keep a larger MoE working set
+  // resident, while using generation and throughput to break the ranking.
+  // Explicit IDs remain authoritative. If all adapters have an explicit ID,
+  // no auto-selection occurs.
+  std::vector<bool> reserved_device_ids(static_cast<size_t>(hw_count), false);
+  for (const auto &gc : gpus) {
+    if (gc.device_id >= 0 && gc.device_id < hw_count)
+      reserved_device_ids[static_cast<size_t>(gc.device_id)] = true;
+  }
+  for (auto &gc : gpus) {
+    if (gc.device_id != -1)
+      continue;
+    int best_device = -1;
+    long double best_score = -1.0L;
+    cudaDeviceProp best_prop{};
+    int best_clock_rate_khz = 0;
+    for (int device = 0; device < hw_count; ++device) {
+      if (reserved_device_ids[static_cast<size_t>(device)])
+        continue;
+      cudaDeviceProp prop{};
+      if (cudaGetDeviceProperties(&prop, device) != cudaSuccess)
+        continue;
+      int clock_rate_khz = 0;
+      (void)cudaDeviceGetAttribute(&clock_rate_khz,
+                                   cudaDevAttrClockRate, device);
+      const long double score = zeromoe::hardware::gpu_capacity_performance_score(
+          prop.totalGlobalMem, prop.major, prop.minor,
+          prop.multiProcessorCount, clock_rate_khz);
+      if (score > best_score) {
+        best_score = score;
+        best_device = device;
+        best_prop = prop;
+        best_clock_rate_khz = clock_rate_khz;
+      }
+    }
+    if (best_device < 0) {
+      std::cerr << "[CONFIG] automatic GPU selection found no unassigned CUDA device.\n";
+      continue;
+    }
+    gc.device_id = best_device;
+    gc.name = best_prop.name;
+    if (gc.vram_gb <= 0.0)
+      gc.vram_gb = static_cast<double>(best_prop.totalGlobalMem) / 1e9;
+    reserved_device_ids[static_cast<size_t>(best_device)] = true;
+    LOG_STREAM_INFO()
+        << "[CONFIG] Auto-selected GPU " << best_device << " (" << gc.name
+        << "): " << gc.vram_gb << " GB VRAM, "
+        << best_prop.multiProcessorCount << " SMs, "
+        << best_clock_rate_khz / 1000.0 << " GHz core clock, compute "
+        << best_prop.major << "." << best_prop.minor
+        << " (capacity/performance score=" << static_cast<double>(best_score)
+        << ")\n";
+  }
+
   std::vector<GpuConfig> valid_gpus;
   for (auto &gc : gpus) {
     if (gc.device_id < 0 || gc.device_id >= hw_count) {
@@ -3709,7 +3766,7 @@ max_new_tokens = 256
 temperature    = 0.0    # 0 = greedy; raise for sampling
 
 [[gpus]]
-device_id = 0
+device_id = -1 # auto-select highest VRAM/performance device
 role      = "dense+moe"
 )";
 }
@@ -4278,7 +4335,7 @@ expert_fetch_threads = 4
 # commands from exactly this -- the CPU expert-fallback path alone can
 # fire thousands of times per run, each call spinning up to every core,
 # three times (gate/up/down), fully uncoordinated with anything else
-# running. 0 = auto (hardware_concurrency() - 2, floor 1) -- leaves
+# 0 = auto: ceil(80% of CPUs allowed by process affinity, floor 1).
 # headroom for the OS/other processes by default; set explicitly to
 # override. expert_fetch_threads above still applies to its own one
 # region regardless of this value (explicit num_threads() always wins

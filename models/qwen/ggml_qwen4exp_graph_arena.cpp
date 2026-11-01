@@ -830,4 +830,18 @@ void *alloc_registered_host(FullGraph &g, size_t bytes) {
 
 } // namespace qwen4exp_graph
 
+size_t qwen35moe_full_graph_dense_weight_bytes(
+    const StreamingEngine &engine) {
+  size_t total = 0;
+  for (const auto &[name, tensor] : engine.resident_layers) {
+    if (!tensor.host_ptr || !qwen4exp_graph::graph_dense_weight_name(name))
+      continue;
+    const size_t bytes = static_cast<size_t>(tensor.meta.size_bytes);
+    if (bytes > SIZE_MAX - total)
+      return 0;
+    total += bytes;
+  }
+  return total;
+}
+
 #endif // ZEROMOE_USE_GGML_CUDA
