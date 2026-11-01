@@ -82,7 +82,7 @@ CUDA MoE models run through the shared full-graph runtime. Each supported GGUF a
 | **DeepSeek V4.1 Flash** | See [bench config](configs/bench/deepseek_v41_100gib_ddr_17gib_vram_dual_gpu.toml) | 3090 + 5060 Ti | ~29 tok/s (817 tokens) | **4.0-4.5 tok/s** | Dual-GPU offload. |
 | **MiMo V2.6 Flash** | See [bench config](configs/bench/mimo26_flash_gsq_rco_3bit_ingraph_dual.toml) | 3090 + 5060 Ti | **80.4 tok/s** (1022 tokens) | **13.4-15.7 tok/s** | Dual-GPU, in-graph decode. |
 | **Ling** | See [bench config](configs/bench/ling/) | 3090 + 5060 Ti | **22.2 tok/s** (1771 tokens) | **10.1 tok/s** | Full-graph prefill. |
-| **Ornith 1.5 122B** | `qwen35moe` GGUF (IQ1_S-class) | 3090 only | **9.6 tok/s** (24 tokens) | **35.6 tok/s** equal-weight / **42.5 tok/s** 8x-weighted (full-graph) | Full-graph decode only; 17.0 GiB usage-ranked hotset (5,561 experts, 81.6% coverage). See [ornith-1.5-122b.md](docs/models/ornith-1.5-122b.md). |
+| **Ornith 1.5 122B** | `qwen35moe` GGUF (IQ1_S-class) | 3090 only | **9.6 tok/s** (24 tokens, unoptimized) | **35.6 tok/s** equal-weight / **42.5 tok/s** 8x-weighted (full-graph) | Full-graph decode only; prefill is slow (DDR-bound, not tuned). 17.0 GiB usage-ranked hotset (5,561 experts, 81.6% coverage). See [ornith-1.5-122b.md](docs/models/ornith-1.5-122b.md). |
 
 *All numbers are from [configs/bench/perf-baselines.md](configs/bench/perf-baselines.md) on the hardware above. Performance varies by quantization, placement, and run conditions. See individual model docs in [docs/models/](docs/models/) for specific setup.*
 
