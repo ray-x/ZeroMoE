@@ -39,7 +39,6 @@ use_active_layer_area = false
 move_on_promotion = true
 expert_gpu_activation = false
 moe_gpu_accum = true
-decode_async_prewarm = false
 active_layer_upload_worker_threads = 2
 ram_vram_promote_layer_gate = false
 
@@ -64,3 +63,4 @@ dense_gb = 0.0
 moe_cache_gb = 12.5
 active_layer_weight = 1
 active_layer_capacity_slots = 8
+decode_async_prewarm_mode = "off"

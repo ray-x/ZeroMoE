@@ -182,7 +182,12 @@ struct EngineConfig {
   // re-enabled by an upgrade. UNVERIFIED ON REAL HARDWARE as of this
   // writing -- the safer, capped version has not yet been tested end to
   // end on a real run.
-  bool decode_async_prewarm = false;
+  // Combined mode for the decode-time async pre-warm (replaces the two
+  // separate decode_async_prewarm / decode_async_prewarm_nonblocking flags):
+  //   off  - disabled (default)
+  //   sync - batched issue, blocking sync per group
+  //   async - batched issue, nonblocking poll (experimental)
+  std::string decode_async_prewarm_mode = "off";
 
   // Caps how many of a token's active-layer VRAM misses get batched into
   // ONE async-issue-then-sync group at a time when decode_async_prewarm
@@ -237,7 +242,7 @@ struct EngineConfig {
   // (unchanged blocking behavior) so this is a clean, revertible A/B, not
   // a silent behavior change; only takes effect when decode_async_prewarm
   // is also true. UNVERIFIED ON REAL HARDWARE as of this writing.
-  bool decode_async_prewarm_nonblocking = false;
+  // (merged into decode_async_prewarm_mode)
 
   // MLA absorbed-attention qabsorb (Q_absorbed = q_nope @ WUK) BF16 batched
   // GPU fast-path (CudaManager::upload_wuk_bf16/qabsorb_bf16_batched_host,
@@ -2601,17 +2606,21 @@ inline bool EngineConfig::load(const std::string &path) {
   direct_io = doc.root.get_bool("direct_io", direct_io);
   prefill_warm_via_prefetcher = doc.root.get_bool("prefill_warm_via_prefetcher",
                                                   prefill_warm_via_prefetcher);
-  decode_async_prewarm =
-      doc.root.get_bool("decode_async_prewarm", decode_async_prewarm);
+  decode_async_prewarm_mode = doc.root.get_str("decode_async_prewarm_mode",
+                                              decode_async_prewarm_mode);
   decode_async_prewarm_max_batch = doc.root.get_int(
       "decode_async_prewarm_max_batch", decode_async_prewarm_max_batch);
-  decode_async_prewarm_nonblocking = doc.root.get_bool(
-      "decode_async_prewarm_nonblocking", decode_async_prewarm_nonblocking);
   if (decode_async_prewarm_max_batch < 1) {
     LOG_WARN("[CONFIG] decode_async_prewarm_max_batch must be >= 1 (got %d) -- "
              "clamping to 1\n",
              decode_async_prewarm_max_batch);
     decode_async_prewarm_max_batch = 1;
+  }
+  if (decode_async_prewarm_mode != "off" && decode_async_prewarm_mode != "sync" &&
+      decode_async_prewarm_mode != "async") {
+    LOG_WARN("[CONFIG] decode_async_prewarm_mode=%s invalid -- using off\n",
+             decode_async_prewarm_mode.c_str());
+    decode_async_prewarm_mode = "off";
   }
   attn_qabsorb_gpu = doc.root.get_bool("attn_qabsorb_gpu", attn_qabsorb_gpu);
   attn_qabsorb_gpu_max_vram_gb = doc.root.get_double(
@@ -3269,20 +3278,8 @@ inline void EngineConfig::print() const {
   LOG_STREAM_INFO()
       << "[CONFIG] Decode async pre-warm (batched active-layer H2D for "
          "decode-time misses): "
-      << (decode_async_prewarm ? "ON"
-                               : "off (legacy sequential blocking upload)")
-      << (decode_async_prewarm
-              ? (", max_batch=" +
-                 std::to_string(decode_async_prewarm_max_batch))
-              : std::string())
-      << (decode_async_prewarm
-              ? (std::string(", nonblocking=") +
-                 (decode_async_prewarm_nonblocking
-                      ? "ON (poll via find_active_expert, no "
-                        "cudaStreamSynchronize)"
-                      : "off (blocking sync_active_layer_batch, legacy)"))
-              : std::string())
-      << "\n";
+      << decode_async_prewarm_mode
+      << " (max_batch=" << decode_async_prewarm_max_batch << ")\n";
   LOG_STREAM_INFO()
       << "[CONFIG] MLA qabsorb BF16 batched GPU path: "
       << (attn_qabsorb_gpu ? "ON" : "off (CPU per-head matmul() loop)")
@@ -3832,7 +3829,7 @@ prefill_warm_via_prefetcher = false
 # headroom, and watch [SLOW-HOST-ALLOC]/[SLOW-PICKUP] for signs of memory
 # pressure before trusting it for a real run. See CLAUDE.md and
 # tests/bench_dma_sync_vs_async.cu.
-decode_async_prewarm = false
+decode_async_prewarm_mode = "off"  # off | sync | async
 # decode_async_prewarm_max_batch: caps how many misses get batched into one
 # async-issue-then-sync group at a time when decode_async_prewarm=true --
 # bounds peak simultaneous in-flight footprint (RAM slots pinned + active-
@@ -3848,7 +3845,7 @@ decode_async_prewarm_max_batch = 3
 # (self-healing, same mechanism main-cache COPY-mode promotions already
 # use). Only takes effect when decode_async_prewarm=true. Default off
 # (unchanged blocking behavior). UNVERIFIED ON REAL HARDWARE.
-decode_async_prewarm_nonblocking = false
+# (decode_async_prewarm_nonblocking merged into decode_async_prewarm_mode)
 
 # attn_qabsorb_gpu: batched BF16 GPU GEMM (cublasGemmStridedBatchedEx, all
 # attention heads in one call) for MLA's absorbed-query step (Q_absorbed =

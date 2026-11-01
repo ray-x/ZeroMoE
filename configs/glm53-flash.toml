@@ -44,9 +44,8 @@ prefetch_pilot_depth = 1
 prefetch_pilot_k = 8
 prefetch_pilot_k_depth2 = 1
 prefetch_attn_pilot = false
-decode_async_prewarm = true
-decode_async_prewarm_nonblocking = true
 decode_async_prewarm_max_batch = 3
+decode_async_prewarm_mode = "async"
 
 active_layer_capacity = 64
 use_active_layer_area = true

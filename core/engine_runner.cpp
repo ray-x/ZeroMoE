@@ -300,10 +300,10 @@ std::expected<void, std::string> EngineRunner::apply_engine_config() {
            "ram_pin_eager_preregister's own comment): "
         << (config.ram_pin_eager_preregister ? "ON" : "off") << "\n";
   }
-  engine.decode_async_prewarm = config.decode_async_prewarm;
+  const std::string &mode = config.decode_async_prewarm_mode;
+  engine.decode_async_prewarm = mode == "sync" || mode == "async";
   engine.decode_async_prewarm_max_batch = config.decode_async_prewarm_max_batch;
-  engine.decode_async_prewarm_nonblocking =
-      config.decode_async_prewarm_nonblocking;
+  engine.decode_async_prewarm_nonblocking = mode == "async";
   engine.cpu_offload_max_experts = config.cpu_offload_max_experts;
   engine.prefill_retention_decay = config.prefill_retention_decay;
   engine.prefill_hint_order_by_earliest_token =

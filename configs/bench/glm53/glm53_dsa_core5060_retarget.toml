@@ -123,7 +123,6 @@ cpu_offload_max_experts = 0
 # top_k.
 attn_pilot_vram_promote_top_k = 0
 
-decode_async_prewarm = true
 # decode_async_prewarm_nonblocking (2026-08-28): removes decode_async_
 # prewarm's own last blocking cudaStreamSynchronize (sync_active_layer_
 # batch), letting find_active_expert's already-proven poll-before-trust
@@ -155,8 +154,8 @@ decode_async_prewarm = true
 # rate needle" complaint, which is still open. See CLAUDE.md and
 # prefetch-pilot-k-8-decode-win.md's Follow-up 25 + its correction for the
 # full writeup.
-decode_async_prewarm_nonblocking = true
 # decode_async_prewarm_max_batch: real A/B tested at 6 (2026-08-19, vs the
+decode_async_prewarm_mode = "async"
 # default 3) specifically to see whether fewer/larger sync chunks amortize
 # active_layer_prewarm_issue's cost (the single largest decode bucket,
 # ~16-17s/req). No benefit: decode stayed at 0.85 tok/s (same band as
