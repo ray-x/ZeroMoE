@@ -83,6 +83,9 @@ std::expected<void, std::string> EngineRunner::validate_expert_placement() {
       .complete_if_disjoint = max_unique_slots == total_slots,
   };
   const FullGraphModel *graph_model = engine.family_ops.graph_model;
+  const bool graph_owns_experts =
+      engine.cuda_moe_full_graph_decode_required && graph_model &&
+      graph_model->engine_caps(engine).owns_expert_storage;
   const auto capabilities =
       graph_model ? graph_model->moe_execution_capabilities()
                   : zeromoe::graph::MoEExecutionCapabilities{};
@@ -92,8 +95,12 @@ std::expected<void, std::string> EngineRunner::validate_expert_placement() {
       engine.moe_placement, capabilities, ModelGraphPhase::Decode);
   engine.moe_prefill_execution = prefill_policy.moe;
   engine.moe_decode_execution = decode_policy.moe;
+  const char *placement_scope =
+      graph_owns_experts ? "[LEGACY-CACHE-PREFLIGHT]" : "[PLACEMENT-PREFLIGHT]";
+  const char *execution_scope =
+      graph_owns_experts ? "[LEGACY-EXECUTION-POLICY]" : "[EXECUTION-POLICY]";
   LOG_STREAM_INFO()
-      << "[PLACEMENT-PREFLIGHT] class=" << placement
+      << placement_scope << " class=" << placement
       << " model_experts=" << total_slots << " across " << moe_layers
       << " layer(s), model_bytes=" << (double)total_bytes / gib << " GiB; "
       << "VRAM=" << vram_slots << " slots/" << (double)vram_bytes / gib
@@ -101,7 +108,7 @@ std::expected<void, std::string> EngineRunner::validate_expert_placement() {
       << " GiB; maximum disjoint coverage=" << max_unique_slots << "/"
       << total_slots << " ("
       << (100.0 * (double)max_unique_slots / (double)total_slots) << "%)\n";
-  LOG_STREAM_INFO() << "[EXECUTION-POLICY] prefill="
+  LOG_STREAM_INFO() << execution_scope << " prefill="
                     << prefill_policy.reason << "; decode="
                     << decode_policy.reason << "\n";
 

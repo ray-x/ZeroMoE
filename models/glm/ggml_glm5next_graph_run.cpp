@@ -4,6 +4,7 @@
 // declarations live in ggml_glm5next_graph_impl.hpp.
 
 #include "ggml_glm5next_graph_impl.hpp"
+#include "full_graph_boundary_probe.hpp"
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
 
@@ -147,6 +148,10 @@ bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
     return false;
   }
   ggml_backend_sched_synchronize(g.sched);
+  if (!dump_full_graph_boundary_taps(g)) {
+    release_graph_vram_experts(g);
+    return false;
+  }
   release_graph_vram_experts(g);
   if (g.engine->capture_prefill_usage) {
     size_t captured_routes = 0;

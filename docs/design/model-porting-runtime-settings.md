@@ -2,6 +2,8 @@
 
 This guide complements [Full graph model design and onboarding](full-graph-model-onboarding.md). That guide covers architecture validation and graph lifecycle. This one covers the host assumptions, configuration sources, and environment-variable behavior that can make a correct port fail at startup or run far below expected speed.
 
+Before tuning a new model, use the [profile transfer record](model-porting-profile-transfer-template.md) to capture the exact reference config, resolved environment, and per-setting transfer decisions. This prevents a family label from silently supplying unverified runtime defaults.
+
 It describes the current code. The typed graph-settings resolver resolves defaults, family overrides, root TOML settings, legacy environment aliases, and generated `--graph-*` CLI flags, in that precedence order. Profiles remain a proposal.
 
 ## 1. Record the target system before tuning
@@ -77,7 +79,7 @@ For every variable used in a recipe, document its owner, accepted values, defaul
 
 Read startup output in this order:
 
-1. **`[PREFLIGHT]`**: topology or resource findings. `graph_preflight_strict=true` in TOML or `--graph-preflight-strict true` turns findings into a startup refusal.
+1. **`[PREFLIGHT]`**: topology or resource findings. `graph_preflight_strict=true` in TOML or `--graph-preflight-strict true` turns findings into a startup refusal and forbids layered fallback when the decode memory plan is `Insufficient`.
 2. **`[SETTINGS]`**: typed graph settings, their resolved value, and whether the source was `default`, `family`, `toml`, `env`, or `cli`.
 3. **`[GRAPH-CAPS]`**: whether prefill/decode graph paths are enabled, CPU-lane support, graph-only status, device expert layer request/direction, and batch limits.
 4. **`[GRAPH-TUNING]`**: model-required host expert source and pin defaults, plus defaults applied by the common setup.
@@ -87,6 +89,21 @@ Read startup output in this order:
 `[GRAPH-CONFIG]` only tracks reads routed through `graphcfg`. Direct `std::getenv` calls do not appear in its consulted-knob registry. `[SETTINGS]` only covers the typed resolver. Use source search when a variable is missing from those tables.
 
 For a graph-only model, a zero device-layer request is a likely performance problem unless the graph has a deliberate alternative. Confirm a complete host source for every nonresident layer, CPU-lane capability where the graph needs it, and pinning budget if transfers depend on pinned pages. A graph that builds successfully has not yet passed performance validation.
+
+### Confirm effective CPU and GPU resources
+
+Do not infer the graph's worker count from `omp_max_threads`. The process-wide
+OpenMP default and the full-graph CPU backend can resolve separately. Record
+both startup messages for the reference profile and target model, including
+the effective affinity mask. For Qwen graphs, inspect the `[GGML-QWEN-FULL]`
+or `[GGML-QWEN-FULL-DECODE]` CPU-backend thread line. If they differ, explain
+and measure the difference before comparing throughput.
+
+Likewise, a TOML `device_id = -1` is only a request for auto-selection. Record
+the selected physical GPU name/ordinal, free VRAM at planning time, selected
+device role, and built CUDA targets. Confirm the GPU that ran the baseline is
+the GPU assigned to the new model; do not treat device enumeration order as a
+stable hardware identity.
 
 ## 5. Port and validate in controlled stages
 
@@ -98,6 +115,13 @@ For a graph-only model, a zero device-layer request is a likely performance prob
 6. **One change at a time**: vary one TOML or environment setting per run. Revert it explicitly before the next comparison. Do not compare measurements taken with different residency, context, prompt batch, quantization, or concurrent host load.
 
 For CPU thread settings, budget all concurrent pools together: `omp_max_threads`, expert-fetch workers, prefetch workers, and any model-specific graph lane. `OMP_NUM_THREADS` influences OpenMP defaults when the config leaves `omp_max_threads` unset; some graph families have their own resolved CPU-thread setting. Avoid setting each pool to all cores independently, which can oversubscribe the host and slow both CPU work and input/output.
+
+For a full-graph MoE, record the process-wide OpenMP default and the graph
+CPU backend team separately. `omp_max_threads` does not guarantee that the
+graph backend uses the same count. On Qwen graphs, verify the startup line
+`[GGML-QWEN-FULL-DECODE] CPU backend configured with N threads`; compare that
+effective `N` with the reference profile and llama.cpp `-t`. If they differ,
+resolve or explain the difference before measuring performance.
 
 Keep the complete launch command with each baseline. For example, a Qwen4Exp graph run uses the default prefill/decode graph and a TOML profile:
 

@@ -4,6 +4,7 @@
 // declarations live in ggml_glm5next_graph_impl.hpp.
 
 #include "ggml_glm5next_graph_impl.hpp"
+#include "full_graph_boundary_probe.hpp"
 #include "ggml_bailingmoe3_graph.hpp"
 #include "graph_settings_global.hpp"
 
@@ -531,6 +532,10 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
     return false;
   }
   ggml_backend_sched_synchronize(g.sched);
+  if (!dump_full_graph_boundary_taps(g)) {
+    release_graph_vram_experts(g);
+    return false;
+  }
   release_graph_vram_experts(g);
   if (!g.early_ready.empty()) {
     static int lane_tokens = 0;

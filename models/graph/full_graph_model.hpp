@@ -162,6 +162,9 @@ class FullGraphModel {
   // placement policy lets model adapters carry measured residency defaults
   // into the common cache/preload planning path.
   virtual bool device_expert_trailing() const = 0;
+  virtual bool device_expert_trailing(const StreamingEngine &) const {
+    return device_expert_trailing();
+  }
 
   // ---- policy ---------------------------------------------------------------
   virtual moe_routed::RouterSpec router_spec(const ArchitectureConfig &c,

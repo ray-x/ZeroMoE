@@ -30,19 +30,47 @@ struct RouterSpec {
   float weights_scale = 0.0f; // 0 or 1 = no scaling
 };
 
+// Optional node handles for teacher-forced router boundary traces. Passing a
+// null pointer leaves the graph and its execution unchanged.
+struct RouterGateNodes {
+  ggml_tensor *logits = nullptr;
+  ggml_tensor *probs = nullptr;
+};
+
+struct RouteWeightNodes {
+  ggml_tensor *probs3 = nullptr;
+  ggml_tensor *picked = nullptr;
+  ggml_tensor *weights2 = nullptr;
+  ggml_tensor *sum = nullptr;
+  ggml_tensor *sum_clamped = nullptr;
+  ggml_tensor *normalized = nullptr;
+  ggml_tensor *scaled = nullptr;
+  ggml_tensor *weights3 = nullptr;
+};
+
 // Router probabilities [n_experts, n_tokens] from the router matmul.
 inline ggml_tensor *gate_probs(ggml_context *ctx, const RouterSpec &spec,
-                               ggml_tensor *router, ggml_tensor *cur) {
+                               ggml_tensor *router, ggml_tensor *cur,
+                               RouterGateNodes *nodes = nullptr) {
   ggml_tensor *logits = ggml_mul_mat(ctx, router, cur);
+  if (nodes)
+    nodes->logits = logits;
+  ggml_tensor *probs = nullptr;
   switch (spec.gating) {
   case Gating::Sigmoid:
-    return ggml_sigmoid(ctx, logits);
+    probs = ggml_sigmoid(ctx, logits);
+    break;
   case Gating::SqrtSoftplus:
-    return ggml_sqrt(ctx, ggml_softplus(ctx, logits));
+    probs = ggml_sqrt(ctx, ggml_softplus(ctx, logits));
+    break;
   case Gating::Softmax:
   default:
-    return ggml_soft_max(ctx, logits);
+    probs = ggml_soft_max(ctx, logits);
+    break;
   }
+  if (nodes)
+    nodes->probs = probs;
+  return probs;
 }
 
 // Top-k expert ids [topk, n_tokens] of probs (+ optional selection bias).
@@ -78,19 +106,39 @@ inline ggml_tensor *select_ids(ggml_context *ctx, const RouterSpec &spec,
 // Router weights [1, topk, n_tokens] of the selected experts, normalised and
 // scaled per the spec.
 inline ggml_tensor *route_weights(ggml_context *ctx, const RouterSpec &spec,
-                                  ggml_tensor *probs, ggml_tensor *ids) {
+                                  ggml_tensor *probs, ggml_tensor *ids,
+                                  RouteWeightNodes *nodes = nullptr) {
   ggml_tensor *probs3 =
       ggml_reshape_3d(ctx, probs, 1, spec.n_experts, spec.n_tokens);
+  if (nodes)
+    nodes->probs3 = probs3;
   ggml_tensor *picked = ggml_get_rows(ctx, probs3, ids);
+  if (nodes)
+    nodes->picked = picked;
   ggml_tensor *w2 = ggml_reshape_2d(ctx, picked, spec.topk, spec.n_tokens);
+  if (nodes)
+    nodes->weights2 = w2;
   if (spec.weights_norm) {
     ggml_tensor *sum = ggml_sum_rows(ctx, w2);
+    if (nodes)
+      nodes->sum = sum;
     sum = ggml_clamp(ctx, sum, 6.103515625e-5f, INFINITY);
+    if (nodes)
+      nodes->sum_clamped = sum;
     w2 = ggml_div(ctx, w2, sum);
+    if (nodes)
+      nodes->normalized = w2;
   }
-  if (spec.weights_scale != 0.0f && spec.weights_scale != 1.0f)
+  if (spec.weights_scale != 0.0f && spec.weights_scale != 1.0f) {
     w2 = ggml_scale(ctx, w2, spec.weights_scale);
-  return ggml_reshape_3d(ctx, w2, 1, spec.topk, spec.n_tokens);
+    if (nodes)
+      nodes->scaled = w2;
+  }
+  ggml_tensor *weights3 =
+      ggml_reshape_3d(ctx, w2, 1, spec.topk, spec.n_tokens);
+  if (nodes)
+    nodes->weights3 = weights3;
+  return weights3;
 }
 
 // One routed branch's expert tensors. Either gate_up (gate rows then up rows

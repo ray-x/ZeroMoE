@@ -48,7 +48,11 @@ std::expected<void, std::string> EngineRunner::load_model() {
     std::vector<Family> families{Family::Other};
     Family active = Family::Other;
     switch (detect_model_family(engine.model_file)) {
-    case ModelFamily::Qwen4Exp: families.push_back(Family::Qwen); active = Family::Qwen; break;
+    case ModelFamily::Qwen4Exp:
+    case ModelFamily::Qwen:
+      families.push_back(Family::Qwen);
+      active = Family::Qwen;
+      break;
     case ModelFamily::MiMo2: families.push_back(Family::MiMo2); active = Family::MiMo2; break;
     case ModelFamily::BailingMoE3:
       families.push_back(Family::Ling);

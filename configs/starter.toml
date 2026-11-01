@@ -14,5 +14,7 @@ max_new_tokens = 256
 temperature    = 0.0    # 0 = greedy; raise for sampling
 
 [[gpus]]
-device_id = 0
+# -1 auto-selects the device with the best VRAM/capacity and compute score.
+# Set a physical CUDA ordinal to override the automatic choice.
+device_id = -1
 role      = "dense+moe"

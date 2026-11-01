@@ -929,6 +929,16 @@ if(GGML_CUDA)
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
         VERBATIM)
 
+# CPU-only unit test for the shared Qwen router operation sequence. It uses
+# tiny deterministic tensors; it does not load a GGUF or initialize CUDA.
+add_executable(qwen_moe_router_unit_test EXCLUDE_FROM_ALL
+    tests/test_qwen_moe_router_ggml.cpp)
+target_include_directories(qwen_moe_router_unit_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/models/graph
+    ${ZEROMOE_GGML_SRC_DIR})
+target_link_libraries(qwen_moe_router_unit_test PRIVATE ggml)
+add_test(NAME qwen_moe_router_unit COMMAND qwen_moe_router_unit_test)
+
     if(ZEROMOE_USE_GGML_CUDA)
         add_executable(phase_alias_numerics_test EXCLUDE_FROM_ALL tests/test_phase_alias_numerics.cpp)
         target_include_directories(phase_alias_numerics_test PRIVATE ${ZEROMOE_GGML_ROOT}/include ${CUDAToolkit_INCLUDE_DIRS})

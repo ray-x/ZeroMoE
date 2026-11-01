@@ -620,7 +620,7 @@ def main():
     args = parser.parse_args()
 
     CONFIG = Path(args.config).resolve()
-    NGEN = args.ngen
+    NGEN = args.predict
 
     if not ZEROMOE.exists():
         print(f"ERROR: {ZEROMOE} not found — build it first (cmake --build build --target zeromoe)", file=sys.stderr)
