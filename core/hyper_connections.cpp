@@ -712,8 +712,7 @@ void qwen4exp_hc_pre_mix(StreamingEngine &engine, int layer_idx,
 
   engine.qwen4exp_hc_inject.resize((size_t)S * HC);
   static const bool compare_decode_hc = [] {
-    const char *e = zeromoe::graphcfg::env("ZEROMOE_GGML_HC_COMPARE");
-    return e && e[0] == '1';
+    return zeromoe::graphsettings::active_settings().diag.hc_compare.value != 0;
   }();
   const bool compare_this_call =
       compare_decode_hc && S == 1 && layer_idx < 2;
@@ -954,8 +953,7 @@ bool qwen4exp_hc_post_combine_device(StreamingEngine &engine, int layer_idx,
   // layers; it deliberately pays the D2H synchronizations only in that
   // diagnostic run, never in the production path.
   static const bool compare_post = [] {
-    const char *e = zeromoe::graphcfg::env("ZEROMOE_GGML_HC_COMPARE");
-    return e && e[0] == '1';
+    return zeromoe::graphsettings::active_settings().diag.hc_compare.value != 0;
   }();
   const bool compare_this_call = compare_post && S == 1 && layer_idx == 0;
   static int compare_call_index[2][2] = {};
@@ -999,7 +997,9 @@ bool qwen4exp_hc_post_combine_device(StreamingEngine &engine, int layer_idx,
       before_streams.clear();
       inject.clear();
       sub_out.clear();
-    } else if (const char *dump_base = zeromoe::graphcfg::env("ZEROMOE_GGML_HC_COMPARE_DUMP")) {
+    } else if (const char *dump_base = zeromoe::graphsettings::active_settings().diag.hc_compare_dump.value.empty()
+                                            ? nullptr
+                                            : zeromoe::graphsettings::active_settings().diag.hc_compare_dump.value.c_str()) {
       dump_hc_compare_vector(dump_base, "before_streams", layer_idx,
                              sub_block, compare_call, before_streams);
       dump_hc_compare_vector(dump_base, "inject", layer_idx, sub_block,

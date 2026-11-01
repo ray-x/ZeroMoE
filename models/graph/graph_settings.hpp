@@ -209,6 +209,8 @@ struct DiagnosticSettings {
   Resolved<long> prefill_boundary_layer;     // -1 = all layers
   Resolved<long> prefill_boundary_first_pos;
   Resolved<long> prefill_boundary_last_pos;  // -1 = no upper bound
+  Resolved<std::string> hc_compare_dump;   // HC compare dump directory
+  Resolved<long> hc_compare;               // HC compare oracle (default off)
   Resolved<long> preflight_strict;         // bool: a preflight finding aborts instead of warning
 };
 
@@ -447,6 +449,8 @@ inline const std::vector<Field<long>> &long_fields() {
        claims_for(Family::Other), {}, false},
       {"preflight_strict", ZEROMOE_SETTINGS_REF(diag.preflight_strict), 0, Parse::FlagOn,
        kClaimAll, {}, true},
+      {"hc_compare", ZEROMOE_SETTINGS_REF(diag.hc_compare), 0, Parse::FlagOn,
+       kClaimAll, {}, true},
       {"prefill_boundary_layer", ZEROMOE_SETTINGS_REF(diag.prefill_boundary_layer), 0, Parse::IntAtoi,
        kClaimAll, {}, true},
       {"prefill_boundary_first_pos", ZEROMOE_SETTINGS_REF(diag.prefill_boundary_first_pos), 0, Parse::IntStrict,
@@ -508,6 +512,8 @@ inline const std::vector<Field<std::string>> &text_fields() {
       {"decode_logits_dump", ZEROMOE_SETTINGS_REF(diag.decode_logits_dump), std::string(), Parse::Text,
        kClaimAll, {}, true},
       {"prefill_final_hidden_dump", ZEROMOE_SETTINGS_REF(diag.prefill_final_hidden_dump), std::string(), Parse::Text,
+       kClaimAll, {}, true},
+      {"hc_compare_dump", ZEROMOE_SETTINGS_REF(diag.hc_compare_dump), std::string(), Parse::Text,
        kClaimAll, {}, true},
       {"early_ready_stage_layer", ZEROMOE_SETTINGS_REF(tun.early_ready_stage_layer), std::string(), Parse::Text,
        claims_for(Family::Qwen), {}, false},
@@ -720,6 +726,8 @@ inline const char *meaning(const std::string &name) {
       {"prefill_boundary_dump", "Prefill boundary dump directory; empty disables."},
       {"decode_logits_dump", "Decode logits dump file path; empty disables."},
       {"prefill_final_hidden_dump", "Prefill final hidden dump file path; empty disables."},
+      {"hc_compare_dump", "HC compare dump directory; empty disables."},
+      {"hc_compare", "HC compare oracle (default off)."},
       {"prefill_boundary_layer", "Prefill boundary dump layer (-1 = all)."},
       {"prefill_boundary_first_pos", "Prefill boundary dump first position."},
       {"prefill_boundary_last_pos", "Prefill boundary dump last position (-1 = no upper bound)."},

@@ -549,7 +549,7 @@ bool GgmlQwenSharedRunner::run(int layer, const void *device_x,
   // Opt-in A/A diagnostic for the first FFN boundary.  The routed tensor is
   // the output of GgmlMoeRunner; the combined tensor is the result of this
   // shared+routed graph.  Keep this synchronizing path strictly diagnostic.
-  const char *dump_base = zeromoe::graphcfg::env("ZEROMOE_GGML_HC_COMPARE_DUMP");
+  const char *dump_base = zeromoe::graphsettings::active_settings().diag.hc_compare_dump.value.c_str();
   const bool dump_ffn = dump_base && n_tokens_ == 1 && layer < 3;
   auto dump_device_f32 = [&](const char *label, const ggml_tensor *tensor) {
     if (!dump_ffn || !tensor || !tensor->data) return;
@@ -707,8 +707,8 @@ bool GgmlQwenSharedRunner::run_host_routed(int layer, const void *device_x,
   // same opt-in shared-expert snapshots on this production entry point so an
   // A/A comparison cannot accidentally observe only the host fallback.
   if (n_tokens_ == 1 && layer < 3) {
-    const char *dump_base = zeromoe::graphcfg::env("ZEROMOE_GGML_HC_COMPARE_DUMP");
-    if (dump_base) {
+    const char *dump_base = zeromoe::graphsettings::active_settings().diag.hc_compare_dump.value.c_str();
+    if (dump_base && dump_base[0]) {
       cudaSetDevice(device_);
       if (cudaDeviceSynchronize() == cudaSuccess) {
         auto dump = [&](const char *label, const ggml_tensor *tensor) {
@@ -856,8 +856,8 @@ bool GgmlQwenSharedRunner::run_device_routed_add(
   // add before the combine graph runs.  This is deliberately a synchronizing
   // path and is never enabled during normal inference.
   if (n_tokens_ == 1 && layer < 3) {
-    const char *dump_base = zeromoe::graphcfg::env("ZEROMOE_GGML_HC_COMPARE_DUMP");
-    if (dump_base) {
+    const char *dump_base = zeromoe::graphsettings::active_settings().diag.hc_compare_dump.value.c_str();
+    if (dump_base && dump_base[0]) {
       cudaSetDevice(device_);
       cudaDeviceSynchronize();
       auto dump = [&](const char *label, const ggml_tensor *tensor) {

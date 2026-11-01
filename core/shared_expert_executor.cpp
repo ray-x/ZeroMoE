@@ -246,9 +246,9 @@ void run_qwen4exp_shared_host(StreamingEngine &engine, int layer_idx,
   // the real host-shared fallback path because that is the path used when the
   // optional device shared graph is unavailable.  Normal execution does not
   // allocate or copy anything here.
-  const char *diag_base = zeromoe::graphcfg::env("ZEROMOE_GGML_HC_COMPARE_DUMP");
+  const char *diag_base = zeromoe::graphsettings::active_settings().diag.hc_compare_dump.value.c_str();
   static std::atomic<bool> diag_dumped{false};
-  const bool diag = diag_base && layer_idx == 0 && S == 1 &&
+  const bool diag = diag_base && diag_base[0] && layer_idx == 0 && S == 1 &&
                     !diag_dumped.load(std::memory_order_relaxed);
   auto dump_diag = [&](const char *label, const float *data, size_t n) {
     if (!diag || !data || !n) return;
