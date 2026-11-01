@@ -421,6 +421,7 @@ public:
     // Full-graph device-resident layers may use transient GGUF staging.
     // Other model families do not consult this flag.
     bool qwen_ram_preload_all_experts = false;
+    bool graph_ram_register_default = false;
     std::vector<uint8_t> qwen_ram_vram_only_layers;
 
     // Per-expert VRAM split budget for full-graph decode (EngineConfig::
@@ -494,7 +495,7 @@ public:
     // beats a per-layer host-node tap. Off by default: real per-token
     // overhead, only worth paying during a usage survey.
     bool qwen4exp_track_router_usage = false;
-    // 0 = static hot set, 1 = observe (count misses only), 2 = promote (see EngineConfig).
+    std::atomic<uint64_t> qwen4exp_usage_tracked_tokens{0};    // 0 = static hot set, 1 = observe (count misses only), 2 = promote (see EngineConfig).
     int qwen4exp_expert_promotion = 0;
 
     bool qwen4exp_option_b_layer_enabled(int layer) const {

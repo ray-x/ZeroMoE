@@ -3,6 +3,7 @@
 #pragma once
 #include <cuda_runtime.h>
 #include "graph_config.hpp"
+#include "gpu_selection.hpp"
 #include "graph_settings_global.hpp"
 #include <vector>
 #include <string>
