@@ -195,14 +195,9 @@ ggml_tensor *build_qwen4exp_host_node(
     LOG_WARN("[QWEN4EXP-HOST-NODE] layer=%d CPU plan warm-up failed\n", layer);
     return nullptr;
   }
-  const char *direct_pool_env = zeromoe::graphcfg::env("ZEROMOE_QWEN_CPU_DIRECT_POOL");
-  const char *direct_fused_env =
-      zeromoe::graphcfg::env("ZEROMOE_QWEN_CPU_DIRECT_FUSED");
-  const bool direct_fused_requested =
-      direct_fused_env && direct_fused_env[0] == '1';
-  const bool direct_pool_requested =
-      direct_pool_env && direct_pool_env[0] == '1' &&
-      !direct_fused_requested;
+  // Experimental direct-dispatch path retired.
+  const bool direct_fused_requested = false;
+  const bool direct_pool_requested = false;
   if (warm_runner && direct_pool_requested) {
     // The raw direct executor owns its pre-sized worker team.  Borrowing the
     // FullGraph GGML pool here would tear down that direct signature during
