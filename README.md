@@ -3,7 +3,7 @@
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 [![CI](https://github.com/ray-x/ZeroMoE/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/ray-x/ZeroMoE/actions/workflows/ci.yml)
 
-ZeroMoE is a C++/CUDA inference engine for running large mixture of experts (MoE) models locally. It uses tiered storage and compute resources to run models within local RAM and VRAM limits.
+ZeroMoE is a high-performance C++/CUDA inference engine optimized for full-graph MoE execution and AVX-512 VNNI, designed to run large open-weight MoE models locally. It uses tiered storage and compute resources to fit models within local RAM and VRAM limits, supporting multiple popular open-weight MoE families.
 
 Linux with NVIDIA CUDA is the main target. The CPU engine also runs on macOS. Windows support is still in progress.
 
