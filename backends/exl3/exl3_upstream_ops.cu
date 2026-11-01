@@ -123,14 +123,11 @@ cudaError_t gemm(Workspace &w, const Exl3CudaMatrixView &m, const float *input,
 
 } // namespace
 
-// Fused exl3_moe_coop routed FFN (two launches per layer). Opt-out for A/B:
-// ZEROMOE_EXL3_MOE_COOP=0 uses one upstream exl3_gemm sequence per expert.
+// Fused exl3_moe_coop routed FFN (two launches per layer). The non-coop
+// per-expert path remains as a fallback when the cooperative kernel is not
+// supported for a shape.
 bool exl3_upstream_moe_coop_enabled() {
-  static const bool active = [] {
-    const char *v = zeromoe::graphcfg::env("ZEROMOE_EXL3_MOE_COOP");
-    return !v || v[0] != '0';
-  }();
-  return active;
+  return true;
 }
 
 cudaError_t exl3_upstream_matmul(const Exl3CudaMatrixView &m, const float *input,

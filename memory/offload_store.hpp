@@ -412,7 +412,7 @@ class ModelReader final : public ExpertSource {
 public:
   bool drop_page_cache = true;
   std::atomic<uint64_t> reads{0}; // experts served from the main model (buffered per-plane preads)
-  ModelReader() { use_direct = graphcfg::flag_on("ZEROMOE_GLM5NEXT_MODEL_DIRECT"); }
+  ModelReader() { use_direct = false; }
   ~ModelReader() override {
     for (int fd : fds_) if (fd >= 0) ::close(fd);
     for (int fd : fds_dir_) if (fd >= 0) ::close(fd);
