@@ -713,9 +713,9 @@ ggml_tensor *build_split_gpu_tensor(FullGraph &g, ggml_context *ctx,
 // site. Behaves EXACTLY like expert_weight() (returns only `.cpu`, `.gpu`
 // stays null) for every layer graph_expert_projection_resident() already
 // resolves (whole-layer CPU, or whole-layer/boundary VRAM-resident) --
-// those paths are untouched. Only consults g.split_gpu_expert_ids, and
-// only when g.S==1 (decode; see plan_expert_vram_split's own S==1 guard),
-// so a split config never affects prefill's tensor construction at all.
+// those paths are untouched. Only consults g.split_gpu_expert_ids, which
+// plan_expert_vram_split() fills per phase (prefill ranks prefill_pin_file,
+// decode ranks pin_file), so both phases get the resident hotset.
 SplitExpertWeight expert_weight_split(FullGraph &g, ggml_context *ctx,
                                       int layer, const char *stem) {
   ScopedGraphBuildTimer split_timer(g.expert_weight_split_ms_total);
@@ -735,8 +735,13 @@ SplitExpertWeight expert_weight_split(FullGraph &g, ggml_context *ctx,
     return r; // today's whole-layer/boundary VRAM path, unchanged
   }
   r.cpu = load_full_weight(g, ctx, name, /*device_resident=*/false);
-  if (!r.cpu || (g.S != 1 && !g.decode_mode))
-    return r; // today's whole-layer CPU path, unchanged; or non-decode build
+  if (!r.cpu)
+    return r; // today's whole-layer CPU path, unchanged
+  // The split also serves batched prefill (S > 1): plan_expert_vram_split()
+  // plans the hotset per phase, and build_moe()'s split branch looks the
+  // per-expert tables up per token, so the same compact GPU tensor works for
+  // a prompt batch. Negative sentinel ids make a foreign route cost nothing
+  // there too (patch 0006's batched MMQ skip).
   auto it = g.split_gpu_expert_ids.find(layer);
   if (it == g.split_gpu_expert_ids.end() || it->second.empty())
     return r; // no split planned for this layer -- today's path, unchanged

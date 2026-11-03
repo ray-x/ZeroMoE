@@ -45,7 +45,7 @@ The consolidated measurements and benchmark-only profiles are in
 
 Qwen3.6-35B-A3B has passed full-graph execution, teacher-forced parity, and the decode performance gates; it is listed with the accepted model profiles above.
 
-Ornith 1.5 122B (`qwen35moe`) is supported via the Qwen35 MoE full-graph adapter. Full-graph decode and strict prefill gates pass with zero layered forwards. Teacher-forced routed outputs match llama.cpp. On the RTX 3090, a 17.0 GiB usage-ranked hotset (5,561 experts, 81.6% equal-weight coverage) reaches 35.6 tok/s steady decode (29.8 end-to-end, 9.6 prefill) equal-weight, or 42.5 tok/s with an 8x-weighted benchmark prompt profile. See [`ornith-1.5-122b.md`](ornith-1.5-122b.md).
+Ornith 1.5 122B (`qwen35moe`) is **supported but untuned** via the Qwen35 MoE full-graph adapter. Full-graph prefill and decode pass with zero layered forwards, and teacher-forced routed outputs match llama.cpp. On the RTX 3090 a 1088-token prompt prefills at **103 tok/s** (1024-token batches) and decodes at 24-35 tok/s depending on the usage histogram. It does not implement the Qwen3.8 prefill workflow (whole-layer VRAM block plus op-offload staging), so prompt throughput stays below llama.cpp; see the model note for the gap. See [`ornith-1.5-122b.md`](ornith-1.5-122b.md).
 
 The bands are deliberately wide (≈±15 %) because the models are **not bit-deterministic** under
 near-tie routing and single-run decode spread is real (e.g. Qwen 24.6–28.7 tok/s). A regression is

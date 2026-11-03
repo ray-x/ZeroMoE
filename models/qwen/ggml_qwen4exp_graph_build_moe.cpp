@@ -5,6 +5,7 @@
 // declarations live in ggml_qwen4exp_graph_internal.hpp.
 
 #include "ggml_qwen4exp_graph_internal.hpp"
+#include "aliased_expert_placement.hpp"
 #include "graph_settings_global.hpp"
 
 #include <cstdlib>
@@ -537,10 +538,10 @@ int build_gpu_stage_node(FullGraph &g, ggml_context *ctx, ggml_tensor *ids,
 // mask zeroes the contribution, at the price of every branch computing all
 // topk routes (~2x expert compute). Default false is used by
 // build_moe_partial_gpu's Phase 1/2 caller, which ignores the masks.
-ExpertSplitTables build_expert_split_tables(FullGraph &g, ggml_context *ctx,
-                                            int n_experts,
-                                            const std::vector<int> &gpu_ids,
-                                            bool safe_dummy_fill)  {
+ExpertSplitTables build_expert_split_tables(
+    FullGraph &g, ggml_context *ctx, int n_experts,
+    const std::vector<int> &gpu_ids, moe_partial::SentinelPolicy policy,
+    bool single_token_decode)  {
   ExpertSplitTables r;
   if (n_experts <= 0)
     return r;
@@ -560,13 +561,12 @@ ExpertSplitTables build_expert_split_tables(FullGraph &g, ggml_context *ctx,
     gpu_index[static_cast<size_t>(e)] = static_cast<int32_t>(k);
     cpu_index[static_cast<size_t>(e)] = -1;
   }
-  const moe_partial::SentinelPolicy policy =
-      safe_dummy_fill ? moe_partial::SentinelPolicy::ForceDummy
-                      : moe_partial::SentinelPolicy::Auto;
   const moe_partial::ExpertBranchMap gpu_map =
-      moe_partial::ExpertBranchMap::build(gpu_index, 1, true, {}, policy);
+      moe_partial::ExpertBranchMap::build(gpu_index, 1, single_token_decode, {},
+                                          policy);
   const moe_partial::ExpertBranchMap cpu_map =
-      moe_partial::ExpertBranchMap::build(cpu_index, 1, true, {}, policy);
+      moe_partial::ExpertBranchMap::build(cpu_index, 1, single_token_decode, {},
+                                          policy);
   const std::vector<int32_t> &remap_gpu = gpu_map.route_ids();
   const std::vector<int32_t> &remap_cpu = cpu_map.route_ids();
   const std::vector<float> &mgpu = gpu_map.route_mask();
@@ -828,15 +828,25 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   // unchanged single-mul_mat_id path below.
   if (split_gpu_ids && !split_gpu_ids->empty() && gate_exps_gpu &&
       up_exps_gpu && down_exps_gpu) {
-    // Decode (S==1): a real -1 id makes each backend skip the foreign route
-    // and write zeros (patches/ggml-mul-mat-id-negative-skip.patch covers the
-    // CPU op and the CUDA MMVQ decode kernels), so each branch does only its
-    // own share of the expert compute. Prefill (S>1) goes through mmq/mmf/
-    // sorted paths the patch does not cover, so it keeps the valid dummy id
-    // and relies on the mask multiply to zero the foreign contribution.
+    // A route a branch does not own costs nothing when it carries a negative
+    // expert id: ggml then writes zeros and reads no weights. Decode (S==1)
+    // gets that from patches/ggml-mul-mat-id-negative-skip.patch (CPU op +
+    // CUDA MMVQ kernels); a batched prefill gets it from patch 0006's MMQ
+    // path, which is only correct for expert types that actually take MMQ.
+    // Without either capability the tables must use a valid dummy id plus the
+    // 0/1 mask, which makes every branch compute all top-k routes -- the
+    // reason enabling the hotset for prefill used to be a net loss.
+    const bool prefill_batch = g.S > 1 && !g.decode_mode;
+    const bool batched_negative_skip =
+        prefill_batch && g.engine &&
+        zeromoe::graph::layer_experts_take_mmq(*g.engine, layer) &&
+        mmid_negative_skip_batched_available();
+    const moe_partial::SentinelPolicy split_policy =
+        batched_negative_skip ? moe_partial::SentinelPolicy::AutoBatched
+                              : moe_partial::SentinelPolicy::Auto;
     ExpertSplitTables tab = build_expert_split_tables(
-        g, ctx, c.n_experts, *split_gpu_ids,
-        /*safe_dummy_fill=*/g.S != 1 && !g.decode_mode);
+        g, ctx, c.n_experts, *split_gpu_ids, split_policy,
+        /*single_token_decode=*/!prefill_batch);
     if (tab.remap_gpu && tab.remap_cpu && tab.mask_gpu && tab.mask_cpu) {
       if (g.decode_mode) {
         auto &pl = g.promo_layers[layer];
@@ -1035,6 +1045,14 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         }
       }
       experts = ggml_add(ctx, hot_weighted, cold_weighted);
+      if (!g.decode_mode && g.S > 1) {
+        // Both branches read input3 = [D, 1, S] and per-token route ids, so
+        // this layer's MoE output covers every token in the batch: the GPU
+        // hot experts and the CPU cold experts are complementary (the masks
+        // zero each side's foreign routes) and are summed here.
+        ++g.prefill_split_layers;
+        g.prefill_split_tokens = g.S;
+      }
     }
   }
 

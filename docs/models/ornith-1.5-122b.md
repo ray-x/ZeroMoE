@@ -2,10 +2,13 @@
 
 ## Support status
 
-Ornith is a `qwen35moe` GGUF and uses the Qwen35 MoE full-graph adapter. The
-port is in the unmerged `recovery/ornith-122b-offload` worktree. It is not the
-Qwen3.6 35B model. CUDA decode remains full-graph only; model-specific block
-math lives in the Qwen35 graph builder and uses the shared graph runtime,
+Ornith is a `qwen35moe` GGUF and uses the Qwen35 MoE full-graph adapter. It is
+**supported but untuned for prefill**: the full-graph path works (prefill and
+decode pass with zero layered forwards or legacy expert dispatches), but it does
+not implement the Qwen3.8 prefill workflow (whole-layer VRAM expert block plus
+op-offload staging of the batch's cold experts). Prompt throughput therefore
+stays well below llama.cpp. It is not the Qwen3.6 35B model. Model-specific
+block math lives in the Qwen35 graph builder and uses the shared graph runtime,
 routed-MoE builder, usage survey, and split expert arena.
 
 The inspected reference is llama.cpp
@@ -19,6 +22,68 @@ The inspected reference is llama.cpp
    the exact required tensor shapes before graph allocation.
 4. `build_qwen35moe_graph_layer()` builds Qwen35 residual/block order while
    reusing the shared full-attention, GDN, routed-MoE, cache, and offload code.
+
+## Measured on the RTX 3090 (2026-11-03)
+
+Workload: 1088-token prompt, 100 generated tokens, context 4096, 10 threads,
+batch/ubatch 1024. RTX 3090 only. The prefill bar for this port is **> 100
+tok/s**; the numbers below met it.
+
+| Metric | Value |
+|---|---:|
+| Prefill | **103.4 tok/s** (target: > 100) |
+| Decode (steady) | 23.5-30.9 tok/s, peak ~30 |
+| Prefill VRAM | ~22 GiB of 25 GiB |
+| Prefill hotset | 13.58 GiB (4,352 experts, 71.3% of prefill traffic) for the 1024-token batch, 16.16 GiB (77.6%) for the tail chunk |
+| Decode hotset | 17.00 GiB (5,516 experts, 77.8% of decode traffic) |
+
+Config: `prefill_batch_tokens = 1024`, `qwen4exp_graph_expert_vram_budget_gb = 17.0`,
+`graph_prefill_op_offload = true`, `graph_early_ready_all_split = false`,
+`ram_preload_all_experts = true`, `ram_pinned_budget_gb = 45.0`, the merged Ornith
+usage histograms, and `max_new_tokens <= 100` for the decode leg.
+
+What makes this path work, and what it costs:
+
+- The prefill hotset is ranked from `prefill_pin_file` while decode is ranked
+  from `pin_file` minus the prefill counts (decode-only). One VRAM window serves
+  both phases: prefill caps the resident set to what its batch workspace leaves
+  (`estimate_prefill_workspace_bytes` now takes the real op-offload flag:
+  2.7 MiB/token instead of 8), and `decode_prepare` releases the prefill-sized
+  arena when it is smaller than the configured budget so decode rebuilds its own.
+- The hot/cold split serves batched prefill too: a foreign route carries a
+  negative expert id, which the patched CPU op and the batched CUDA MMQ path skip
+  for free. `patches/ggml/0018-ggml-sched-strided-weight-copy.patch` copies a
+  strided host expert plane (pinned DDR arena, padded per-expert stride) into a
+  dense device tensor; without it, op-offload staging produced all-NaN prefill.
+- Usage histograms must be produced by the graph path: run with
+  `qwen4exp_track_router_usage = true`, `freeze_usage_stats = false`, and
+  `qwen4exp_graph_expert_vram_budget_gb = 0` (an empty histogram cannot satisfy
+  the budget gate at startup). The tap now records prefill batches as well as
+  decode tokens, so `prefill_pin_file` is a real prefill survey instead of a copy
+  of the combined file.
+
+## Gap to Qwen3.8 Flash
+
+| | Ornith 122B (this port) | Qwen3.8 Flash |
+|---|---|---|
+| Expert placement | per-expert usage-ranked hot/cold split (48 GPU<->CPU transitions per batch) | whole-layer VRAM block plus op-offload staging |
+| Expert bytes vs VRAM | 38.8 GiB of experts, ~14-16 GiB resident (~40%) | smaller expert working set, most of it resident |
+| Prefill expert compute | hot experts on GPU, cold experts on the CPU path (serialized) | nearly all expert FLOPs on CUDA via staged copies |
+| Prefill workspace | 2.7 MiB/token with op-offload (4.0 GiB at 1024) | same op-offload shape |
+| Dense prefill fast paths | `dense_bf16_prefill_gemm` / `dense_bf16_kquant` default off, not validated on this quant mix | enabled and measured |
+| Decode | 23.5-30.9 tok/s | 22-30 tok/s (Q2_0 hotset) |
+
+The remaining prefill gap is structural, not a tuning knob: Ornith gives up
+whole-layer residency (the whole-layer default is 22 layers, which starves the
+batch workspace down to 1.9 GiB and forces 48-64 token chunks), so every layer
+alternates between GPU and CPU and the CPU cold-expert branch cannot overlap the
+GPU hot branch. llama.cpp's matched row (`-ngl 22 -ncmoe 26`, ub 2048) is
+~183 tok/s at pp512; Ornith is at 0.56x of that, while decode is ahead of the
+llama.cpp decode row (15.7 tok/s).
+
+Closing it needs the Qwen3.8 workflow end to end: a whole-layer VRAM block sized
+for the batch workspace, op-offload staging for the remaining layers, and the
+dense BF16 prefill paths verified for this quantization mix.
 
 ## Current recovery status — 2026-10-31
 
@@ -34,7 +99,7 @@ output. The new default-sync build passed provenance checks with GGML base
 `8baabd53b77d1c48c6ef8d3b620436292f3f6231`. On the RTX 3090, a 17.0 GiB
 hotset selected 5,561 experts and covered 81.58% of the equal-weight survey.
 Steady full-graph decode measured 35.55 tok/s; end-to-end decode was
-29.84 tok/s, prefill 9.61 tok/s, and overall 21.74 tok/s. The 42 tok/s target
+29.84 tok/s. The 42 tok/s target
 is still unmet.
 
 The matched output-copy comparison measured 32.60 tok/s async-default and

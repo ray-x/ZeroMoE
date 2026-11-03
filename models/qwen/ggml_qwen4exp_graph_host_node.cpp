@@ -4,6 +4,7 @@
 // Split out of the former single-file ggml_qwen4exp_graph.cpp; shared
 // declarations live in ggml_qwen4exp_graph_internal.hpp.
 
+#include <algorithm>
 #include <cstdio>
 #include "ggml_qwen4exp_graph_internal.hpp"
 #include "graph_settings_global.hpp"
@@ -219,27 +220,45 @@ void CUDART_CB qwen4exp_cuda_usage_track_callback(void *user_data) {
     return;
   const auto start = std::chrono::steady_clock::now();
   const bool hit_log = Logger::instance().would_log(LogLevel::DEBUG);
-  const uint64_t token_idx = ctx->token_count++;
-  std::string hit_line;
-  for (int l = 0; l < ctx->n_layers; ++l) {
-    int hits = 0;
-    const bool has_mask =
-        l < static_cast<int>(ctx->hot_mask.size()) && !ctx->hot_mask[l].empty();
-    for (int k = 0; k < ctx->topk; ++k) {
-      const int32_t expert = ctx->host_ids[static_cast<size_t>(l) * ctx->topk + k];
-      if (expert < 0 || expert >= ctx->n_experts)
-        continue; // defensive only -- real routing always produces valid ids
-      ctx->engine->bump_route_freq(l, expert);
-      if (has_mask && ctx->hot_mask[l][expert])
-        ++hits;
+  const int64_t token_idx = static_cast<int64_t>(ctx->token_count);
+  const int n_tokens = std::max(1, ctx->n_tokens);
+  const size_t per_layer =
+      static_cast<size_t>(ctx->topk) * static_cast<size_t>(n_tokens);
+  // A prefill batch carries n_tokens routed rows per layer; decode always has
+  // one. Both layouts are token-major inside each layer block (ids_out is a
+  // dense [topk, S] copy, so element (k, t) sits at t*topk + k).
+  for (int t = 0; t < n_tokens; ++t) {
+    std::string hit_line;
+    for (int l = 0; l < ctx->n_layers; ++l) {
+      int hits = 0;
+      const bool has_mask = l < static_cast<int>(ctx->hot_mask.size()) &&
+                            !ctx->hot_mask[l].empty();
+      for (int k = 0; k < ctx->topk; ++k) {
+        const int32_t expert =
+            ctx->host_ids[static_cast<size_t>(l) * per_layer +
+                          static_cast<size_t>(t) * static_cast<size_t>(ctx->topk) +
+                          static_cast<size_t>(k)];
+        if (expert < 0 || expert >= ctx->n_experts)
+          continue; // defensive only -- real routing always produces valid ids
+        ctx->engine->bump_route_freq(l, expert);
+        if (ctx->prefill)
+          ctx->engine->bump_route_freq_prefill(l, expert);
+        if (has_mask && ctx->hot_mask[l][expert])
+          ++hits;
+      }
+      if (hit_log)
+        hit_line += (has_mask ? std::to_string(hits) : std::string("-")) + ",";
     }
     if (hit_log)
-      hit_line += (has_mask ? std::to_string(hits) : std::string("-")) + ",";
+      LOG_DEBUG("[ROUTE-HIT] tok=%lld hits=%s\n",
+                static_cast<long long>(token_idx + t), hit_line.c_str());
   }
-  if (hit_log)
-    LOG_DEBUG("[ROUTE-HIT] tok=%llu hits=%s\n",
-             static_cast<unsigned long long>(token_idx),
-             hit_line.c_str());
+  ctx->token_count += static_cast<uint64_t>(n_tokens);
+  // Session counter the survey gate checks at shutdown ("no routed-ID
+  // callbacks ran"). It lives on the engine because the context is per graph.
+  if (ctx->engine)
+    ctx->engine->qwen4exp_usage_tracked_tokens.fetch_add(
+        static_cast<uint64_t>(n_tokens), std::memory_order_relaxed);
   const double ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - start)
                         .count();

@@ -191,7 +191,11 @@ bool engine_plans_decode_expert_split(const StreamingEngine &engine) {
   const bool option_b_auto = engine.qwen4exp_option_b_concentrated_only &&
                              engine.qwen4exp_option_b_layer < 0;
   return engine.qwen4exp_option_b_layer >= 0 || option_b_auto ||
-         !engine.qwen4exp_option_b_layers.empty();
+         !engine.qwen4exp_option_b_layers.empty() ||
+         // Usage-ranked hotset: one VRAM arena serves prefill and decode, so
+         // it is prepared once at bootstrap instead of being re-allocated by
+         // whichever phase builds first.
+         engine.qwen4exp_graph_expert_vram_budget_gb > 0.0;
 }
 
 // Moves the per-expert split arena (and its address map) out of a decode graph

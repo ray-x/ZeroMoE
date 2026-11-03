@@ -682,13 +682,58 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     FullGraph *expert_source = nullptr;
     if (prefill_arena_source->expert.buffer) {
       expert_source = prefill_arena_source;
-    } else if (g_graph_decode_arena_owner && g_graph_decode_arena_owner->ready &&
-               g_graph_decode_arena_owner->engine == &engine &&
-               g_graph_decode_arena_owner->device == dev &&
-               g_graph_decode_arena_owner->expert.buffer) {
+    }
+    // A prefill graph sizes its split arena against the VRAM the prefill
+    // workspace left over, which can be far below the usage budget the decode
+    // planner was fitted to (measured: 8.91 GiB borrowed vs 17 GiB planned on
+    // Ornith 122B with a 9 GiB 1024-token prefill workspace). Prefer whichever
+    // owner actually holds the larger arena so decode keeps its planned
+    // hotset instead of silently shrinking to the prefill reservation.
+    if (g_graph_decode_arena_owner && g_graph_decode_arena_owner->ready &&
+        g_graph_decode_arena_owner->engine == &engine &&
+        g_graph_decode_arena_owner->device == dev &&
+        g_graph_decode_arena_owner->expert.buffer &&
+        (!expert_source ||
+         g_graph_decode_arena_owner->expert.capacity >
+             expert_source->expert.capacity)) {
       expert_source = g_graph_decode_arena_owner.get();
       LOG_INFO("[GGML-QWEN-FULL-DECODE] rebinding the per-expert split arena "
                "prepared at startup (no re-upload)\n");
+    }
+    // A prefill graph sizes its split arena around its own batch workspace, so
+    // it can sit far below the decode budget (measured on Ornith 122B: a
+    // 10 GiB prefill-ranked hotset vs a 17 GiB decode plan). Borrowing it caps
+    // decode at the prefill reservation for the whole request. Give the VRAM
+    // back: release the prefill owners and let the decode graph allocate the
+    // arena it actually planned. The prefill state is already written back to
+    // the host caches above, so the fresh graph seeds from them unchanged; a
+    // device state handoff keeps the owners alive instead (its addresses are
+    // what it hands over).
+    const double decode_expert_budget_gb =
+        engine.qwen4exp_graph_expert_vram_budget_gb;
+    if (expert_source && !prefill_state_handoff &&
+        decode_expert_budget_gb > 0.0) {
+      const size_t want_bytes = static_cast<size_t>(
+          decode_expert_budget_gb * 1024.0 * 1024.0 * 1024.0);
+      const size_t have_bytes = expert_source->expert.capacity;
+      constexpr size_t kBudgetSlackBytes = 256ull << 20;
+      if (have_bytes + kBudgetSlackBytes < want_bytes) {
+        if (prefill_state_source &&
+            prefill_state_source->prefill_host_state_deferred &&
+            !sync_prefill_recurrent_state_to_host(*prefill_state_source))
+          return false;
+        LOG_INFO("[GGML-QWEN-FULL-DECODE] releasing the prefill-sized expert "
+                 "arena (%.2f GiB) so decode can build its planned %.2f GiB "
+                 "hotset; the prefill graph's VRAM returns to decode here\n",
+                 static_cast<double>(have_bytes) / (1024.0 * 1024.0 * 1024.0),
+                 decode_expert_budget_gb);
+        g_graph_prefill_state_owner.reset();
+        g_graph_prefill_arena_owner.reset();
+        g_graph_decode_arena_owner.reset();
+        prefill_arena_source = nullptr;
+        prefill_state_source = nullptr;
+        expert_source = nullptr;
+      }
     }
     g = build_one(prefill_state_handoff ? prefill_state_source : nullptr,
                   prefill_arena_source, expert_source);
@@ -724,15 +769,33 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     if (!g)
       return false;
   }
-  if (engine.family_ops.family == ModelFamily::Qwen &&
-      (g->device_expert_layers != c.n_layers ||
-       !g->split_gpu_expert_ids.empty())) {
-    LOG_ERROR("[QWEN35MOE-GRAPH] planner selected a full-fit run, but graph "
-              "placement is incomplete (device_layers=%d/%d split_layers=%zu); "
-              "refusing partial expert residency\n",
-              g->device_expert_layers, c.n_layers,
-              g->split_gpu_expert_ids.size());
-    return false;
+  if (engine.family_ops.family == ModelFamily::Qwen) {
+    // Placement is complete when every layer's routed experts are resident
+    // somewhere the graph can read them without a runtime fetch: the
+    // whole-layer VRAM block, or a complete preloaded DDR layer arena (the
+    // usage-ranked hotset + DDR tail placement Ornith 122B uses). A partial
+    // residency that leaves experts to be fetched per token is what this
+    // gate refuses.
+    int ddr_layers = 0;
+    for (int layer = 0; layer < c.n_layers; ++layer) {
+      if (device_expert_block_covers(*g, layer))
+        continue;
+      if (!engine.graph_ram_layer_ready(layer)) {
+        LOG_ERROR("[QWEN35MOE-GRAPH] planner selected a full-fit run, but "
+                  "layer %d has neither a VRAM expert block nor a complete "
+                  "preloaded DDR arena (device_layers=%d/%d split_layers=%zu); "
+                  "refusing partial expert residency\n",
+                  layer, g->device_expert_layers, c.n_layers,
+                  g->split_gpu_expert_ids.size());
+        return false;
+      }
+      ++ddr_layers;
+    }
+    if (ddr_layers > 0) {
+      LOG_INFO("[QWEN35MOE-GRAPH] expert placement complete: %d whole layer(s) "
+               "on GPU, %d layer(s) from preloaded DDR arenas\n",
+               g->device_expert_layers, ddr_layers);
+    }
   }
   if (engine.family_ops.family == ModelFamily::Qwen) {
     LOG_INFO("[QWEN35MOE-GRAPH] decode ready: expert_layers_on_gpu=%d/%d "

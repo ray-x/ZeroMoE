@@ -212,10 +212,21 @@ static ggml_tensor *build_qwen35moe_graph_layer(FullGraph &g,
       expert_weight_split(g, g.ctx, layer, "ffn_down_exps.weight");
   if (!gate.cpu || !up.cpu || !down.cpu)
     return nullptr;
+  // Qwen full graphs consume either the whole-layer VRAM block/partial
+  // gate-up arena or a complete, fully preloaded DDR layer arena (pinned and
+  // aliased, not re-fetched per node; prefill copies the experts a batch uses
+  // across under prefill_op_offload). The DDR case is what a usage-ranked
+  // VRAM budget plus a DDR tail (Ornith 122B) relies on: without it, the
+  // first DDR-resident layer fails here and the model can never build a
+  // prefill graph even though every expert is resident and preloaded.
+  const bool projections_graph_visible =
+      graph_expert_projection_resident(g, layer, "ffn_gate_exps.weight") &&
+      graph_expert_projection_resident(g, layer, "ffn_up_exps.weight") &&
+      graph_expert_projection_resident(g, layer, "ffn_down_exps.weight");
+  const bool ddr_layer_ready =
+      g.engine && g.engine->graph_ram_layer_ready(layer);
   if (g.engine->family_ops.family == ModelFamily::Qwen &&
-      (!graph_expert_projection_resident(g, layer, "ffn_gate_exps.weight") ||
-       !graph_expert_projection_resident(g, layer, "ffn_up_exps.weight") ||
-       !graph_expert_projection_resident(g, layer, "ffn_down_exps.weight")))
+      !projections_graph_visible && !ddr_layer_ready)
     return nullptr;
   const bool split = gate.gpu && up.gpu && down.gpu;
   const std::vector<int> *split_ids = nullptr;
@@ -228,12 +239,28 @@ static ggml_tensor *build_qwen35moe_graph_layer(FullGraph &g,
       zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP") != nullptr;
   ggml_tensor *route_ids = nullptr;
   ggml_tensor *route_weights = nullptr;
+  ggml_tensor *usage_ids = nullptr;
   ggml_tensor *moe = build_moe(
       g, g.ctx, ffn_in, layer, router, bias, gate.cpu, up.cpu, down.cpu,
       split ? gate.gpu : nullptr, split ? up.gpu : nullptr,
       split ? down.gpu : nullptr, split_ids, nullptr,
-      probe_moe ? &route_ids : nullptr,
+      (probe_moe || g.usage_tap_enabled) ? &route_ids : nullptr,
       probe_moe ? &route_weights : nullptr);
+  if (g.usage_tap_enabled && route_ids) {
+    // Same accumulation the Qwen4Exp branch performs inline: append this
+    // layer's routed ids (flattened to 1D for a prompt batch) so the single
+    // flush marker after the layer loop reads every layer's real routing.
+    ggml_tensor *ids_cont = ggml_cont(g.ctx, route_ids);
+    if (g.S > 1 && !g.decode_mode)
+      ids_cont = ids_cont ? ggml_reshape_1d(
+                                g.ctx, ids_cont,
+                                static_cast<int64_t>(c.topk) * g.S)
+                          : nullptr;
+    if (ids_cont)
+      g.usage_track_ids = g.usage_track_ids
+                              ? ggml_concat(g.ctx, g.usage_track_ids, ids_cont, 0)
+                              : ids_cont;
+  }
   if (!moe)
     return nullptr;
   probe("moe_routed", moe);
@@ -425,12 +452,20 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
   // comment). Every layer that goes through build_moe() below appends its
   // real routed ids into g.usage_track_ids via an ordinary ggml_concat node;
   // a single flush marker after the loop reads the whole buffer once.
+  // Decode always; prefill only when a prefill survey target is configured
+  // (capture_prefill_usage is derived from prefill_pin_file being set and
+  // usage stats not frozen). Without the prefill leg there is no way to
+  // produce a genuine prefill histogram: route_freq_prefill only ever saw
+  // the layered dispatcher, so a graph-only model's prefill_pin_file could
+  // only be a copy of the combined decode file.
   const bool usage_track_enabled =
-      g.decode_mode && g.engine->qwen4exp_track_router_usage;
+      g.engine->qwen4exp_track_router_usage &&
+      (g.decode_mode || (g.engine->capture_prefill_usage && g.S > 1));
   // Expert promotion reads the same ids tap, but straight from the device after each run (no host
   // callback): it needs the routed ids of every layer and token, nothing else.
   const bool promo_tap = g.decode_mode && g.engine->qwen4exp_expert_promotion > 0;
   const bool ids_tap = usage_track_enabled || promo_tap;
+  g.usage_tap_enabled = usage_track_enabled;
   for (int l = 0; l < g.n_layers; ++l) {
     const std::string p = "blk." + std::to_string(l) + ".";
     if (g.engine->family_ops.family == ModelFamily::Qwen) {
@@ -780,6 +815,15 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       // route_ids already uses, even though decode S==1 rows never hit the
       // argsort-view-stride pitfall that convention guards against.
       ggml_tensor *ids_cont = ggml_cont(g.ctx, layer_ids_for_usage);
+      if (g.S > 1 && !g.decode_mode) {
+        // Dense [topk, S] per layer -> 1D so the per-layer blocks concatenate
+        // as [layer][token][route] instead of along the route axis.
+        ggml_tensor *flat = ggml_reshape_1d(
+            g.ctx, ids_cont, static_cast<int64_t>(c.topk) * g.S);
+        if (!flat)
+          return false;
+        ids_cont = flat;
+      }
       g.usage_track_ids = g.usage_track_ids
                               ? ggml_concat(g.ctx, g.usage_track_ids, ids_cont, 0)
                               : ids_cont;
@@ -810,6 +854,14 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
         std::chrono::steady_clock::now() - t_moe_start).count();
   }
 
+  if (!g.decode_mode && g.S > 1) {
+    LOG_DEBUG("[QWEN4EXP-SPLIT-PREFILL] hot/cold split applied to %d/%d "
+             "layer(s), %d token(s) per layer%s\n",
+             g.prefill_split_layers, g.n_layers, g.prefill_split_tokens,
+             g.prefill_split_layers == g.n_layers
+                 ? " (every layer, every token: GPU hot + CPU cold summed)"
+                 : " (the rest ran CPU-only for this batch)");
+  }
   // Decode-only router-usage tap: one flush marker for the whole graph,
   // built once here after every layer has appended into g.usage_track_ids
   // (see the per-layer ggml_concat block above and
@@ -822,12 +874,15 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     ggml_build_forward_expand(g.graph, g.usage_track_ids);
   }
   if (usage_track_enabled && g.usage_track_ids) {
-    const int total_ids = c.topk * g.n_layers;
+    const int usage_tokens = (g.decode_mode || g.S < 1) ? 1 : g.S;
+    const int total_ids = c.topk * g.n_layers * usage_tokens;
     auto usage_ctx = std::make_unique<Qwen4ExpUsageTrackContext>();
     usage_ctx->engine = g.engine;
     usage_ctx->n_layers = g.n_layers;
     usage_ctx->n_experts = c.n_experts;
     usage_ctx->topk = c.topk;
+    usage_ctx->n_tokens = usage_tokens;
+    usage_ctx->prefill = !g.decode_mode;
     usage_ctx->ids_bytes = static_cast<size_t>(total_ids) * sizeof(int32_t);
     usage_ctx->hot_mask.assign(g.n_layers, {});
     for (const auto &[layer, ids] : g.split_gpu_expert_ids) {
@@ -858,9 +913,10 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
         ggml_set_output(usage_marker);
         ggml_build_forward_expand(g.graph, usage_marker);
         g.usage_track_context = std::move(usage_ctx);
-        LOG_INFO("[QWEN4EXP-USAGE-TRACK] flush marker captured: n_layers=%d "
-                 "topk=%d total_ids=%d\n",
-                 g.n_layers, c.topk, total_ids);
+        LOG_INFO("[QWEN4EXP-USAGE-TRACK] flush marker captured: phase=%s "
+                 "n_layers=%d topk=%d tokens=%d total_ids=%d\n",
+                 g.decode_mode ? "decode" : "prefill", g.n_layers, c.topk,
+                 usage_tokens, total_ids);
       } else {
         LOG_WARN("[QWEN4EXP-USAGE-TRACK] marker construction failed; usage "
                  "tracking disabled for this graph\n");
