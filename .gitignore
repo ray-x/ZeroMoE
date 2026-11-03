@@ -24,6 +24,7 @@ tests/bench_outproj
 !/configs/deepseek41-flash.toml
 !/configs/glm53-dsa.toml
 !/configs/mimo26-flash.toml
+!/configs/ornith-1.5-122b.toml
 !/configs/single_gpu.toml
 
 # Local benchmark profiles are generated per prompt/run. Keep the committed

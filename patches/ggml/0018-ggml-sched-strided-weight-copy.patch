@@ -1,0 +1,68 @@
+--- a/src/ggml-backend.cpp
++++ b/src/ggml-backend.cpp
+@@ -636,7 +636,48 @@
+ 
+ // backend copy
+ 
++// ZEROMOE: a static weight whose HOST source is strided (a pinned DDR expert
++// plane keeps a padded per-expert stride) may be copied into a DENSE device
++// tensor: the CUDA kernels require contiguous weights, and the plain linear
++// copy would land the padded source span at the wrong offsets, which surfaced
++// as all-NaN prefill on a qwen35moe model whose experts alias a strided DDR
++// arena. Only the expert axis is assumed padded -- the layout every ggml expert
++// plane uses -- so the inner two dimensions stay contiguous per expert slab.
++static bool ggml_backend_copy_strided_host_tensor(const struct ggml_tensor * src, struct ggml_tensor * dst) {
++    if (src->data == NULL || dst->data == NULL) {
++        return false;
++    }
++    if (src->type != dst->type || src->ne[0] != dst->ne[0] || src->ne[1] != dst->ne[1] ||
++        src->ne[2] != dst->ne[2] || src->ne[3] != dst->ne[3]) {
++        return false;
++    }
++    // nb[0] is a whole quantization block (e.g. 50 bytes per 256 IQ1_S
++    // weights), so the contiguous-row test must use ggml_row_size, not
++    // nb[0]*ne[0].
++    if (src->nb[1] != ggml_row_size(src->type, src->ne[0]) ||
++        dst->nb[1] != ggml_row_size(dst->type, dst->ne[0])) {
++        return false; // not expert-axis-only padding
++    }
++    const size_t inner = ggml_row_size(src->type, src->ne[0]) * (size_t) src->ne[1];
++    if (inner == 0) {
++        return false;
++    }
++    for (int64_t i3 = 0; i3 < src->ne[3]; ++i3) {
++        ggml_backend_tensor_set_2d(dst,
++            (const char *) src->data + (size_t) i3*src->nb[3], (size_t) i3*dst->nb[3],
++            inner, (size_t) src->ne[2], dst->nb[2], src->nb[2]);
++    }
++    return true;
++}
++
+ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor * dst) {
++    if (src != dst && !ggml_are_same_layout(src, dst)) {
++        // ZEROMOE: strided host weight -> dense device weight (see above).
++        const bool host_src = src->buffer != NULL && ggml_backend_buffer_is_host(src->buffer);
++        if (host_src && ggml_backend_copy_strided_host_tensor(src, dst)) {
++            return;
++        }
++    }
+     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
+ 
+     if (src == dst) {
+@@ -1574,7 +1615,15 @@
+                         const int n_copies_for_src =
+                             (src->flags & GGML_TENSOR_FLAG_INPUT) ? sched->n_copies : 1;
+                         for (int c = 0; c < n_copies_for_src; c++) {
+-                            struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
++                            // ZEROMOE: a strided host weight must land in a
++                            // DENSE device tensor -- the CUDA kernels require
++                            // contiguous weights, and the copy helper moves it
++                            // expert slab by expert slab.
++                            struct ggml_tensor * tensor_copy =
++                                (src->buffer != NULL && ggml_backend_buffer_is_host(src->buffer) &&
++                                 !ggml_is_contiguous(src))
++                                    ? ggml_dup_tensor(sched->ctx, src)
++                                    : ggml_dup_tensor_layout(sched->ctx, src);
+                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
+                             if (sched->n_copies > 1) {
+                                 ggml_set_input(tensor_copy);

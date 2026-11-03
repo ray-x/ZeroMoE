@@ -233,6 +233,7 @@ std::expected<void, std::string> EngineRunner::apply_engine_config() {
   engine.qwen4exp_graph_expert_vram_budget_gb =
       config.qwen4exp_graph_expert_vram_budget_gb;
   engine.qwen4exp_graph_pin_file = config.pin_file;
+  engine.qwen4exp_prefill_graph_pin_file = config.prefill_pin_file;
   engine.exl3_ggml_bridge_model_path = config.exl3_ggml_bridge_model_path;
   engine.exl3_ggml_bridge_layer = config.exl3_ggml_bridge_layer;
   engine.exl3_ggml_bridge_layers = config.exl3_ggml_bridge_layers;

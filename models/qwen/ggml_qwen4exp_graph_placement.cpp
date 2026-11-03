@@ -7,6 +7,7 @@
 #include "ggml_qwen4exp_graph_internal.hpp"
 
 #include <map>
+#include <numeric>
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
 
@@ -32,9 +33,12 @@ void plan_expert_vram_split(FullGraph &g) {
       g.engine->cuda_moe_full_graph_decode_required &&
       g.engine->qwen4exp_graph_expert_vram_budget_gb <= 0.0)
     return; // Qwen's layer planner owns placement unless usage hotset is opted in.
-  if (g.S != 1 && !g.decode_mode)
-    return;
-
+  // The usage-ranked byte-budget hotset (below) is planned for BOTH phases:
+  // prefill ranks its own histogram, decode ranks its own, and the two share
+  // one VRAM window. That is what lets prefill keep a resident MoE instead of
+  // running every expert on CPU from DDR. Option B's staging proof stays
+  // decode-only (its branch keeps the S==1 gate).
+  //
   // Option B is a deterministic usage-driven plan: a static hot set per
   // selected layer, with complementary experts left in the fixed-stride DDR
   // arena.  In concentrated-only mode the selected layers were chosen from
@@ -49,6 +53,10 @@ void plan_expert_vram_split(FullGraph &g) {
   if (option_top_n > 0 &&
       (option_layer >= 0 || option_b_auto ||
        !g.engine->qwen4exp_option_b_layers.empty())) {
+    // Option B's staging proof is decode-only (S == 1): its route tables and
+    // staged single-expert proof assume one token.
+    if (g.S != 1 && !g.decode_mode)
+      return;
     const auto &c = g.engine->model_file.architecture_config;
 
     const std::string path = g.engine->qwen4exp_graph_pin_file.empty()
@@ -251,16 +259,74 @@ void plan_expert_vram_split(FullGraph &g) {
   if (budget_gb <= 0.0)
     return; // feature off -- identical to today, zero planning cost
 
-  const std::string path = g.engine->qwen4exp_graph_pin_file.empty()
-                               ? std::string(".zeromoe_usage")
-                               : g.engine->qwen4exp_graph_pin_file;
-  auto [entries, maxc] = StreamingEngine::load_usage(path);
+  // Prefill ranks its own routing histogram (prefill_pin_file) so the resident
+  // set matches prompt traffic; decode ranks pin_file. Falling back keeps a
+  // config without a prefill survey working unchanged.
+  const bool prefill_phase = g.S > 1 && !g.decode_mode;
+  const std::string &phase_pin =
+      prefill_phase ? g.engine->qwen4exp_prefill_graph_pin_file
+                    : g.engine->qwen4exp_graph_pin_file;
+  const std::string path = phase_pin.empty()
+                               ? (g.engine->qwen4exp_graph_pin_file.empty()
+                                      ? std::string(".zeromoe_usage")
+                                      : g.engine->qwen4exp_graph_pin_file)
+                               : phase_pin;
+  auto [loaded_entries, maxc] = StreamingEngine::load_usage(path);
   (void)maxc;
+  std::vector<StreamingEngine::UsageEntry> entries =
+      std::move(loaded_entries);
   if (entries.empty()) {
     LOG_INFO("[GGML-QWEN-FULL-SPLIT] no usage data at %s -- per-expert VRAM "
              "split stays off this run.\n",
              path.c_str());
     return;
+  }
+  if (!prefill_phase && !g.engine->qwen4exp_prefill_graph_pin_file.empty() &&
+      g.engine->qwen4exp_prefill_graph_pin_file != path) {
+    // pin_file accumulates BOTH phases (route_freq), and prefill contributes
+    // far more selections per request than a short decode does, so ranking
+    // decode from it directly under-weights decode's own routing. Subtract the
+    // prefill-only histogram to get decode-only counts. An empty difference
+    // means the prefill file is not a real prefill survey (e.g. a copy of this
+    // same data) -- keep the combined ranking and say so.
+    auto [pf_entries, pf_maxc] =
+        StreamingEngine::load_usage(g.engine->qwen4exp_prefill_graph_pin_file);
+    (void)pf_maxc;
+    if (!pf_entries.empty()) {
+      std::map<std::pair<int, int>, uint64_t> prefill_counts;
+      for (const auto &e : pf_entries)
+        prefill_counts[{e.layer, e.expert}] += e.count;
+      std::vector<StreamingEngine::UsageEntry> decode_only;
+      decode_only.reserve(entries.size());
+      uint64_t total_removed = 0;
+      for (const auto &e : entries) {
+        const auto it = prefill_counts.find({e.layer, e.expert});
+        const uint64_t pf = it == prefill_counts.end() ? 0 : it->second;
+        total_removed += pf;
+        if (e.count > pf)
+          decode_only.push_back({e.layer, e.expert, e.count - pf});
+      }
+      if (!decode_only.empty()) {
+        LOG_INFO("[GGML-QWEN-FULL-SPLIT] decode ranking uses decode-only "
+                 "counts: %zu of %zu (layer,expert) rows kept after "
+                 "subtracting %llu of %llu prefill selections\n",
+                 decode_only.size(), entries.size(),
+                 static_cast<unsigned long long>(total_removed),
+                 static_cast<unsigned long long>(
+                     std::accumulate(pf_entries.begin(), pf_entries.end(),
+                                     uint64_t{0},
+                                     [](uint64_t a, const auto &e) {
+                                       return a + e.count;
+                                     })));
+        entries = std::move(decode_only);
+      } else {
+        LOG_WARN("[GGML-QWEN-FULL-SPLIT] %s is not a distinct prefill "
+                 "survey (decode|prefill difference is empty); ranking decode "
+                 "from the combined %s\n",
+                 g.engine->qwen4exp_prefill_graph_pin_file.c_str(),
+                 path.c_str());
+      }
+    }
   }
 
   const auto &c = g.engine->model_file.architecture_config;
@@ -326,8 +392,42 @@ void plan_expert_vram_split(FullGraph &g) {
                      return a.expert < b.expert;
                    });
 
-  size_t remaining_budget =
+  size_t budget_bytes =
       static_cast<size_t>(budget_gb * 1024.0 * 1024.0 * 1024.0);
+  if (prefill_phase) {
+    // Prefill's own workspace and dense arena need VRAM that decode does not:
+    // a prompt batch keeps ~8 MiB/token of device workspace. Cap the prefill
+    // hotset by what is actually free after that reservation instead of
+    // letting the arena squeeze the batch (the batch size is the prefill
+    // throughput knob). Decode then builds the full configured budget.
+    size_t free_b = 0, total_b = 0;
+    const cudaError_t mem = cudaMemGetInfo(&free_b, &total_b);
+    constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+    // Dense graph weights + device state/KV + admission slack.
+    constexpr double kPrefillFixedReserve = 5.0 * kGiB;
+    // The batch workspace is 2.7 MiB/token with GPU op-offload and 8 MiB/token
+    // when the cold experts run on the CPU; budgeting the wrong one either
+    // starves the batch or wastes VRAM the hotset could use.
+    const bool prefill_op_offload = qwen4exp_prefill_op_offload_enabled();
+    const double workspace = static_cast<double>(
+        estimate_prefill_workspace_bytes(g.S, prefill_op_offload));
+    if (mem == cudaSuccess && free_b > 0) {
+      const double available =
+          static_cast<double>(free_b) - kPrefillFixedReserve - workspace;
+      const size_t cap =
+          available > 0.0 ? static_cast<size_t>(available) : 0;
+      if (cap < budget_bytes) {
+        LOG_INFO("[GGML-QWEN-FULL-SPLIT] phase=prefill: capping the resident "
+                 "hotset to %.3f GiB (configured %.3f GiB) so a %d-token "
+                 "batch keeps its %.3f GiB workspace; decode rebuilds the "
+                 "full budget after prefill\n",
+                 static_cast<double>(cap) / kGiB, budget_gb, g.S,
+                 workspace / kGiB);
+        budget_bytes = cap;
+      }
+    }
+  }
+  size_t remaining_budget = budget_bytes;
   std::unordered_map<int, std::unordered_set<int>> chosen;
   size_t experts_placed = 0;
   size_t bytes_spent = 0;
@@ -363,9 +463,12 @@ void plan_expert_vram_split(FullGraph &g) {
           ? 0.0
           : 100.0 * static_cast<double>(hot_usage) /
                 static_cast<double>(total_usage);
-  LOG_INFO("[GGML-QWEN-FULL-SPLIT] budget=%.3f GiB spent=%.3f GiB across %zu "
-           "layer(s), %zu expert(s), usage_coverage=%.2f%%\n",
-           budget_gb, bytes_spent / (1024.0 * 1024.0 * 1024.0),
+  LOG_INFO("[GGML-QWEN-FULL-SPLIT] phase=%s histogram=%s budget=%.3f GiB "
+           "spent=%.3f GiB across %zu layer(s), %zu expert(s), "
+           "usage_coverage=%.2f%%\n",
+           prefill_phase ? "prefill" : "decode", path.c_str(),
+           static_cast<double>(budget_bytes) / (1024.0 * 1024.0 * 1024.0),
+           bytes_spent / (1024.0 * 1024.0 * 1024.0),
            g.split_gpu_expert_ids.size(), experts_placed, usage_coverage);
 }
 

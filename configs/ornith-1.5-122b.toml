@@ -1,0 +1,56 @@
+# Ornith 1.5 122B (qwen35moe) full-graph profile, single RTX 3090.
+#
+# Measured on the RTX 3090 with a 1088-token prompt and 100 generated tokens:
+# prefill 103.4 tok/s, decode 23.5-30.9 tok/s, prefill VRAM ~22 GiB of 25 GiB.
+# The model is supported but its prefill path is untuned: it does not implement
+# the Qwen3.8 workflow (whole-layer VRAM expert block plus op-offload staging
+# of the batch's cold experts). See docs/models/ornith-1.5-122b.md.
+#
+# The usage histograms below are generated per machine, not shipped. Record
+# them with this profile but `qwen4exp_graph_expert_vram_budget_gb = 0` (an
+# empty histogram cannot satisfy the budget gate at startup):
+#   qwen4exp_track_router_usage = true
+#   freeze_usage_stats          = false
+# then point pin_file / prefill_pin_file at the two dumps. prefill_pin_file
+# must be a real prefill survey: decode planning subtracts it from pin_file to
+# rank decode-only traffic.
+
+model_path = "/path/to/Ornith-1.5-122B-UD-IQ3_XXS.gguf"
+context_size   = 4096
+max_new_tokens = 100
+temperature    = 0.0
+
+# Prompt tokens per graph batch. Larger batches amortize the per-batch expert
+# staging; the memory pre-check lowers this when the batch does not fit.
+prefill_batch_tokens = 1024
+
+# Per-machine routing histograms (see the note above).
+pin_file         = "tests/moe_usage_survey/zeromoe_ornith_usage"
+prefill_pin_file = "tests/moe_usage_survey/zeromoe_ornith_prefill_usage"
+
+# VRAM expert budget for the usage-ranked hotset. Prefill caps its resident set
+# to what the batch workspace leaves and decode rebuilds the full budget after
+# prefill releases its arena.
+qwen4exp_graph_expert_vram_budget_gb = 17.0
+
+# Whole routed-expert set preloaded into pinned DDR so the graph binds it
+# directly instead of reading the GGUF per layer.
+ram_pinned_budget_gb    = 45.0
+ram_preload_all_experts = true
+
+# Usage-ranked hotset only: no whole-layer VRAM block (that default starves the
+# prefill batch workspace).
+graph_device_expert_layers = 0
+
+# Stage the batch's cold experts onto the GPU for prefill. Requires the
+# strided host-weight copy in patches/ggml (0018); without it the promoted
+# MUL_MAT_ID reads garbage and the prompt comes out NaN.
+graph_prefill_op_offload = true
+
+# The Qwen early-ready all-split lane assumes a decode-shaped single-token
+# graph and hard-fails on qwen35moe; keep it off for this architecture.
+graph_early_ready_all_split = false
+
+[[gpus]]
+device_id = 0
+role      = "dense+moe"

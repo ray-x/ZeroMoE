@@ -434,6 +434,11 @@ public:
     // copied here since the graph builder has no other route to
     // EngineConfig (it only receives StreamingEngine&).
     std::string qwen4exp_graph_pin_file;
+    // Prefill's own routing histogram (EngineConfig::prefill_pin_file). The
+    // VRAM hotset is planned per phase: prefill ranks what prefill routes,
+    // decode ranks what decode routes, and the two share the same VRAM
+    // window (released/rebuilt at the phase boundary when the batch needs it).
+    std::string qwen4exp_prefill_graph_pin_file;
     std::string exl3_ggml_bridge_model_path;
     int exl3_ggml_bridge_layer = -1;
     std::vector<int> exl3_ggml_bridge_layers;

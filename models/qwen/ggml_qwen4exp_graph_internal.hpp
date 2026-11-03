@@ -389,7 +389,12 @@ struct Qwen4ExpUsageTrackContext {
   int n_layers = 0;
   int n_experts = 0;
   int topk = 0;
-  int32_t *host_ids = nullptr; // pinned, n_layers * topk entries
+  // Tokens this graph batch routed. Decode graphs are always 1; a prefill
+  // graph covers its whole batch, so the id buffer is n_layers*topk*n_tokens
+  // and each token's rows sit at l*(topk*n_tokens) + t*topk.
+  int n_tokens = 1;
+  bool prefill = false; // true => also bump route_freq_prefill
+  int32_t *host_ids = nullptr; // pinned, n_layers * topk * n_tokens entries
   size_t ids_bytes = 0;
   std::atomic<double> last_callback_ms{0.0};
   // Per-layer hot-set membership (empty = layer has no static split).
@@ -678,6 +683,19 @@ std::vector<std::tuple<int, ggml_tensor *>> layer_input_taps;
   // layer loop; usage_track_context owns the single flush marker's pinned
   // buffer/state, built once after the loop.
   ggml_tensor *usage_track_ids = nullptr;
+  // True when build_graph enabled the router-usage tap for this graph (decode
+  // always under qwen4exp_track_router_usage; prefill when a prefill survey is
+  // configured). The Qwen35 layer builder appends its routed ids itself --
+  // the Qwen4Exp branch of build_graph's loop does that inline, but the Qwen35
+  // branch returns from a separate function and `continue`s.
+  bool usage_tap_enabled = false;
+  // Coverage proof for a batched split prefill: how many layers actually took
+  // the hot/cold branch and how many tokens each one routed. A layer whose
+  // compact GPU tensor could not be built falls back to CPU-only (still every
+  // token, every expert) and deliberately does NOT count here, so
+  // layers < n_layers means the hotset served less than the whole prompt.
+  int prefill_split_layers = 0;
+  int prefill_split_tokens = 0;
   std::unique_ptr<struct Qwen4ExpUsageTrackContext> usage_track_context;
   const uint8_t *stage_src_gate = nullptr;
   const uint8_t *stage_src_up = nullptr;
