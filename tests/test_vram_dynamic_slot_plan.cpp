@@ -68,6 +68,22 @@ void test_dual_gpu_preload_preserves_dynamic_slots() {
         "static preload must stop exactly at the planned dynamic reserve");
 }
 
+void test_dynamic_64_slot_candidate_preserves_full_placement_capacity() {
+const auto plan = plan_vram_dynamic_slots(
+64, {{0, 1409, 0}, {1, 1226, 0}});
+check((bool)plan, "64-slot dual-GPU reserve should be feasible");
+check(plan.per_gpu.size() == 2, "64-slot reserve must include both GPUs");
+check(plan.per_gpu[0].gpu_id == 0 && plan.per_gpu[0].slots == 34,
+      "64-slot reserve should assign 34 slots to the 3090");
+check(plan.per_gpu[1].gpu_id == 1 && plan.per_gpu[1].slots == 30,
+      "64-slot reserve should assign 30 slots to the 5060 Ti");
+
+std::vector<VramUnpinnedSlotCount> unpinned = {{0, 1409}, {1, 1226}};
+simulate_static_uploads(plan.per_gpu, unpinned, 2571);
+check(slots_for(unpinned, 0) == 34 && slots_for(unpinned, 1) == 30,
+      "64-slot candidate should preserve its per-GPU staging reserve after static preload");
+}
+
 void test_existing_core_pins_reduce_available_pool() {
   const auto plan = plan_vram_dynamic_slots(
       32, {{0, 1409, 1024}, {1, 1226, 0}});
@@ -167,6 +183,7 @@ void test_deepseek_cpu_offload_is_phase_specific() {
 
 int main() {
   test_dual_gpu_preload_preserves_dynamic_slots();
+test_dynamic_64_slot_candidate_preserves_full_placement_capacity();
   test_existing_core_pins_reduce_available_pool();
   test_infeasible_dynamic_reserve_fails_closed();
   test_dummy_candidate_requires_pinned_matching_ddr_source();

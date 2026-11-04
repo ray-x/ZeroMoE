@@ -965,3 +965,12 @@ The unverified bounce-upload change was removed from the active inference source
 ### v26 swap-threshold chronology from the passive monitor
 
 The saved 2 s monitor samples first show MemAvailable below the configured 4.5 GiB floor at `2026-11-04T05:43:39Z` (2.917 GiB), four seconds after `[PREFILL-DONE]` at `05:43:35Z`. PSI-full avg10 crossed 5% at `05:43:41Z`; ZeroMoE VmSwap exceeded 0.25 GiB and system SwapUsed growth exceeded 0.5 GiB at `05:43:43Z`. The watchdog would trigger on the first low-MemAvailable sample, before the recorded swap growth; this is a replay of saved samples, not a hardware intervention. Two chronology-focused synthetic tests were added, so the watchdog suite is now 6/6. Hardware validation remains unapproved and unperformed.
+
+
+### DeepSeek next cache-capacity A/B prepared (not launched)
+
+A v27 full-residency candidate is prepared at `build_mtp_results/2026-11-04-7f76290-deepseek41-dynamic64-swapguard-v27/`. Its only runtime change from v25 is raising the dynamic VRAM staging reserve from 32 to 64 slots; bounce upload stays disabled. The expected DDR increase is about 0.26 GiB, with exact placement checked by the runtime planner. The saved guarded launcher includes the reusable live swap watchdog and two sequential 959-token/64-token requests; it sends the second only after HTTP 200 for the first.
+
+Current host MemAvailable is 125.973 GB with about 0.002 GiB swap used; this candidate's startup gate requires 127.945 GB including host cap, startup margin, and request headroom, so it will not start in the current state. No server or GPU process is running. No rerun has started after the power reset; wait for user authorization.
+
+The v27 64-slot reserve also passes the offline placement-planner test: 34 dynamic slots on the 3090, 30 on the 5060 Ti, with 2,571 static-resident slots retained. The runtime DDR/VRAM placement remains unverified. Current MemAvailable (125.95 GB) is below the guarded candidate’s 127.945 GB startup requirement, so it is not launchable now; the saved launcher would wait. No hardware load has been started.
