@@ -3,6 +3,7 @@
 // a former local became an EngineRunner member of the same name.
 #include "engine_runner.hpp"
 #include "graph_config.hpp"
+#include "vram_dynamic_slot_plan.hpp"
 
 // Batches up to Ring::CAPACITY/3 packed-format experts' reads into ONE
 // io_uring submission, for the startup [PIN] preload pass -- real
@@ -210,14 +211,33 @@ std::vector<StreamingEngine::UsageEntry> EngineRunner::sanitize_usage_entries(
 }
 
 std::expected<void, std::string> EngineRunner::preload_experts() {
+  int strict_pin_failures = 0;
+  int tier1_pin_fail = 0, tier2_pin_fail = 0;
+  if (config.require_full_moe_residency) {
+    if (!config.ram_preload_all_experts)
+      return std::unexpected("require_full_moe_residency requires ram_preload_all_experts=true");
+    if (!config.pin_global_tiers || config.pin_strategy != "global_topn" ||
+        config.vram_preload_prefix_layers > 0 || engine.qwen4exp_option_b_committed)
+      return std::unexpected(
+          "require_full_moe_residency requires global_topn tiers without "
+          "prefix or Option-B placement");
+    if (!ram_mgr.vram_cache || ram_mgr.vram_cache->expert_vram_cache_cap == 0)
+      return std::unexpected("require_full_moe_residency requires an allocated VRAM expert cache");
+    if (graph_ram_cache)
+      return std::unexpected(
+          "require_full_moe_residency cannot use graph-owned full-layer RAM arenas");
+    for (int layer = 0; layer < (int)engine.layers_experts.size(); ++layer)
+      if (engine.compute_expert_slab_bytes(layer) > 0 && engine.qwen_ram_vram_only_layer(layer))
+        return std::unexpected("require_full_moe_residency cannot omit a VRAM-only MoE layer " +
+                               std::to_string(layer));
+  }
   // Graph families that own a separate expert source must not also build a
   // second cache-sized preload. Qwen/GLM use that policy unless they alias
   // the existing tiers. DeepSeek-V4.1 and opt-in Ling native graphs call the
   // cache-aware dispatcher, so they keep the ordinary usage-ranked preload
   // active in graph mode.
   if ((!graph_mode || graph_ram_cache || graph_uses_native_moe_cache) &&
-      (!config.pin_file.empty() || config.ram_preload_all_experts) &&
-      ram_mgr.vram_cache &&
+      (!config.pin_file.empty() || config.ram_preload_all_experts) && ram_mgr.vram_cache &&
       (ram_graph_cache || ram_mgr.vram_cache->expert_vram_cache_cap > 0)) {
     ram_mgr.vram_cache->startup_preload_phase = true;
     auto [entries, maxc] = StreamingEngine::load_usage(config.pin_file);
@@ -554,13 +574,34 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
             v.push_back({layer, expert, 0});
             ++added;
           }
-          std::stable_sort(
-              v.begin(), v.end(),
-              [](const auto &a, const auto &b) { return a.count > b.count; });
+          std::stable_sort(v.begin(), v.end(),
+                           [](const auto& a, const auto& b) { return a.count > b.count; });
         }
-        LOG_STREAM_INFO()
-            << "[PIN] ram_preload_all_experts: added " << added
-            << " history-missing model experts to the preload manifest\n";
+        LOG_STREAM_INFO() << "[PIN] ram_preload_all_experts: added " << added
+                          << " history-missing model experts to the preload manifest\n";
+      }
+      if (config.require_full_moe_residency) {
+        const int model_experts = engine.model_file.architecture_config.n_experts;
+        for (auto& [layer, v] : by_layer) {
+          if (layer < 0 || layer >= (int)engine.layers_experts.size() ||
+              engine.compute_expert_slab_bytes(layer) == 0)
+            continue;
+          std::vector<uint64_t> counts((size_t)model_experts, 0);
+          for (const auto& entry : v) {
+            if (entry.expert < 0 || entry.expert >= model_experts)
+              return std::unexpected(
+                  "full-residency manifest contains an out-of-range expert identity");
+            counts[(size_t)entry.expert] += entry.count;
+          }
+          v.clear();
+          v.reserve((size_t)model_experts);
+          for (int expert = 0; expert < model_experts; ++expert)
+            v.push_back({layer, expert, counts[(size_t)expert]});
+          std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) {
+            if (a.count != b.count) return a.count > b.count;
+            return a.expert < b.expert;
+          });
+        }
       }
 
       // Option B's static hot set is prepared from the same final ranking
@@ -1140,6 +1181,69 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
         }
       }
 
+  // In strict multi-GPU residency, leave the configured dynamic staging slots
+  // on every GPU instead of letting unrestricted upload_expert() fill the
+  // first pool and strand the entire reserve on the later pool. DeepSeek's
+  // batched prefill needs a local same-layer dummy slot on each participating
+  // GPU, even when the GPU owns no routed expert for that layer.
+  std::vector<zeromoe::memory::VramDynamicSlotReserve>
+      dynamic_vram_reserve_by_gpu;
+  const bool per_gpu_dynamic_reserve = config.require_full_moe_residency &&
+      !gpu.topology.expert_compact_layout &&
+      config.full_moe_vram_dynamic_slots > 0;
+  if (per_gpu_dynamic_reserve) {
+    std::vector<zeromoe::memory::VramSlotPoolCapacity> pools;
+    for (int vi : gpu.topology.vault_gpus) {
+      const int device = gpu.topology.devices[(size_t)vi].id;
+      zeromoe::memory::VramSlotPoolCapacity pool;
+      pool.gpu_id = device;
+      for (const auto &loc : gpu.topology.expert_vram_cache) {
+        if (loc.gpu_id != device || !loc.device_ptr) continue;
+        ++pool.slots;
+        if (loc.pinned) ++pool.pinned;
+      }
+      if (pool.slots) pools.push_back(pool);
+    }
+    const auto plan = zeromoe::memory::plan_vram_dynamic_slots(
+        (size_t)config.full_moe_vram_dynamic_slots, std::move(pools));
+    if (!plan)
+      return std::unexpected("strict full-residency dynamic slot plan failed: " +
+                             plan.error);
+    dynamic_vram_reserve_by_gpu = plan.per_gpu;
+    for (const auto &reserve : dynamic_vram_reserve_by_gpu)
+      LOG_STREAM_INFO() << "[PIN] dynamic VRAM staging reserve: GPU "
+                        << reserve.gpu_id << " keeps " << reserve.slots
+                        << " unpinned slot(s)\n";
+  }
+
+  auto current_unpinned_slots = [&]() {
+    std::vector<zeromoe::memory::VramUnpinnedSlotCount> counts;
+    counts.reserve(dynamic_vram_reserve_by_gpu.size());
+    for (const auto &reserve : dynamic_vram_reserve_by_gpu)
+      counts.push_back({reserve.gpu_id, 0});
+    std::lock_guard<std::recursive_mutex> lock(gpu.topology.cache_mutex);
+    for (size_t slot : gpu.topology.unpinned_slot_indices) {
+      if (slot >= gpu.topology.expert_vram_cache.size()) continue;
+      const int device = gpu.topology.expert_vram_cache[slot].gpu_id;
+      for (auto &count : counts)
+        if (count.gpu_id == device) {
+          ++count.slots;
+          break;
+        }
+    }
+    return counts;
+  };
+  auto static_upload_target = [&](int layer, int expert) {
+    if (dynamic_vram_reserve_by_gpu.empty()) return -1;
+    {
+      std::lock_guard<std::recursive_mutex> lock(gpu.topology.cache_mutex);
+      if (const auto *loc = gpu.topology.find_expert(layer, expert))
+        return loc->gpu_id;
+    }
+    return zeromoe::memory::choose_static_vram_upload_gpu(
+        dynamic_vram_reserve_by_gpu, current_unpinned_slots());
+  };
+
       // Concentration diagnostic: pinning a FIXED top-K per layer only
       // helps future (unseen) prompts to the extent that layer's
       // historical routing is actually concentrated in that top-K --
@@ -1267,12 +1371,12 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
       // (now itself logged in detail by upload_expert -- see
       // n_upload_expert_no_victim/n_upload_expert_memcpy_fail).
       int tier1_disk_fail = 0, tier1_upload_fail = 0;
+      int strict_vram_pinned = 0;
       int tier2_disk_fail = 0, tier2_upload_fail = 0;
       // pin_global_tiers: per-layer VRAM-LRU and RAM preload counts from one
       // global ranking of what remains after each layer's pinned prefix.
       // The totals equal what the per-layer rule would have loaded.
-      const bool global_tiers = config.pin_global_tiers && global_topn &&
-                                !prefix_vram &&
+      const bool global_tiers = config.pin_global_tiers && global_topn && !prefix_vram &&
                                 !engine.qwen4exp_option_b_committed;
       std::unordered_map<int, int> global_lru_count, global_ram_count;
       if (global_tiers) {
@@ -1292,10 +1396,9 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
               !engine.layers_experts[(size_t)layer].empty())
             layers.push_back(layer);
         std::sort(layers.begin(), layers.end());
-        auto rank_remaining = [&](const std::unordered_map<int, int> &start,
-                                  const std::unordered_map<int, int> &limit,
-                                  long budget,
-                                  std::unordered_map<int, int> &out) {
+        auto rank_remaining = [&](const std::unordered_map<int, int>& start,
+                                  const std::unordered_map<int, int>& limit, long budget,
+                                  std::unordered_map<int, int>& out) {
           std::vector<TierCand> cands;
           for (int layer : layers) {
             const auto &v = by_layer[layer];
@@ -1321,24 +1424,87 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
         // Tier 2 (VRAM-LRU pre-warm): same total as the uniform rule.
         std::unordered_map<int, int> pin_start, vram_room;
         long lru_budget = 0;
+        long planned_pin_slots = 0;
         for (int layer : layers) {
           const int n = (int)by_layer[layer].size();
-          const int pins = std::min(layer_pin_count.count(layer)
-                                        ? layer_pin_count[layer] : 0, n);
+          const int pins = std::min(layer_pin_count.count(layer) ? layer_pin_count[layer] : 0, n);
+          planned_pin_slots += pins;
           pin_start[layer] = pins;
           int room = n - pins;
           if (!compact_layer_capacity.empty()) {
             auto it = compact_layer_capacity.find(layer);
-            room = std::min(room, it == compact_layer_capacity.end()
-                                      ? 0 : it->second - pins);
+            room = std::min(room, it == compact_layer_capacity.end() ? 0 : it->second - pins);
           }
           room = std::max(0, room);
           if (is_cpu_affinity_layer(layer)) room = 0;
           vram_room[layer] = room;
-          lru_budget += std::min(vram_lru_n, room);
+          lru_budget += config.require_full_moe_residency ? room : std::min(vram_lru_n, room);
         }
-        const long lru_taken =
-            rank_remaining(pin_start, vram_room, lru_budget, global_lru_count);
+        const long dynamic_vram_slots =
+            config.require_full_moe_residency ? std::max(0, config.full_moe_vram_dynamic_slots) : 0;
+        if (config.require_full_moe_residency) {
+          const long cache_capacity = (long)std::min<size_t>(
+              ram_mgr.vram_cache->expert_vram_cache_cap, (size_t)std::numeric_limits<long>::max());
+          const long after_pins = std::max(0L, cache_capacity - planned_pin_slots);
+          lru_budget = std::min(lru_budget, std::max(0L, after_pins - dynamic_vram_slots));
+        }
+        const long lru_taken = rank_remaining(pin_start, vram_room, lru_budget, global_lru_count);
+        if (config.require_full_moe_residency) {
+          if (!global_tiers)
+            return std::unexpected("full-MoE residency requires the global three-tier planner");
+          const int model_experts = engine.model_file.architecture_config.n_experts;
+          std::vector<int> ram_caps(engine.layers_experts.size(), 0);
+          size_t required_ram_slots = 0;
+          size_t required_ram_bytes = 0;
+          int planned_vram_slots = 0;
+          for (const auto& [layer, pins] : layer_pin_count) planned_vram_slots += pins;
+          for (int layer : layers) {
+            const int n = (int)by_layer[layer].size();
+            if (n != model_experts)
+              return std::unexpected(
+                  "full-residency manifest does not cover every expert in layer " +
+                  std::to_string(layer));
+            const bool aff = is_cpu_affinity_layer(layer);
+            const int vram_count =
+                aff ? 0 : std::min(n, pin_start[layer] + global_lru_count[layer]);
+            const int ddr_count = n - vram_count;
+            const size_t slab_bytes = engine.compute_expert_slab_bytes(layer);
+            if (slab_bytes == 0 ||
+                (size_t)ddr_count >
+                    (std::numeric_limits<size_t>::max() - required_ram_bytes) / slab_bytes)
+              return std::unexpected("full-residency DDR byte estimate overflowed at layer " +
+                                     std::to_string(layer));
+            ram_caps[(size_t)layer] = ddr_count;
+            required_ram_slots += (size_t)ddr_count;
+            required_ram_bytes += (size_t)ddr_count * slab_bytes;
+          }
+          if (ram_mgr.configured_total_experts > 0 &&
+              required_ram_slots > (size_t)ram_mgr.configured_total_experts)
+            return std::unexpected("full-residency DDR complement needs " +
+                                   std::to_string(required_ram_slots) + " slots, exceeding " +
+                                   std::to_string(ram_mgr.configured_total_experts) +
+                                   " ram_cache_total_experts");
+          const double headroom_bytes_f = config.full_moe_host_headroom_gb * 1.0e9;
+          if (!std::isfinite(headroom_bytes_f) || headroom_bytes_f < 0.0 ||
+              headroom_bytes_f > (double)std::numeric_limits<size_t>::max())
+            return std::unexpected("full-residency host request headroom is not representable");
+          const size_t headroom_bytes = (size_t)std::ceil(headroom_bytes_f);
+          if (required_ram_bytes > std::numeric_limits<size_t>::max() - headroom_bytes ||
+              required_ram_bytes + headroom_bytes > ram_mgr.ram_expert_budget_bytes)
+            return std::unexpected("full-residency DDR complement plus " +
+                                   std::to_string(config.full_moe_host_headroom_gb) +
+                                   " GB prefill/request headroom exceeds the safe byte budget " +
+                                   std::to_string((double)ram_mgr.ram_expert_budget_bytes / 1.0e9) +
+                                   " GB; increase VRAM placement or lower other host allocations");
+          ram_mgr.full_residency_cap_by_layer = std::move(ram_caps);
+          LOG_STREAM_INFO() << "[FULL-RESIDENCY-PLAN] DDR=" << required_ram_slots << " slots/"
+                            << (double)required_ram_bytes / 1.0e9
+                            << " GB, VRAM=" << planned_vram_slots + (int)lru_taken
+                            << " resident slots, dynamic VRAM reserve=" << dynamic_vram_slots
+                            << " empty/evictable slots, host request headroom="
+                            << config.full_moe_host_headroom_gb
+                            << " GB; DDR holds the exact per-layer complement\n";
+        }
         // Tier 3 (RAM preload): same total as the uniform rule, starting
         // after each layer's VRAM entries.
         std::unordered_map<int, int> ram_start, ram_room;
@@ -1346,18 +1512,26 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
         for (int layer : layers) {
           const int n = (int)by_layer[layer].size();
           const bool aff = is_cpu_affinity_layer(layer);
-          const int s0 = aff ? 0
-                             : std::min(n, pin_start[layer] +
-                                               global_lru_count[layer]);
+          const int s0 = aff ? 0 : std::min(n, pin_start[layer] + global_lru_count[layer]);
           ram_start[layer] = s0;
-          const int limit = layer_ram_limit(layer);
+          const int limit = config.require_full_moe_residency
+                                ? ram_mgr.full_residency_cap_by_layer[(size_t)layer]
+                                : layer_ram_limit(layer);
           ram_room[layer] = std::max(0, std::min(limit, n - s0));
-          ram_budget += config.ram_preload_all_experts
-                            ? ram_room[layer]
-                            : std::min(ram_n, ram_room[layer]);
+          ram_budget +=
+              config.ram_preload_all_experts ? ram_room[layer] : std::min(ram_n, ram_room[layer]);
         }
-        const long ram_taken =
-            rank_remaining(ram_start, ram_room, ram_budget, global_ram_count);
+        const long ram_taken = rank_remaining(ram_start, ram_room, ram_budget, global_ram_count);
+        if (config.require_full_moe_residency) {
+          if (ram_taken != ram_budget)
+            return std::unexpected(
+                "full-residency DDR planner could not assign every complementary expert");
+          for (int layer : layers)
+            if (global_ram_count[layer] != ram_room[layer])
+              return std::unexpected(
+                  "full-residency DDR planner left an unassigned expert in layer " +
+                  std::to_string(layer));
+        }
         int lmin = 1 << 30, lmax = 0, rmin = 1 << 30, rmax = 0;
         for (int layer : layers) {
           lmin = std::min(lmin, global_lru_count[layer]);
@@ -1365,10 +1539,9 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
           rmin = std::min(rmin, global_ram_count[layer]);
           rmax = std::max(rmax, global_ram_count[layer]);
         }
-        LOG_STREAM_INFO() << "[PIN] global tiers: VRAM-LRU " << lru_taken << "/"
-                          << lru_budget << " (per layer " << lmin << ".."
-                          << lmax << "), RAM preload " << ram_taken << "/"
-                          << ram_budget << " (per layer " << rmin << ".."
+        LOG_STREAM_INFO() << "[PIN] global tiers: VRAM-LRU " << lru_taken << "/" << lru_budget
+                          << " (per layer " << lmin << ".." << lmax << "), RAM preload "
+                          << ram_taken << "/" << ram_budget << " (per layer " << rmin << ".."
                           << rmax << "), RAM starts after VRAM entries\n";
       }
       for (auto &[layer, v] : by_layer) {
@@ -1509,17 +1682,26 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
               // double-count the redirect diagnostics below
               // without changing where anything lands --
               // confirmed real on a first attempt at this).
-              ExpertLocation *loc = gpu.topology.upload_expert(
+              const int target_gpu =
+                  static_upload_target(v[i + j].layer, v[i + j].expert);
+              if (!dynamic_vram_reserve_by_gpu.empty() && target_gpu < 0) {
+                ++tier1_upload_fail;
+                LOG_ERROR("[PIN] no VRAM target remains for tier-1 expert layer=%d expert=%d without consuming a per-GPU dynamic slot\n",
+                          v[i + j].layer, v[i + j].expert);
+                engine.release_slab(s);
+                continue;
+              }
+              ExpertLocation* loc = gpu.topology.upload_expert(
                   v[i + j].layer, v[i + j].expert, s.slab_buffer,
-                  s.slab_capacity, -1, true);
-              if (loc &&
-                  gpu.topology.pin_expert(v[i + j].layer, v[i + j].expert)) {
-                gpu.topology.mark_startup_preloaded(v[i + j].layer,
-                                                    v[i + j].expert);
+                  s.slab_capacity, target_gpu, true);
+              if (loc && gpu.topology.pin_expert(v[i + j].layer, v[i + j].expert)) {
+                gpu.topology.mark_startup_preloaded(v[i + j].layer, v[i + j].expert);
                 ++pinned;
-                ++total_pinned; // Three-tier: track global pinned count
+                ++total_pinned;  // Three-tier: track global pinned count
               } else if (!loc) {
                 ++tier1_upload_fail;
+              } else {
+                ++tier1_pin_fail;
               }
             } else {
               ++tier1_disk_fail;
@@ -1557,14 +1739,31 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
             ++attempted;
             MoEExpertBlock &s = scratch[j];
             if (s.slab_buffer && s.slab_capacity > 0) {
-              if (gpu.topology.upload_expert(v[i + j].layer, v[i + j].expert,
-                                             s.slab_buffer, s.slab_capacity, -1,
-                                             true)) {
+              const int target_gpu =
+                  static_upload_target(v[i + j].layer, v[i + j].expert);
+              if (!dynamic_vram_reserve_by_gpu.empty() && target_gpu < 0) {
+                ++tier2_upload_fail;
+                LOG_ERROR("[PIN] no VRAM target remains for tier-2 expert layer=%d expert=%d without consuming a per-GPU dynamic slot\n",
+                          v[i + j].layer, v[i + j].expert);
+              } else if (gpu.topology.upload_expert(
+                             v[i + j].layer, v[i + j].expert, s.slab_buffer,
+                             s.slab_capacity, target_gpu, true)) {
                 gpu.topology.mark_startup_preloaded(v[i + j].layer,
                                                     v[i + j].expert);
                 ++vram_lru;
+                if (config.require_full_moe_residency) {
+                  if (gpu.topology.pin_expert(v[i + j].layer,
+                                              v[i + j].expert)) {
+                    ++strict_vram_pinned;
+                    ++total_pinned;
+                  } else {
+                    ++tier2_pin_fail;
+                  }
+                }
               } else {
                 ++tier2_upload_fail;
+                LOG_ERROR("[PIN] tier-2 upload failed for layer=%d expert=%d target GPU=%d\n",
+                          v[i + j].layer, v[i + j].expert, target_gpu);
               }
             } else {
               ++tier2_disk_fail;
@@ -1719,20 +1918,24 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
           off += chunk_n;
         }
       }
-      LOG_STREAM_INFO() << "[PIN] Batched io_uring preload: "
-                        << preload_uring_chunks_ok << " chunk(s) batched / "
-                        << preload_uring_chunks_fallback
+      LOG_STREAM_INFO() << "[PIN] Batched io_uring preload: " << preload_uring_chunks_ok
+                        << " chunk(s) batched / " << preload_uring_chunks_fallback
                         << " chunk(s) fell back to the original "
                            "single-expert-at-a-time load (ring "
                            "unavailable, a non-packed-format layer, or a "
                            "short/failed read -- see "
                            "preload_batch_load's own comment)\n";
-      LOG_STREAM_INFO() << "[PIN] Preloaded " << pinned << " VRAM-pinned + "
-                        << vram_lru << " VRAM-unpinned + " << ram_preloaded
-                        << " RAM (of " << attempted << " attempted).\n";
+      if (config.require_full_moe_residency) {
+        LOG_STREAM_INFO() << "[PIN] Full-residency preload: " << pinned + strict_vram_pinned
+                          << " permanently pinned VRAM + " << ram_preloaded << " DDR experts (of "
+                          << attempted << " attempted).\n";
+      } else {
+        LOG_STREAM_INFO() << "[PIN] Preloaded " << pinned << " VRAM-pinned + " << vram_lru
+                          << " VRAM-unpinned + " << ram_preloaded << " RAM (of " << attempted
+                          << " attempted).\n";
+      }
       if (pin_core_gpu_redirected || pin_core_gpu_redirect_fallback) {
-        LOG_STREAM_INFO() << "[PIN] pin_core_gpu_top_n: "
-                          << pin_core_gpu_redirected
+        LOG_STREAM_INFO() << "[PIN] pin_core_gpu_top_n: " << pin_core_gpu_redirected
                           << " expert(s) landed on the CoreEngine GPU (gpu="
                           << gpu.topology.core_gpu << ") as intended, "
                           << pin_core_gpu_redirect_fallback
@@ -1740,38 +1943,34 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
                              "own slots were full "
                              "by the time they were reached)\n";
       }
-      if (tier1_disk_fail || tier1_upload_fail || tier2_disk_fail ||
-          tier2_upload_fail) {
-        LOG_STREAM_WARN()
-            << "[PIN] Preload attrition -- Tier1(pinned): " << tier1_disk_fail
-            << " disk-read failures, " << tier1_upload_fail
-            << " GPU-upload rejections | "
-            << "Tier2(unpinned): " << tier2_disk_fail << " disk-read failures, "
-            << tier2_upload_fail << " GPU-upload rejections "
-            << "(see [MOE-VRAM] upload_expert error lines above for the "
-               "specific "
-            << "cudaMemcpy/evict_lru cause of any upload rejections).\n";
+      if (tier1_disk_fail || tier1_upload_fail || tier1_pin_fail || tier2_disk_fail ||
+          tier2_upload_fail || tier2_pin_fail) {
+        LOG_STREAM_WARN() << "[PIN] Preload attrition -- Tier1(pinned): " << tier1_disk_fail
+                          << " disk-read failures, " << tier1_upload_fail
+                          << " GPU-upload rejections, " << tier1_pin_fail << " GPU-pin failures | "
+                          << "Tier2(unpinned): " << tier2_disk_fail << " disk-read failures, "
+                          << tier2_upload_fail << " GPU-upload rejections " << tier2_pin_fail
+                          << " GPU-pin failures "
+                          << "(see [MOE-VRAM] upload_expert error lines above for the "
+                             "specific "
+                          << "cudaMemcpy/evict_lru cause of any upload rejections).\n";
       }
 
       // Three-tier caching: Log final pinned count
       if (max_pinned_total > 0) {
         const int physical_vram_target = std::min(
-            max_pinned_total,
-            (int)std::min<size_t>(
-                ram_mgr.vram_cache->expert_vram_cache_cap,
-                (size_t)std::numeric_limits<int>::max()));
+            max_pinned_total, (int)std::min<size_t>(ram_mgr.vram_cache->expert_vram_cache_cap,
+                                                    (size_t)std::numeric_limits<int>::max()));
         LOG_STREAM_INFO() << "[PIN] Three-tier: " << total_pinned
                           << " experts pinned (target: " << physical_vram_target
-                          << ", configured: " << max_pinned_total
-                          << ") across " << vram_moe_layers
+                          << ", configured: " << max_pinned_total << ") across " << vram_moe_layers
                           << " GPU-executed layers (" << moe_layers
                           << " total MoE layers; CPU-affinity layers excluded) ("
-                          << (total_pinned >= physical_vram_target
-                                  ? "target met"
-                                  : "below target")
+                          << (total_pinned >= physical_vram_target ? "target met" : "below target")
                           << ")\n";
       }
     }
+    strict_pin_failures = tier1_pin_fail + tier2_pin_fail;
     ram_mgr.vram_cache->startup_preload_phase = false;
 
     if (ram_graph_cache) {
@@ -1781,18 +1980,58 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
       for (int layer = 0; layer < n_graph_layers; ++layer) {
         if (engine.graph_ram_layer_allocated(layer)) {
           ++allocated;
-          if (engine.graph_ram_layer_ready(layer))
-            ++ready;
+          if (engine.graph_ram_layer_ready(layer)) ++ready;
         }
       }
-      LOG_STREAM_INFO() << "[GRAPH-RAM] post-preload: " << ready << "/"
-                        << allocated
+      LOG_STREAM_INFO() << "[GRAPH-RAM] post-preload: " << ready << "/" << allocated
                         << " arena layer(s) have the required expert-ID"
                            " mapping and host tensor views\n";
-
     }
   }
 
+  if (config.require_full_moe_residency) {
+    if (strict_pin_failures != 0)
+      return std::unexpected("full-residency preload failed to pin every assigned VRAM expert");
+    const int n_experts = engine.model_file.architecture_config.n_experts;
+    size_t total_experts = 0;
+    size_t resident_experts = 0;
+    size_t ddr_experts = 0;
+    size_t vram_experts = 0;
+    size_t missing_experts = 0;
+    std::string missing_sample;
+    for (int layer = 0; layer < (int)engine.layers_experts.size(); ++layer) {
+      if (engine.compute_expert_slab_bytes(layer) == 0) continue;
+      total_experts += (size_t)n_experts;
+      std::vector<unsigned char> in_ddr((size_t)n_experts, 0);
+      const auto& slots = engine.layers_experts[(size_t)layer];
+      const size_t cap = std::min(slots.size(), (size_t)std::max(0, ram_mgr.cap_for_layer(layer)));
+      for (size_t i = 0; i < cap; ++i) {
+        const int expert = slots[i].expert_id;
+        if (expert >= 0 && expert < n_experts) in_ddr[(size_t)expert] = 1;
+      }
+      for (int expert = 0; expert < n_experts; ++expert) {
+        const bool ddr = in_ddr[(size_t)expert] != 0;
+        const bool vram = gpu.topology.main_layer_has(layer, expert);
+        ddr_experts += ddr ? 1 : 0;
+        vram_experts += vram ? 1 : 0;
+        if (ddr || vram) {
+          ++resident_experts;
+        } else {
+          if (missing_experts < 8) {
+            if (!missing_sample.empty()) missing_sample += ", ";
+            missing_sample += "(" + std::to_string(layer) + "," + std::to_string(expert) + ")";
+          }
+          ++missing_experts;
+        }
+      }
+    }
+    LOG_STREAM_INFO() << "[FULL-RESIDENCY-CHECK] resident=" << resident_experts << "/"
+                      << total_experts << " identities; DDR=" << ddr_experts
+                      << ", VRAM=" << vram_experts << ", missing=" << missing_experts << "\n";
+    if (missing_experts != 0)
+      return std::unexpected("full-residency verification found " +
+                             std::to_string(missing_experts) + " cold experts: " + missing_sample);
+  }
 
   // 2026-08-29: EngineConfig::ram_pin_eager_preregister's FIRST
   // implementation lived here -- RAMSafetyManager::eager_preregister_

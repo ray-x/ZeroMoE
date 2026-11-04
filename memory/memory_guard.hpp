@@ -31,10 +31,12 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include "logger.hpp"
 // Deliberately does NOT include perf_timer.hpp: that header includes this one
 // (for the shutdown report), and the cycle only survives on #pragma once.
@@ -93,6 +95,24 @@ inline bool physical_host_budget_allows(size_t startup_available,
     return true;
 }
 
+// MemAvailable can remain high while the kernel is moving anonymous pages to
+// swap to make room for file cache. Treat sustained reclaim as pressure too.
+inline bool memory_reclaim_pressure_should_block(double mem_available_gib,
+                                                 double psi_full_avg10_pct,
+                                                 double psi_some_avg10_pct,
+                                                 double swapout_mib_per_sec) {
+  constexpr double kFullPressurePct = 4.0;
+  constexpr double kFullPressureMemGiB = 32.0;
+  constexpr double kSomePressurePct = 20.0;
+  constexpr double kSomePressureMemGiB = 48.0;
+  constexpr double kSwapoutMiBPerSec = 64.0;
+  return swapout_mib_per_sec >= kSwapoutMiBPerSec ||
+         (psi_full_avg10_pct >= kFullPressurePct &&
+          mem_available_gib < kFullPressureMemGiB) ||
+         (psi_some_avg10_pct >= kSomePressurePct &&
+          mem_available_gib < kSomePressureMemGiB);
+}
+
 class MemoryGuard {
 public:
     static constexpr long kMinimumHostReserveMiB = 10 * 1024;
@@ -100,6 +120,13 @@ public:
         return requested_mb < kMinimumHostReserveMiB
             ? kMinimumHostReserveMiB : requested_mb;
     }
+  static constexpr long resolve_stop_limit_mb(long requested_mb,
+                                               long graph_override_mb) {
+    const long default_floor = effective_stop_limit_mb(requested_mb);
+    return graph_override_mb >=
+                   zeromoe::graphsettings::kMinimumConfigurableMemGuardFloorMiB
+        ? graph_override_mb : default_floor;
+  }
     // `host_ram_gb` is the process-wide host-memory ceiling, not merely a
     // suggestion for the RAM expert cache. Resident tensors, KV/state, RAM
     // slabs, graph source, and MTP scratch all share this ledger. A value of
@@ -147,10 +174,11 @@ public:
 
     void start(long warn_mb, long stop_mb, int poll_ms) {
         if (running_.load()) return;
-        stop_mb_ = effective_stop_limit_mb(stop_mb);
-        // Experiment-only override (ZEROMOE_MEM_GUARD_FLOOR_MB): lets an A/B run use a lower host reserve than the 10 GiB default.
-        const long v = zeromoe::graphsettings::active_settings().tun.mem_guard_floor_mb.value;
-        if (v >= 8 * 1024) stop_mb_ = v;
+    // Explicit graph setting can lower the default floor, but only to the
+    // supported 4.5 GiB minimum. The config parser enforces the same bound.
+    stop_mb_ = resolve_stop_limit_mb(
+        stop_mb_,
+        zeromoe::graphsettings::active_settings().tun.mem_guard_floor_mb.value);
         warn_mb_ = std::max(warn_mb, stop_mb_);
         poll_ms_ = poll_ms > 0 ? poll_ms : 500;
         stop_limit_mb_.store(stop_mb_, std::memory_order_relaxed);
@@ -272,8 +300,54 @@ public:
     static long stop_limit_mb() { return stop_limit_mb_.load(std::memory_order_relaxed); }
 
 private:
+struct PressureSample {
+double some_avg10_pct = -1.0;
+double full_avg10_pct = -1.0;
+uint64_t swapout_pages = 0;
+bool swapout_valid = false;
+};
+
+static double parse_avg10(const char *line) {
+const char *field = std::strstr(line, "avg10=");
+if (!field) return -1.0;
+field += 6;
+char *end = nullptr;
+const double value = std::strtod(field, &end);
+return end == field ? -1.0 : value;
+}
+
+static PressureSample read_pressure_sample() {
+PressureSample sample;
+if (FILE *f = std::fopen("/proc/pressure/memory", "r")) {
+char line[256];
+while (std::fgets(line, sizeof(line), f)) {
+if (std::strncmp(line, "some ", 5) == 0)
+sample.some_avg10_pct = parse_avg10(line);
+else if (std::strncmp(line, "full ", 5) == 0)
+sample.full_avg10_pct = parse_avg10(line);
+}
+std::fclose(f);
+}
+if (FILE *f = std::fopen("/proc/vmstat", "r")) {
+char line[256];
+while (std::fgets(line, sizeof(line), f)) {
+unsigned long long pages = 0;
+if (std::sscanf(line, "pswpout %llu", &pages) == 1) {
+sample.swapout_pages = static_cast<uint64_t>(pages);
+sample.swapout_valid = true;
+break;
+}
+}
+std::fclose(f);
+}
+return sample;
+}
+
     void loop() {
         bool was_blocked = false, was_warned = false;
+int pressure_streak = 0;
+PressureSample previous_pressure = read_pressure_sample();
+const long page_size = std::max(1L, sysconf(_SC_PAGESIZE));
         while (running_.load()) {
             const long mb = read_available_mb();
             if (mb >= 0) {
@@ -281,19 +355,39 @@ private:
                 long prev = min_mb_.load(std::memory_order_relaxed);
                 while (mb < prev && !min_mb_.compare_exchange_weak(prev, mb)) {}
 
-                const bool block = (mb < stop_mb_);
-                blocked_.store(block, std::memory_order_relaxed);
-                if (block && !was_blocked) {
-                    n_block_.fetch_add(1, std::memory_order_relaxed);
-                    LOG_ERROR("[MEM-GUARD] MemAvailable %ld MB < stop threshold %ld MB -- "
-                              "BLOCKING further host allocations. The RAM tier will re-read "
-                              "these experts instead of growing; that is bounded, whereas "
-                              "allocating into thrash is not.\n", mb, stop_mb_);
-                } else if (!block && was_blocked) {
-                    LOG_STREAM_INFO() << "[MEM-GUARD] recovered: MemAvailable " << mb
-                                      << " MB >= " << stop_mb_ << " MB, allocations re-enabled\n";
-                }
-                was_blocked = block;
+                const PressureSample pressure = read_pressure_sample();
+double swapout_mib_per_sec = 0.0;
+if (pressure.swapout_valid && previous_pressure.swapout_valid &&
+    pressure.swapout_pages >= previous_pressure.swapout_pages) {
+    const double elapsed_s =
+        std::max(0.001, static_cast<double>(poll_ms_) / 1000.0);
+    swapout_mib_per_sec =
+        static_cast<double>(pressure.swapout_pages -
+                            previous_pressure.swapout_pages) *
+        static_cast<double>(page_size) / elapsed_s / (1024.0 * 1024.0);
+}
+const bool pressure_high = memory_reclaim_pressure_should_block(
+    static_cast<double>(mb) / 1024.0, pressure.full_avg10_pct,
+    pressure.some_avg10_pct, swapout_mib_per_sec);
+pressure_streak = pressure_high ? std::min(pressure_streak + 1, 2) : 0;
+const bool pressure_block = pressure_streak >= 2;
+const bool block = (mb < stop_mb_) || pressure_block;
+blocked_.store(block, std::memory_order_relaxed);
+if (block && !was_blocked) {
+    n_block_.fetch_add(1, std::memory_order_relaxed);
+    LOG_ERROR("[MEM-GUARD] blocking host allocations: "
+              "MemAvailable=%ld MB (floor=%ld MB), "
+              "memory PSI some/full avg10=%.2f/%.2f%%, "
+              "swap-out=%.1f MiB/s.\n",
+              mb, stop_mb_, pressure.some_avg10_pct,
+              pressure.full_avg10_pct, swapout_mib_per_sec);
+} else if (!block && was_blocked) {
+    LOG_STREAM_INFO() << "[MEM-GUARD] recovered: MemAvailable " << mb
+                      << " MB and reclaim pressure subsided, "
+                      << "allocations re-enabled\n";
+}
+was_blocked = block;
+previous_pressure = pressure;
 
                 if (!block && mb < warn_mb_ && !was_warned) {
                     LOG_WARN("[MEM-GUARD] MemAvailable %ld MB is below the warn threshold "

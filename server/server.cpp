@@ -443,69 +443,71 @@ struct Server::Impl {
             cv.notify_all();
         });
         struct ListenerGuard {
-            Impl &owner;
-            std::thread &thread;
-            ~ListenerGuard() { owner.stop(); if (thread.joinable()) thread.join(); }
+          Impl& owner;
+          std::thread& thread;
+          ~ListenerGuard() {
+            owner.stop();
+            if (thread.joinable()) thread.join();
+          }
         } listener_guard{*this, listener};
-        std::string fatal_error;
         std::fprintf(stderr, "[API] listening on %s:%d\n", options.host.c_str(), port);
         while (!stopping && !should_stop()) {
-            std::shared_ptr<Job> job;
-            {
-                std::unique_lock lock(mutex);
-                cv.wait_for(lock, std::chrono::milliseconds(50), [&] { return stopping || !queue.empty(); });
-                if (queue.empty()) continue;
-                job = queue.front();
-                queue.pop_front();
-                active = job;
+          std::shared_ptr<Job> job;
+          {
+            std::unique_lock lock(mutex);
+            cv.wait_for(lock, std::chrono::milliseconds(50),
+                        [&] { return stopping || !queue.empty(); });
+            if (queue.empty()) continue;
+            job = queue.front();
+            queue.pop_front();
+            active = job;
+          }
+          if (!job->cancel) {
+            try {
+              Prepared prepared = backend.prepare(job->request);
+              if (prepared.tokens.empty()) throw ApiError(400, "empty tokenized prompt");
+              if (prepared.tokens.size() > static_cast<size_t>(model.context_size) ||
+                  (!job->count_only &&
+                   static_cast<size_t>(job->request.max_tokens) >
+                       static_cast<size_t>(model.context_size) - prepared.tokens.size()))
+                throw ApiError(400, "prompt and output exceed model context");
+              Event first;
+              first.result.usage.prompt_tokens = static_cast<int>(prepared.tokens.size());
+              if (job->push(first) && !job->count_only) {
+                StopFilter filter(job->request.stops,
+                                  [&](const auto& s) { return job->push({Event::Text, s}); });
+                Result result = backend.generate(job->request, prepared, job->cancel,
+                                                 [&](const auto& s) { return filter.feed(s); });
+                filter.finish();
+                if (filter.stopped) {
+                  result.finish = Finish::Stop;
+                  result.stop_sequence = filter.matched;
+                } else if (result.finish == Finish::Cancelled)
+                  throw ApiError(408, "generation cancelled");
+                Event done{Event::Done};
+                done.result = result;
+                job->push(std::move(done));
+              }
+            } catch (const ApiError& e) {
+              std::fprintf(stderr, "[API] inference request failed: %s\n", e.what());
+              Event error{Event::Error, e.what()};
+              error.status = e.status;
+              job->push(std::move(error));
+            } catch (const std::exception& e) {
+              std::fprintf(stderr, "[API] inference request failed; keeping server alive: %s\n",
+                           e.what());
+              Event error{Event::Error, e.what()};
+              error.status = 500;
+              job->push(std::move(error));
             }
-            if (!job->cancel) {
-                try {
-                    Prepared prepared = backend.prepare(job->request);
-                    if (prepared.tokens.empty()) throw ApiError(400, "empty tokenized prompt");
-                    if (prepared.tokens.size() > static_cast<size_t>(model.context_size) ||
-                        (!job->count_only && static_cast<size_t>(job->request.max_tokens) >
-                         static_cast<size_t>(model.context_size) - prepared.tokens.size()))
-                        throw ApiError(400, "prompt and output exceed model context");
-                    Event first;
-                    first.result.usage.prompt_tokens = static_cast<int>(prepared.tokens.size());
-                    if (job->push(first) && !job->count_only) {
-                        StopFilter filter(job->request.stops, [&](const auto &s) {
-                            return job->push({Event::Text, s});
-                        });
-                        Result result = backend.generate(job->request, prepared, job->cancel,
-                                                         [&](const auto &s) { return filter.feed(s); });
-                        filter.finish();
-                        if (filter.stopped) {
-                            result.finish = Finish::Stop;
-                            result.stop_sequence = filter.matched;
-                        }
-                        else if (result.finish == Finish::Cancelled)
-                            throw ApiError(408, "generation cancelled");
-                        Event done{Event::Done};
-                        done.result = result;
-                        job->push(std::move(done));
-                    }
-                } catch (const ApiError &e) {
-                    std::fprintf(stderr, "[API] inference request failed: %s\n", e.what());
-                    Event error{Event::Error, e.what()};
-                    error.status = e.status;
-                    job->push(std::move(error));
-                } catch (const std::exception &e) {
-                    std::fprintf(stderr, "[API] fatal inference error: %s\n", e.what());
-                    job->push({Event::Error, "inference runtime failed"});
-                    fatal_error = e.what();
-                    stopping = true;
-                }
-            }
-            {
-                std::lock_guard lock(mutex);
-                active.reset();
-            }
+          }
+          {
+            std::lock_guard lock(mutex);
+            active.reset();
+          }
         }
         stop();
         listener.join();
-        if (!fatal_error.empty()) throw std::runtime_error(fatal_error);
         if (listener_failed) throw std::runtime_error("HTTP listener failed");
     }
 };

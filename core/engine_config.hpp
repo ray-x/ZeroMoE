@@ -76,6 +76,9 @@ struct EngineConfig {
   std::string api_key;
   // Model paths
   std::string model_path; // Primary model GGUF (experts + architecture)
+  // Optional DeepSeek-V4.1 Engram lookup-table GGUF. Keep it separate so
+  // sidecar metadata cannot replace the base model architecture.
+  std::string engram_model_path;
   std::string model_format = "gguf";
   std::string exl3_backend = "native";
   std::string exl3_ggml_bridge_model_path;
@@ -1245,6 +1248,9 @@ struct EngineConfig {
   // uses only the remainder after those other allocations are charged.
   // 0 = auto-detect (88% of currently-available system memory).
   double host_ram_gb = 0.0;
+  // Optional per-run override for startup admission headroom, in GiB.
+  // Zero preserves preflight's default max(20 GiB, 5% of budget).
+  double host_ram_startup_margin_gib = 0.0;
 
   // Optional hard limit for the logical number of MoE expert slots in the
   // host-RAM tier, counted across all MoE layers.  0 = let the byte-aware
@@ -1261,6 +1267,20 @@ struct EngineConfig {
   // usage-ranked preload behavior.
   bool ram_preload_all_experts = false;
   bool ram_preload_all_experts_explicit = false;
+  // Require every routed expert to be resident across the DDR and VRAM
+  // tiers before requests are accepted. The preload planner fills all
+  // available VRAM slots, assigns each layer's remaining experts to DDR,
+  // and fails startup if the combined placement cannot fit.
+  bool require_full_moe_residency = false;
+  // Leave this many VRAM cache slots unfilled and evictable for graph-time
+  // staging. Strict residency places the corresponding source experts in
+  // DDR so a graph upload cannot evict the only resident copy.
+  int full_moe_vram_dynamic_slots = 0;
+  bool full_moe_vram_dynamic_slots_explicit = false;
+  // Preserve host budget for prompt activations and request scratch after
+  // the full DDR expert complement has been placed.
+  double full_moe_host_headroom_gb = 0.0;
+  bool full_moe_host_headroom_gb_explicit = false;
 
   // Persistent RAM-slab pinning budget, in GB. 0 (default) = OFF, every
   // slab stays plain pageable memory (pre-2026-08-15 behavior).
@@ -2380,6 +2400,7 @@ inline bool EngineConfig::load(const std::string &path) {
   }
 
   model_path = doc.root.get_str("model_path");
+  engram_model_path = doc.root.get_str("engram_model_path");
   model_format = doc.root.get_str("model_format", model_format);
   exl3_backend = doc.root.get_str("exl3_backend", exl3_backend);
   exl3_ggml_bridge_model_path =
@@ -2794,22 +2815,26 @@ inline bool EngineConfig::load(const std::string &path) {
   prefetch_worker_threads =
       doc.root.get_int("prefetch_worker_threads", prefetch_worker_threads);
   host_ram_gb = doc.root.get_double("host_ram_gb", host_ram_gb);
-  ram_cache_total_experts = doc.root.get_int(
-      "ram_cache_total_experts", ram_cache_total_experts);
-  ram_preload_all_experts = doc.root.get_bool(
-      "ram_preload_all_experts", ram_preload_all_experts);
-  ram_preload_all_experts_explicit =
-      doc.root.has("ram_preload_all_experts");
+  host_ram_startup_margin_gib =
+      doc.root.get_double("host_ram_startup_margin_gib", host_ram_startup_margin_gib);
+  ram_cache_total_experts = doc.root.get_int("ram_cache_total_experts", ram_cache_total_experts);
+  ram_preload_all_experts = doc.root.get_bool("ram_preload_all_experts", ram_preload_all_experts);
+  ram_preload_all_experts_explicit = doc.root.has("ram_preload_all_experts");
+  require_full_moe_residency =
+      doc.root.get_bool("require_full_moe_residency", require_full_moe_residency);
+  full_moe_vram_dynamic_slots =
+      (int)doc.root.get_int("full_moe_vram_dynamic_slots", full_moe_vram_dynamic_slots);
+  full_moe_vram_dynamic_slots_explicit = doc.root.has("full_moe_vram_dynamic_slots");
+  full_moe_host_headroom_gb =
+      doc.root.get_double("full_moe_host_headroom_gb", full_moe_host_headroom_gb);
+  full_moe_host_headroom_gb_explicit = doc.root.has("full_moe_host_headroom_gb");
   mirror_model_path = doc.root.get_str("mirror_model_path", mirror_model_path);
-  mirror_coverage_file =
-      doc.root.get_str("mirror_coverage_file", mirror_coverage_file);
-  ram_pinned_budget_gb =
-      doc.root.get_double("ram_pinned_budget_gb", ram_pinned_budget_gb);
+  mirror_coverage_file = doc.root.get_str("mirror_coverage_file", mirror_coverage_file);
+  ram_pinned_budget_gb = doc.root.get_double("ram_pinned_budget_gb", ram_pinned_budget_gb);
   ram_pinned_budget_gb_explicit = doc.root.has("ram_pinned_budget_gb");
   ram_pin_eager_preregister =
       doc.root.get_bool("ram_pin_eager_preregister", ram_pin_eager_preregister);
-  promote_hit_threshold =
-      doc.root.get_int("promote_hit_threshold", promote_hit_threshold);
+  promote_hit_threshold = doc.root.get_int("promote_hit_threshold", promote_hit_threshold);
   pin_threshold = doc.root.get_int("pin_threshold", pin_threshold);
   pin_file = doc.root.get_str("pin_file", pin_file);
   prefill_pin_file = doc.root.get_str("prefill_pin_file", prefill_pin_file);
@@ -2980,12 +3005,32 @@ gdn_proj_ggml = doc.root.get_bool("gdn_proj_ggml", gdn_proj_ggml);
     return false;
   }
 
-  std::cerr << "[CONFIG] Loaded from " << path << " (" << gpus.size()
-            << " GPU entries)\n";
+  std::cerr << "[CONFIG] Loaded from " << path << " (" << gpus.size() << " GPU entries)\n";
   return true;
 }
 
 inline bool EngineConfig::validate() {
+  if (!std::isfinite(host_ram_startup_margin_gib) || host_ram_startup_margin_gib < 0.0 ||
+      host_ram_startup_margin_gib > 1024.0) {
+    std::cerr << "[CONFIG] host_ram_startup_margin_gib must be finite and in [0, 1024]\n";
+    return false;
+  }
+  if (full_moe_vram_dynamic_slots < 0 || full_moe_vram_dynamic_slots > 100000) {
+    std::cerr << "[CONFIG] full_moe_vram_dynamic_slots must be in [0, 100000]\n";
+    return false;
+  }
+  if (!std::isfinite(full_moe_host_headroom_gb) || full_moe_host_headroom_gb < 0.0 ||
+      full_moe_host_headroom_gb > 1024.0) {
+    std::cerr << "[CONFIG] full_moe_host_headroom_gb must be finite and in [0, 1024]\n";
+    return false;
+  }
+  if (require_full_moe_residency &&
+      (!full_moe_vram_dynamic_slots_explicit || full_moe_vram_dynamic_slots <= 0 ||
+       !full_moe_host_headroom_gb_explicit || full_moe_host_headroom_gb <= 0.0)) {
+    std::cerr << "[CONFIG] strict full residency requires explicit positive "
+                 "full_moe_vram_dynamic_slots and full_moe_host_headroom_gb\n";
+    return false;
+  }
   if (!std::isfinite(repeat_penalty) || repeat_penalty <= 0.0f) {
     std::cerr << "[CONFIG] repeat_penalty must be finite and positive\n";
     return false;
@@ -2994,7 +3039,7 @@ inline bool EngineConfig::validate() {
     std::cerr << "[CONFIG] embedding_device must be auto, cpu or gpu\n";
     return false;
   }
-  for (const auto &gc : gpus) {
+  for (const auto& gc : gpus) {
     if (!std::isfinite(gc.moe_cache_reserve_gb) || gc.moe_cache_reserve_gb < 0.0 ||
         gc.moe_cache_reserve_gb >= double(SIZE_MAX) / 1e9) {
       std::cerr << "[CONFIG] moe_cache_reserve_gb must be finite, non-negative and representable in bytes\n";
@@ -3249,6 +3294,8 @@ inline void EngineConfig::print() const {
   }
   if (!dense_model_path.empty() && dense_model_path != model_path)
     LOG_STREAM_INFO() << "[CONFIG] Dense model: " << dense_model_path << "\n";
+  if (!engram_model_path.empty())
+    LOG_STREAM_INFO() << "[CONFIG] Engram sidecar: " << engram_model_path << "\n";
   if (!mtp_model_path.empty())
     LOG_STREAM_INFO() << "[CONFIG] MTP model (shared draft-block checkpoint): "
                       << mtp_model_path << "\n";
@@ -3442,6 +3489,12 @@ inline void EngineConfig::print() const {
                     << (host_ram_gb > 0
                             ? std::to_string(host_ram_gb) + " GB (explicit)"
                             : "auto-detect")
+                    << "\n";
+  LOG_STREAM_INFO() << "[CONFIG] Host RAM startup margin: "
+                    << (host_ram_startup_margin_gib > 0.0
+                            ? std::to_string(host_ram_startup_margin_gib) +
+                                  " GiB (explicit)"
+                            : "default max(20 GiB, 5% of budget)")
                     << "\n";
   LOG_STREAM_INFO() << "[CONFIG] Host RAM expert-slot limit: "
                     << (ram_cache_total_experts > 0
@@ -3732,6 +3785,7 @@ inline void EngineConfig::write_sample(const std::string &path) {
 model_path = "/path/to/model.gguf"
 model_format = "gguf"       # "gguf" or "exl3"
 model_load_only = false      # EXL3 metadata/payload load smoke; no inference
+# engram_model_path = "/path/to/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf" # DSV4.1 table sidecar
 # dense_model_path = "/path/to/dense-weights"  # optional: separate dense weights
 # spec_type = "none"           # or "draft-mtp"
 # spec_draft_model = "/path/to/mtp-draft.gguf"  # optional: a standalone

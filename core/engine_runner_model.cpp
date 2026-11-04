@@ -43,6 +43,28 @@ std::expected<void, std::string> EngineRunner::load_model() {
     return std::unexpected(
         "Failed to parse GGUF file or map descriptor tree structure");
   }
+  if (!config.engram_model_path.empty()) {
+    if (detect_model_family(engine.model_file) != ModelFamily::DeepSeek_V41) {
+      return std::unexpected(
+          "engram_model_path is only supported with general.architecture=deepseek41");
+    }
+    if (!engine.engram_model_file.load_header(config.engram_model_path)) {
+      return std::unexpected(
+          "Failed to parse Engram sidecar GGUF (engram_model_path)");
+    }
+    const auto sidecar_arch =
+        engine.engram_model_file.kv_string.find("general.architecture");
+    if (sidecar_arch == engine.engram_model_file.kv_string.end() ||
+        sidecar_arch->second != "deepseek41-engram") {
+      return std::unexpected(
+          "Engram sidecar must declare general.architecture=deepseek41-engram");
+    }
+    engine.has_engram_model = true;
+    LOG_STREAM_INFO() << "[DSV41-ENGRAM] separate lookup sidecar: "
+                      << config.engram_model_path << " ("
+                      << engine.engram_model_file.tensors.size()
+                      << " table tensor(s); base architecture metadata preserved)\n";
+  }
   {
     using namespace zeromoe::graphsettings;
     std::vector<Family> families{Family::Other};

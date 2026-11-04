@@ -108,6 +108,11 @@ public:
   // config flag) when real usage history exists; empty otherwise. Never
   // read directly -- always go through cap_for_layer(layer).
   std::vector<int> slots_per_layer_by_layer;
+  // Startup-only fixed DDR complement for strict full-MoE residency. When
+  // present, this exact per-layer cap takes precedence over adaptive and
+  // prefill-window caps, and survives per-request byte-budget recalculation.
+  // A zero entry means the layer has no DDR experts in the planned split.
+  std::vector<int> full_residency_cap_by_layer;
 
   // Byte-aware base capacity.  Each entry is bounded using that layer's
   // own maximum expert slab size, so a small-expert layer is not charged the
@@ -1398,19 +1403,21 @@ public:
     if (prefill_retention_weight_ref() == 0) return;
     RAM_TIMED_LOCK(lock);
     uint64_t n = 0;
-    for (auto &layer_slots : engine.layers_experts)
-      for (auto &slot : layer_slots)
-        if (slot.prefill_demand) { slot.prefill_demand /= 2; ++n; }
+    for (auto& layer_slots : engine.layers_experts)
+      for (auto& slot : layer_slots)
+        if (slot.prefill_demand) {
+          slot.prefill_demand /= 2;
+          ++n;
+        }
     perf().n_prefill_retention_decayed.fetch_add(n, std::memory_order_relaxed);
   }
 
-
   int base_cap_for_layer(int layer) const {
+    if (layer >= 0 && layer < (int)full_residency_cap_by_layer.size())
+      return full_residency_cap_by_layer[(size_t)layer];
     int cap = slots_per_layer;
-    if (layer >= 0 &&
-        layer < (int)byte_slots_per_layer_by_layer.size() &&
-        layer < (int)layer_expert_slab_bytes.size() &&
-        layer_expert_slab_bytes[(size_t)layer] > 0) {
+    if (layer >= 0 && layer < (int)byte_slots_per_layer_by_layer.size() &&
+        layer < (int)layer_expert_slab_bytes.size() && layer_expert_slab_bytes[(size_t)layer] > 0) {
       cap = byte_slots_per_layer_by_layer[(size_t)layer];
     }
     if (layer >= 0 && layer < (int)slots_per_layer_by_layer.size() &&
@@ -1420,6 +1427,8 @@ public:
   }
 
   int cap_for_layer(int layer) const {
+    if (layer >= 0 && layer < (int)full_residency_cap_by_layer.size())
+      return full_residency_cap_by_layer[(size_t)layer];
     if (layer >= 0 && layer < (int)prefill_window_cap_by_layer.size() &&
         prefill_window_cap_by_layer[layer] > 0)
       return prefill_window_cap_by_layer[layer];

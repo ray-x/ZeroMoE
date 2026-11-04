@@ -76,7 +76,14 @@ std::expected<void, std::string> EngineRunner::apply_graph_tuning() {
 }
 
 std::expected<void, std::string>
-EngineRunner::resolve_cuda_moe_graph_policy() {
+EngineRunner::resolve_cuda_moe_graph_policy(bool final_placement) {
+  if (final_placement) {
+    engine.cuda_moe_full_graph_decode_required = false;
+    engine.cuda_moe_layered_fallback_reason.clear();
+    engine.cuda_moe_graph_memory_plan = "not-applicable";
+    engine.cuda_moe_graph_device_expert_layers = 0;
+    engine.cuda_moe_graph_device_expert_trailing = false;
+  }
   const bool cpu_only = config.cpu_only;
   const bool cuda_moe = !cpu_only && !gpu.topology.devices.empty() &&
                         engine.model_file.architecture_config.n_experts > 0;
@@ -192,6 +199,11 @@ std::expected<void, std::string> EngineRunner::run() {
     return result;
   if (auto result = validate_expert_placement(); !result)
     return result;
+  if (const FullGraphModel *model = engine.family_ops.graph_model;
+      model && model->plan_decode_memory_after_placement()) {
+    if (auto result = resolve_cuda_moe_graph_policy(true); !result)
+      return result;
+  }
   if (auto result = preload_experts(); !result)
     return result;
   if (auto result = start_workers(); !result)
@@ -417,7 +429,9 @@ std::expected<void, std::string> EngineRunner::init_host_and_gpu() {
   ram_mgr.reactive_promote_gpu1_every_n = config.reactive_promote_gpu1_every_n;
   ram_mgr.pin_threshold = (uint32_t)std::max(0, config.pin_threshold);
   ram_mgr.expert_fetch_threads = std::max(1, config.expert_fetch_threads);
-  ram_mgr.move_on_promotion = config.move_on_promotion;
+  ram_mgr.move_on_promotion = config.require_full_moe_residency ? false : config.move_on_promotion;
+  if (config.require_full_moe_residency)
+    LOG_INFO("[FULL-RESIDENCY] DDR source copies are retained during VRAM promotion\n");
   ram_mgr.ram_copy_reclaim_threshold = config.ram_copy_reclaim_threshold;
   ram_mgr.disk_batch_padding = config.disk_batch_padding;
   ram_mgr.disk_batch_padding_target = config.disk_batch_padding_target;
@@ -425,8 +439,7 @@ std::expected<void, std::string> EngineRunner::init_host_and_gpu() {
   gpu.topology.active_layer_promote_threshold =
       std::max(1, config.active_layer_promote_hit_threshold);
 
-  gpu.topology.speculative_active_layer_fill =
-      config.speculative_promote_to_active_layer;
+  gpu.topology.speculative_active_layer_fill = config.speculative_promote_to_active_layer;
   // The CUDA runtime reports all physical adapters, but the TOML's
   // [[gpus]] list is an explicit allocation allow-list. Without passing it
   // into the topology, a GPU omitted from a single-GPU profile was still

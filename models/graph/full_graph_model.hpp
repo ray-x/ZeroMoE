@@ -98,6 +98,11 @@ class FullGraphModel {
   virtual GraphMemoryPlan plan_decode_memory(const StreamingEngine &) const {
     return {};
   }
+  // Some native-cache graphs cannot size their final decode headroom until
+  // dense weights and expert pools have been allocated and placement has
+  // been resolved. Such adapters return Unknown during early startup, then
+  // request one final plan immediately after the shared cache planner.
+  virtual bool plan_decode_memory_after_placement() const { return false; }
   // Optional work done once at engine start (expert source preload, ...).
   // Returns false only when startup must fail.
   virtual bool bootstrap(StreamingEngine &) const { return true; }

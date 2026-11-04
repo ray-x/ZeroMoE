@@ -196,11 +196,23 @@ def stamp(args: argparse.Namespace) -> int:
         ggml_base = "unknown"
         ggml_base_source = "unknown"
     if configured_ggml_base and ggml_base != configured_ggml_base:
-        raise RuntimeError(
-            "GGML base mismatch: selected "
-            f"{ggml_base} from {ggml_base_source}, but CMakeCache pins "
-            f"{configured_ggml_base}"
-        )
+        # ggml-src.txt commonly records a 10-character checkout hash while
+        # CMakeCache pins the full 40-character revision. Accept only a
+        # prefix match and keep the longer value in the manifest; unrelated
+        # revisions still fail the provenance gate.
+        if (configured_ggml_base.startswith(ggml_base) or
+                ggml_base.startswith(configured_ggml_base)):
+            if len(configured_ggml_base) >= len(ggml_base):
+                ggml_base = configured_ggml_base
+                ggml_base_source += "+cmake-cache"
+            else:
+                ggml_base_source += "+ggml-source"
+        else:
+            raise RuntimeError(
+                "GGML base mismatch: selected "
+                f"{ggml_base} from {ggml_base_source}, but CMakeCache pins "
+                f"{configured_ggml_base}"
+            )
     info = {
         "schema": 1,
         "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),

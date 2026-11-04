@@ -1,0 +1,104 @@
+# DeepSeek-V4.1-Flash dual-GPU starter profile (context 4096, temperature 0).
+# Benchmark-only profiles and measured conditions are in configs/bench/.
+# Full graph is the default; see docs/deepseek_v41_decode.md.
+# 3090: 17.25 GB (~16.1 GiB) main expert cache, 48 active slots, one shared dense pool.
+# 5060 Ti: 13.5 GiB main expert cache and 16 active slots.
+# DDR target: 13,100 expert slots (~105 GiB); the byte-aware cap also charges
+# resident tensors and graph/runtime headroom. With host_ram_gb=120 GB, the
+# current model's effective DDR ceiling is about 100.6 GiB. The 8 GiB reserve
+# is enforced both at startup and by the live MemAvailable guard.
+# host_ram_gb is the total process allocation ceiling, in decimal GB.
+# Caches fill on demand. Graph-owned MoE weight bytes = 0; dense bindings alias
+# the engine's persistent device pool across prefill/decode graph lifetimes.
+
+model_path = "/mnt/usb-ssd/@/home/ray/models/DeepSeek-V4.1-Flash-1017-GSQ-RCO/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00006.gguf"
+engram_model_path = "/mnt/usb-ssd/@/home/ray/models/DeepSeek-V4.1-Flash-1017-GSQ-RCO/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf"
+graph_gpu_prefill = true
+graph_cache_moe_graph = true
+graph_cache_moe_decode = true
+graph_cache_moe_cpu_cold = true
+graph_full_graph_decode = true
+graph_engram_storage_mode = 1
+graph_engram_cache_mb = 0
+log_level = "INFO"
+context_size = 4096
+max_new_tokens = 8
+temperature = 0.0
+top_p = 1.0
+prompt_cache = false
+drop_pages = true
+direct_io = false
+io_uring = true
+host_ram_gb = 120.0
+host_ram_startup_margin_gib = 8.0
+graph_mem_guard_floor_mb = 8192
+mem_guard_warn_mb = 16384
+mem_guard_stop_mb = 8192
+ram_cache_total_experts = 13100
+ram_preload_all_experts = true
+ram_pinned_budget_gb = 105.0
+freeze_usage_stats = true
+omp_max_threads = 10
+attn_score_threads = 8
+pin_file = "/home/ray/Projects/ZeroMoE/build_mtp_results/2026-11-03-e216712-deepseek41-engram-105gib-ddr-30gib-vram-retry7/route_usage.txt"
+prefill_pin_file = "/home/ray/Projects/ZeroMoE/build_mtp_results/2026-11-03-e216712-deepseek41-engram-105gib-ddr-30gib-vram-retry7/prefill_usage.txt"
+cpu_affinity_layers = []
+cpu_offload_max_experts = 6
+ram_cache_layer_adaptive = false
+moe_ggml_mul_mat_id = false
+pin_strategy = "global_topn"
+pin_global_floor_per_layer = 1
+pin_topk_per_layer = 0
+pin_vram_lru_fraction = 0.25
+pin_ram_fraction = 0.50
+pin_global_tiers = true
+pinned_vram_capacity = 1024
+prefetch_worker_threads = 6
+expert_fetch_threads = 10
+prefetch_attn_pilot = false
+prefetch_pilot_k_adaptive = true
+prefetch_pilot_k_adaptive_threshold = 0.50
+prefetch_pilot_k_adaptive_min_samples = 30
+promote_hit_threshold = 3
+pin_threshold = 8
+active_layer_capacity = 64
+use_active_layer_area = true
+move_on_promotion = true
+expert_gpu_activation = true
+moe_gpu_accum = true
+decode_async_prewarm_max_batch = 3
+decode_async_prewarm_mode = "off"
+active_layer_upload_worker_threads = 2
+ram_vram_promote_top_k = 2
+ram_vram_promote_layer_gate = true
+ram_vram_promote_layer_gate_threshold = 0.65
+ram_vram_promote_layer_gate_min_samples = 30
+ram_vram_promote_layer_gate_top_fraction = 0.3
+speculative_promote_to_active_layer = true
+ram_vram_promote_adaptive = false
+vram_evict_demote_to_ram = false
+
+[[gpus]]
+device_id = 0
+name = "NVIDIA GeForce RTX 3090"
+role = "dense+moe"
+vram_gb = 24.0
+dense_gb = 3.2
+kv_cache_gb = 2.0
+# kv_bits = 4 # historical experiment note; runtime currently budgets KV through kv_cache_gb. llama.cpp uses separate K/V cache-type settings; this historical scalar is not wired.
+moe_cache_gb = 17.25
+active_layer_weight = 3
+active_layer_capacity_slots = 48
+
+
+[[gpus]]
+device_id = 1
+name = "NVIDIA GeForce RTX 5060 Ti"
+role = "moe"
+vram_gb = 16.0
+dense_gb = 0.0
+kv_cache_gb = 0.0
+# kv_bits = 4 # historical experiment note; runtime currently budgets KV through kv_cache_gb. llama.cpp uses separate K/V cache-type settings; this historical scalar is not wired.
+moe_cache_gb = 14.495514624
+active_layer_weight = 1
+active_layer_capacity_slots = 16

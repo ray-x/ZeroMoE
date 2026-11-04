@@ -1,0 +1,108 @@
+# DeepSeek V4.1 strict full-residency dual-GPU profile.
+# Runtime requires explicit dynamic VRAM slots and host prefill headroom.
+# 32 VRAM slots stay empty for graph uploads; their model experts stay in DDR.
+# Planner checks the exact per-layer DDR complement plus 0.65 GB host headroom.
+# 3090 cache is reduced by 0.60 GB and assigned to the 5060 Ti cache,
+# giving the graph/core GPU more prefill workspace while retaining pool bytes.
+# Host cap 123 decimal GB; startup margin 4 GiB; live allocation floor 4.5 GiB.
+# The startup audit rejects this profile before requests if all 15,360 experts
+# and the configured prompt headroom do not fit safely.
+# Frozen five-prompt route ranking, context 4096, temperature 0.8.
+# Page registration is capped at 15 GB; strict mode keeps DDR copies on promotion.
+
+model_path = '/mnt/usb-ssd/@/home/ray/models/DeepSeek-V4.1-Flash-1017-GSQ-RCO/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00006.gguf'
+engram_model_path = '/mnt/usb-ssd/@/home/ray/models/DeepSeek-V4.1-Flash-1017-GSQ-RCO/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf'
+graph_gpu_prefill = true
+graph_cache_moe_graph = true
+graph_cache_moe_decode = true
+graph_cache_moe_async_upload = true
+graph_cache_moe_cpu_cold = true
+graph_cache_moe_cpu_cold_decode = false
+graph_full_graph_decode = true
+graph_engram_storage_mode = 1
+graph_engram_cache_mb = 0
+log_level = "INFO"
+context_size = 4096
+max_new_tokens = 160
+temperature = 0.8
+top_p = 1.0
+prompt_cache = false
+drop_pages = true
+direct_io = false
+io_uring = true
+host_ram_gb = 123.0
+host_ram_startup_margin_gib = 4.0
+graph_mem_guard_floor_mb = 4608
+mem_guard_warn_mb = 16384
+mem_guard_stop_mb = 4608
+ram_cache_total_experts = 13100
+ram_preload_all_experts = true
+require_full_moe_residency = true
+full_moe_vram_dynamic_slots = 32
+full_moe_host_headroom_gb = 0.65
+ram_pinned_budget_gb = 15.0
+freeze_usage_stats = true
+omp_max_threads = 10
+attn_score_threads = 8
+pin_file = "build_mtp_results/2026-11-03-c0e9963-deepseek41-full-resident-reserve4-replay7/decode_usage.txt"
+prefill_pin_file = "build_mtp_results/2026-11-03-c0e9963-deepseek41-full-resident-reserve4-replay7/prefill_usage.txt"
+cpu_affinity_layers = []
+cpu_offload_max_experts = 6
+ram_cache_layer_adaptive = false
+moe_ggml_mul_mat_id = false
+pin_strategy = "global_topn"
+pin_global_floor_per_layer = 1
+pin_topk_per_layer = 0
+pin_vram_lru_fraction = 0.59
+pin_ram_fraction = 1.0
+pin_global_tiers = true
+pinned_vram_capacity = 1024
+prefetch_worker_threads = 6
+expert_fetch_threads = 10
+prefetch_attn_pilot = false
+prefetch_pilot_k_adaptive = true
+prefetch_pilot_k_adaptive_threshold = 0.50
+prefetch_pilot_k_adaptive_min_samples = 30
+promote_hit_threshold = 3
+pin_threshold = 8
+active_layer_capacity = 64
+use_active_layer_area = true
+move_on_promotion = true
+expert_gpu_activation = true
+moe_gpu_accum = true
+decode_async_prewarm_max_batch = 3
+decode_async_prewarm_mode = "off"
+active_layer_upload_worker_threads = 2
+ram_vram_promote_top_k = 2
+ram_vram_promote_layer_gate = true
+ram_vram_promote_layer_gate_threshold = 0.65
+ram_vram_promote_layer_gate_min_samples = 30
+ram_vram_promote_layer_gate_top_fraction = 0.3
+speculative_promote_to_active_layer = true
+ram_vram_promote_adaptive = false
+vram_evict_demote_to_ram = false
+
+[[gpus]]
+device_id = 0
+name = "NVIDIA GeForce RTX 3090"
+role = "dense+moe"
+vram_gb = 24.0
+dense_gb = 3.2
+kv_cache_gb = 2.0
+# kv_bits = 4 # historical experiment note; runtime currently budgets KV through kv_cache_gb. llama.cpp uses separate K/V cache-type settings; this historical scalar is not wired.
+moe_cache_gb = 16.95
+active_layer_weight = 3
+active_layer_capacity_slots = 48
+
+
+[[gpus]]
+device_id = 1
+name = "NVIDIA GeForce RTX 5060 Ti"
+role = "moe"
+vram_gb = 16.0
+dense_gb = 0.0
+kv_cache_gb = 0.0
+# kv_bits = 4 # historical experiment note; runtime currently budgets KV through kv_cache_gb. llama.cpp uses separate K/V cache-type settings; this historical scalar is not wired.
+moe_cache_gb = 15.095514624
+active_layer_weight = 1
+active_layer_capacity_slots = 16

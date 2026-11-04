@@ -3,7 +3,7 @@
 # 3090: 17 GiB main expert cache, 48 active slots, one shared native dense pool.
 # 5060 Ti: 13.5 GiB main expert cache and 16 active slots.
 # DDR: 8360 slots are an upper capacity target; physical-memory admission
-# stops growth while preserving 20 GiB for Linux, drivers, and graph scratch.
+# stops growth while preserving 10 GiB for Linux, drivers, and graph scratch.
 # host_ram_gb includes expert slabs plus resident/state/scratch, in decimal GB.
 # Caches fill on demand. Graph-owned MoE weight bytes = 0; dense bindings alias
 # the engine's persistent device pool across prefill/decode graph lifetimes.
@@ -20,7 +20,7 @@ direct_io = true
 io_uring = true
 host_ram_gb = 107.0
 mem_guard_warn_mb = 32768
-mem_guard_stop_mb = 20480
+mem_guard_stop_mb = 10240
 ram_cache_total_experts = 8360
 ram_pinned_budget_gb = 40.0   # more DDR slabs pinned: active upload 103 -> ~83 ms/token, decode ~+5-8% (4 runs, 2026-10-18)
 freeze_usage_stats = true

@@ -887,7 +887,11 @@ int ubatch_size_cli = -1;
     std::vector<int> gpu_ids;
     for (auto &g : config.gpus)
       gpu_ids.push_back(g.device_id);
-    if (!preflight::run(config.host_ram_gb, gpu_ids, force_start_cli)) {
+    const double startup_margin_gb = config.host_ram_startup_margin_gib > 0.0
+        ? config.host_ram_startup_margin_gib * 1024.0 * 1024.0 * 1024.0 / 1.0e9
+        : -1.0;
+    if (!preflight::run(config.host_ram_gb, gpu_ids, force_start_cli,
+                        startup_margin_gb)) {
       LOG_STREAM_ERROR()
           << "  Startup pre-flight check(s) failed -- see [PREFLIGHT] "
              "lines above. Refusing to start (pass --force-start only when "

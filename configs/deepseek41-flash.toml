@@ -1,42 +1,48 @@
 # DeepSeek-V4.1-Flash dual-GPU starter profile (context 4096, temperature 0).
 # Benchmark-only profiles and measured conditions are in configs/bench/.
 # Full graph is the default; see docs/deepseek_v41_decode.md.
-# 3090: 17 GiB main expert cache, 48 active slots, one shared native dense pool.
+# 3090: 17.25 GB (~16.1 GiB) main expert cache, 48 active slots, one shared dense pool.
 # 5060 Ti: 13.5 GiB main expert cache and 16 active slots.
-# DDR: 8360 slots are an upper capacity target; physical-memory admission
-# stops growth while preserving 20 GiB for Linux, drivers, and graph scratch.
-# host_ram_gb includes expert slabs plus resident/state/scratch, in decimal GB.
+# DDR target: 13,100 expert slots (~105 GiB); the byte-aware cap also charges
+# resident tensors and graph/runtime headroom. With host_ram_gb=120 GB, the
+# current model's effective DDR ceiling is about 100.6 GiB. The 8 GiB reserve
+# is enforced both at startup and by the live MemAvailable guard.
+# host_ram_gb is the total process allocation ceiling, in decimal GB.
 # Caches fill on demand. Graph-owned MoE weight bytes = 0; dense bindings alias
 # the engine's persistent device pool across prefill/decode graph lifetimes.
 
 model_path = "/path/to/model-or-shard-directory"
 log_level = "INFO"
 context_size = 4096
-max_new_tokens = 40
+max_new_tokens = 64
 temperature = 0.0
 top_p = 1.0
 prompt_cache = false
-drop_pages = false
+drop_pages = true
 direct_io = true
 io_uring = true
-host_ram_gb = 107.0
+host_ram_gb = 120.0
+host_ram_startup_margin_gib = 8.0
+graph_mem_guard_floor_mb = 8192
 mem_guard_warn_mb = 32768
-mem_guard_stop_mb = 20480
-ram_cache_total_experts = 8360
-ram_pinned_budget_gb = 40.0   # more DDR slabs pinned: active upload 103 -> ~83 ms/token, decode ~+5-8% (4 runs, 2026-10-18)
+mem_guard_stop_mb = 8192
+ram_cache_total_experts = 13100
+ram_preload_all_experts = true
+ram_pinned_budget_gb = 105.0
 freeze_usage_stats = true
 omp_max_threads = 10
 attn_score_threads = 8
 pin_file = ".zeromoe_deepseek-v41_usage"
 prefill_pin_file = ".zeromoe_deepseek-v41_usage_prefill"
 cpu_affinity_layers = []
+cpu_offload_max_experts = 6
 ram_cache_layer_adaptive = false
 moe_ggml_mul_mat_id = false
 pin_strategy = "global_topn"
 pin_global_floor_per_layer = 1
 pin_topk_per_layer = 0
 pin_vram_lru_fraction = 0.25
-pin_ram_fraction = 1.0   # fill the DDR tier at startup: +8-11% decode, -20-35% SSD reads (A/B on 3 prompts, 2026-10-18)
+pin_ram_fraction = 0.5
 pin_global_tiers = true
 pinned_vram_capacity = 1024
 prefetch_worker_threads = 6
@@ -72,7 +78,7 @@ vram_gb = 24.0
 dense_gb = 3.2
 kv_cache_gb = 2.0
 # kv_bits = 4 # historical experiment note; runtime currently budgets KV through kv_cache_gb. llama.cpp uses separate K/V cache-type settings; this historical scalar is not wired.
-moe_cache_gb = 18.253611008
+moe_cache_gb = 17.25
 active_layer_weight = 3
 active_layer_capacity_slots = 48
 

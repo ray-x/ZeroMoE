@@ -348,6 +348,10 @@ struct MoEExpertBlock {
 class StreamingEngine {
 public:
     GGUFFile model_file;
+    // Separate DeepSeek-V4.1 Engram table sidecar. Its tensors are addressed
+    // on demand; its GGUF architecture/KV metadata must not override model_file.
+    GGUFFile engram_model_file;
+    bool has_engram_model = false;
     GGUFFile dense_model_file;      // separate dense GGUF (config.dense_model_path); optional
     bool has_dense_model = false;
     // Standalone "shared" MTP/NextN checkpoint (config.mtp_model_path),

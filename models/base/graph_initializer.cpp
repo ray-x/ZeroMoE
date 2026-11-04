@@ -678,6 +678,70 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
       c.dsv41_engram_compressed_vocab_size =
           file.get_config_int("engram.compressed_vocab_size", 0);
 
+      // The 1017 GGUF stores the hash layout under the earlier `ple.*`
+      // names. Its table is split out as a separate `deepseek41-engram`
+      // sidecar, while the small gate/KV projections remain in the trunk.
+      // Translate only for this exact DeepSeek-V4.1 family; do not route
+      // generic PLE metadata through this model-specific path.
+      if (c.dsv41_engram_layer_ids.empty()) {
+        const auto ple_layers = file.get_config_int_array("ple.layers");
+        const int ple_ngram = file.get_config_int("ple.ngram_size", 0);
+        const int ple_heads = file.get_config_int("ple.heads_per_ngram", 0);
+        const int row_dim =
+            file.get_config_int("embedding_length_per_layer_input", 0);
+        const auto ple_primes =
+            file.get_config_int_array("ple.head_vocab_sizes");
+        const auto ple_offsets =
+            file.get_config_int_array("ple.head_offsets");
+        const auto ple_multipliers =
+            file.get_config_int_array("ple.layer_multipliers");
+        const int cols = std::max(0, ple_ngram - 1) * ple_heads;
+        const size_t required_cols = ple_layers.size() * (size_t)cols;
+        if (!ple_layers.empty() && ple_ngram >= 2 && ple_heads > 0 &&
+            row_dim > 0 && cols > 0 &&
+            ple_primes.size() == required_cols &&
+            ple_offsets.size() == required_cols &&
+            ple_multipliers.size() ==
+                ple_layers.size() * (size_t)ple_ngram) {
+          c.dsv41_engram_layer_ids = ple_layers;
+          c.dsv41_engram_max_ngram_size = ple_ngram;
+          c.dsv41_engram_n_heads = ple_heads;
+          c.dsv41_engram_head_dim = row_dim;
+          c.dsv41_engram_primes = ple_primes;
+          c.dsv41_engram_multipliers = ple_multipliers;
+          c.dsv41_engram_offsets.resize(required_cols);
+          for (size_t layer = 0; layer < ple_layers.size(); ++layer) {
+            const int64_t base = ple_offsets[layer * (size_t)cols];
+            for (int col = 0; col < cols; ++col) {
+              const size_t i = layer * (size_t)cols + (size_t)col;
+              if (ple_offsets[i] < base) {
+                c.dsv41_engram_offsets.clear();
+                break;
+              }
+              // PLE offsets address one concatenated table. The Engram
+              // sidecar stores a separate tensor per layer, so rebase each
+              // layer's bucket offsets to its own tensor.
+              c.dsv41_engram_offsets[i] = ple_offsets[i] - base;
+            }
+            if (c.dsv41_engram_offsets.empty())
+              break;
+          }
+          if (!c.dsv41_engram_offsets.empty()) {
+            c.dsv41_engram_pad_id =
+                file.get_config_int("engram.pad_token_id", 2);
+            c.dsv41_engram_vocab_size =
+                (int)c.dsv41_engram_token_map.size();
+            LOG_STREAM_INFO()
+                << "[DSV41-ENGRAM] using PLE hash metadata for the "
+                << "separate Engram table sidecar (layers="
+                << c.dsv41_engram_layer_ids.size() << ", ngram="
+                << c.dsv41_engram_max_ngram_size << ", heads/ngram="
+                << c.dsv41_engram_n_heads << ", row_dim="
+                << c.dsv41_engram_head_dim << ")\n";
+          }
+        }
+      }
+
       // The converter writes source lists, but infer them from the tensor
       // presence as a compatibility fallback for early converted files.
       if (c.dsv41_kv_source_layers.empty() ||
@@ -1313,7 +1377,9 @@ if (fam == ModelFamily::Qwen4Exp) {
       return false;
     }
     {
-      const size_t n_engram = c.dsv41_engram_layer_ids.size();
+    const GGUFFile &engram_file =
+        engine.has_engram_model ? engine.engram_model_file : file;
+    const size_t n_engram = c.dsv41_engram_layer_ids.size();
       const int n_hash_cols =
           std::max(0, c.dsv41_engram_max_ngram_size - 1) *
           c.dsv41_engram_n_heads;
@@ -1330,7 +1396,9 @@ if (fam == ModelFamily::Qwen4Exp) {
                              "to run without the converter's hash layout.\n";
         return false;
       }
-      for (size_t i = 0; i < n_engram; ++i) {
+    if (c.dsv41_engram_num_embeddings.empty())
+      c.dsv41_engram_num_embeddings.resize(n_engram);
+    for (size_t i = 0; i < n_engram; ++i) {
         const int l = (int)c.dsv41_engram_layer_ids[i];
         if (l < 0 || l >= c.n_layers) {
           LOG_STREAM_ERROR() << "[DSV41] Engram layer id out of range: " << l
@@ -1338,16 +1406,35 @@ if (fam == ModelFamily::Qwen4Exp) {
           return false;
         }
         const std::string p = "blk." + std::to_string(l) + ".";
-        auto table = file.tensors.find(p + "engram_embd.weight");
-        if (table == file.tensors.end() || table->second.shape.size() != 2 ||
+      auto table = engram_file.tensors.find(p + "engram_embd.weight");
+      if (table != engram_file.tensors.end() &&
+          table->second.shape.size() == 2 &&
+          c.dsv41_engram_num_embeddings[i] == 0)
+        c.dsv41_engram_num_embeddings[i] =
+            (int64_t)table->second.shape[1];
+      bool bucket_ranges_fit = table != engram_file.tensors.end() &&
+                               table->second.shape.size() == 2;
+      if (bucket_ranges_fit) {
+        for (int col = 0; col < n_hash_cols; ++col) {
+          const size_t hi = i * (size_t)n_hash_cols + (size_t)col;
+          const int64_t offset = c.dsv41_engram_offsets[hi];
+          const int64_t prime = c.dsv41_engram_primes[hi];
+          if (offset < 0 || prime <= 0 ||
+              (uint64_t)offset + (uint64_t)prime > table->second.shape[1]) {
+            bucket_ranges_fit = false;
+            break;
+          }
+        }
+      }
+      if (table == engram_file.tensors.end() || table->second.shape.size() != 2 ||
             table->second.shape[0] != (uint64_t)c.dsv41_engram_head_dim ||
-            (!c.dsv41_engram_num_embeddings.empty() &&
-             table->second.shape[1] !=
-                 (uint64_t)c.dsv41_engram_num_embeddings[i]) ||
+          table->second.shape[1] !=
+              (uint64_t)c.dsv41_engram_num_embeddings[i] ||
+          !bucket_ranges_fit ||
             row_bytes(table->second.type, c.dsv41_engram_head_dim) == 0 ||
-            numel(p + "engram_q.weight") != (uint64_t)c.hc_mult * c.hidden ||
-            numel(p + "engram_k.weight") != (uint64_t)c.hc_mult * c.hidden ||
-            numel(p + "engram_wkv.weight") !=
+          numel(p + "engram_gate.weight") !=
+              (uint64_t)c.hc_mult * c.hidden ||
+          numel(p + "engram_kv.weight") !=
                 (uint64_t)(c.hc_mult + 1) * c.hidden * n_hash_cols *
                     c.dsv41_engram_head_dim) {
           LOG_STREAM_ERROR() << "[DSV41] Engram tensors for layer " << l
@@ -1981,8 +2068,9 @@ if (fam == ModelFamily::Qwen4Exp) {
     } else if (fam == ModelFamily::DeepSeek_V41) {
       // DeepSeek-V4.1 uses the V4 raw/SWA tensor names, but its compressed
       // tensors are ratio-1/2 source-layer weights and its indexer derives
-      // keys directly from the pooled latent. The huge engram table is never
-      // added here; it is mmap-gathered by deepseek41_engram.cpp.
+      // keys directly from the pooled latent. The huge Engram table is never
+      // added here; it stays in its sidecar and is gathered by the Engram
+      // adapter using the selected mmap or buffered-read mode.
       dense_preload_manifest.push_back(p + "attn_q_a.weight");
       dense_preload_manifest.push_back(p + "attn_q_a_norm.weight");
       dense_preload_manifest.push_back(p + "attn_q_b.weight");
@@ -2011,9 +2099,8 @@ if (fam == ModelFamily::Qwen4Exp) {
         dense_preload_manifest.push_back(p + "indexer.k_norm.weight");
       }
       if (dsv41_is_engram_layer(c, l)) {
-        dense_preload_manifest.push_back(p + "engram_q.weight");
-        dense_preload_manifest.push_back(p + "engram_k.weight");
-        dense_preload_manifest.push_back(p + "engram_wkv.weight");
+        dense_preload_manifest.push_back(p + "engram_gate.weight");
+        dense_preload_manifest.push_back(p + "engram_kv.weight");
       }
     } else if (c.cache_shape == CacheShape::MLARawSWA) {
       // MLA raw/SWA attention (DeepSeek-V4) -- no absorption tensors

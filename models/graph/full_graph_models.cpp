@@ -918,8 +918,121 @@ class DeepseekV41GraphModel final
   ModelFamily family() const override { return ModelFamily::DeepSeek_V41; }
   const char *name() const override { return "deepseek_v41"; }
 
+  bool supports_architecture(const StreamingEngine &e) const {
+    const auto it = e.model_file.kv_string.find("general.architecture");
+    return it != e.model_file.kv_string.end() && it->second == "deepseek41";
+  }
+
+  bool plan_decode_memory_after_placement() const override { return true; }
+
+  GraphMemoryPlan plan_decode_memory(const StreamingEngine &e) const override {
+    GraphMemoryPlan plan;
+    if (!supports_architecture(e)) {
+      plan.fit = GraphMemoryFit::Unsupported;
+      plan.reason = "DeepSeek-V4.1 adapter only supports general.architecture=deepseek41";
+      return plan;
+    }
+    const auto &c = e.model_file.architecture_config;
+    if (c.n_layers != 40 || c.hidden != 5120 || c.n_experts != 384 ||
+        c.topk != 6 || c.hc_mult != 4 || c.n_expert_shared != 1 ||
+        c.dsv41_engram_layer_ids.empty()) {
+      plan.fit = GraphMemoryFit::Unsupported;
+      plan.reason = "DeepSeek-V4.1 Engram tensor topology does not match the registered 1017 graph adapter";
+      return plan;
+    }
+    // Dense weights and the engine-owned DDR/VRAM expert caches are already
+    // allocated when this final plan runs. Their bytes therefore reduce the
+    // live free-VRAM estimates below. Account the graph's scheduler workspace
+    // plus its explicit 1 GiB construction safety floor on every participating
+    // device; historical decode graphs used ~1 MiB workspace, while the
+    // larger prompt graph is checked separately by its builder.
+    if (e.moe_placement.model_slots == 0 || !e.gpu) {
+      plan.reason = "DeepSeek native-cache placement is not ready; final planning runs after cache allocation";
+      return plan;
+    }
+#if defined(ZEROMOE_USE_GGML_CUDA)
+    constexpr size_t kGraphWorkspaceEstimate = 64ull * 1024ull * 1024ull;
+    constexpr size_t kGraphConstructionReserve = 1ull * 1024ull * 1024ull * 1024ull;
+    plan.required_device_bytes =
+        kGraphWorkspaceEstimate + kGraphConstructionReserve;
+    plan.device_expert_layers = 0;
+    plan.device_expert_trailing = false;
+
+    int active_device = -1;
+    if (cudaGetDevice(&active_device) != cudaSuccess)
+      active_device = -1;
+    size_t min_free_bytes = std::numeric_limits<size_t>::max();
+    int checked_devices = 0;
+    int limiting_device = -1;
+    for (const auto &device : e.gpu->topology.devices) {
+      if (device.role == GpuRole::Unused)
+        continue;
+      if (cudaSetDevice(device.id) != cudaSuccess) {
+        if (active_device >= 0)
+          cudaSetDevice(active_device);
+        plan.required_device_bytes = 0;
+        plan.reason = "CUDA could not select every participating DeepSeek graph device";
+        return plan;
+      }
+      size_t free_bytes = 0, total_bytes = 0;
+      const cudaError_t status = cudaMemGetInfo(&free_bytes, &total_bytes);
+      (void)total_bytes;
+      if (status != cudaSuccess || free_bytes == 0) {
+        if (active_device >= 0)
+          cudaSetDevice(active_device);
+        plan.required_device_bytes = 0;
+        plan.reason = "CUDA could not report free VRAM for DeepSeek graph planning";
+        return plan;
+      }
+      if (free_bytes < min_free_bytes) {
+        min_free_bytes = free_bytes;
+        limiting_device = device.id;
+      }
+      ++checked_devices;
+    }
+    if (active_device >= 0)
+      cudaSetDevice(active_device);
+    if (checked_devices == 0 || min_free_bytes == std::numeric_limits<size_t>::max()) {
+      plan.required_device_bytes = 0;
+      plan.reason = "DeepSeek graph has no active CUDA device for final memory planning";
+      return plan;
+    }
+    plan.available_device_bytes = min_free_bytes;
+    if (plan.required_device_bytes <= plan.available_device_bytes) {
+      plan.fit = GraphMemoryFit::Fits;
+      plan.reason = "engine-owned dense/MoE allocations are committed; graph workspace plus 1 GiB safety floor fits on all active GPUs";
+      LOG_INFO("[DSV41-PLAN] memory_plan=fits devices=%d limiting_gpu=%d "
+               "required_gib=%.3f available_gib=%.3f DDR_gib=%.2f VRAM_gib=%.2f\n",
+               checked_devices, limiting_device,
+               static_cast<double>(plan.required_device_bytes) / (1024.0 * 1024.0 * 1024.0),
+               static_cast<double>(plan.available_device_bytes) / (1024.0 * 1024.0 * 1024.0),
+               static_cast<double>(e.moe_placement.ddr_bytes) / (1024.0 * 1024.0 * 1024.0),
+               static_cast<double>(e.moe_placement.vram_bytes) / (1024.0 * 1024.0 * 1024.0));
+    } else {
+      plan.fit = GraphMemoryFit::Insufficient;
+      plan.reason = "DeepSeek decode graph workspace plus 1 GiB safety floor exceeds free VRAM after engine-owned dense/MoE allocations";
+      LOG_WARN("[DSV41-PLAN] memory_plan=insufficient limiting_gpu=%d "
+               "required_gib=%.3f available_gib=%.3f\n",
+               limiting_device,
+               static_cast<double>(plan.required_device_bytes) / (1024.0 * 1024.0 * 1024.0),
+               static_cast<double>(plan.available_device_bytes) / (1024.0 * 1024.0 * 1024.0));
+    }
+#else
+    plan.required_device_bytes = 0;
+    plan.reason = "DeepSeek CUDA graph memory planning is unavailable in this build";
+#endif
+    return plan;
+  }
+  GraphEngineCaps engine_caps(const StreamingEngine &) const override {
+    return {.aliases_vram_cache = true};
+  }
+  bool uses_native_moe_cache() const override { return true; }
+
   bool enabled(const StreamingEngine &e, ModelGraphPhase phase) const override {
-    return !e.mtp_enabled &&
+    if (phase == ModelGraphPhase::Decode &&
+        e.cuda_moe_graph_memory_plan == "insufficient")
+      return false;
+    return supports_architecture(e) && !e.mtp_enabled &&
            (phase == ModelGraphPhase::Decode
                 ? deepseek_v41_full_graph_decode_enabled()
                 : deepseek_v41_full_graph_enabled());
@@ -935,7 +1048,7 @@ class DeepseekV41GraphModel final
   }
 
   bool accepts(const StreamingEngine &e, const ModelGraphRequest &r) const {
-    return !e.mtp_enabled &&
+    return supports_architecture(e) && !e.mtp_enabled &&
            (r.phase == ModelGraphPhase::Prefill ? r.pos_base == 0
                : r.n_tokens == 1 && r.pos_base >= 0);
   }

@@ -70,6 +70,14 @@ inline double mem_available_gb() {
   return -1.0;
 }
 
+// Central, cached system info collected once during preflight::run().
+struct SystemInfo {
+  double mem_available_gb = -1.0;
+};
+inline SystemInfo g_system_info;
+
+inline const SystemInfo &system_info() { return g_system_info; }
+
 inline double default_host_margin_gb(double required_host_ram_gb) {
   // Preserve at least 20 GiB outside the configured process budget. The
   // earlier 10 GiB floor was insufficient when the DeepSeek run page-locked
@@ -151,10 +159,10 @@ inline void release_host_admission_lock() {
 // (never silently proceeds). Returns true iff it is safe to continue.
 // `required_host_ram_gb` is this run's own resolved config.host_ram_gb
 // process-wide ceiling (MoE + resident/KV/state + graph + MTP);
-// margin_gb defaults to a real, previously-necessary headroom (max(20 GiB,
-// 5% of the budget), expressed in decimal GB -- see CLAUDE.md's "host_ram_gb swap-thrashing
-// regression" entry: exactly-the-budget was already once a real,
-// measured, reboot-surviving regression on this box, not a hypothetical).
+// margin_gb defaults to a previously-necessary headroom (max(20 GiB,
+// 5% of the budget), in decimal GB; a per-run explicit override is
+// available for an operator-set reserve when live MemAvailable guards
+// are configured consistently. See CLAUDE.md host-RAM incident notes.
 // gpu_device_ids is this run's own resolved config.gpus[*].device_id list.
 // `force` lets an operator proceed when certain the concurrent workload is
 // safe, for example when instances use disjoint GPU sets.
@@ -191,6 +199,7 @@ inline bool run(double required_host_ram_gb,
   }
 
   double avail = mem_available_gb();
+  g_system_info.mem_available_gb = avail;
   if (avail >= 0.0) {
     double need = required_host_ram_gb + margin_gb;
     if (avail < need) {

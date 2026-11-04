@@ -3130,6 +3130,12 @@ void test_host_budget_admission() {
                                       5 * GiB, 2 * GiB, 2 * GiB));
   assert(!physical_host_budget_allows(0, 8 * GiB, 0,
                                       1, 2 * GiB));
+  assert(!memory_reclaim_pressure_should_block(58.94, 2.34, 2.34, 0.0));
+  assert(!memory_reclaim_pressure_should_block(32.0, 4.0, 0.0, 0.0));
+  assert(memory_reclaim_pressure_should_block(31.99, 4.0, 0.0, 0.0));
+  assert(memory_reclaim_pressure_should_block(47.99, 0.0, 20.0, 0.0));
+  assert(memory_reclaim_pressure_should_block(100.0, 0.0, 0.0, 64.0));
+  assert(!memory_reclaim_pressure_should_block(100.0, -1.0, -1.0, 63.99));
   std::cout << " PASSED\n";
 }
 

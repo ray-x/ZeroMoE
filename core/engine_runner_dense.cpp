@@ -94,9 +94,9 @@ std::expected<void, std::string> EngineRunner::offload_dense_tensors() {
     if (name.find("hc_") != std::string::npos)
       return true;
     // indexer.proj (DeepSeek-V4.1's Lightning Indexer projection) and
-    // engram_q/engram_k/engram_wkv (its Engram gate/projection weights --
-    // NOT engram_embd, the giant hash-embedding table that's deliberately
-    // kept mmap'd on NVMe and never reaches resident_layers at all, see
+  // engram_gate/engram_kv (its fused Engram gate/projection weights --
+  // NOT engram_embd, the giant hash-embedding tables that stay in the
+  // separate sidecar and are read by deepseek41_engram.cpp, see
     // deepseek41_engram.cpp) are real, per-token dense_proj targets that
     // were simply missing from this allowlist. Found investigating a real
     // ~10.7s/60-token-request CPU dequant-matmul cost that expert_calls'
@@ -106,10 +106,9 @@ std::expected<void, std::string> EngineRunner::offload_dense_tensors() {
     // engram_wkv fires per Engram layer per token and indexer.proj per
     // CSA/HCA layer per token, so the CPU-vs-GPU gap compounds across a
     // whole decode.
-    if (name.find("indexer.proj.weight") != std::string::npos ||
-        name.find("engram_wkv.weight") != std::string::npos ||
-        name.find("engram_q.weight") != std::string::npos ||
-        name.find("engram_k.weight") != std::string::npos)
+  if (name.find("indexer.proj.weight") != std::string::npos ||
+      name.find("engram_gate.weight") != std::string::npos ||
+      name.find("engram_kv.weight") != std::string::npos)
       return true;
     // ssm_/ple_ catch Qwen4Exp's GDN recurrent-layer tensors (ssm_conv1d,
     // ssm_beta/alpha, ssm_out, ssm_norm, ...) and PLE layer tensors --
@@ -508,10 +507,9 @@ std::expected<void, std::string> EngineRunner::offload_dense_tensors() {
     // projections).
     if (name.find("hc_") != std::string::npos)
       return "hyper_connections (hc_*)";
-    if (name.find("indexer.proj.weight") != std::string::npos ||
-        name.find("engram_wkv.weight") != std::string::npos ||
-        name.find("engram_q.weight") != std::string::npos ||
-        name.find("engram_k.weight") != std::string::npos)
+  if (name.find("indexer.proj.weight") != std::string::npos ||
+      name.find("engram_gate.weight") != std::string::npos ||
+      name.find("engram_kv.weight") != std::string::npos)
       return "indexer/engram (DeepSeek-V4.1 gate projections)";
     if (name.find("shexp") != std::string::npos)
       return "shared_expert (shexp)";

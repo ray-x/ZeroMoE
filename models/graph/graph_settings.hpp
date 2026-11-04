@@ -29,6 +29,9 @@
 #include <vector>
 
 namespace zeromoe::graphsettings {
+// Lowest supported live-host reserve for explicit experiments. Keep the
+// config validator and MemoryGuard override on this same floor.
+inline constexpr long kMinimumConfigurableMemGuardFloorMiB = 4608;
 
 // Concrete model families for settings resolution. Glm covers GLM-5.x and
 // GLM-DSA. The GLM graph implementation is shared with Ling, but that is a
@@ -188,8 +191,15 @@ struct GraphSettings {
   Resolved<long> cache_moe_decode;
   Resolved<long> cache_moe_async_upload;
   Resolved<long> cache_moe_cpu_cold;
+  Resolved<long> cache_moe_cpu_cold_decode;
   Resolved<long> full_graph_decode;
   Resolved<long> full_graph_use_ram_cache;
+  // DeepSeek V4.1 Engram (conditional-memory) table storage:
+  // -1 = auto (default): mmap if DDR has room for MoE + >=40% of Engram,
+  //      else buffered on-demand reads with bounded LRU cache.
+  // 0 = mmap NVMe, 1 = buffered on-demand reads with bounded LRU cache.
+  Resolved<long> engram_storage_mode;
+  Resolved<long> engram_cache_mb;   // 0 = default row count (8192) for mode 1
   Resolved<long> pilot_k;
   Resolved<long> pilot_cold_k;
   Resolved<long> pilot_gate;
@@ -433,10 +443,16 @@ inline const std::vector<Field<long>> &long_fields() {
        claims_for(Family::Other), {}, false},
       {"cache_moe_cpu_cold", ZEROMOE_SETTINGS_REF(tun.cache_moe_cpu_cold), 0, Parse::FlagOn,
        claims_for(Family::Other), {}, false},
+      {"cache_moe_cpu_cold_decode", ZEROMOE_SETTINGS_REF(tun.cache_moe_cpu_cold_decode), 1, Parse::FlagOn,
+       claims_for(Family::Other), {}, false},
       {"full_graph_decode", ZEROMOE_SETTINGS_REF(tun.full_graph_decode), 1, Parse::FlagUnlessOff,
        claims_for(Family::Other), {}, false},
       {"full_graph_use_ram_cache", ZEROMOE_SETTINGS_REF(tun.full_graph_use_ram_cache), 0, Parse::FlagOn,
        kClaimAll, {}, false},
+      {"engram_storage_mode", ZEROMOE_SETTINGS_REF(tun.engram_storage_mode), -1, Parse::IntStrict,
+       claims_for(Family::Other), {}, false},
+      {"engram_cache_mb", ZEROMOE_SETTINGS_REF(tun.engram_cache_mb), 0, Parse::IntStrict,
+       claims_for(Family::Other), {}, false},
       {"pilot_k", ZEROMOE_SETTINGS_REF(tun.pilot_k), 0, Parse::IntStrict,
        claims_for(Family::Other), {}, false},
       {"pilot_cold_k", ZEROMOE_SETTINGS_REF(tun.pilot_cold_k), 0, Parse::IntStrict,
@@ -564,7 +580,9 @@ inline bool valid_integer(const std::string &name, long n) {
   if (name == "graph_host_offset") return n >= 0 && n <= 4096;
   if (name == "sparse_decode_reserve") return n >= 0 && n <= 1000000;
   if (name == "assist_device") return n >= -1 && n <= 1000;
-  if (name == "mem_guard_floor_mb") return n == -1 || n >= 8192;
+if (name == "mem_guard_floor_mb")
+  return n == -1 || n >= kMinimumConfigurableMemGuardFloorMiB;
+  if (name == "engram_storage_mode") return n >= -1 && n <= 1;
   if (name == "gpu1_min_layer") return n >= 0 && n <= 1000000;
   if (name == "gpu1_min_layer") return n >= 0 && n <= 1000000;
   if (name == "assist2_device") return n >= -1 && n <= 1000;
@@ -620,7 +638,7 @@ inline const char *meaning(const std::string &name) {
       {"offload_pin_transient", "Pin transient offload experts (default off)."},
       {"offload_seed_par", "Offload seed parallelism (default 8)."},
       {"offload_transient_par", "Offload transient read parallelism (default 8)."},
-      {"mem_guard_floor_mb", "Memory guard stop floor in MB (-1 default; >=8192 overrides)."},
+      {"mem_guard_floor_mb", "Memory guard stop floor in MB (-1 default; >=4608 overrides)."},
       {"dense_scratch_reserve_mb", "Dense scratch reserve in MB (default 256)."},
       {"offload_first_layer", "First GLM/Ling layer in the host offload tier; -1 leaves the tier disabled."},
       {"gpu_assist_slots", "Concurrent staging slots for host experts computed on GPU; consumes extra VRAM."},
@@ -687,9 +705,12 @@ inline const char *meaning(const std::string &name) {
       {"router_compare", "Qwen router correctness oracle (default off)."},
       {"device_route", "Qwen device-side routing experiment (default off)."},
       {"cache_moe_async_upload", "DeepSeek cache-MoE async upload (default off)."},
-      {"cache_moe_cpu_cold", "DeepSeek cache-MoE CPU cold path (default off)."},
+      {"cache_moe_cpu_cold", "DeepSeek cache-MoE DDR CPU path for prefill VRAM overflow (default off)."},
+      {"cache_moe_cpu_cold_decode", "DeepSeek decode: use CPU for DDR experts when true; when false, stage resident DDR misses to VRAM for graph decode (default on)."},
       {"full_graph_decode", "DeepSeek full-graph decode (on unless set to 0)."},
       {"full_graph_use_ram_cache", "Force legacy RAM cache in graph mode (default off)."},
+      {"engram_storage_mode", "DeepSeek V4.1 Engram table storage: -1 auto (default), 0 mmap NVMe, 1 buffered on-demand reads with bounded LRU cache."},
+      {"engram_cache_mb", "DeepSeek V4.1 Engram LRU row cache size in MiB for storage mode 1 (0 = default 8192 rows)."},
       {"pilot_k", "DeepSeek decode pilot k (0 disables)."},
       {"pilot_cold_k", "DeepSeek decode pilot cold k (0 disables)."},
       {"pilot_gate", "DeepSeek pilot gate (on unless set to 0)."},

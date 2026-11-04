@@ -939,6 +939,13 @@ target_include_directories(qwen_moe_router_unit_test PRIVATE
 target_link_libraries(qwen_moe_router_unit_test PRIVATE ggml)
 add_test(NAME qwen_moe_router_unit COMMAND qwen_moe_router_unit_test)
 
+# CPU-only dry-run for per-GPU dynamic VRAM slots and pinned-DDR dummy sources.
+add_executable(vram_dynamic_slot_plan_test EXCLUDE_FROM_ALL
+    tests/test_vram_dynamic_slot_plan.cpp)
+target_include_directories(vram_dynamic_slot_plan_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME vram_dynamic_slot_plan COMMAND vram_dynamic_slot_plan_test)
+
     if(ZEROMOE_USE_GGML_CUDA)
         add_executable(phase_alias_numerics_test EXCLUDE_FROM_ALL tests/test_phase_alias_numerics.cpp)
         target_include_directories(phase_alias_numerics_test PRIVATE ${ZEROMOE_GGML_ROOT}/include ${CUDAToolkit_INCLUDE_DIRS})

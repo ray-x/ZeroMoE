@@ -8,15 +8,21 @@
 #include "dense_dispatch.hpp"
 #include "dsv41_engram.hpp"
 #include "kquant_dequant.hpp"
+#include "../graph/graph_settings.hpp"
+#include "startup_preflight.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cerrno>
 #include <fcntl.h>
 #include <limits>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -30,6 +36,10 @@ struct EngramTableMap {
   const uint8_t *rows = nullptr;
   size_t row_bytes = 0;
   uint64_t n_rows = 0;
+  // No-mmap mode: retain a descriptor for buffered positional row reads.
+  std::string shard_path;
+  uint64_t data_offset = 0;
+  std::shared_ptr<int> direct_fd;
 };
 
 std::unordered_map<std::string, EngramTableMap> g_tables;
@@ -62,11 +72,31 @@ struct EngramRowKeyHash {
 
 class EngramRowCache {
 public:
-  // Exposed for the [DSV41-ENGRAM-CACHE] diagnostic line -- was
-  // previously hardcoded as a literal "8192" in that log message, which
-  // silently went stale the moment this constant changed. Read it from
-  // here instead so the two can never drift apart again.
-  static constexpr size_t capacity() { return kCapacity; }
+  // Runtime capacity (rows). Configurable via
+  // ZEROMOE_DSV41_ENGRAM_CACHE_ROWS or ZEROMOE_DSV41_ENGRAM_CACHE_MB.
+  // Defaults to 8192 rows.
+  size_t capacity(int head_dim = 0) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (capacity_rows_ == 0) {
+      long cache_mb = 0;
+      try { cache_mb = zeromoe::graphsettings::active_settings().tun.engram_cache_mb.value; } catch (...) { cache_mb = 0; }
+      const char *rows_env = std::getenv("ZEROMOE_DSV41_ENGRAM_CACHE_ROWS");
+      const char *mb_env = std::getenv("ZEROMOE_DSV41_ENGRAM_CACHE_MB");
+      if (rows_env && rows_env[0]) {
+        capacity_rows_ = (size_t)std::strtoull(rows_env, nullptr, 10);
+      } else if (cache_mb > 0 && head_dim > 0) {
+        const size_t row_bytes = (size_t)head_dim * sizeof(float);
+        if (row_bytes > 0) capacity_rows_ = ((size_t)cache_mb * 1024ULL * 1024ULL) / row_bytes;
+      } else if (mb_env && mb_env[0] && head_dim > 0) {
+        const size_t mb = (size_t)std::strtoull(mb_env, nullptr, 10);
+        const size_t row_bytes = (size_t)head_dim * sizeof(float);
+        if (row_bytes > 0) capacity_rows_ = (mb * 1024ULL * 1024ULL) / row_bytes;
+      }
+      if (capacity_rows_ == 0) capacity_rows_ = 8192;
+    }
+    return capacity_rows_;
+  }
+  static size_t capacity_static() { return 8192; }
   bool get(int table_id, int64_t row, int head_dim, float *out) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = map_.find({table_id, row});
@@ -76,6 +106,9 @@ public:
     return true;
   }
   void put(int table_id, int64_t row, const float *data, int head_dim) {
+    // Resolve capacity before taking mutex_: capacity() takes the same lock.
+    // Calling it from inside this critical section deadlocks the first miss.
+    const size_t effective_cap = capacity(head_dim);
     std::lock_guard<std::mutex> lock(mutex_);
     const EngramRowKey key{table_id, row};
     auto it = map_.find(key);
@@ -83,7 +116,7 @@ public:
       order_.splice(order_.begin(), order_, it->second.order_it);
       return;
     }
-    if (map_.size() >= kCapacity) {
+    if (map_.size() >= effective_cap) {
       const EngramRowKey victim = order_.back();
       order_.pop_back();
       map_.erase(victim);
@@ -109,7 +142,7 @@ private:
   // longer real conversations with genuine n-gram repetition, untested
   // this session). See [[deepseek-v41-decode-speed-session]] for the
   // full investigation.
-  static constexpr size_t kCapacity = 8192;
+  size_t capacity_rows_ = 0;
   struct Entry {
     std::vector<float> data;
     std::list<EngramRowKey>::iterator order_it;
@@ -132,14 +165,14 @@ EngramRowCache g_row_cache;
 std::atomic<uint64_t> g_engram_cache_hits{0};
 std::atomic<uint64_t> g_engram_cache_misses{0};
 
-const EngramTableMap *map_table(StreamingEngine &engine, const GGUFTensor &t,
-                                int row_dim) {
+const EngramTableMap *map_table(StreamingEngine &engine, const GGUFFile &source,
+                                const GGUFTensor &t, int row_dim) {
   if (t.shape.size() != 2 ||
       t.shape[0] != (uint64_t)row_dim || t.shard_idx < 0 ||
-      (size_t)t.shard_idx >= engine.model_file.shard_paths.size())
+      (size_t)t.shard_idx >= source.shard_paths.size())
     return nullptr;
-  const std::string key = engine.model_file.shard_paths[(size_t)t.shard_idx] +
-                          "#" + t.name;
+  const std::string shard_path = source.shard_paths[(size_t)t.shard_idx];
+  const std::string key = shard_path + "#" + t.name;
   std::lock_guard<std::mutex> lock(g_tables_mutex);
   auto found = g_tables.find(key);
   if (found != g_tables.end()) return &found->second;
@@ -159,16 +192,46 @@ const EngramTableMap *map_table(StreamingEngine &engine, const GGUFTensor &t,
   if (length > SIZE_MAX || base > (uint64_t)std::numeric_limits<off_t>::max())
     return nullptr;
 
-  const int fd = ::open(engine.model_file.shard_paths[(size_t)t.shard_idx].c_str(),
-                         O_RDONLY);
+  const int fd = ::open(shard_path.c_str(), O_RDONLY);
   if (fd < 0) {
     LOG_ERROR("[DSV41-ENGRAM] cannot open shard %s: %s\n",
-              engine.model_file.shard_paths[(size_t)t.shard_idx].c_str(),
-              std::strerror(errno));
+              shard_path.c_str(), std::strerror(errno));
     return nullptr;
   }
-  void *mapped = ::mmap(nullptr, (size_t)length, PROT_READ, MAP_SHARED, fd,
-                        (off_t)base);
+
+  const auto &gs = zeromoe::graphsettings::active_settings();
+  long storage_mode = gs.tun.engram_storage_mode.value;
+  if (storage_mode == -1) {
+    double mem_avail_gb = preflight::system_info().mem_available_gb;
+    if (mem_avail_gb < 0.0) mem_avail_gb = preflight::mem_available_gb();
+    if (mem_avail_gb < 0.0) mem_avail_gb = 0.0;
+    const double engram_gb = (double)length / 1.0e9;
+    if (gs.tun.engram_cache_mb.value > 0) storage_mode = 1;
+    else if (mem_avail_gb >= 0.4 * engram_gb + 1.0) storage_mode = 0;
+    else storage_mode = 1;
+  }
+  const bool direct_requested = (storage_mode == 1);
+  if (direct_requested) {
+    EngramTableMap entry;
+    entry.row_bytes = rb;
+    entry.n_rows = rows;
+    entry.shard_path = shard_path;
+    entry.data_offset = t.offset;
+    entry.direct_fd = std::shared_ptr<int>(
+        new int(fd), [](int *open_fd) {
+          if (*open_fd >= 0) ::close(*open_fd);
+          delete open_fd;
+        });
+    auto inserted = g_tables.emplace(key, entry);
+    LOG_STREAM_INFO() << "[DSV41-ENGRAM] on-demand pread " << t.name << ": " << rows
+                      << " rows x " << row_dim
+                      << " (buffered positional reads, no mmap)\n";
+    return &inserted.first->second;
+  }
+
+  void *mapped = nullptr;
+  mapped = ::mmap(nullptr, (size_t)length, PROT_READ, MAP_SHARED, fd,
+                  (off_t)base);
   ::close(fd);
   if (mapped == MAP_FAILED) {
     LOG_ERROR("[DSV41-ENGRAM] mmap failed for %s: %s\n",
@@ -311,7 +374,7 @@ void deepseek41_engram_print_cache_stats() {
            "row lookups, fixed capacity %zu rows\n",
            (unsigned long long)hits, (unsigned long long)misses,
            100.0 * (double)hits / (double)total, (unsigned long long)total,
-           EngramRowCache::capacity());
+           g_row_cache.capacity(0));
 }
 
 void deepseek41_engram_layer_input(StreamingEngine &engine, int layer_idx,
@@ -337,8 +400,11 @@ void deepseek41_engram_layer_input(StreamingEngine &engine, int layer_idx,
     return;
 
   const std::string prefix = "blk." + std::to_string(layer_idx) + ".";
-  auto table_it = engine.model_file.tensors.find(prefix + "engram_embd.weight");
-  if (table_it == engine.model_file.tensors.end()) {
+  const GGUFFile &table_file = engine.has_engram_model
+                                  ? engine.engram_model_file
+                                  : engine.model_file;
+  auto table_it = table_file.tensors.find(prefix + "engram_embd.weight");
+  if (table_it == table_file.tensors.end()) {
     LOG_ERROR("[DSV41-ENGRAM] missing table for layer %d\n", layer_idx);
     return;
   }
@@ -348,14 +414,13 @@ void deepseek41_engram_layer_input(StreamingEngine &engine, int layer_idx,
     return;
 
   std::vector<float> kv((size_t)S * (HC + 1) * D);
-  dense_proj(engine, prefix + "engram_wkv.weight", embed.data(), kv.data(), S,
+  dense_proj(engine, prefix + "engram_kv.weight", embed.data(), kv.data(), S,
              n_hash_cols * head_dim, (HC + 1) * D);
-  std::vector<float> q_weight, k_weight;
-  if (!load_small_f32(engine, prefix + "engram_q.weight", (size_t)HC * D,
-                      q_weight) ||
-      !load_small_f32(engine, prefix + "engram_k.weight", (size_t)HC * D,
-                      k_weight)) {
-    LOG_ERROR("[DSV41-ENGRAM] missing q/k weights at layer %d\n", layer_idx);
+  std::vector<float> gate_weight;
+  if (!load_small_f32(engine, prefix + "engram_gate.weight",
+                      (size_t)HC * D, gate_weight)) {
+    LOG_ERROR("[DSV41-ENGRAM] missing fused gate weight at layer %d\n",
+              layer_idx);
     return;
   }
 
@@ -370,8 +435,7 @@ void deepseek41_engram_layer_input(StreamingEngine &engine, int layer_idx,
       double hss = 0.0, kss = 0.0, dot = 0.0;
       for (int d = 0; d < D; ++d) {
         const float hv = stream[d];
-        const float weight = q_weight[(size_t)h * D + d] *
-                             k_weight[(size_t)h * D + d];
+      const float weight = gate_weight[(size_t)h * D + d];
         hss += (double)hv * hv;
         kss += (double)key[d] * key[d];
         dot += (double)hv * weight * key[d];
@@ -417,12 +481,16 @@ bool deepseek41_engram_embedding_rows(StreamingEngine &engine, int layer_idx,
     return false;
   }
   const std::string prefix = "blk." + std::to_string(layer_idx) + ".";
-  auto table_it = engine.model_file.tensors.find(prefix + "engram_embd.weight");
-  if (table_it == engine.model_file.tensors.end()) {
+  const GGUFFile &table_file = engine.has_engram_model
+                                  ? engine.engram_model_file
+                                  : engine.model_file;
+  auto table_it = table_file.tensors.find(prefix + "engram_embd.weight");
+  if (table_it == table_file.tensors.end()) {
     LOG_ERROR("[DSV41-ENGRAM] missing table for layer %d\n", layer_idx);
     return false;
   }
-  const EngramTableMap *table = map_table(engine, table_it->second, head_dim);
+  const EngramTableMap *table =
+      map_table(engine, table_file, table_it->second, head_dim);
   if (!table) {
     LOG_ERROR("[DSV41-ENGRAM] cannot map table for layer %d\n", layer_idx);
     return false;
@@ -442,9 +510,31 @@ bool deepseek41_engram_embedding_rows(StreamingEngine &engine, int layer_idx,
       float *dst = embedding.data() + ((size_t)s * n_hash_cols + col) * head_dim;
       if (!g_row_cache.get(table_id, row, head_dim, dst)) {
         g_engram_cache_misses.fetch_add(1, std::memory_order_relaxed);
-        dequant_row(table_it->second.type,
-                    table->rows + (size_t)row * table->row_bytes, dst,
-                    head_dim);
+        std::vector<uint8_t> rowbuf(table->row_bytes);
+        if (table->rows) {
+          std::memcpy(rowbuf.data(), table->rows + (size_t)row * table->row_bytes,
+                      table->row_bytes);
+        } else {
+          if (!table->direct_fd || *table->direct_fd < 0) {
+            LOG_ERROR("[DSV41-ENGRAM] no open read handle for %s\n",
+                      table->shard_path.c_str());
+            embedding.clear();
+            return false;
+          }
+          const off_t off = (off_t)(table->data_offset +
+                                   (size_t)row * table->row_bytes);
+          const ssize_t r = ::pread(*table->direct_fd, rowbuf.data(),
+                                    table->row_bytes, off);
+          posix_fadvise(*table->direct_fd, off, (off_t)table->row_bytes,
+                        POSIX_FADV_DONTNEED);
+          if (r != (ssize_t)table->row_bytes) {
+            LOG_ERROR("[DSV41-ENGRAM] short read row %lld for layer %d\n",
+                      (long long)row, layer_idx);
+            embedding.clear();
+            return false;
+          }
+        }
+        dequant_row(table_it->second.type, rowbuf.data(), dst, head_dim);
         g_row_cache.put(table_id, row, dst, head_dim);
       } else {
         g_engram_cache_hits.fetch_add(1, std::memory_order_relaxed);
