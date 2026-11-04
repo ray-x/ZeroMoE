@@ -928,3 +928,35 @@ The decode path no longer spills experts to CPU, but per-token GPU uploads/cache
 
 ### DeepSeek v25 persistent-pin hint A/B (2026-11-04)
 Binary SHA-256 `9adbb80fbbfc9d6d34435db5c0a2357cb02efbb996a8beae2d76ff918b19ab94`; same GGML base/patch manifest as v24. Artifact: `build_mtp_results/2026-11-04-c0e9963-deepseek41-fullgraph-prefill-decode-v25/`. Full residency and full-graph checker passed. The only code change from v24 passed `MoEExpertBlock::slab_pinned` into `upload_expert_async` to skip redundant transient registration when the slab is already pinned. Decode was 2.14 tok/s wall / 2.22 steady versus v24 1.91 wall / 2.25 steady (no material improvement). Async registration plus deferred unregistration remained 10.24 s over 71.90 GB; 2,488/14,847 calls (16.8%) were already pinned. MemAvailable low-water 5.456 GiB, zero process swap, PSI peak 1.26%. Shutdown exited 0 without core. The pin-hint micro-optimization is safe but not the 10 tok/s lever; next work should address H2D transfer volume/latency or hotset/cache policy, and separately accelerate the prefill CPU path.
+
+
+## DeepSeek v26 bounce-upload attempt and swap incident (2026-11-04)
+
+Source worktree: `codex/deepseek-v41-continuation`, HEAD `de4d7f50c35949fbe026eb713fe89987a0040df3`, with an uncommitted opt-in DeepSeek async bounce-upload change. Binary SHA-256 `ccbb54bc3bd46b8f50b901d4dd9cf483746e25cbd116d8c14c14c32b5e045973`; GGML base `8baabd53b77d1c48c6ef8d3b620436292f3f6231`; patch manifest `5c4c17e7164237cf7da1570a5dcf1194fbd700df0ee3ca980bf96dcc4530f95b`. Artifact: `build_mtp_results/2026-11-04-de4d7f5-deepseek41-bounce-upload-ab-v26/`.
+
+The guarded startup gate passed with MemAvailable 129.255 GB, both GPUs idle, CUDA device count 2, and 1.317 GiB system swap in use. Full residency loaded 15,360/15,360 experts. The 959-token full-graph prefill with CPU offload completed all 40 layers in 62.654 s (15.306 tok/s) and reported zero MoE disk reads. The first decode graph token failed before generating output; therefore v26 has no decode rate and the bounce-upload speed effect is inconclusive. The second request was not sent.
+
+The host-process monitor later recorded MemAvailable 0 GiB, system swap 39.625 GiB, process VmSwap 28.005 GiB, and memory PSI avg10 about 98.6%/98.4%. The user reports that the machine froze and required a power reset. The server log's last application message was a CUDA invalid-resource-handle error on GPU 1, but this does not establish the cause of the whole-host freeze. The previous-boot kernel journal was not retained. No new model or GPU test should run until swap-aware live protection is added and the user authorizes another attempt.
+
+The v26 launcher only gated initial MemAvailable and swap-out rate, and its monitor only recorded host memory. It did not stop when the model process or system began swapping. That guard is insufficient. The next safety work is to add a live watchdog that records and stops the run on process VmSwap growth, system swap growth, sustained memory PSI, or crossing the configured MemAvailable floor; keep ordinary HTTP/model failures separate so a failed prompt still leaves the server alive when host memory remains safe.
+
+
+### Post-reset swap guard retrofit (not runtime-tested)
+
+The v26 run’s guarded-start script required initial MemAvailable and a low swap-out rate, but its live monitor only recorded host memory and did not stop the server as swap grew. After the power reset, the v26 artifact was retrofitted with a stricter startup gate (system SwapUsed <=2 GiB, growth <=256 MiB, swap-out <1 MiB/s) and a live watchdog. The watchdog sends SIGTERM only for host-safety violations: configured MemAvailable floor, process VmSwap >0.25 GiB, system SwapUsed growth >0.50 GiB, PSI-full avg10 >5% for two samples, or swap-out >8 MiB/s for two samples. Ordinary HTTP/model failures still leave ZeroMoE alive when host memory is safe.
+
+A synthetic check confirms the v25 low-swap sample passes and v26’s final monitor sample triggers the watchdog conditions. The script passes Python compilation and `bash -n`. This retrofit has not been run on hardware. No further GPU/model run has been started after the power reset; wait for user authorization before another attempt.
+
+
+### Reusable swap watchdog (post-reset safety work)
+
+The passive per-run monitor used in v26 is retained as historical evidence. A reusable replacement now lives at `tools/host_pressure_watchdog.py`; the saved guarded launcher calls it after startup. It records every second and sends SIGTERM only for explicit host-safety conditions: MemAvailable below the configured 4.5 GiB floor, ZeroMoE VmSwap above 0.25 GiB, system swap growth above 0.50 GiB from launch, PSI-full avg10 above 5% for two samples, or swap-out above 8 MiB/s for two samples. Ordinary HTTP/model failure alone leaves ZeroMoE up. Startup also includes the configured MoE request headroom and rejects system swap above 2 GiB, growth above 256 MiB, or swap-out >=1 MiB/s. Four synthetic policy tests pass; the watchdog has not been run on hardware. No new model run has been started after the power reset.
+
+
+### Bounce-upload experiment disabled after failed decode
+
+The v26 opt-in bounce-upload path was reverted from the active source after its only guarded request failed on the first decode token and produced no decode measurement. The v26 config and logs remain as immutable run evidence; do not rerun that artifact. The active worktree now matches the committed v25 engine source for inference, plus the separately tested host swap watchdog utility. No GPU/model test has been run after the power reset.
+
+### Post-reset active state (2026-11-04)
+
+The unverified bounce-upload change was removed from the active inference source; the failed v26 config/logs remain in its artifact directory. The active DeepSeek engine sources now match commit `de4d7f50c35949fbe026eb713fe89987a0040df3`. A fresh non-inference build passed provenance (binary SHA-256 `a1e422990b50299d136af83fbf39fe260fd667321041419582014882fd3fb556`). `graph_settings`, `graph_settings_binding`, and `vram_dynamic_slot_plan` pass (3/3), and the new swap-watchdog synthetic tests pass (4/4). The v26 host watchdog is now backed by reusable `tools/host_pressure_watchdog.py`; no hardware rerun has occurred after the power reset.
