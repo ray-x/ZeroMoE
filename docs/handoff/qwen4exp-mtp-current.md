@@ -1,6 +1,6 @@
 # Qwen4Exp MTP shared handoff
 
-Updated 2026-11-03. Promo and MTP prefill-overlap controls are now typed Qwen graph settings (`graph_promo_*`, `graph_mtp_prefill_overlap`); `ZEROMOE_MTP_GREEDY_FAST_PATH`, `ZEROMOE_QWEN4EXP_EXPERT_PROMOTION`, and `ZEROMOE_QWEN4EXP_ROUTE_IDS_DUMP` were removed. Refresh the current HEAD and worktree list before using any
+Updated 2026-11-04. Promo and MTP prefill-overlap controls are now typed Qwen graph settings (`graph_promo_*`, `graph_mtp_prefill_overlap`); `ZEROMOE_MTP_GREEDY_FAST_PATH`, `ZEROMOE_QWEN4EXP_EXPERT_PROMOTION`, and `ZEROMOE_QWEN4EXP_ROUTE_IDS_DUMP` were removed. Refresh the current HEAD and worktree list before using any
 binary or citing a result.
 
 ## v0.0.1 baseline: plain decode and MTP (2026-10-28, locally measured)
@@ -985,7 +985,7 @@ The opt-in path now creates a completion event per device per portable bounce bu
 
 ## DeepSeek V4.1 Flash full-graph v30 (2026-11-04; locally measured)
 
-Owner/worktree: `codex/deepseek-v41-continuation` at runtime source commit `2b5a16503f9dd17842051052b1c27365e2579b0b`; current branch advanced to watchdog-only commit `187d751e144742cad6d36cac6a4dddc72f7c857f`. Binary SHA256 `2c5ec2eea13bb182ad4174658ee2204e1d414db56ba2f1296bafe594325dbc69`; GGML base `8baabd53b77d1c48c6ef8d3b620436292f3f6231`; GGML patch manifest `5c4c17e7164237cf7da1570a5dcf1194fbd700df0ee3ca980bf96dcc4530f95b`. Toolchain CUDA 13.3, GCC 16.2.1, driver 610.57.04, native targets `sm_86;sm_120`. Dual GPUs: RTX 3090 + RTX 5060 Ti, `CUDA_VISIBLE_DEVICES=0,1`, OMP threads 10.
+Owner/worktree: `codex/deepseek-v41-continuation`; the measured run used runtime source commit `2b5a16503f9dd17842051052b1c27365e2579b0b`. Current HEAD is `9629a7cc4fbe8fe2e4c71f74c8ea7434a0043ab2` after the watchdog-only code commit and this handoff update; no inference source changed after the run. Binary SHA256 `2c5ec2eea13bb182ad4174658ee2204e1d414db56ba2f1296bafe594325dbc69`; GGML base `8baabd53b77d1c48c6ef8d3b620436292f3f6231`; GGML patch manifest `5c4c17e7164237cf7da1570a5dcf1194fbd700df0ee3ca980bf96dcc4530f95b`. Toolchain CUDA 13.3, GCC 16.2.1, driver 610.57.04, native targets `sm_86;sm_120`. Dual GPUs: RTX 3090 + RTX 5060 Ti, `CUDA_VISIBLE_DEVICES=0,1`, OMP threads 10.
 
 Input layout was confirmed after user correction: numbered main GGUF shards 1–5 plus `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` as logical component 6. Main GGUF reported 1,042 tensors; Engram sidecar reported 2 tables. No GGUF data was copied.
 
