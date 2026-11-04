@@ -61,12 +61,15 @@ def pressure_reasons(
     swapout_mib_s: float,
     swapout_streak: int,
     live_floor_gib: float,
-    process_swap_limit_gib: float = 0.25,
-    system_swap_growth_limit_gib: float = 0.50,
-    psi_full_limit_pct: float = 5.0,
-    psi_full_samples: int = 2,
-    swapout_limit_mib_s: float = 8.0,
-    swapout_samples: int = 2,
+    # The previous DeepSeek run escalated to 39+ GiB system swap and froze
+    # the host. Stop on early signs of new swapping instead of waiting for
+    # severe pressure.
+    process_swap_limit_gib: float = 0.0625,  # 64 MiB
+    system_swap_growth_limit_gib: float = 0.125,  # 128 MiB
+    psi_full_limit_pct: float = 1.0,
+    psi_full_samples: int = 1,
+    swapout_limit_mib_s: float = 1.0,
+    swapout_samples: int = 1,
 ) -> list[str]:
     """Pure policy function, also used by the synthetic safety test."""
     reasons: list[str] = []
@@ -183,8 +186,8 @@ def run(args: argparse.Namespace) -> int:
                     elapsed = max(0.001, now - previous_mono)
                     swapout_mib_s = max(0, pages - previous_pages) * page_size / MIB / elapsed
                 previous_pages, previous_mono = pages, now
-                full_psi_streak = full_psi_streak + 1 if psi_full > 5.0 else 0
-                swapout_streak = swapout_streak + 1 if swapout_mib_s > 8.0 else 0
+                full_psi_streak = full_psi_streak + 1 if psi_full > 1.0 else 0
+                swapout_streak = swapout_streak + 1 if swapout_mib_s > 1.0 else 0
                 sample = {
                     "memavailable_gib": available / GIB,
                     "vm_swap_gib": status.get("VmSwap", 0) / GIB,

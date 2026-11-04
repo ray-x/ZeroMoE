@@ -17,8 +17,8 @@ class PressureReasonTests(unittest.TestCase):
         values = {
             "memavailable_gib": 5.5,
             "vm_swap_gib": 0.0,
-            "swap_used_gib": 1.5,
-            "baseline_swap_gib": 1.3,
+            "swap_used_gib": 1.317,
+            "baseline_swap_gib": 1.317,
             "psi_full_avg10_pct": 1.0,
             "full_psi_streak": 0,
             "swapout_mib_s": 0.0,
@@ -43,6 +43,22 @@ class PressureReasonTests(unittest.TestCase):
             swapout_streak=3,
         )
         self.assertGreaterEqual(len(reasons), 5)
+
+    def test_small_process_swap_growth_trips_early(self):
+        reasons = self.reasons(vm_swap_gib=0.063)
+        self.assertTrue(any("VmSwap" in reason for reason in reasons))
+
+    def test_small_system_swap_growth_trips_early(self):
+        reasons = self.reasons(swap_used_gib=1.426, baseline_swap_gib=1.300)
+        self.assertTrue(any("SwapUsed" in reason for reason in reasons))
+
+    def test_first_swapout_sample_trips(self):
+        reasons = self.reasons(swapout_mib_s=1.1, swapout_streak=1)
+        self.assertTrue(any("swap-out" in reason for reason in reasons))
+
+    def test_first_psi_full_sample_trips(self):
+        reasons = self.reasons(psi_full_avg10_pct=1.1, full_psi_streak=1)
+        self.assertTrue(any("PSI full" in reason for reason in reasons))
 
     def test_process_swap_is_separately_gated(self):
         reasons = self.reasons(vm_swap_gib=0.3)
