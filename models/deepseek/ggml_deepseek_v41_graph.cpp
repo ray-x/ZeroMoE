@@ -775,6 +775,8 @@ void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
   RamPinGuard cpu_spill_pins(*ram, (size_t)c.n_experts);
   const bool async_upload = !site.cpu_cold_graph &&
       zeromoe::graphsettings::active_settings().tun.cache_moe_async_upload.value != 0;
+  const bool prefer_bounce_upload = async_upload &&
+      zeromoe::graphsettings::active_settings().tun.cache_moe_async_bounce_upload.value != 0;
   std::vector<ExpertLocation *> pending_locations((size_t)c.n_experts, nullptr);
   std::vector<ExpertLocation *> held_locations((size_t)c.n_experts, nullptr);
   site.cpu_experts.clear();
@@ -958,7 +960,8 @@ void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
           {
             std::lock_guard<std::recursive_mutex> cache_lock(topo->cache_mutex);
             loc = topo->upload_expert_async(site.layer, expert, block->slab_buffer,
-                                            bytes, preferred, block->slab_pinned);
+                                            bytes, preferred, block->slab_pinned,
+                                            prefer_bounce_upload);
             if (loc) {
               // Protect the slot before another cache worker can observe its
               // completed event and evict it. The graph will not read the data

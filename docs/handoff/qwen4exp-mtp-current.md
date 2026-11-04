@@ -974,3 +974,10 @@ A v27 full-residency candidate is prepared at `build_mtp_results/2026-11-04-7f76
 Current host MemAvailable is 125.973 GB with about 0.002 GiB swap used; this candidate's startup gate requires 127.945 GB including host cap, startup margin, and request headroom, so it will not start in the current state. No server or GPU process is running. No rerun has started after the power reset; wait for user authorization.
 
 The v27 64-slot reserve also passes the offline placement-planner test: 34 dynamic slots on the 3090, 30 on the 5060 Ti, with 2,571 static-resident slots retained. The runtime DDR/VRAM placement remains unverified. Current MemAvailable (125.95 GB) is below the guarded candidate’s 127.945 GB startup requirement, so it is not launchable now; the saved launcher would wait. No hardware load has been started.
+
+
+### v26 decode-handle diagnosis and corrected opt-in path (2026-11-04; runtime unverified)
+
+Static review found a concrete candidate for v26’s first decode-token invalid-resource-handle error: GpuTopology had one bounce-buffer completion event per host buffer, created once in whichever CUDA device context was current, then recorded against copy streams from both GPUs. NVIDIA’s multi-device guide says cudaEventRecord fails when the event and stream belong to different devices ([CUDA Programming Guide, multi-device stream/event behavior](https://docs.nvidia.com/cuda/cuda-programming-guide/03-advanced/multi-gpu-systems.html#multi-device-stream-event-and-memory-copy-behavior)). This candidate explains the logged first-token decode failure; it does not explain the separate later host freeze, whose monitor evidence is swap exhaustion.
+
+The opt-in path now creates a completion event per device per portable bounce buffer, waits all device events before reusing a buffer, checks copy size against buffer capacity, and drains in-flight events at teardown. The cache_moe_async_bounce_upload setting defaults off. CPU-only compile and tests pass, including the event-device mapping/capacity checks. There has been no hardware test; candidate artifact is build_mtp_results/2026-11-04-b43915e-deepseek41-bounce-device-events-v28/.

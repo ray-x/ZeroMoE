@@ -1,4 +1,5 @@
 #include "core/vram_dynamic_slot_plan.hpp"
+#include "core/gpu_bounce_pool_plan.hpp"
 #include "memory/memory_guard.hpp"
 #include "models/deepseek/deepseek_cache_policy.hpp"
 
@@ -14,6 +15,8 @@ using zeromoe::memory::choose_static_vram_upload_gpu;
 using zeromoe::memory::is_pinned_ddr_dummy_candidate;
 using zeromoe::memory::plan_deepseek_prefill_dummy_stage;
 using zeromoe::memory::plan_vram_dynamic_slots;
+using zeromoe::gpu::bounce_buffer_suitable;
+using zeromoe::gpu::bounce_event_index_for_gpu;
 
 namespace {
 void check(bool condition, const char *message) {
@@ -82,6 +85,22 @@ std::vector<VramUnpinnedSlotCount> unpinned = {{0, 1409}, {1, 1226}};
 simulate_static_uploads(plan.per_gpu, unpinned, 2571);
 check(slots_for(unpinned, 0) == 34 && slots_for(unpinned, 1) == 30,
       "64-slot candidate should preserve its per-GPU staging reserve after static preload");
+}
+
+void test_bounce_pool_events_are_device_scoped_and_bounded() {
+  const std::vector<int> event_devices = {0, 1};
+  check(bounce_event_index_for_gpu(event_devices, 0) == 0,
+        "GPU0 must use its own bounce completion event");
+  check(bounce_event_index_for_gpu(event_devices, 1) == 1,
+        "GPU1 must use its own bounce completion event");
+  check(bounce_event_index_for_gpu(event_devices, 2) == -1,
+        "a device without a bounce event must take the pageable fallback");
+  check(bounce_buffer_suitable(12, 12, true),
+        "an in-bounds copy with a device event may use the bounce buffer");
+  check(!bounce_buffer_suitable(13, 12, true),
+        "an oversized copy must not overrun the bounce buffer");
+  check(!bounce_buffer_suitable(12, 12, false),
+        "missing target-device event must disable bounce staging");
 }
 
 void test_existing_core_pins_reduce_available_pool() {
@@ -184,6 +203,7 @@ void test_deepseek_cpu_offload_is_phase_specific() {
 int main() {
   test_dual_gpu_preload_preserves_dynamic_slots();
 test_dynamic_64_slot_candidate_preserves_full_placement_capacity();
+  test_bounce_pool_events_are_device_scoped_and_bounded();
   test_existing_core_pins_reduce_available_pool();
   test_infeasible_dynamic_reserve_fails_closed();
   test_dummy_candidate_requires_pinned_matching_ddr_source();

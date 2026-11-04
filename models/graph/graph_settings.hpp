@@ -190,6 +190,7 @@ struct GraphSettings {
   Resolved<long> cache_moe_graph;
   Resolved<long> cache_moe_decode;
   Resolved<long> cache_moe_async_upload;
+  Resolved<long> cache_moe_async_bounce_upload;
   Resolved<long> cache_moe_cpu_cold;
   Resolved<long> cache_moe_cpu_cold_decode;
   Resolved<long> full_graph_decode;
@@ -440,6 +441,8 @@ inline const std::vector<Field<long>> &long_fields() {
       {"cache_moe_decode", ZEROMOE_SETTINGS_REF(tun.cache_moe_decode), 0, Parse::FlagOn,
        claims_for(Family::Other), {}, false},
       {"cache_moe_async_upload", ZEROMOE_SETTINGS_REF(tun.cache_moe_async_upload), 0, Parse::FlagOn,
+       claims_for(Family::Other), {}, false},
+      {"cache_moe_async_bounce_upload", ZEROMOE_SETTINGS_REF(tun.cache_moe_async_bounce_upload), 0, Parse::FlagOn,
        claims_for(Family::Other), {}, false},
       {"cache_moe_cpu_cold", ZEROMOE_SETTINGS_REF(tun.cache_moe_cpu_cold), 0, Parse::FlagOn,
        claims_for(Family::Other), {}, false},
@@ -705,6 +708,7 @@ inline const char *meaning(const std::string &name) {
       {"router_compare", "Qwen router correctness oracle (default off)."},
       {"device_route", "Qwen device-side routing experiment (default off)."},
       {"cache_moe_async_upload", "DeepSeek cache-MoE async upload (default off)."},
+      {"cache_moe_async_bounce_upload", "DeepSeek async DDR-to-VRAM upload bounce staging for unpinned sources (default off)."},
       {"cache_moe_cpu_cold", "DeepSeek cache-MoE DDR CPU path for prefill VRAM overflow (default off)."},
       {"cache_moe_cpu_cold_decode", "DeepSeek decode: use CPU for DDR experts when true; when false, stage resident DDR misses to VRAM for graph decode (default on)."},
       {"full_graph_decode", "DeepSeek full-graph decode (on unless set to 0)."},

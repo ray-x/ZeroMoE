@@ -5,6 +5,7 @@
 #include "graph_config.hpp"
 #include "gpu_selection.hpp"
 #include "graph_settings_global.hpp"
+#include "gpu_bounce_pool_plan.hpp"
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -807,10 +808,15 @@ public:
     // tier's own slab_buffer directly.
     struct BounceBuffer {
         uint8_t* host_ptr = nullptr;
-        cudaEvent_t in_flight = nullptr;  // records the last DMA that read this buffer
+        size_t size_bytes = 0;
+        // Portable host memory can be read by either GPU, but CUDA events are
+        // device-scoped. Track each device's last DMA before reusing a buffer.
+        std::vector<cudaEvent_t> in_flight_by_device;
+        std::vector<uint8_t> pending_by_device;
     };
     static constexpr int BOUNCE_POOL_SIZE = 4;
     std::vector<BounceBuffer> bounce_pool;
+    std::vector<int> bounce_event_gpu_ids;
     size_t bounce_next = 0;
 
     // upload_expert_async's cudaHostRegister conversion (2026-08-13, Alt A,
@@ -1042,10 +1048,29 @@ public:
             }
         }
         if (h_xfer_pinned) cudaFreeHost(h_xfer_pinned);
+        int bounce_previous_device = -1;
+        cudaGetDevice(&bounce_previous_device);
         for (auto& bb : bounce_pool) {
-            if (bb.in_flight) cudaEventDestroy(bb.in_flight);
+            for (size_t i = 0; i < bb.in_flight_by_device.size(); ++i) {
+                auto event = bb.in_flight_by_device[i];
+                if (!event) continue;
+                if (i < bounce_event_gpu_ids.size()) {
+                    cudaSetDevice(bounce_event_gpu_ids[i]);
+                    if (i < bb.pending_by_device.size() &&
+                        bb.pending_by_device[i]) {
+                        const cudaError_t sync_status = cudaEventSynchronize(event);
+                        if (sync_status != cudaSuccess) {
+                            cudaGetLastError();
+                            LOG_WARN("[GPU] bounce buffer drain failed on GPU %d during teardown\n",
+                                     bounce_event_gpu_ids[i]);
+                        }
+                    }
+                }
+                cudaEventDestroy(event);
+            }
             if (bb.host_ptr) cudaFreeHost(bb.host_ptr);
         }
+        if (bounce_previous_device >= 0) cudaSetDevice(bounce_previous_device);
         if (active_layer_pool) { cudaSetDevice(active_layer_slots.front().gpu_id); cudaFree(active_layer_pool); }
         MemoryGuard::release_host_bytes(host_pinned_reservation_bytes);
         host_pinned_reservation_bytes = 0;
@@ -1080,50 +1105,102 @@ public:
             return;
         }
         host_pinned_reservation_bytes += total_host_bytes;
+        int previous_device = -1;
+        cudaGetDevice(&previous_device);
+        bounce_event_gpu_ids.clear();
+        bounce_event_gpu_ids.reserve(devices.size());
+        for (const auto& dev : devices) bounce_event_gpu_ids.push_back(dev.id);
+
         bounce_pool.resize(BOUNCE_POOL_SIZE);
         int allocated = 0;
         for (auto& bb : bounce_pool) {
-            cudaError_t err = cudaHostAlloc((void**)&bb.host_ptr, slab_bytes, cudaHostAllocPortable);
-            if (err != cudaSuccess) {
-                LOG_STREAM_ERROR() << "[GPU] Bounce buffer cudaHostAlloc(" << slab_bytes / 1e6
-                          << " MB) failed: " << cudaGetErrorString(err)
-                          << " -- expert uploads fall back to direct pageable-source copy.\n";
+            bb.size_bytes = slab_bytes;
+            bb.in_flight_by_device.assign(devices.size(), nullptr);
+            bb.pending_by_device.assign(devices.size(), 0);
+            const cudaError_t alloc_status =
+                cudaHostAlloc((void**)&bb.host_ptr, slab_bytes, cudaHostAllocPortable);
+            if (alloc_status != cudaSuccess) {
+                LOG_STREAM_ERROR() << "[GPU] Bounce buffer cudaHostAlloc("
+                                  << slab_bytes / 1e6 << " MB) failed: "
+                                  << cudaGetErrorString(alloc_status)
+                                  << " -- expert uploads fall back to direct pageable-source copy.\n";
                 bb.host_ptr = nullptr;
                 continue;
             }
             ++allocated;
-            cudaEventCreate(&bb.in_flight);
+            for (size_t i = 0; i < devices.size(); ++i) {
+                if (cudaSetDevice(devices[i].id) != cudaSuccess) {
+                    cudaGetLastError();
+                    continue;
+                }
+                const cudaError_t event_status =
+                    cudaEventCreateWithFlags(&bb.in_flight_by_device[i],
+                                             cudaEventDisableTiming);
+                if (event_status != cudaSuccess) {
+                    cudaGetLastError();
+                    bb.in_flight_by_device[i] = nullptr;
+                    LOG_WARN("[GPU] bounce completion event unavailable on GPU %d; "
+                             "uploads will use pageable fallback\n",
+                             devices[i].id);
+                }
+            }
         }
+        if (previous_device >= 0) cudaSetDevice(previous_device);
         if (allocated < BOUNCE_POOL_SIZE) {
             const size_t unused = (size_t)(BOUNCE_POOL_SIZE - allocated) * slab_bytes;
             MemoryGuard::release_host_bytes(unused);
             host_pinned_reservation_bytes -= unused;
         }
         LOG_STREAM_INFO() << "[GPU] Bounce buffer pool: " << BOUNCE_POOL_SIZE << " x "
-                  << slab_bytes / 1e6 << " MB pinned (portable) staging buffers for expert H2D uploads\n";
+                          << slab_bytes / 1e6
+                          << " MB pinned (portable), with device-scoped completion events\n";
     }
 
-    // Round-robins bounce_pool; waits only if THIS buffer's previous DMA
-    // hasn't drained yet (double buffering -- with BOUNCE_POOL_SIZE > 1 the
-    // wait is normally a no-op, since real compute happens between calls).
-    // Returns nullptr (caller falls back to copying straight from the
-    // pageable source) if the pool failed to allocate.
-    BounceBuffer* acquire_bounce_buffer() {
+    // Reuse a portable host buffer only after every GPU that read it has
+    // completed. Each event is recorded only on the copy stream of the GPU
+    // whose context created that event.
+    BounceBuffer* acquire_bounce_buffer(int target_gpu_id, size_t copy_bytes) {
         if (bounce_pool.empty()) return nullptr;
+        const int target_index = zeromoe::gpu::bounce_event_index_for_gpu(
+            bounce_event_gpu_ids, target_gpu_id);
+        if (target_index < 0) return nullptr;
         BounceBuffer& bb = bounce_pool[bounce_next];
         bounce_next = (bounce_next + 1) % bounce_pool.size();
-        if (!bb.host_ptr) return nullptr;
-        // Direct test of a real hypothesis -- see t_bounce_buffer_wait's own
-        // comment in PerfCounters for the full reasoning: this exact wait
-        // was never timed before (by anything, ever), and is suspected to
-        // be most of this codebase's own long-standing "untimed expert=
-        // gap". Now the only caller is upload_expert_async (upload_expert
-        // was converted off the bounce pool entirely -- see gpu_topology.hpp's
-        // upload_expert), so this should read small if that hypothesis holds.
-        if (bb.in_flight) {
+        if (!bb.host_ptr ||
+            !zeromoe::gpu::bounce_buffer_suitable(
+                copy_bytes, bb.size_bytes,
+                bb.in_flight_by_device[(size_t)target_index] != nullptr))
+            return nullptr;
+
+        int previous_device = target_gpu_id;
+        if (cudaGetDevice(&previous_device) != cudaSuccess) {
+            cudaGetLastError();
+            previous_device = target_gpu_id;
+        }
+        for (size_t i = 0; i < bb.in_flight_by_device.size(); ++i) {
+            if (!bb.pending_by_device[i]) continue;
+            if (i >= bounce_event_gpu_ids.size() ||
+                !bb.in_flight_by_device[i] ||
+                cudaSetDevice(bounce_event_gpu_ids[i]) != cudaSuccess) {
+                cudaGetLastError();
+                cudaSetDevice(previous_device);
+                return nullptr;
+            }
             PERF_START(bounce_buffer_wait);
-            cudaEventSynchronize(bb.in_flight);
+            const cudaError_t sync_status =
+                cudaEventSynchronize(bb.in_flight_by_device[i]);
             PERF_END(bounce_buffer_wait, t_bounce_buffer_wait);
+            if (sync_status != cudaSuccess) {
+                cudaGetLastError();
+                cudaSetDevice(previous_device);
+                return nullptr;
+            }
+            bb.pending_by_device[i] = 0;
+        }
+        if (cudaSetDevice(target_gpu_id) != cudaSuccess) {
+            cudaGetLastError();
+            cudaSetDevice(previous_device);
+            return nullptr;
         }
         return &bb;
     }
@@ -2787,7 +2864,8 @@ public:
     ExpertLocation* upload_expert_async(int layer, int expert_id,
                                          const uint8_t* host_data, size_t bytes,
                                          int target_gpu_id = -1,
-                                         bool src_already_pinned = false) {
+                                         bool src_already_pinned = false,
+                                         bool prefer_bounce = false) {
         if (expert_vram_cache_cap == 0 || !host_data || bytes == 0) return nullptr;
         GPU_TOPO_TIMED_LOCK(lock);
         // Whole-function cost -- had ZERO instrumentation of any kind before
@@ -2867,7 +2945,7 @@ public:
             // compute-sanitizer-flagged CUDA API error, not just tolerates
             // it after the fact).
             perf().n_upload_async_src_already_pinned.fetch_add(1, std::memory_order_relaxed);
-        } else if (slot->upload_event) {
+        } else if (!prefer_bounce && slot->upload_event) {
             PERF_START(upload_async_host_register);
             cudaError_t reg_err = cudaHostRegister((void*)host_data, copy_bytes, cudaHostRegisterPortable);
             registered = (reg_err == cudaSuccess);
@@ -2889,7 +2967,7 @@ public:
             // what gives this path real double buffering: while buffer[i]'s
             // DMA is still draining on copy_stream, the NEXT call's memcpy
             // into buffer[i+1] can proceed immediately without waiting on it.
-            bb = acquire_bounce_buffer();
+            bb = acquire_bounce_buffer(dev.id, copy_bytes);
             if (bb) {
                 // Same staging cost bucket upload_expert's sync path used to
                 // share this with, back when it also used the bounce pool --
@@ -2908,7 +2986,27 @@ public:
             perf().n_h2d_upload_by_gpu[slot->gpu_id].fetch_add(1, std::memory_order_relaxed);
         }
         if (slot->upload_event) cudaEventRecord(slot->upload_event, dev.copy_stream);
-        if (bb && bb->in_flight) cudaEventRecord(bb->in_flight, dev.copy_stream);
+        if (bb) {
+            const int event_index = zeromoe::gpu::bounce_event_index_for_gpu(
+                bounce_event_gpu_ids, dev.id);
+            if (event_index < 0 ||
+                (size_t)event_index >= bb->in_flight_by_device.size() ||
+                !bb->in_flight_by_device[(size_t)event_index])
+                throw std::runtime_error(
+                    "bounce buffer has no completion event for target GPU");
+            const cudaError_t event_status = cudaEventRecord(
+                bb->in_flight_by_device[(size_t)event_index], dev.copy_stream);
+            if (event_status == cudaSuccess) {
+                bb->pending_by_device[(size_t)event_index] = 1;
+            } else {
+                cudaGetLastError();
+                if (cudaStreamSynchronize(dev.copy_stream) != cudaSuccess)
+                    throw std::runtime_error(
+                        "bounce DMA could not be drained after event-record failure");
+                LOG_WARN("[GPU] bounce event record failed on GPU %d; copy stream "
+                         "synchronized before buffer reuse\n", dev.id);
+            }
+        }
         if (registered) {
             // Unregister deferred to reap_pending_host_unregisters() (this
             // function's own next call, or the destructor) once
