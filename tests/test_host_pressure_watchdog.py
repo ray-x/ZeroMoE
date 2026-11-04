@@ -138,5 +138,26 @@ class SafetyTerminationTests(unittest.TestCase):
         kill.assert_called_once_with(123, signal.SIGTERM)
 
 
+class WatchdogFloorConfigTests(unittest.TestCase):
+    def test_explicit_watchdog_floor_overrides_engine_floor(self):
+        self.assertEqual(
+            WATCHDOG.watchdog_live_floor_gib({
+                "graph_mem_guard_floor_mb": 4608,
+                "host_pressure_watchdog_floor_mb": 1024,
+            }),
+            1.0,
+        )
+
+    def test_watchdog_floor_defaults_to_engine_floor(self):
+        self.assertEqual(
+            WATCHDOG.watchdog_live_floor_gib({"graph_mem_guard_floor_mb": 4608}),
+            4.5,
+        )
+
+    def test_nonpositive_watchdog_floor_is_rejected(self):
+        with self.assertRaises(ValueError):
+            WATCHDOG.watchdog_live_floor_gib({"host_pressure_watchdog_floor_mb": 0})
+
+
 if __name__ == "__main__":
     unittest.main()

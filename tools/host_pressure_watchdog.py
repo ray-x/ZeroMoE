@@ -13,6 +13,7 @@ import argparse
 import csv
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -131,6 +132,17 @@ def swap_baseline_from_gate(pid_file: Path) -> float | None:
     return None
 
 
+def watchdog_live_floor_gib(config: dict[str, object]) -> float:
+    """Read the watchdog floor, separate from the engine request floor."""
+    floor_mb = float(config.get(
+        "host_pressure_watchdog_floor_mb",
+        config.get("graph_mem_guard_floor_mb", 4608),
+    ))
+    if not math.isfinite(floor_mb) or floor_mb <= 0:
+        raise ValueError("host pressure watchdog floor must be a positive finite MiB value")
+    return floor_mb / 1024.0
+
+
 def terminate_for_host_safety(
     pid: int,
     expected_start_ticks: int,
@@ -180,7 +192,7 @@ def run(args: argparse.Namespace) -> int:
     run_dir = args.run_dir.resolve()
     pid_file = args.pid_file.resolve()
     config = tomllib.loads(args.config.resolve().read_text())
-    live_floor_gib = float(config.get("graph_mem_guard_floor_mb", 4608)) / 1024.0
+    live_floor_gib = watchdog_live_floor_gib(config)
     proc_root = Path(args.proc_root)
     page_size = os.sysconf("SC_PAGE_SIZE")
     started = time.monotonic()
