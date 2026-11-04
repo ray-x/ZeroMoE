@@ -960,3 +960,8 @@ The v26 opt-in bounce-upload path was reverted from the active source after its 
 ### Post-reset active state (2026-11-04)
 
 The unverified bounce-upload change was removed from the active inference source; the failed v26 config/logs remain in its artifact directory. The active DeepSeek engine sources now match commit `de4d7f50c35949fbe026eb713fe89987a0040df3`. A fresh non-inference build passed provenance (binary SHA-256 `a1e422990b50299d136af83fbf39fe260fd667321041419582014882fd3fb556`). `graph_settings`, `graph_settings_binding`, and `vram_dynamic_slot_plan` pass (3/3), and the new swap-watchdog synthetic tests pass (4/4). The v26 host watchdog is now backed by reusable `tools/host_pressure_watchdog.py`; no hardware rerun has occurred after the power reset.
+
+
+### v26 swap-threshold chronology from the passive monitor
+
+The saved 2 s monitor samples first show MemAvailable below the configured 4.5 GiB floor at `2026-11-04T05:43:39Z` (2.917 GiB), four seconds after `[PREFILL-DONE]` at `05:43:35Z`. PSI-full avg10 crossed 5% at `05:43:41Z`; ZeroMoE VmSwap exceeded 0.25 GiB and system SwapUsed growth exceeded 0.5 GiB at `05:43:43Z`. The watchdog would trigger on the first low-MemAvailable sample, before the recorded swap growth; this is a replay of saved samples, not a hardware intervention. Two chronology-focused synthetic tests were added, so the watchdog suite is now 6/6. Hardware validation remains unapproved and unperformed.

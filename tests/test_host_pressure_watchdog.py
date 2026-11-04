@@ -48,6 +48,26 @@ class PressureReasonTests(unittest.TestCase):
         reasons = self.reasons(vm_swap_gib=0.3)
         self.assertTrue(any("VmSwap" in reason for reason in reasons))
 
+    def test_v26_first_live_floor_crossing_stops_before_large_swap(self):
+        reasons = self.reasons(
+            memavailable_gib=2.917,
+            vm_swap_gib=0.0,
+            swap_used_gib=1.317,
+            baseline_swap_gib=1.317,
+            psi_full_avg10_pct=0.0,
+        )
+        self.assertIn("MemAvailable below configured live floor", reasons)
+
+    def test_swap_growth_is_gated_before_psi_reaches_critical_level(self):
+        reasons = self.reasons(
+            memavailable_gib=8.0,
+            vm_swap_gib=0.0,
+            swap_used_gib=2.086,
+            baseline_swap_gib=1.317,
+            psi_full_avg10_pct=2.0,
+        )
+        self.assertTrue(any("SwapUsed grew" in reason for reason in reasons))
+
     def test_request_failure_without_memory_pressure_does_not_trigger_watchdog(self):
         # HTTP status is intentionally not an input to the host-safety policy.
         self.assertEqual(self.reasons(), [])
