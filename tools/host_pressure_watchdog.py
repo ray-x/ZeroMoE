@@ -2,8 +2,9 @@
 """Stop a guarded model run before swap pressure can stall the host.
 
 The watchdog is deliberately separate from request handling: an HTTP/model
-failure leaves ZeroMoE running, while host-memory safety violations send it
-SIGTERM. It never kills a PID whose /proc start time changed.
+failure leaves ZeroMoE running, while host-memory safety violations send
+SIGTERM and escalate to SIGKILL if the same process remains after a short
+grace period. It never signals a PID whose /proc start time changed.
 """
 
 from __future__ import annotations
@@ -130,6 +131,51 @@ def swap_baseline_from_gate(pid_file: Path) -> float | None:
     return None
 
 
+def terminate_for_host_safety(
+    pid: int,
+    expected_start_ticks: int,
+    proc_root: Path = Path("/proc"),
+    grace_seconds: float = 2.0,
+    poll_interval: float = 0.1,
+) -> str:
+    """Stop the guarded server on host pressure, escalating only if needed."""
+    try:
+        if proc_start_ticks(pid, proc_root) != expected_start_ticks:
+            return "PID identity changed; no signal sent"
+    except OSError:
+        return "process exited before SIGTERM"
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return "process exited before SIGTERM"
+
+    deadline = time.monotonic() + max(0.0, grace_seconds)
+    while time.monotonic() < deadline:
+        try:
+            current_start_ticks = proc_start_ticks(pid, proc_root)
+        except OSError:
+            return "SIGTERM sent; process exited during grace period"
+        if current_start_ticks != expected_start_ticks:
+            return "SIGTERM sent; PID identity changed during grace period"
+        remaining = max(0.0, deadline - time.monotonic())
+        if remaining == 0.0:
+            break
+        time.sleep(min(max(0.001, poll_interval), remaining))
+
+    try:
+        current_start_ticks = proc_start_ticks(pid, proc_root)
+    except OSError:
+        return "SIGTERM sent; process exited during grace period"
+    if current_start_ticks != expected_start_ticks:
+        return "SIGTERM sent; PID identity changed during grace period"
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return "SIGTERM sent; process exited before SIGKILL"
+    return "SIGTERM sent; SIGKILL sent after grace period"
+
+
 def run(args: argparse.Namespace) -> int:
     run_dir = args.run_dir.resolve()
     pid_file = args.pid_file.resolve()
@@ -220,13 +266,18 @@ def run(args: argparse.Namespace) -> int:
                         "reasons": reasons,
                         "sample": sample,
                         "baseline_swap_used_gib": baseline_swap_gib,
-                        "action": "SIGTERM sent to ZeroMoE for host safety",
+                        "action": "host-safety termination requested",
                     }
                     emergency_path.write_text(json.dumps(emergency, indent=2) + "\n")
                     # Request failures alone never signal ZeroMoE. This branch
                     # is only reachable on explicit host-memory pressure.
-                    if proc_start_ticks(pid, proc_root) == expected_start_ticks:
-                        os.kill(pid, signal.SIGTERM)
+                    emergency["action"] = terminate_for_host_safety(
+                        pid,
+                        expected_start_ticks,
+                        proc_root=proc_root,
+                        grace_seconds=args.terminate_grace_seconds,
+                    )
+                    emergency_path.write_text(json.dumps(emergency, indent=2) + "\n")
                     return 2
             except (KeyError, OSError, StopIteration, ValueError) as exc:
                 with (run_dir / "host-monitor-errors.log").open("a") as errors:
@@ -244,6 +295,7 @@ def main() -> int:
     parser.add_argument("--emergency-output", type=Path, required=True)
     parser.add_argument("--proc-root", type=Path, default=Path("/proc"))
     parser.add_argument("--interval", type=float, default=1.0)
+    parser.add_argument("--terminate-grace-seconds", type=float, default=2.0)
     return run(parser.parse_args())
 
 

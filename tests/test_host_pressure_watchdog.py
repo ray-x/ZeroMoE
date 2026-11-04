@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Synthetic checks for the guarded inference host-swap watchdog."""
 
+import signal
 from pathlib import Path
 import importlib.util
 import unittest
+from unittest import mock
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "tools" / "host_pressure_watchdog.py"
 SPEC = importlib.util.spec_from_file_location("host_pressure_watchdog", MODULE_PATH)
@@ -87,6 +89,53 @@ class PressureReasonTests(unittest.TestCase):
     def test_request_failure_without_memory_pressure_does_not_trigger_watchdog(self):
         # HTTP status is intentionally not an input to the host-safety policy.
         self.assertEqual(self.reasons(), [])
+
+
+class SafetyTerminationTests(unittest.TestCase):
+    def test_pid_reuse_is_never_signaled(self):
+        with mock.patch.object(WATCHDOG, "proc_start_ticks", return_value=456):
+            with mock.patch.object(WATCHDOG.os, "kill") as kill:
+                action = WATCHDOG.terminate_for_host_safety(123, 123)
+        self.assertIn("identity changed", action)
+        kill.assert_not_called()
+
+    def test_escalates_to_sigkill_only_after_grace_for_same_process(self):
+        with mock.patch.object(WATCHDOG, "proc_start_ticks", return_value=123):
+            with mock.patch.object(WATCHDOG.os, "kill") as kill:
+                action = WATCHDOG.terminate_for_host_safety(
+                    123, 123, grace_seconds=0.0
+                )
+        self.assertIn("SIGKILL sent after grace period", action)
+        self.assertEqual(
+            [call.args[1] for call in kill.call_args_list],
+            [signal.SIGTERM, signal.SIGKILL],
+        )
+
+    def test_does_not_escalate_if_process_exits_after_sigterm(self):
+        with mock.patch.object(
+            WATCHDOG,
+            "proc_start_ticks",
+            side_effect=[123, FileNotFoundError],
+        ):
+            with mock.patch.object(WATCHDOG.os, "kill") as kill:
+                action = WATCHDOG.terminate_for_host_safety(
+                    123, 123, grace_seconds=1.0
+                )
+        self.assertIn("exited during grace", action)
+        kill.assert_called_once_with(123, signal.SIGTERM)
+
+    def test_does_not_kill_reused_pid_after_grace(self):
+        with mock.patch.object(
+            WATCHDOG,
+            "proc_start_ticks",
+            side_effect=[123, 456],
+        ):
+            with mock.patch.object(WATCHDOG.os, "kill") as kill:
+                action = WATCHDOG.terminate_for_host_safety(
+                    123, 123, grace_seconds=1.0
+                )
+        self.assertIn("identity changed during grace", action)
+        kill.assert_called_once_with(123, signal.SIGTERM)
 
 
 if __name__ == "__main__":
