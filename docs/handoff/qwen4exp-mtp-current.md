@@ -1000,9 +1000,13 @@ The sequential repeat was refused before tokenization (HTTP 500): the host reque
 Next action: do not reload or resend requests until the user instructs. Use v35, whose admission gate aborts immediately on swap-out or >128 MiB swap growth. If it passes, confirm the strict full-residency plan, run the long request, and inspect route-usage output before changing the hot set. Full run artifacts are under `build_mtp_results/2026-11-04-2b5a165-deepseek41-bounce-dynamic64-v30/`.
 
 
-### v34 admission-gate freeze incident (2026-11-04; no model started)
+### v34 admission-gate pressure sample (2026-11-04; no model started)
 
-After the system rebooted, v34's saved gate log showed no `wait-gate-result.txt`, no `server.log`, and no ZeroMoE PID/port: the launcher never passed admission and did not load the model. The last recorded sample had MemAvailable 26.188 GB versus 127.945 GB required, SwapUsed 1.175 GiB from a 0.893 GiB baseline (+0.282 GiB), and swap-out 62 MiB/s; GPU/CUDA probes still returned two idle devices. Previous-boot kernel logs were unavailable, so the exact freeze cause cannot be proven. The gate's failure was continuing to poll after it observed active swap pressure.
+v34's saved gate log has no `wait-gate-result.txt`, no `server.log`, and no ZeroMoE PID/port: it never passed admission or loaded the model. Its last sample had MemAvailable 26.188 GB versus 127.945 GB required, SwapUsed 1.175 GiB from a 0.893 GiB baseline (+0.282 GiB), and swap-out 62 MiB/s. This is a separate later admission-wait observation, not evidence that v34 allocated the model. Previous-boot kernel logs were unavailable.
+
+### DeepSeek process memory and reported freeze (2026-11-04)
+
+The user reports DeepSeek was the only running workload and suspects its memory footprint caused the Linux freeze. The v30 monitor supports that concern: at its low-water sample the ZeroMoE process had VmRSS 114.673 GiB while MemAvailable was 4.483 GiB; process VmSwap was 0, system SwapUsed was 0.002 GiB with no growth, swap-out was 0, and memory PSI-full was 0. This is consistent with very low host headroom from the loaded instance as a likely contributor, though the exact kernel freeze mechanism cannot be proven because no previous-boot journal was retained. The v34 gate was a distinct process and never started ZeroMoE.
 
 ### v35 fail-closed admission gate (prepared; not launched)
 
