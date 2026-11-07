@@ -710,12 +710,6 @@ struct V41CacheMoeSite {
   size_t cpu_ggml_grouped_experts = 0;
   size_t cpu_quant_grouped_experts = 0;
   size_t cpu_scalar_experts = 0;
-  // Prefill only: copies of this layer's non-resident experts issued while the
-  // previous layer's attention ran. The route node waits for them before
-  // classifying hits; the DDR blocks stay pinned until then.
-  bool prefetch_issued = false;
-  std::vector<MoEExpertBlock *> prefetch_pins;
-  size_t prefetch_count = 0;
   void release() {
     for (auto &h : holds) h.topo->release_hold(h.layer, h.expert, h.ptr, false);
     holds.clear();
@@ -730,9 +724,6 @@ std::vector<std::unique_ptr<V41CacheMoeSite>> g_v41_decode_cache_sites;
 std::vector<std::unique_ptr<V41CacheMoeSite>> &v41_sites_for(const FullGraph &g) {
   return g.decode_mode ? g_v41_decode_cache_sites : g_v41_cache_sites;
 }
-
-void v41_prefill_prefetch_wait(V41CacheMoeSite &site, RAMSafetyManager &ram,
-                               GpuTopology &topo);
 
 void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
                             int ith, int, void *ud) {
@@ -756,7 +747,6 @@ void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
   // every preceding expert kernel. The prior layer's holds can now retire.
   if (site.layer > 0) v41_sites_for(g)[(size_t)site.layer - 1]->release();
   auto *topo = ram->vram_cache;
-  v41_prefill_prefetch_wait(site, *ram, *topo);
   topo->prefill_current_layer = site.layer;
   // LayerScratch was sized for this batch before graph execution. Reuse its
   // routed-output scratch for the router's zeroing step; the graph computes
@@ -1679,71 +1669,6 @@ void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
            ms(start, routed), ms(routed, uploaded), ms(uploaded, done));
 }
 
-// Prefill staging overlap. In a long prompt almost every expert of every layer
-// is used, so the experts layer L has to stage (everything not resident in
-// VRAM) are known before its router runs. The previous layer's merge node has
-// just released its holds and its MoE kernels are complete, so the shared
-// dynamic slots are free: issue the asynchronous DDR->VRAM copies there and let
-// them run on the copy streams while layer L's attention executes on the GPU.
-// Only data movement is reordered; the experts and their bytes are unchanged.
-void v41_prefill_prefetch(V41CacheMoeSite &next) {
-  auto &g = *next.g;
-  if (g.decode_mode || g.S < 256 || !next.cpu_cold_prefill) return;
-  auto &e = *g.engine;
-  const auto &c = e.model_file.architecture_config;
-  RAMSafetyManager *ram = nullptr;
-  LockFreePrefetcher *prefetch = nullptr;
-  LayerScratch *scratch = nullptr;
-  if (!deepseek_v41_graph_runtime(e, ram, prefetch, scratch) || !ram->vram_cache)
-    return;
-  auto *topo = ram->vram_cache;
-  if (!topo->expert_compact_layout || next.pools.empty()) return;
-  const size_t cap = (size_t)std::max(0, topo->expert_compact_shared_dynamic_slots);
-  size_t issued = 0;
-  for (int expert = 0; expert < c.n_experts && issued < cap; ++expert) {
-    {
-      std::lock_guard<std::recursive_mutex> lock(topo->cache_mutex);
-      auto *loc = topo->find_expert(next.layer, expert);
-      if (loc && loc->device_ptr) continue;  // resident (or already in flight)
-    }
-    auto *block = ram->get_expert(e, next.layer, expert);
-    if (!block || !block->slab_buffer) continue;
-    ram->ram_pin(*block);
-    const size_t bytes = block->gate_proj.meta.size_bytes +
-                         block->up_proj.meta.size_bytes + block->down_proj.meta.size_bytes;
-    const int preferred = next.pools[issued % next.pools.size()].device;
-    ExpertLocation *loc = nullptr;
-    {
-      std::lock_guard<std::recursive_mutex> lock(topo->cache_mutex);
-      loc = topo->upload_expert_async(next.layer, expert, block->slab_buffer, bytes,
-                                      preferred, block->slab_pinned, false);
-    }
-    if (!loc) {
-      ram->ram_unpin(*block);
-      break;  // no free victim: the route node stages the rest as before
-    }
-    next.prefetch_pins.push_back(block);
-    ++issued;
-  }
-  next.prefetch_issued = issued > 0;
-  next.prefetch_count = issued;
-}
-
-// Called at the start of this layer's route node: wait for the prefetched
-// copies so find_expert() reports them as ready, then drop the DDR pins.
-void v41_prefill_prefetch_wait(V41CacheMoeSite &site, RAMSafetyManager &ram,
-                               GpuTopology &topo) {
-  if (!site.prefetch_issued) return;
-  for (int vi : topo.vault_gpus) {
-    auto &dev = topo.devices[(size_t)vi];
-    cudaSetDevice(dev.id);
-    cudaStreamSynchronize(dev.copy_stream);
-  }
-  for (auto *block : site.prefetch_pins) ram.ram_unpin(*block);
-  site.prefetch_pins.clear();
-  site.prefetch_issued = false;
-}
-
 void v41_cache_cpu_merge_node(ggml_tensor *dst, int ith, int, void *ud) {
   if (ith) return;
   auto &site = *static_cast<V41CacheMoeSite *>(ud);
@@ -1789,11 +1714,6 @@ void v41_cache_cpu_merge_node(ggml_tensor *dst, int ith, int, void *ud) {
   // those preallocated LRU slots without moving or reallocating tensor data.
   const size_t released_holds = site.holds.size();
   site.release();
-  if (site.cpu_cold_prefill) {
-    auto &next_sites = v41_sites_for(*site.g);
-    if ((size_t)site.layer + 1 < next_sites.size())
-      v41_prefill_prefetch(*next_sites[(size_t)site.layer + 1]);
-  }
   LOG_INFO("[DSV41-CACHE-MOE-RELEASE] layer=%d cpu_prefill=%d merge_elements=%zu released=%zu slot holds after merged output; shared dynamic slots are reusable\n",
            site.layer, site.cpu_cold_prefill ? 1 : 0, merge_elements,
            released_holds);
