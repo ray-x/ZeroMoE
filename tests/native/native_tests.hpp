@@ -8,6 +8,8 @@ void test_graph_initializer();
 void test_attention_extraction();
 void test_cuda_execution();
 bool test_cuda_fused_kernels();
+// ---- tests_dspark.cpp ----
+bool test_dspark_config();
 // ---- tests_cpu_quant.cpp ----
 bool test_avx512_dequant();
 bool test_avx512_dequant_iq();

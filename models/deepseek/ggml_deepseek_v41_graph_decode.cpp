@@ -59,6 +59,9 @@ struct DecodeGraph : FullGraph {
   std::array<double, kDecodeTimerCount> first_node_ms{};
   std::vector<std::array<double, 3>> layer_attention_ms;
   std::vector<std::array<double, 3>> layer_moe_ms;
+  // DSpark feature taps: HC-mean of the residual stream entering each draft target layer.
+  struct DsparkTap { int layer; ggml_tensor *value; };
+  std::vector<DsparkTap> dspark_taps;
   PerfCounters::Snapshot perf_at_first_run{};
 };
 std::unique_ptr<DecodeGraph> decode;
@@ -748,6 +751,20 @@ bool build(DecodeGraph &g) {
     ggml_tensor *carry;  // the pre-mix carried between layers (GPU hyper-connections); read after the loop
     ggml_tensor *build_layer(ggml_tensor *res, int l) override {
     if (MemoryGuard::allocation_blocked()) return nullptr;
+    if (g.engine->has_dspark_model) {
+      const auto &tl = g.engine->dspark_config.target_layers;
+      if (std::find(tl.begin(), tl.end(), l) != tl.end()) {
+        // Same reduction as llama.cpp's build_hc_mean: sum the HC streams, scale by 1/HC.
+        ggml_tensor *acc = ggml_view_2d(g.ctx, res, g.D, 1, res->nb[2], 0);
+        for (int hcs = 1; hcs < g.HC; ++hcs)
+          acc = ggml_add(g.ctx, acc, ggml_view_2d(g.ctx, res, g.D, 1, res->nb[2],
+                                                  (size_t)hcs * res->nb[1]));
+        acc = ggml_scale(g.ctx, acc, 1.0f / (float)g.HC);
+        ggml_set_output(acc);
+        ggml_build_forward_expand(g.graph, acc);
+        g.dspark_taps.push_back({l, acc});
+      }
+    }
     mark_trace(g, "input", l,
                ggml_view_2d(g.ctx, res, g.D, 1, res->nb[2], 0));
     if (std::find(c.dsv41_engram_layer_ids.begin(),
@@ -1046,6 +1063,33 @@ bool deepseek_v41_full_graph_decode_run(StreamingEngine &e, float *hidden,
                             g.HC * sizeof(float));
     std::memcpy(e.hc_pending_pre_mix.data(), e.hc_final_pre_mix.data(),
                 g.HC * sizeof(float));
+  }
+  if (!g.dspark_taps.empty()) {
+    auto &feat = e.dspark_features;
+    feat.resize((size_t)g.D * g.dspark_taps.size());
+    // Taps are appended in layer order, which is the draft's `target_layers` order.
+    for (size_t k = 0; k < g.dspark_taps.size(); ++k)
+      ggml_backend_tensor_get(g.dspark_taps[k].value, feat.data() + k * (size_t)g.D, 0,
+                              (size_t)g.D * sizeof(float));
+    e.dspark_features_pos = pos;
+    if (e.dspark_dump) {
+      const int32_t rec[2] = {(int32_t)pos, (int32_t)g.token};
+      std::fwrite(rec, sizeof(int32_t), 2, e.dspark_dump.get());
+      std::fwrite(feat.data(), sizeof(float), feat.size(), e.dspark_dump.get());
+      std::fflush(e.dspark_dump.get());
+    }
+    static bool logged_tap = false;
+    if (!logged_tap) {
+      logged_tap = true;
+      for (size_t k = 0; k < g.dspark_taps.size(); ++k) {
+        const float *v = feat.data() + k * (size_t)g.D;
+        double ss = 0.0;
+        bool finite = true;
+        for (int i = 0; i < g.D; ++i) { finite = finite && std::isfinite(v[i]); ss += (double)v[i] * v[i]; }
+        LOG_INFO("[DSPARK] feature tap layer=%d pos=%d l2=%.4f finite=%d\n", g.dspark_taps[k].layer, pos,
+                 std::sqrt(ss), finite ? 1 : 0);
+      }
+    }
   }
   for (const auto &trace : g.traces) {
     if (!dsv41_trace::enabled(trace.layer, pos)) continue;

@@ -90,6 +90,12 @@ struct EngineConfig {
   // Optional DeepSeek-V4.1 Engram lookup-table GGUF. Keep it separate so
   // sidecar metadata cannot replace the base model architecture.
   std::string engram_model_path;
+  // DSpark (DFlash) speculative-decoding draft GGUF for DeepSeek-V4.1 Flash. Parsed and
+  // validated at load (docs/design/dspark-support.md); the target taps its hidden states.
+  std::string dspark_model_path;
+  // Optional: append one record per decoded token (position, input token, feature taps) to this
+  // binary file, for the offline draft acceptance study (tools/dspark_study/).
+  std::string dspark_dump_path;
   std::string model_format = "gguf";
   std::string exl3_backend = "native";
   std::string exl3_ggml_bridge_model_path;
@@ -2418,6 +2424,8 @@ inline bool EngineConfig::load(const std::string &path) {
   deepseek_v41_strategy_test_isolation = doc.root.get_bool(
       "deepseek_v41_strategy_test_isolation", deepseek_v41_strategy_test_isolation);
   engram_model_path = doc.root.get_str("engram_model_path");
+  dspark_model_path = doc.root.get_str("dspark_model_path");
+  dspark_dump_path = doc.root.get_str("dspark_dump_path");
   model_format = doc.root.get_str("model_format", model_format);
   exl3_backend = doc.root.get_str("exl3_backend", exl3_backend);
   exl3_ggml_bridge_model_path =
@@ -3339,6 +3347,8 @@ inline void EngineConfig::print() const {
     LOG_STREAM_INFO() << "[CONFIG] Dense model: " << dense_model_path << "\n";
   if (!engram_model_path.empty())
     LOG_STREAM_INFO() << "[CONFIG] Engram sidecar: " << engram_model_path << "\n";
+  if (!dspark_model_path.empty())
+    LOG_STREAM_INFO() << "[CONFIG] DSpark draft: " << dspark_model_path << "\n";
   if (!mtp_model_path.empty())
     LOG_STREAM_INFO() << "[CONFIG] MTP model (shared draft-block checkpoint): "
                       << mtp_model_path << "\n";
@@ -3829,6 +3839,7 @@ model_path = "/path/to/model.gguf"
 model_format = "gguf"       # "gguf" or "exl3"
 model_load_only = false      # EXL3 metadata/payload load smoke; no inference
 # engram_model_path = "/path/to/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf" # DSV4.1 table sidecar
+# dspark_model_path = "/path/to/dspark-DeepSeek-V4.1-Flash-1017-BF16.gguf" # DSpark draft (config check + feature taps; no speculation yet)
 # dense_model_path = "/path/to/dense-weights"  # optional: separate dense weights
 # spec_type = "none"           # or "draft-mtp"
 # spec_draft_model = "/path/to/mtp-draft.gguf"  # optional: a standalone

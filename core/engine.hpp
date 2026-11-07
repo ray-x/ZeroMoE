@@ -1,8 +1,11 @@
 #pragma once
 #include <unordered_set>
+#include <cstdio>
+#include <memory>
 #include "graph_config.hpp"
 #include "graph_settings_global.hpp"
 #include "gguf_loader.hpp"
+#include "dspark_config.hpp"
 #include "direct_io.hpp"
 #include "io_uring_backend.hpp"
 #include "posix_fadvise_compat.hpp"
@@ -351,6 +354,16 @@ public:
     // Separate DeepSeek-V4.1 Engram table sidecar. Its tensors are addressed
     // on demand; its GGUF architecture/KV metadata must not override model_file.
     GGUFFile engram_model_file;
+    // DSpark draft (config_.dspark_model_path): header + validated config only. The
+    // decode graph taps the HC-mean of the residual stream entering each
+    // `dspark_config.target_layers` layer and publishes it in `dspark_features`
+    // ([taps][n_embd], position `dspark_features_pos`).
+    GGUFFile dspark_model_file;
+    bool has_dspark_model = false;
+    zeromoe::dspark::Config dspark_config;
+    std::vector<float> dspark_features;
+    int dspark_features_pos = -1;
+    std::unique_ptr<std::FILE, int (*)(std::FILE *)> dspark_dump{nullptr, &std::fclose};
     bool has_engram_model = false;
     GGUFFile dense_model_file;      // separate dense GGUF (config.dense_model_path); optional
     bool has_dense_model = false;

@@ -780,6 +780,7 @@ if(GGML_CUDA)
         tests/native/main_test.cpp
         tests/native/tests_basic_cuda.cpp
         tests/native/tests_cpu_quant.cpp
+        tests/native/tests_dspark.cpp
         tests/native/tests_cpu_moe.cpp
         tests/native/tests_gpu_attention.cpp
         tests/native/tests_quant_proto.cpp

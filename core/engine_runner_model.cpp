@@ -65,6 +65,52 @@ std::expected<void, std::string> EngineRunner::load_model() {
                       << engine.engram_model_file.tensors.size()
                       << " table tensor(s); base architecture metadata preserved)\n";
   }
+  if (!config.dspark_model_path.empty()) {
+    if (detect_model_family(engine.model_file) != ModelFamily::DeepSeek_V41) {
+      return std::unexpected(
+          "dspark_model_path is only supported with general.architecture=deepseek41");
+    }
+    if (!engine.dspark_model_file.load_header(config.dspark_model_path)) {
+      return std::unexpected("Failed to parse the DSpark draft GGUF (dspark_model_path)");
+    }
+    std::string dspark_err;
+    if (!zeromoe::dspark::parse_config(engine.dspark_model_file, engine.dspark_config, dspark_err) ||
+        !zeromoe::dspark::validate_tensors(engine.dspark_model_file, engine.dspark_config, dspark_err)) {
+      return std::unexpected("Invalid DSpark draft GGUF: " + dspark_err);
+    }
+    const auto &dc = engine.dspark_config;
+    // architecture_config is only filled once the model is initialised; read the
+    // target's own GGUF metadata here.
+    double target_width = 0, target_blocks = 0;
+    if (!zeromoe::dspark::detail::get_num(engine.model_file, "deepseek41.embedding_length", target_width) ||
+        !zeromoe::dspark::detail::get_num(engine.model_file, "deepseek41.block_count", target_blocks))
+      return std::unexpected("Target GGUF lacks deepseek41.embedding_length / block_count");
+    if (dc.n_embd != (int)target_width)
+      return std::unexpected("DSpark draft width " + std::to_string(dc.n_embd) +
+                             " does not match the target hidden size " +
+                             std::to_string((int)target_width));
+    for (int l : dc.target_layers)
+      if (l < 0 || l >= (int)target_blocks)
+        return std::unexpected("DSpark target layer " + std::to_string(l) +
+                               " is outside the target's " + std::to_string((int)target_blocks) + " blocks");
+    engine.has_dspark_model = true;
+    if (!config.dspark_dump_path.empty()) {
+      // Header: "DSPK" magic, int32 version 1, int32 n_taps, int32 n_embd; then per decoded
+      // token: int32 position, int32 input token id, float32 features[n_taps * n_embd].
+      engine.dspark_dump.reset(std::fopen(config.dspark_dump_path.c_str(), "wb"));
+      if (!engine.dspark_dump)
+        return std::unexpected("Cannot open dspark_dump_path for writing");
+      const char magic[4] = {'D', 'S', 'P', 'K'};
+      const int32_t hdr[3] = {1, (int32_t)dc.target_layers.size(), (int32_t)dc.n_embd};
+      std::fwrite(magic, 1, 4, engine.dspark_dump.get());
+      std::fwrite(hdr, sizeof(int32_t), 3, engine.dspark_dump.get());
+      std::fflush(engine.dspark_dump.get());
+    }
+    LOG_STREAM_INFO() << "[DSPARK] draft validated: " << dc.n_layer << " stages, block_size "
+                      << dc.block_size << ", taps on target layers";
+    for (int l : dc.target_layers) LOG_STREAM_INFO() << " " << l;
+    LOG_STREAM_INFO() << ", Markov rank " << dc.markov_rank << " (taps only; speculation not enabled)\n";
+  }
   {
     using namespace zeromoe::graphsettings;
     std::vector<Family> families{Family::Other};
