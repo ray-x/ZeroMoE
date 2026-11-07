@@ -1697,11 +1697,7 @@ void v41_prefill_prefetch(V41CacheMoeSite &next) {
   if (!deepseek_v41_graph_runtime(e, ram, prefetch, scratch) || !ram->vram_cache)
     return;
   auto *topo = ram->vram_cache;
-  if (!topo->expert_compact_layout || next.pools.empty()) {
-    LOG_INFO("[DSV41-PREFETCH] layer=%d skipped compact=%d pools=%zu\n", next.layer,
-             topo->expert_compact_layout ? 1 : 0, next.pools.size());
-    return;
-  }
+  if (!topo->expert_compact_layout || next.pools.empty()) return;
   const size_t cap = (size_t)std::max(0, topo->expert_compact_shared_dynamic_slots);
   size_t issued = 0;
   for (int expert = 0; expert < c.n_experts && issued < cap; ++expert) {
@@ -1724,7 +1720,6 @@ void v41_prefill_prefetch(V41CacheMoeSite &next) {
     }
     if (!loc) {
       ram->ram_unpin(*block);
-      LOG_INFO("[DSV41-PREFETCH] layer=%d no victim after %zu uploads\n", next.layer, issued);
       break;  // no free victim: the route node stages the rest as before
     }
     next.prefetch_pins.push_back(block);
@@ -1732,7 +1727,6 @@ void v41_prefill_prefetch(V41CacheMoeSite &next) {
   }
   next.prefetch_issued = issued > 0;
   next.prefetch_count = issued;
-  LOG_INFO("[DSV41-PREFETCH] layer=%d issued=%zu cap=%zu\n", next.layer, issued, cap);
 }
 
 // Called at the start of this layer's route node: wait for the prefetched
