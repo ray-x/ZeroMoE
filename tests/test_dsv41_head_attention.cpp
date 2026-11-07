@@ -75,8 +75,29 @@ int main() {
       check(cudaMemcpy(dsel, sel.data(), sel.size() * 4, cudaMemcpyHostToDevice));
       launch_dsv41_head_attention(dq, dwin, dcomp, dsel, nsel, dsink, pos, past, window, qh, H, scale, dout, nullptr);
       check(cudaDeviceSynchronize());
+      {  // kernel timing (median of 200 launches)
+        cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+        std::vector<float> ts;
+        for (int it = 0; it < 220; ++it) {
+          cudaEventRecord(e0);
+          launch_dsv41_head_attention(dq, dwin, dcomp, dsel, nsel, dsink, pos, past, window, qh, H, scale, dout, nullptr);
+          cudaEventRecord(e1); cudaEventSynchronize(e1);
+          float ms = 0; cudaEventElapsedTime(&ms, e0, e1); if (it >= 20) ts.push_back(ms * 1000.f);
+        }
+        std::sort(ts.begin(), ts.end());
+        std::printf("  kernel median %.1f us (n=%d keys)\n", ts[ts.size() / 2], n);
+      }
       std::vector<float> gpu(q.size());
       check(cudaMemcpy(gpu.data(), dout, gpu.size() * 4, cudaMemcpyDeviceToHost));
+      {  // bitwise comparison with the output saved from the previous kernel version
+        char fn[256]; std::snprintf(fn, sizeof fn, "/tmp/claude-1000/ha_ref_%d_%d.bin", nsel, pos);
+        FILE* f = std::fopen(fn, "rb");
+        if (!f) { f = std::fopen(fn, "wb"); std::fwrite(gpu.data(), 4, gpu.size(), f); std::printf("  saved reference output %s\n", fn); }
+        else { std::vector<float> old(gpu.size()); size_t r = std::fread(old.data(), 4, old.size(), f);
+               int diff = 0; for (size_t i = 0; i < gpu.size(); ++i) diff += std::memcmp(&old[i], &gpu[i], 4) != 0;
+               std::printf("  vs saved output: %s (%d differing values)\n", (r == old.size() && !diff) ? "bit-identical" : "DIFFERENT", diff); }
+        std::fclose(f);
+      }
       double eg = 0, eh = 0, mx = 0;
       for (size_t i = 0; i < gpu.size(); ++i) {
         eg = std::max(eg, std::fabs(gpu[i] - ref[i])); eh = std::max(eh, std::fabs(host32[i] - ref[i]));
