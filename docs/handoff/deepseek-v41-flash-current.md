@@ -188,3 +188,20 @@ Findings:
 2. The CPU cold-expert lane costs 13 ms of exposed wait. Launching it earlier (route prediction / pilot) or pinning more of the hot set in VRAM would hide most of it (estimated 8-10 ms).
 3. The ~25 ms unattributed bucket needs a per-node GPU timer (CUDA events) before tuning.
 Estimated reachable decode with 1+2: about 55-60 ms/token (16-18 tok/s) if the estimates hold; not measured. Any new GPU attention/projection path changes rounding and needs the llama.cpp teacher-forced check.
+
+## v75: fused Q/KV projection chain (commit 0709643), measured 2026-11-07
+
+Artifact: `build_mtp_results/2026-11-07-0709643-deepseek41-fused-qkv-v75/` (binary built from clean 0709643, sha256 614287c0...ce60b9... see `zeromoe.build-info.json`; same config as v74 except `host_ram_startup_margin_gib = 3.0` because a shared host left only 127.1 GB available against the 127.9 GB gate; request headroom 5 GB unchanged). Two requests (the harness sends two), same 959+64 workload.
+
+| | v74 | v75 |
+|---|---:|---:|
+| Prefill tok/s | 70.37 / 71.81 / 71.66 | 69.91 / 71.86 |
+| Decode tok/s (first-to-last) | 10.73 / 10.81 / 10.81 | 10.95 / 11.07 |
+| Decode p50 ms | ~91 | 89.8 / 87.7 |
+| native_qkv ms/token | 15.56 | 12.56 |
+| warm decode mean ms | 92.4 | 91.6 |
+
+- Decode routes are bit-identical to v74: 0 of 2,520 route lines differ in each of the two requests (as designed: same kernels, same order, no host hops between them).
+- `check_full_graph_moe_run.py --full-fit --require-full-graph-prefill`: PASS.
+- Gain is small (about +2% decode, native_qkv -3 ms). Request-1 prefill (69.91) is just under the 70 tok/s target; two requests on a shared host are not enough to call it a regression or a gain. The attention timers rose (context 16.6 -> 18.0, other 6.8 -> 9.0 ms), so some of the saving is eaten elsewhere or is run-to-run noise; v74 baseline is left unchanged.
+- Fusing only saved 3 of the estimated 5-8 ms; the remaining Q/KV cost is kernel time, not hop latency. Next: nsys to split the ~25 ms unattributed bucket before fusing attention.
