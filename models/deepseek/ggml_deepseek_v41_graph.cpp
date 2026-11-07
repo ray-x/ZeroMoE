@@ -733,6 +733,7 @@ std::vector<std::unique_ptr<V41CacheMoeSite>> &v41_sites_for(const FullGraph &g)
 
 void v41_prefill_prefetch_wait(V41CacheMoeSite &site, RAMSafetyManager &ram,
                                GpuTopology &topo);
+void v41_prefill_prefetch(V41CacheMoeSite &next);
 
 void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
                             int ith, int, void *ud) {
@@ -1677,6 +1678,14 @@ void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
            site.layer, g.S, site.holds.size(), misses, staged_misses,
            site.cpu_experts.size(),
            ms(start, routed), ms(routed, uploaded), ms(uploaded, done));
+  // This layer's experts are staged and held and its MoE kernels are about to
+  // run (~100+ ms for a long prompt). Copy the next layer's non-resident
+  // experts into the free half of the shared dynamic region meanwhile.
+  if (site.cpu_cold_prefill) {
+    auto &next_sites = v41_sites_for(g);
+    if ((size_t)site.layer + 1 < next_sites.size())
+      v41_prefill_prefetch(*next_sites[(size_t)site.layer + 1]);
+  }
 }
 
 // Prefill staging overlap. In a long prompt almost every expert of every layer
@@ -1702,7 +1711,8 @@ void v41_prefill_prefetch(V41CacheMoeSite &next) {
              topo->expert_compact_layout ? 1 : 0, next.pools.size());
     return;
   }
-  const size_t cap = (size_t)std::max(0, topo->expert_compact_shared_dynamic_slots);
+  // Half of the shared region: the other half holds the current layer's staged experts.
+  const size_t cap = (size_t)std::max(0, topo->expert_compact_shared_dynamic_slots) / 2;
   size_t issued = 0;
   for (int expert = 0; expert < c.n_experts && issued < cap; ++expert) {
     {
@@ -1796,11 +1806,6 @@ void v41_cache_cpu_merge_node(ggml_tensor *dst, int ith, int, void *ud) {
   // those preallocated LRU slots without moving or reallocating tensor data.
   const size_t released_holds = site.holds.size();
   site.release();
-  if (site.cpu_cold_prefill) {
-    auto &next_sites = v41_sites_for(*site.g);
-    if ((size_t)site.layer + 1 < next_sites.size())
-      v41_prefill_prefetch(*next_sites[(size_t)site.layer + 1]);
-  }
   LOG_INFO("[DSV41-CACHE-MOE-RELEASE] layer=%d cpu_prefill=%d merge_elements=%zu released=%zu slot holds after merged output; shared dynamic slots are reusable\n",
            site.layer, site.cpu_cold_prefill ? 1 : 0, merge_elements,
            released_holds);
