@@ -248,3 +248,20 @@ Both are built into `build_dsv41_retry16/zeromoe` (source 446f685) and are desig
 - Estimated combined gain 4-7 ms/token (unmeasured). Gate: v85 two-request run on a quiet host, 0 differing decode route lines versus v78 (`2026-11-07-lane8q5-v78/observed-routes.log`), `check_full_graph_moe_run.py` PASS.
 
 nsys facts used (v83, `--cuda-graph-trace=node`, ~101 ms/token under profiling): RTX 3090 busy 27%, RTX 5060 Ti 6%; about 800 host-to-device and 525 device-to-host copies per token; lane8 Q5_K matvecs 10.9 ms/token on the 3090 (mostly the 8-group out-projection), head attention 5.3, expert `mul_mat_vec_q` 5.4 (3090) + 5.4 (5060 Ti).
+
+## v85: batched out-projection + GPU indexer scores measured (2026-11-07)
+
+Run `build_mtp_results/2026-11-07-outproj-indexer-v85b/` (binary from source fd320bd = 446f685 code; model files on NVMe, direct_io=true, startup margin 3.0 GiB; host quiet during the run; two requests, 959+64):
+
+| | v78 (USB) | v81 (NVMe, same kernels minus the two new changes) | v85b |
+|---|---:|---:|---:|
+| Decode tok/s | 11.63 / 11.91 | 11.33 / 11.77 | **12.10 / 12.66** |
+| Decode p50 ms | 84.2 / 82.0 | 86.0 / 83.0 | 80.6 / 76.4 |
+| Warm decode mean ms | 83.9 | 88.6 | 83.1 |
+| Prefill tok/s | 70.96 / 71.92 | 68.82 / 70.64 | 68.13 / 69.93 |
+| attention context_node ms/token | 17.3 | 18.7 | 15.2 |
+| attention outproj_node ms/token | 8.2 | 8.5 | 7.5 |
+
+- Gain versus the same NVMe setup (v81): decode +7% (11.33/11.77 to 12.10/12.66); smaller than the 4-7 ms/token estimate, `context_node` -3.5 ms and `outproj_node` -1.0 ms. Prefill is unchanged within noise but about 2-3% below the USB-disk v78 in both NVMe runs (cause not isolated).
+- Routes: request 1 is bit-identical to v78 (0 of 2,520 decode route lines differ). Request 2 has 256 differing lines, first at token 6, layer 26 (one near-tie expert), then cascading. Not yet explained: either run-to-run non-determinism in request 2 (expert placement after prefill) or a state bug in one of the two new paths on a second request. The determinism rerun (v85c) was ruined by a neighbor's compile (HTTP 408 timeout; its partial request-1 lines still matched v78). Rerun the same binary and compare request 2 between two runs before calling the new paths bit-identical across requests.
+- `check_full_graph_moe_run.py --full-fit --require-full-graph-prefill`: PASS.
