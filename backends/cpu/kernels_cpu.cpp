@@ -849,6 +849,61 @@ void dequantize_row_iq2_xs_avx512(const uint8_t *block, float *y, int64_t k) {
   }
 }
 
+// IQ1_M: qs[32] + qh[16] + scales[8] (4 x uint16) = 56 bytes per 256 values; the
+// super-block scale is packed into the top nibbles of the four scale words.
+// Same operations as ggml's dequantize_row_iq1_m: y = dl * ((float)grid + delta),
+// one float add then one float multiply per value, so the output is
+// bit-identical; only the 8-value grid expansion is vectorized (the scalar
+// reference was 37% of CPU samples during DeepSeek prefill's cold-expert lane).
+void dequantize_row_iq1_m_avx512(const uint8_t *block, float *y, int64_t k) {
+  static std::atomic<bool> logged{false};
+  if (should_log_once(logged))
+    LOG_INFO("[AVX512-DEQUANT] dequantize_row_iq1_m_avx512 is live\n");
+
+  constexpr int QK_K = 256;
+  constexpr size_t BLOCK_BYTES = 56;
+  constexpr float IQ1S_DELTA = 0.125f;
+  const int64_t nb = k / QK_K;
+  const uint8_t *grid = static_cast<const uint8_t *>(ms_grid_iq1s()); // 2048 x 8 int8
+
+  for (int64_t i = 0; i < nb; ++i) {
+    const uint8_t *base = block + (size_t)i * BLOCK_BYTES;
+    const uint8_t *qs = base;
+    const uint8_t *qh = base + 32;
+    uint16_t sc[4];
+    std::memcpy(sc, base + 48, sizeof(sc));
+    const uint16_t scale_bits = (uint16_t)((sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) |
+                                           ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000));
+    const float d = fp16_to_fp32(scale_bits);
+    float *yy = y + (size_t)i * QK_K;
+    for (int ib = 0; ib < QK_K / 32; ++ib) {
+      const float dl1 = d * (float)(2 * ((sc[ib / 2] >> (6 * (ib % 2) + 0)) & 0x7) + 1);
+      const float dl2 = d * (float)(2 * ((sc[ib / 2] >> (6 * (ib % 2) + 3)) & 0x7) + 1);
+      const uint16_t idx[4] = {
+          (uint16_t)(qs[0] | ((qh[0] << 8) & 0x700)),
+          (uint16_t)(qs[1] | ((qh[0] << 4) & 0x700)),
+          (uint16_t)(qs[2] | ((qh[1] << 8) & 0x700)),
+          (uint16_t)(qs[3] | ((qh[1] << 4) & 0x700))};
+      const float delta[4] = {
+          (qh[0] & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA,
+          (qh[0] & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA,
+          (qh[1] & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA,
+          (qh[1] & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA};
+      for (int l = 0; l < 4; ++l) {
+        const float dl = (l < 2) ? dl1 : dl2;
+        uint64_t g;
+        std::memcpy(&g, grid + (size_t)idx[l] * 8, sizeof(g));
+        __m256 v = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_cvtsi64_si128((long long)g)));
+        v = _mm256_add_ps(v, _mm256_set1_ps(delta[l]));
+        v = _mm256_mul_ps(v, _mm256_set1_ps(dl));
+        _mm256_storeu_ps(yy + ib * 32 + l * 8, v);
+      }
+      qs += 4;
+      qh += 2;
+    }
+  }
+}
+
 void dequantize_row_iq3_xxs_avx512(const uint8_t *block, float *y, int64_t k) {
   static std::atomic<bool> logged{false};
   if (should_log_once(logged))

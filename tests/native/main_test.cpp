@@ -805,6 +805,8 @@ int main(int argc, char **argv) {
     }
     if (std::getenv("ZEROMOE_TEST_ONLY_CPU_IQ_MATMUL"))
         return test_cpu_iq_matmul_paths() ? 0 : 1;
+    if (std::getenv("ZEROMOE_TEST_ONLY_AVX512_DEQUANT_IQ"))
+        return test_avx512_dequant_iq() ? 0 : 1;
     if (std::getenv("ZEROMOE_TEST_ONLY_COMPACT_VRAM"))
         return test_compact_vram_slot_planner() ? 0 : 1;
     if (std::getenv("ZEROMOE_TEST_ONLY_EXL3_GGML_CONFIG"))

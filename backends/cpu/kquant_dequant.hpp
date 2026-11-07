@@ -589,6 +589,9 @@ inline bool dequant_row(GGUFType type, const uint8_t* ptr, float* out, int n) {
         case GGUFType::IQ2_S:
             dequantize_row_iq2_s_avx512(ptr, out, n);
             return true;
+        case GGUFType::IQ1_M:
+            dequantize_row_iq1_m_avx512(ptr, out, n);
+            return true;
         default: {
             int ok = ggml_dequant_row((uint32_t)type, ptr, out, n);
             if (!ok) std::fill(out, out + n, 0.0f);

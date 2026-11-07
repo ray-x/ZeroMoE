@@ -1,4 +1,5 @@
 // Native test harness: tests_cpu_quant (split from tests/native/main_test.cpp).
+#include <cstring>
 #include "native_tests.hpp"
 #include "cpu_expert_executor.hpp"
 #include "expert_activation.hpp"
@@ -26,6 +27,7 @@ extern void dequantize_row_q3_K_avx512(const uint8_t* block, float* y, int64_t k
 extern void dequantize_row_iq2_xxs_avx512(const uint8_t* block, float* y, int64_t k);
 extern void dequantize_row_iq2_xs_avx512(const uint8_t* block, float* y, int64_t k);
 extern void dequantize_row_iq3_xxs_avx512(const uint8_t* block, float* y, int64_t k);
+extern void dequantize_row_iq1_m_avx512(const uint8_t* block, float* y, int64_t k);
 
 static bool run_dequant_case(GGUFType type, int elements_per_row, int n_rows) {
     const char* name = gpu_type_name(type);
@@ -57,6 +59,7 @@ static bool run_dequant_case(GGUFType type, int elements_per_row, int n_rows) {
             case GGUFType::IQ2_XXS: dequantize_row_iq2_xxs_avx512(w_bytes.data(), y_avx.data(), elements_per_row); break;
             case GGUFType::IQ2_XS:  dequantize_row_iq2_xs_avx512(w_bytes.data(), y_avx.data(), elements_per_row); break;
             case GGUFType::IQ3_XXS: dequantize_row_iq3_xxs_avx512(w_bytes.data(), y_avx.data(), elements_per_row); break;
+            case GGUFType::IQ1_M:   dequantize_row_iq1_m_avx512(w_bytes.data(), y_avx.data(), elements_per_row); break;
             default: assert(false && "run_dequant_case: unhandled type"); break;
         }
 
@@ -115,6 +118,36 @@ bool test_avx512_dequant() {
 // design as Test 6 (no FMA, same integer arithmetic before the single float
 // multiply), and it's this test, not Test 6, that actually matters for this
 // checkpoint's performance.
+// IQ1_M: random valid blocks (the reference quantizer needs an importance
+// matrix), compared BITWISE with ggml's dequantize_row_iq1_m.
+static bool run_iq1m_exact_case(int elements_per_row, int n_rows) {
+    std::mt19937 rng(4242);
+    const int rb = row_bytes(GGUFType::IQ1_M, elements_per_row);
+    bool pass = true;
+    for (int r = 0; r < n_rows && pass; ++r) {
+        std::vector<uint8_t> w((size_t)rb);
+        for (auto& b : w) b = (uint8_t)rng();
+        // Keep the packed fp16 super-block scale finite: its 16 bits live in the
+        // top nibbles of the block's four scale words (bytes 48..55 of each block).
+        for (int blk = 0; blk < elements_per_row / 256; ++blk) {
+            uint16_t sc[4];
+            uint8_t* base = w.data() + (size_t)blk * 56 + 48;
+            std::memcpy(sc, base, sizeof(sc));
+            const uint16_t half = (uint16_t)(0x2800 + (rng() % 0x1000));  // positive normal halves
+            for (int j = 0; j < 4; ++j)
+                sc[j] = (uint16_t)((sc[j] & 0x0fff) | (((half >> (4 * j)) & 0xf) << 12));
+            std::memcpy(base, sc, sizeof(sc));
+        }
+        std::vector<float> ref((size_t)elements_per_row), got((size_t)elements_per_row);
+        if (!ggml_dequant_row((uint32_t)GGUFType::IQ1_M, w.data(), ref.data(), elements_per_row)) return false;
+        dequantize_row_iq1_m_avx512(w.data(), got.data(), elements_per_row);
+        if (std::memcmp(ref.data(), got.data(), ref.size() * sizeof(float)) != 0) pass = false;
+    }
+    std::cout << "  -> IQ1_M AVX-512 dequant vs ggml (elements_per_row=" << elements_per_row
+              << " rows=" << n_rows << "): " << (pass ? "PASSED (bit-identical)" : "FAILED") << "\n";
+    return pass;
+}
+
 bool test_avx512_dequant_iq() {
     std::cout << "[Test 7] AVX-512 IQ2_XXS/IQ2_XS/IQ3_XXS Dequant vs ggml Reference...\n";
     bool all_pass = true;
@@ -128,6 +161,8 @@ bool test_avx512_dequant_iq() {
     // comment (kernels_cpu.cpp) for the algorithm this checks against.
     all_pass &= run_dequant_case(GGUFType::IQ2_XS, 256, 5);
     all_pass &= run_dequant_case(GGUFType::IQ2_XS, 2048, 4);
+    all_pass &= run_iq1m_exact_case(256, 6);
+    all_pass &= run_iq1m_exact_case(4096, 6);
 
     std::cout << "  -> " << (all_pass ? "AVX-512 IQ dequant agrees with ggml's reference."
                                        : "AVX-512 IQ dequant DISAGREED with ggml's reference -- see MISMATCH lines above.")
