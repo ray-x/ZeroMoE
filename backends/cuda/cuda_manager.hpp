@@ -38,6 +38,7 @@ extern "C" void launch_q2_K_grouped_dot_f32_batch(
 extern "C" void launch_q3_K_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
 extern "C" void launch_q4_K_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
 extern "C" void launch_q5_K_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
+extern "C" bool launch_q5_K_matmul_grouped(float* y, const float* x, const void* weights, int groups, size_t group_stride_bytes, int I, int O);
 extern "C" void launch_q6_K_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
 extern "C" void launch_iq2_xxs_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
 extern "C" void launch_iq2_xs_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
@@ -3313,7 +3314,11 @@ public:
         if (cudaMemcpy(d_outproj_x, x_host, x_bytes,
                        cudaMemcpyHostToDevice) != cudaSuccess)
             return false;
-        for (int g = 0; g < o_groups; ++g) {
+        bool batched = false;
+        if (wtype == GGUFType::Q5_K)
+            batched = launch_q5_K_matmul_grouped(d_outproj_y, d_outproj_x, d_WOA,
+                                                 o_groups, group_stride_bytes, group_in, o_rank);
+        for (int g = 0; !batched && g < o_groups; ++g) {
             if (!dense_matmul_device(
                     wtype,
                     static_cast<const uint8_t*>(d_WOA) +

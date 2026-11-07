@@ -462,6 +462,43 @@ KQUANT_MATMUL_KERNEL_LANE8(q2_K, block_q2_K_cu, dequant_q2_K_lane8)
 KQUANT_MATMUL_KERNEL_LANE8(q3_K, block_q3_K_cu, dequant_q3_K_lane8)
 KQUANT_MATMUL_KERNEL_LANE8(q4_K, block_q4_K_cu, dequant_q4_K_lane8)
 KQUANT_MATMUL_KERNEL_LANE8(q5_K, block_q5_K_cu, dequant_q5_K_lane8)
+
+// DeepSeek grouped output-A: one launch for all groups. blockIdx.y selects the
+// group; the arithmetic per output row is exactly q5_K_kquant_matmul_kernel_lane8
+// with S=1 (same block order, FMAs and reduction), only the weight and input
+// bases advance per group, so results are bit-identical to one launch per group.
+__global__ void q5_K_kquant_matmul_kernel_lane8_grouped(
+    float* __restrict__ y, const float* __restrict__ x, const block_q5_K_cu* __restrict__ W,
+    int I, int O, size_t group_stride_blocks)
+{
+    int o = blockIdx.x, g = blockIdx.y, tid = threadIdx.x;
+    if (o >= O) return;
+    int bpr = I / 256;
+    const block_q5_K_cu* w_row = W + (size_t)g * group_stride_blocks + (size_t)o * bpr;
+    const float* x_row = x + (size_t)g * I;
+    int warp_id = tid >> 5, lane = tid & 31;
+    float acc = 0.0f;
+    for (int b = warp_id; b < bpr; b += 8) {
+        float wv[8];
+        dequant_q5_K_lane8(&w_row[b], lane, wv);
+        const float* xp = x_row + (size_t)b * 256 + lane * 8;
+        float4 x0 = *reinterpret_cast<const float4*>(xp);
+        float4 x1 = *reinterpret_cast<const float4*>(xp + 4);
+        acc += wv[0]*x0.x + wv[1]*x0.y + wv[2]*x0.z + wv[3]*x0.w
+             + wv[4]*x1.x + wv[5]*x1.y + wv[6]*x1.z + wv[7]*x1.w;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off /= 2) acc += __shfl_down_sync(0xffffffff, acc, off);
+    __shared__ float s_warp[8];
+    if (lane == 0) s_warp[warp_id] = acc;
+    __syncthreads();
+    if (warp_id == 0) {
+        float v = (lane < 8) ? s_warp[lane] : 0.0f;
+        #pragma unroll
+        for (int off = 16; off > 0; off /= 2) v += __shfl_down_sync(0xffffffff, v, off);
+        if (lane == 0) y[(size_t)g * O + o] = v;
+    }
+}
 KQUANT_MATMUL_KERNEL_LANE8(q6_K, block_q6_K_cu, dequant_q6_K_lane8)
 
 // Gate for the lane8 path. Two real requirements, not style choices:
@@ -565,6 +602,15 @@ extern "C" void launch_q4_K_matmul(float* y, const float* x, const void* w, int 
         q4_K_kquant_matmul_kernel_lane8<<<dim3(O, S), 256>>>(y, x, (const block_q4_K_cu*)w, S, I, O);
     else
         q4_K_kquant_matmul_kernel<<<dim3(O, S), 256>>>(y, x, (const block_q4_K_cu*)w, S, I, O);
+}
+// Returns false when the shape does not take the lane8 kernel (caller loops per group).
+extern "C" bool launch_q5_K_matmul_grouped(float* y, const float* x, const void* w,
+                                           int groups, size_t group_stride_bytes, int I, int O) {
+    if (!(kquant_lane8_ok(I) || ((I / 256) >= 4 && (I % 4) == 0))) return false;
+    if (group_stride_bytes % sizeof(block_q5_K_cu) != 0 || groups <= 0) return false;
+    q5_K_kquant_matmul_kernel_lane8_grouped<<<dim3(O, groups), 256>>>(
+        y, x, (const block_q5_K_cu*)w, I, O, group_stride_bytes / sizeof(block_q5_K_cu));
+    return true;
 }
 extern "C" void launch_q5_K_matmul(float* y, const float* x, const void* w, int S, int I, int O) {
     // Q5_K also takes the lane8 kernel for 4-7 blocks per row (DeepSeek attn_q_b,
