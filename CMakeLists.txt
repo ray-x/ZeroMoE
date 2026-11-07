@@ -571,6 +571,7 @@ if(GGML_CUDA)
         kernels/math/attn_score_softmax.cu
         kernels/models/dsv4_score_softmax.cu
         kernels/models/dsv41_head_attention.cu
+        kernels/models/dsv41_indexer_score.cu
         kernels/quant/dequant_bf16.cu
         kernels/math/expert_accum.cu
         kernels/math/expert_activation.cu
@@ -999,6 +1000,18 @@ add_test(NAME vram_dynamic_slot_plan COMMAND vram_dynamic_slot_plan_test)
             target_link_libraries(dsv41_grouped_outproj_test PRIVATE
                 OpenMP::OpenMP_CXX)
         endif()
+    endif()
+
+    # Bitwise parity of the GPU Lightning-indexer scores with the host loop.
+    if(ZEROMOE_USE_GGML_CUDA)
+        add_executable(dsv41_indexer_score_test EXCLUDE_FROM_ALL
+            tests/test_dsv41_indexer_score.cpp
+            kernels/models/dsv41_indexer_score.cu)
+        target_compile_options(dsv41_indexer_score_test PRIVATE
+            ${ZEROMOE_AVX512_FLAGS})
+        set_target_properties(dsv41_indexer_score_test PROPERTIES
+            CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
+        target_link_libraries(dsv41_indexer_score_test PRIVATE CUDA::cudart)
     endif()
 
     if(ZEROMOE_USE_GGML_CUDA)

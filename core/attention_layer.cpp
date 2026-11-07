@@ -4077,9 +4077,19 @@ static void dsv41_attention_impl(StreamingEngine &engine, int layer_idx,
       std::vector<float> scores((size_t)visible, 0.0f);
       const float scale = 1.0f / std::sqrt((float)(c.dsv4_indexer_key_length *
                                                    c.dsv4_indexer_head_count));
+      // Single-token decode: score on the GPU. The kernel keeps the host
+      // loop's exact operation order (no FMA contraction, serial per block),
+      // so scores and the top-k below are bit-identical.
+      bool scored_on_gpu = false;
+      if (S == 1 && pos_base > 0 && visible > 0 && engine.gpu)
+        scored_on_gpu = engine.gpu->dsv41_indexer_score_host(
+            layer_idx, iq.data(), iw.data(), state.indexer_keys.data(), visible,
+            c.dsv4_indexer_head_count, c.dsv4_indexer_key_length, scale,
+            scores.data());
       // Blocks are independent and each keeps its own serial accumulation
       // order, so the result is bit-identical to the serial loop (matters
       // for near-tie top-k). Only worth a team for long prompts.
+      if (!scored_on_gpu) {
       #pragma omp parallel for schedule(static) num_threads(attn_score_threads()) if (visible >= 64)
       for (int block = 0; block < visible; ++block) {
         const float *key = state.indexer_keys.data() +
@@ -4096,6 +4106,7 @@ static void dsv41_attention_impl(StreamingEngine &engine, int layer_idx,
                    iw[(size_t)s * c.dsv4_indexer_head_count + h] * scale;
         }
         scores[(size_t)block] = score;
+      }
       }
       if (engine.dsv41_candidate_positions.size() != (size_t)S)
         engine.dsv41_candidate_positions.resize((size_t)S);

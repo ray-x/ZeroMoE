@@ -38,6 +38,7 @@ extern "C" void launch_q2_K_grouped_dot_f32_batch(
 extern "C" void launch_q3_K_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
 extern "C" void launch_q4_K_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
 extern "C" void launch_q5_K_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
+extern "C" bool launch_dsv41_indexer_score(const float* iq, const float* iw, const float* keys, int visible, int heads, int klen, float scale, float* out, cudaStream_t stream);
 extern "C" bool launch_q5_K_matmul_grouped(float* y, const float* x, const void* weights, int groups, size_t group_stride_bytes, int I, int O);
 extern "C" void launch_q6_K_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
 extern "C" void launch_iq2_xxs_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
@@ -584,6 +585,10 @@ public:
             if (l.d_comp) cudaFree(l.d_comp);
         }
         if (d_qkv_chain) cudaFree(d_qkv_chain);
+        if (d_is_in) cudaFree(d_is_in);
+        if (h_is_in) cudaFreeHost(h_is_in);
+        if (d_is_out) cudaFree(d_is_out);
+        if (h_is_out) cudaFreeHost(h_is_out);
         if (d_ha_in) cudaFree(d_ha_in);
         if (d_ha_out) cudaFree(d_ha_out);
         if (h_ha_in) cudaFreeHost(h_ha_in);
@@ -3346,10 +3351,81 @@ public:
     struct Dsv41HaLayer {
         float* d_win = nullptr; int win_rows = 0; long long synced_pos = -1;
         float* d_comp = nullptr; int comp_cap = 0; int synced_blocks = 0;
+        float* d_ik = nullptr; int ik_cap = 0; int ik_synced = 0;  // indexer-key mirror
     };
     std::vector<Dsv41HaLayer> dsv41_ha_layers;
     void dsv41_head_attention_invalidate() {
-        for (auto& l : dsv41_ha_layers) { l.synced_pos = -1; l.synced_blocks = 0; }
+        for (auto& l : dsv41_ha_layers) { l.synced_pos = -1; l.synced_blocks = 0; l.ik_synced = 0; }
+    }
+
+    // DeepSeek-V4.1 Lightning-indexer scores for one decoded token on the GPU.
+    // Bit-identical to the host loop (see kernels/models/dsv41_indexer_score.cu).
+    // Indexer keys of completed blocks are write-once, so only blocks beyond
+    // the last upload are copied; the mirror resets with the head-attention one.
+    float* d_is_in = nullptr; float* h_is_in = nullptr; size_t d_is_in_cap = 0;
+    float* d_is_out = nullptr; float* h_is_out = nullptr; size_t d_is_out_cap = 0;
+    bool dsv41_indexer_score_host(int layer, const float* iq_host, const float* iw_host,
+                                  const float* keys_host, int visible, int heads,
+                                  int klen, float scale, float* scores_host) {
+        if (layer < 0 || layer > 1024 || !iq_host || !iw_host || !keys_host ||
+            !scores_host || visible <= 0 || heads <= 0 || klen <= 0 || !outproj_stream)
+            return false;
+        if ((size_t)layer >= dsv41_ha_layers.size())
+            dsv41_ha_layers.resize((size_t)layer + 1);
+        Dsv41HaLayer& L = dsv41_ha_layers[(size_t)layer];
+        cudaSetDevice(device_id);
+        cudaStream_t st = outproj_stream;
+        auto fail = [&]() { L.ik_synced = 0; cudaGetLastError(); return false; };
+        const size_t key_bytes = (size_t)klen * sizeof(float);
+        if (visible > L.ik_cap) {
+            if (L.d_ik) cudaFree(L.d_ik);
+            L.d_ik = nullptr;
+            const int cap = std::max(visible, std::max(64, L.ik_cap * 2));
+            if (cudaMalloc((void**)&L.d_ik, (size_t)cap * key_bytes) != cudaSuccess) {
+                L.ik_cap = 0; return fail();
+            }
+            L.ik_cap = cap; L.ik_synced = 0;
+        }
+        const size_t in_floats = (size_t)heads * klen + (size_t)heads;
+        const size_t in_bytes = in_floats * sizeof(float);
+        if (in_bytes > d_is_in_cap) {
+            if (d_is_in) { cudaFree(d_is_in); d_is_in = nullptr; }
+            if (h_is_in) { cudaFreeHost(h_is_in); h_is_in = nullptr; }
+            d_is_in_cap = 0;
+            if (cudaMalloc((void**)&d_is_in, in_bytes) != cudaSuccess ||
+                cudaMallocHost((void**)&h_is_in, in_bytes) != cudaSuccess) return fail();
+            d_is_in_cap = in_bytes;
+        }
+        const size_t out_bytes = (size_t)visible * sizeof(float);
+        if (out_bytes > d_is_out_cap) {
+            if (d_is_out) { cudaFree(d_is_out); d_is_out = nullptr; }
+            if (h_is_out) { cudaFreeHost(h_is_out); h_is_out = nullptr; }
+            d_is_out_cap = 0;
+            const size_t want = std::max(out_bytes, (size_t)(64 * 1024));
+            if (cudaMalloc((void**)&d_is_out, want) != cudaSuccess ||
+                cudaMallocHost((void**)&h_is_out, want) != cudaSuccess) return fail();
+            d_is_out_cap = want;
+        }
+        std::memcpy(h_is_in, iq_host, (size_t)heads * klen * sizeof(float));
+        std::memcpy(h_is_in + (size_t)heads * klen, iw_host, (size_t)heads * sizeof(float));
+        bool ok = cudaMemcpyAsync(d_is_in, h_is_in, in_bytes, cudaMemcpyHostToDevice, st) == cudaSuccess;
+        if (visible > L.ik_synced) {
+            ok = ok && cudaMemcpyAsync(L.d_ik + (size_t)L.ik_synced * klen,
+                                       keys_host + (size_t)L.ik_synced * klen,
+                                       (size_t)(visible - L.ik_synced) * key_bytes,
+                                       cudaMemcpyHostToDevice, st) == cudaSuccess;
+        }
+        if (!ok) { cudaStreamSynchronize(st); return fail(); }
+        if (!launch_dsv41_indexer_score(d_is_in, d_is_in + (size_t)heads * klen, L.d_ik,
+                                        visible, heads, klen, scale, d_is_out, st))
+            return fail();
+        if (cudaGetLastError() != cudaSuccess) { cudaStreamSynchronize(st); return fail(); }
+        if (cudaMemcpyAsync(h_is_out, d_is_out, out_bytes, cudaMemcpyDeviceToHost, st) != cudaSuccess)
+            return fail();
+        if (cudaStreamSynchronize(st) != cudaSuccess) return fail();
+        L.ik_synced = std::max(L.ik_synced, visible);
+        std::memcpy(scores_host, h_is_out, out_bytes);
+        return true;
     }
 
     bool dsv41_head_attention_host(
