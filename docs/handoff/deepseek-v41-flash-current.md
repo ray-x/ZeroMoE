@@ -239,3 +239,12 @@ Artifact: `build_mtp_results/2026-11-07-0709643-deepseek41-fused-qkv-v75/` (bina
 | v82 | NVMe, buffered | 68.32 / 70.74 | 11.07 / 11.72 | 88.2 / 82.6 |
 
 Routes in v81 are identical to v78 (0/0), so the disk does not change numerics. Throughput is about 2-3% lower than v78 in both NVMe configs; attention host-side "other" rose 6.3 to 8.4-8.6 ms. The cause is not isolated (host state differed between runs; only two requests each), so v78 stays the best measured number and no baseline is changed. `check_full_graph_moe_run.py` PASS in all.
+
+## Pending measurement: batched out-projection and GPU indexer scores (commits 4aaee8a, 446f685)
+
+Both are built into `build_dsv41_retry16/zeromoe` (source 446f685) and are designed to be bit-identical to v78:
+- `4aaee8a`: one launch for all Q5_K grouped out-projection A groups (`launch_q5_K_matmul_grouped`). The v84 run (`build_mtp_results/2026-11-07-grouped-outproj-v84/`) was contaminated by another session's zeromoe (host swap-out; request 1 decode 6.77 tok/s, request 2 skipped), so it gives no timing. Its request-1 decode routes matched v78 (0 of 2,520 lines differ).
+- `446f685`: Lightning-indexer block scores on the GPU for single-token decode (`kernels/models/dsv41_indexer_score.cu`, mirror of the write-once indexer keys per layer). The engine builds with `-std=c++23`, which disables FMA contraction, so the kernel uses separate multiply and add; `build_dsv41_retry16/dsv41_indexer_score_test` compares it bit for bit with the host loop (1, 7, 64, 260, 1000 blocks: PASS). Host cost being removed: about 0.7 ms per CSA-layer call, roughly 5.7 ms/token.
+- Estimated combined gain 4-7 ms/token (unmeasured). Gate: v85 two-request run on a quiet host, 0 differing decode route lines versus v78 (`2026-11-07-lane8q5-v78/observed-routes.log`), `check_full_graph_moe_run.py` PASS.
+
+nsys facts used (v83, `--cuda-graph-trace=node`, ~101 ms/token under profiling): RTX 3090 busy 27%, RTX 5060 Ti 6%; about 800 host-to-device and 525 device-to-host copies per token; lane8 Q5_K matvecs 10.9 ms/token on the 3090 (mostly the 8-group out-projection), head attention 5.3, expert `mul_mat_vec_q` 5.4 (3090) + 5.4 (5060 Ti).
