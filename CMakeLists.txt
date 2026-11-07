@@ -1021,6 +1021,25 @@ add_test(NAME vram_dynamic_slot_plan COMMAND vram_dynamic_slot_plan_test)
         endif()
     endif()
 
+    # Accuracy of the GPU single-token head attention against float64.
+    if(ZEROMOE_USE_GGML_CUDA)
+        add_executable(dsv41_head_attention_test EXCLUDE_FROM_ALL
+            tests/test_dsv41_head_attention.cpp
+            backends/cpu/kernels_cpu.cpp
+            backends/cpu/ggml_grids.cpp
+            kernels/models/dsv41_head_attention.cu)
+        target_include_directories(dsv41_head_attention_test PRIVATE
+            ${ZEROMOE_GGML_SRC_DIR})
+        target_compile_options(dsv41_head_attention_test PRIVATE
+            ${ZEROMOE_AVX512_FLAGS})
+        set_target_properties(dsv41_head_attention_test PROPERTIES
+            CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
+        target_link_libraries(dsv41_head_attention_test PRIVATE CUDA::cudart ggml)
+        if(OpenMP_CXX_FOUND)
+            target_link_libraries(dsv41_head_attention_test PRIVATE OpenMP::OpenMP_CXX)
+        endif()
+    endif()
+
     # Bitwise parity of the GPU Lightning-indexer scores with the host loop.
     if(ZEROMOE_USE_GGML_CUDA)
         add_executable(dsv41_indexer_score_test EXCLUDE_FROM_ALL
