@@ -41,22 +41,38 @@ __global__ void dsv41_head_attn_kernel(
     }
     __syncthreads();
 
-    for (int i = warp; i < n; i += nwarps) {
-        const int r = koff[i];
-        const float* key = (r & 0x40000000)
-            ? comp + (size_t)(r & 0x3fffffff) * qh
-            : win + (size_t)r * qh;
-        float acc = 0.0f;
+    // Four keys per warp iteration: independent dot products issue their loads
+    // together; each key's accumulation order is unchanged (bit-identical).
+    for (int base = warp; base < n; base += 4 * nwarps) {
+        const float* keyp[4];
+        int idx[4];
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            idx[u] = base + u * nwarps;
+            const int r = idx[u] < n ? koff[idx[u]] : koff[base];
+            keyp[u] = (r & 0x40000000)
+                ? comp + (size_t)(r & 0x3fffffff) * qh
+                : win + (size_t)r * qh;
+        }
+        float acc[4] = {0.f, 0.f, 0.f, 0.f};
         for (int j = lane * 4; j < qh; j += 128) {
-            const float4 kv = *reinterpret_cast<const float4*>(key + j);
-            acc = fmaf(qs[j], kv.x, acc);
-            acc = fmaf(qs[j + 1], kv.y, acc);
-            acc = fmaf(qs[j + 2], kv.z, acc);
-            acc = fmaf(qs[j + 3], kv.w, acc);
+            float4 kv[4];
+            #pragma unroll
+            for (int u = 0; u < 4; ++u) kv[u] = *reinterpret_cast<const float4*>(keyp[u] + j);
+            #pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                acc[u] = fmaf(qs[j], kv[u].x, acc[u]);
+                acc[u] = fmaf(qs[j + 1], kv[u].y, acc[u]);
+                acc[u] = fmaf(qs[j + 2], kv[u].z, acc[u]);
+                acc[u] = fmaf(qs[j + 3], kv[u].w, acc[u]);
+            }
         }
         #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
-        if (lane == 0) scores[i] = acc * scale;
+        for (int u = 0; u < 4; ++u) {
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) acc[u] += __shfl_down_sync(0xffffffffu, acc[u], o);
+            if (lane == 0 && idx[u] < n) scores[idx[u]] = acc[u] * scale;
+        }
     }
     if (tid == 0) scores[n] = sinks ? sinks[h] : -1e30f;  // sink is unscaled
     __syncthreads();
@@ -97,10 +113,10 @@ __global__ void dsv41_head_attn_kernel(
         const int d0 = tid, d1 = tid + (int)blockDim.x;
         float a0 = 0.0f, a1 = 0.0f;
         int i = 0;
-        for (; i + 4 <= n; i += 4) {
-            float k0[4], k1[4], sc[4];
+        for (; i + 8 <= n; i += 8) {
+            float k0[8], k1[8], sc[8];
             #pragma unroll
-            for (int u = 0; u < 4; ++u) {
+            for (int u = 0; u < 8; ++u) {
                 const int r = koff[i + u];
                 const float* key = (r & 0x40000000)
                     ? comp + (size_t)(r & 0x3fffffff) * qh
@@ -110,7 +126,7 @@ __global__ void dsv41_head_attn_kernel(
                 sc[u] = scores[i + u];
             }
             #pragma unroll
-            for (int u = 0; u < 4; ++u) {
+            for (int u = 0; u < 8; ++u) {
                 a0 = fmaf(sc[u], k0[u], a0);
                 a1 = fmaf(sc[u], k1[u], a1);
             }
