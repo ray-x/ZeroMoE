@@ -32,7 +32,8 @@ residency needs >= ~118). Stop other large processes first; no swap is allowed i
 ```bash
 # 1. Build (Release, provenance-stamped; re-run cmake after any source edit or the stamp is rejected)
 cmake -S . -B build_dsv41 -DCMAKE_BUILD_TYPE=Release && cmake --build build_dsv41 -j
-# 2. Serve (config uses model paths under /mnt/usb-ssd/DeepSeek-V4.1-Flash-1017-GSQ-RCO/; edit if different)
+# 2. Serve (config uses model paths under /mnt/usb-ssd/DeepSeek-V4.1-Flash-1017-GSQ-RCO/; edit if different.
+#    A local NVMe copy of the six GGUFs cuts start-to-/health from ~324 s to ~62 s with the same throughput within noise)
 CUDA_VISIBLE_DEVICES=0,1 NVIDIA_TF32_OVERRIDE=0 OMP_NUM_THREADS=10 \
   ./build_dsv41/zeromoe --serve --config configs/bench/deepseek_v41_iq2xxs_fullres_dual_gpu.toml \
   --host 127.0.0.1 --port 18081 --alias deepseek-v41-flash

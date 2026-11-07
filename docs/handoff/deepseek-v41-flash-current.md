@@ -224,3 +224,18 @@ Artifact: `build_mtp_results/2026-11-07-0709643-deepseek41-fused-qkv-v75/` (bina
 
 - `check_full_graph_moe_run.py --full-fit --require-full-graph-prefill`: PASS. Generated text starts identically and is coherent.
 - This is a rounding change (different reduction tree): 438 and 407 of 2,520 decode route lines differ from v75 in the two requests (free-running, so later divergence compounds). Not compared with llama.cpp. Treat as a candidate: v74 stays the documented baseline until the teacher-forced check is run.
+
+## v79-v82: model files on the local NVMe, head-attention interleave (2026-11-07)
+
+- **Model location.** The six GGUFs were copied (user-approved) from the USB SSD (`/mnt/usb-ssd/DeepSeek-V4.1-Flash-1017-GSQ-RCO/`, exFAT) to the local NVMe `/home/ray/vllm-workspace/DeepSeek-V41-Flash/GSQ-RCO-IQ2_XXS/` (sizes verified equal; Engram first 2 GB compared). **Server start to `/health` dropped from about 324 s to about 62 s.** `guarded_start.sh` `MODEL_DIR` points at the NVMe folder in v79+.
+- **v79** was killed by the host-pressure watchdog 54 s after launch (swap-out 165 MiB/s, MemAvailable 39 GB during preload, `emergency-stop.json`); the same config loaded fine in v80-v82. Cause not isolated (page-cache pressure from the faster disk or a neighbor's load at that moment).
+- **Head-attention interleave (two output chains, 4-key unroll; commit cad5cf0, reverted as 77ba56f).** Bit-identical to v78 (0 of 2,520 route lines differ in both requests) but no speedup: `context_node` 17.5 ms vs 17.3, so the kernel is not the bottleneck of that node. Removed.
+- **NVMe runs (same binary as v78 except the reverted kernel; 959+64 workload, 2 requests, startup margin 3.0):**
+
+| Run | Disk / IO | Prefill tok/s | Decode tok/s | Decode p50 ms |
+|---|---|---:|---:|---:|
+| v78 | USB, buffered | 70.96 / 71.92 | 11.63 / 11.91 | 84.2 / 82.0 |
+| v81 | NVMe, direct_io=true | 68.82 / 70.64 | 11.33 / 11.77 | 86.0 / 83.0 |
+| v82 | NVMe, buffered | 68.32 / 70.74 | 11.07 / 11.72 | 88.2 / 82.6 |
+
+Routes in v81 are identical to v78 (0/0), so the disk does not change numerics. Throughput is about 2-3% lower than v78 in both NVMe configs; attention host-side "other" rose 6.3 to 8.4-8.6 ms. The cause is not isolated (host state differed between runs; only two requests each), so v78 stays the best measured number and no baseline is changed. `check_full_graph_moe_run.py` PASS in all.
