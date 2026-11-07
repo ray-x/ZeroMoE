@@ -570,6 +570,7 @@ if(GGML_CUDA)
         backends/exl3/exl3_aux.cu
         kernels/math/attn_score_softmax.cu
         kernels/models/dsv4_score_softmax.cu
+        kernels/models/dsv41_head_attention.cu
         kernels/quant/dequant_bf16.cu
         kernels/math/expert_accum.cu
         kernels/math/expert_activation.cu

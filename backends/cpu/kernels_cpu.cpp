@@ -38,6 +38,8 @@ extern "C" void ggml_vec_dot_iq2_xxs_q8_K(int, float *, size_t, const void *,
                                           size_t, const void *, size_t, int);
 extern "C" void ggml_vec_dot_iq3_xxs_q8_K(int, float *, size_t, const void *,
                                           size_t, const void *, size_t, int);
+extern "C" void ggml_vec_dot_iq2_xs_q8_K(int, float *, size_t, const void *,
+                                         size_t, const void *, size_t, int);
 extern "C" void quantize_row_q8_0(const float *, void *, int64_t);
 extern "C" void ggml_vec_dot_iq4_nl_q8_0(int, float *, size_t, const void *,
                                            size_t, const void *, size_t, int);
@@ -2512,6 +2514,13 @@ static float dot_iq2_xxs_ggml_q8k_exact(const uint8_t *w,
   return out;
 }
 
+static float dot_iq2_xs_ggml_q8k_exact(const uint8_t *w,
+                                       const block_q8_K_local *xq, int64_t n) {
+  float out = 0.0f;
+  ggml_vec_dot_iq2_xs_q8_K((int)n, &out, 0, w, 0, xq, 0, 1);
+  return out;
+}
+
 static float dot_iq3_xxs_ggml_q8k_exact(const uint8_t *w,
                                         const block_q8_K_local *xq, int64_t n) {
   float out = 0.0f;
@@ -3266,6 +3275,14 @@ bool matmul_iq2_xxs_ggml_q8k_grouped(float *const *y, const float *x,
                                      int n_matrices, int S, int I, int O) {
   return matmul_iqxxs_ggml_grouped_impl(
       y, x, W_quantized, n_matrices, S, I, O, 66, dot_iq2_xxs_ggml_q8k_exact);
+}
+
+bool matmul_iq2_xs_ggml_q8k_grouped(float *const *y, const float *x,
+                                    const uint8_t *const *W_quantized,
+                                    int n_matrices, int S, int I, int O) {
+  // IQ2_XS: 74 bytes per 256-weight block (2 d + 64 qs + 8 scales).
+  return matmul_iqxxs_ggml_grouped_impl(
+      y, x, W_quantized, n_matrices, S, I, O, 74, dot_iq2_xs_ggml_q8k_exact);
 }
 
 bool matmul_iq3_xxs_ggml_q8k_grouped(float *const *y, const float *x,

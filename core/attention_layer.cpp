@@ -3807,6 +3807,7 @@ static void dsv41_attention_impl(StreamingEngine &engine, int layer_idx,
           ? (int)c.dsv4_compress_ratios[(size_t)layer_idx]
           : 0;
   if (layer_idx == 0 && pos_base == 0) {
+    if (engine.gpu) engine.gpu->dsv41_head_attention_invalidate();
     for (auto &state : engine.dsv41_compressed)
       state.reset();
     engine.dsv41_candidate_positions.clear();
@@ -4167,6 +4168,40 @@ static void dsv41_attention_impl(StreamingEngine &engine, int layer_idx,
     // Dedicated team (see attn_score_threads) with one scores buffer per
     // thread: at decode context lengths the per-head work is microseconds,
     // so spawn/barrier cost against the prefetch/IO pools dominated.
+    // Single-token decode: run the per-head loop on the GPU (falls back to
+    // the CPU loop below on any failure or unsupported shape).
+    bool gpu_done = false;
+    {
+      if (S == 1 && pos_base > 0 && engine.gpu &&
+          !selected.empty() && state.keys.size() >= (size_t)qh) {
+        int max_block = -1;
+        bool valid = true;
+        for (int b : selected) {
+          if (b < 0 || (int64_t)(b + 1) * qh > (int64_t)state.keys.size()) {
+            valid = false;
+            break;
+          }
+          max_block = std::max(max_block, b);
+        }
+        if (valid && engine.KVc[(size_t)layer_idx]) {
+          gpu_done = engine.gpu->dsv41_head_attention_host(
+              layer_idx, Q.data(), H, qh, engine.KVc[(size_t)layer_idx], window, pos, past,
+              state.keys.data(), max_block + 1, selected.data(),
+              (int)selected.size(), sinks, attn_scale,
+              contexts.data() + (size_t)s * H * qh);
+          if (gpu_done) {
+            for (int h = 0; h < H; ++h) {
+              float *out = contexts.data() + ((size_t)s * H + h) * qh;
+              rope_yarn_inplace_inverse(out + nope, rope, pos, rope_theta_v41,
+                                        c.rope_ext_factor, c.rope_freq_scale,
+                                        c.rope_attn_factor, c.rope_yarn_log_mul,
+                                        c.rope_n_ctx_orig, true);
+            }
+          }
+        }
+      }
+    }
+    if (!gpu_done) {
     #pragma omp parallel num_threads(attn_score_threads())
     {
     std::vector<float> scores;
@@ -4201,6 +4236,7 @@ static void dsv41_attention_impl(StreamingEngine &engine, int layer_idx,
                                 c.rope_ext_factor, c.rope_freq_scale,
                                 c.rope_attn_factor, c.rope_yarn_log_mul,
                                 c.rope_n_ctx_orig, true);
+    }
     }
     }
   }

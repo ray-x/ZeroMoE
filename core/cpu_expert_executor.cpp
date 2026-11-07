@@ -70,12 +70,13 @@ bool expert_ffn_cpu_grouped_ddr(
     const std::vector<MoEExpertBlock *> &experts, const float *weights,
     int D, int moe_inter, float swiglu_clamp, int layer_idx) {
   const int n = static_cast<int>(experts.size());
-  if (!input || !output || !weights || n < 2 || D <= 0 || moe_inter <= 0)
+  if (!input || !output || !weights || n < 1 || D <= 0 || moe_inter <= 0)
     return false;
   const auto t0 = std::chrono::steady_clock::now();
   std::vector<const uint8_t *> gate_weights((size_t)n), up_weights((size_t)n),
       down_weights((size_t)n);
-  std::vector<float *> gate((size_t)n), up((size_t)n);
+  std::vector<float *> gate((size_t)n), up((size_t)n), down((size_t)n);
+  std::vector<const float *> down_inputs((size_t)n);
   std::vector<float> gate_storage((size_t)n * moe_inter),
       up_storage((size_t)n * moe_inter), down_storage((size_t)n * D),
       result((size_t)D, 0.0f);
@@ -95,14 +96,21 @@ bool expert_ffn_cpu_grouped_ddr(
     down_weights[(size_t)i] = block->down_proj.host_ptr;
     gate[(size_t)i] = gate_storage.data() + (size_t)i * moe_inter;
     up[(size_t)i] = up_storage.data() + (size_t)i * moe_inter;
+    down[(size_t)i] = down_storage.data() + (size_t)i * D;
   }
   const auto grouped_projection = [&](float *const *dst,
                                       const uint8_t *const *w,
                                       GGUFType type) {
     switch (type) {
+    case GGUFType::IQ1_M:
+      return matmul_iq1_m_ggml_q8k_grouped(dst, input, w, n, 1, D,
+                                           moe_inter);
     case GGUFType::IQ2_XXS:
       return matmul_iq2_xxs_ggml_q8k_grouped(dst, input, w, n, 1, D,
                                               moe_inter);
+    case GGUFType::IQ2_XS:
+      return matmul_iq2_xs_ggml_q8k_grouped(dst, input, w, n, 1, D,
+                                             moe_inter);
     case GGUFType::IQ3_XXS:
       return matmul_iq3_xxs_ggml_q8k_grouped(dst, input, w, n, 1, D,
                                               moe_inter);
@@ -110,8 +118,14 @@ bool expert_ffn_cpu_grouped_ddr(
       return false;
     }
   };
-  if (!grouped_projection(gate.data(), gate_weights.data(), gate_type) ||
-      !grouped_projection(up.data(), up_weights.data(), up_type))
+  const bool iq1m_gate_up_pair = gate_type == GGUFType::IQ1_M &&
+      up_type == GGUFType::IQ1_M &&
+      matmul_iq1_m_ggml_q8k_grouped_pair(
+          gate.data(), up.data(), input, gate_weights.data(),
+          up_weights.data(), n, 1, D, moe_inter);
+  if (!iq1m_gate_up_pair &&
+      (!grouped_projection(gate.data(), gate_weights.data(), gate_type) ||
+       !grouped_projection(up.data(), up_weights.data(), up_type)))
     return false;
   for (int i = 0; i < n; ++i) {
     if (swiglu_clamp_fused()) {
@@ -122,12 +136,24 @@ bool expert_ffn_cpu_grouped_ddr(
       elem_mul(gate[(size_t)i], gate[(size_t)i], up[(size_t)i], moe_inter);
       swiglu_clamp_inplace(gate[(size_t)i], moe_inter, swiglu_clamp);
     }
-    if (!cpu_quant_matmul(down_type, down_weights[(size_t)i],
-                          gate[(size_t)i], down_storage.data() + (size_t)i * D,
-                          1, moe_inter, D))
-      return false;
+    down_inputs[(size_t)i] = gate[(size_t)i];
+  }
+  bool grouped_down = false;
+  if (down_type == GGUFType::IQ1_M)
+    grouped_down = matmul_iq1_m_ggml_q8k_grouped_inputs(
+        down.data(), down_inputs.data(), down_weights.data(), n, 1,
+        moe_inter, D);
+  if (!grouped_down) {
+    for (int i = 0; i < n; ++i) {
+      if (!cpu_quant_matmul(down_type, down_weights[(size_t)i],
+                            down_inputs[(size_t)i], down[(size_t)i],
+                            1, moe_inter, D))
+        return false;
+    }
+  }
+  for (int i = 0; i < n; ++i) {
     const float weight = weights[(size_t)i];
-    const float *expert_out = down_storage.data() + (size_t)i * D;
+    const float *expert_out = down[(size_t)i];
     for (int d = 0; d < D; ++d)
       result[(size_t)d] += weight * expert_out[d];
   }

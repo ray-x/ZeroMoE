@@ -5,6 +5,8 @@
 #include "graph_config.hpp"
 #include "vram_dynamic_slot_plan.hpp"
 
+#include <cstdint>
+
 // Batches up to Ring::CAPACITY/3 packed-format experts' reads into ONE
 // io_uring submission, for the startup [PIN] preload pass -- real
 // measurement (gguf_tool dma's own N-sweep) found that pass's original
@@ -213,6 +215,7 @@ std::vector<StreamingEngine::UsageEntry> EngineRunner::sanitize_usage_entries(
 std::expected<void, std::string> EngineRunner::preload_experts() {
   int strict_pin_failures = 0;
   int tier1_pin_fail = 0, tier2_pin_fail = 0;
+  std::vector<StreamingEngine::UsageEntry> strategy_test_manifest;
   if (config.require_full_moe_residency) {
     if (!config.ram_preload_all_experts)
       return std::unexpected("require_full_moe_residency requires ram_preload_all_experts=true");
@@ -540,14 +543,24 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
         if (engine.qwen_ram_vram_only_layer(layer))
           by_layer.erase(layer);
 
-      // A usage file is a ranking signal, not a complete model
+      // Selective DeepSeek strategy tests use frozen usage files as their
+      // complete resident identity set. Preserve that exact set for the
+      // post-preload check; unobserved model experts must not be added.
+      if (config.deepseek_v41_strategy_test_isolation &&
+          !config.require_full_moe_residency) {
+        for (const auto &[layer, experts] : by_layer)
+          for (const auto &entry : experts)
+            strategy_test_manifest.push_back(entry);
+      }
+
+      // A usage file is normally a ranking signal, not a complete model
       // manifest. When DDR is large enough to hold the whole MoE, add
       // zero-count entries for every model expert so Tier 3 preloads
-      // the full set instead of leaving history-missing experts to
-      // fault in during the first request. Existing counts retain
-      // their ranking priority; the newly added entries simply fill
-      // the remaining RAM slots.
-      if (config.ram_preload_all_experts) {
+      // the full set instead of leaving history-missing experts to fault
+      // in during the first request. Selective DeepSeek strategy tests
+      // intentionally preserve their frozen usage manifest as-is.
+      if (config.ram_preload_all_experts &&
+          !config.deepseek_v41_strategy_test_isolation) {
         // `n_layers` is the target trunk count. When the GLM
         // NextN/MTP bridge is active, the optional final block is a
         // real routed MoE layer too and must be included here;
@@ -883,6 +896,23 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
       // implicit pin_topk_per_layer calculation. This allows precise control
       // over the pinned tier (targeting 1024 experts vs. current ~600).
       int max_pinned_total = config.pinned_vram_capacity;
+      if (config.deepseek_v41_strategy_test_isolation) {
+        const size_t cache_capacity = ram_mgr.vram_cache->expert_vram_cache_cap;
+        const size_t dynamic_slots = static_cast<size_t>(
+            std::max(0, config.full_moe_vram_dynamic_slots));
+        if (cache_capacity <= dynamic_slots ||
+            cache_capacity - dynamic_slots >
+                static_cast<size_t>(std::numeric_limits<int>::max()))
+          return std::unexpected(
+              "DeepSeek strategy isolation cannot reserve the configured dynamic VRAM slots");
+        // Keep the startup hot set immutable across H2D/CPU/split API requests;
+        // only the explicitly reserved dynamic slots are reset between cases.
+        max_pinned_total = static_cast<int>(cache_capacity - dynamic_slots);
+        LOG_STREAM_INFO()
+            << "[DSV41-STRATEGY] isolation pins " << max_pinned_total
+            << " startup VRAM expert(s) and leaves " << dynamic_slots
+            << " dynamic slot(s) for request-scoped strategy tests\n";
+      }
       bool global_topn = (config.pin_strategy == "global_topn");
       if (max_pinned_total > 0 && !global_topn) {
         // Adjust topk per layer to respect the global pinned cap
@@ -905,6 +935,9 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
                                        avg_vram_slots_per_layer));
       int ram_n = std::max(0, (int)std::lround(config.pin_ram_fraction *
                                                ram_mgr.slots_per_layer));
+      const bool selective_strategy_manifest =
+          config.deepseek_v41_strategy_test_isolation &&
+          !config.require_full_moe_residency;
       bool prefix_vram = config.vram_preload_prefix_layers > 0;
 
       // Compact VRAM has a separate, non-interchangeable slot region
@@ -996,21 +1029,62 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
       } else if (global_topn) {
         int floor_n = std::max(0, config.pin_global_floor_per_layer);
         int floor_total = 0;
+        int ddr_safety_pins = 0;
         for (auto &[layer, v] : by_layer) {
           if (is_cpu_affinity_layer(layer)) {
+            if (selective_strategy_manifest) {
+              const int ram_cap = std::min(
+                  (int)engine.layers_experts[(size_t)layer].size(),
+                  std::max(0, ram_mgr.cap_for_layer(layer)));
+              if (graph_ram_cache &&
+                  !engine.graph_ram_layer_allocated(layer)) {
+                return std::unexpected(
+                    "selective DeepSeek manifest exceeds DDR capacity on CPU-only layer " +
+                    std::to_string(layer));
+              }
+              if ((int)v.size() > ram_cap)
+                return std::unexpected(
+                    "selective DeepSeek manifest exceeds DDR capacity on CPU-only layer " +
+                    std::to_string(layer));
+            }
             layer_pin_count[layer] = 0;
             continue;
           }
           int f = std::min(floor_n, (int)v.size());
+          if (selective_strategy_manifest) {
+            int ram_cap = std::min(
+                (int)engine.layers_experts[(size_t)layer].size(),
+                std::max(0, ram_mgr.cap_for_layer(layer)));
+            if (graph_ram_cache &&
+                !engine.graph_ram_layer_allocated(layer))
+              ram_cap = 0;
+            const int ddr_fit_pin_floor =
+                std::max(0, (int)v.size() - ram_cap);
+            f = std::max(f, ddr_fit_pin_floor);
+            ddr_safety_pins +=
+                std::max(0, ddr_fit_pin_floor -
+                                std::min(floor_n, (int)v.size()));
+          }
           if (!compact_layer_capacity.empty()) {
             auto cap_it = compact_layer_capacity.find(layer);
-            f = cap_it == compact_layer_capacity.end()
-                    ? 0
-                    : std::min(f, cap_it->second);
+            const int vram_layer_cap =
+                cap_it == compact_layer_capacity.end() ? 0 : cap_it->second;
+            if (selective_strategy_manifest && f > vram_layer_cap)
+              return std::unexpected(
+                  "selective DeepSeek manifest cannot fit layer " +
+                  std::to_string(layer) +
+                  " across its compact VRAM and DDR capacities");
+            f = std::min(f, vram_layer_cap);
           }
           layer_pin_count[layer] = f;
           floor_total += f;
         }
+        if (max_pinned_total > 0 && floor_total > max_pinned_total)
+          return std::unexpected(
+              "selective DeepSeek per-layer DDR-fit floors require " +
+              std::to_string(floor_total) +
+              " VRAM pins, exceeding the available static pin budget " +
+              std::to_string(max_pinned_total));
         struct GlobalCand {
           int layer;
           uint64_t count;
@@ -1065,7 +1139,13 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
           ++take;
         }
         LOG_STREAM_INFO() << "[PIN] global_topn: floor " << floor_n
-                          << "/layer (" << floor_total << " total) + " << take
+                          << "/layer (" << (floor_total - ddr_safety_pins)
+                          << " base pins)"
+                          << (ddr_safety_pins > 0
+                                  ? " + " + std::to_string(ddr_safety_pins) +
+                                        " DDR-fit pins"
+                                  : std::string())
+                          << " + " << take
                           << " globally-ranked -> " << (floor_total + take)
                           << "/" << effective_cap
                           << (max_pinned_total > 0
@@ -1188,7 +1268,48 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
   // GPU, even when the GPU owns no routed expert for that layer.
   std::vector<zeromoe::memory::VramDynamicSlotReserve>
       dynamic_vram_reserve_by_gpu;
-  const bool per_gpu_dynamic_reserve = config.require_full_moe_residency &&
+  if (gpu.topology.expert_compact_layout &&
+      gpu.topology.expert_compact_shared_dynamic_slots > 0) {
+    size_t shared_dynamic_slots = 0;
+    for (int vi : gpu.topology.vault_gpus) {
+      const auto &device_info = gpu.topology.devices[(size_t)vi];
+      const int device = device_info.id;
+      const std::uintptr_t pool_base = reinterpret_cast<std::uintptr_t>(
+          device_info.expert_cache_pool);
+      if (!device_info.expert_cache_pool || pool_base % 16 != 0)
+        return std::unexpected(
+            "compact shared dynamic pool has a null or misaligned CUDA allocation on GPU " +
+            std::to_string(device));
+      size_t on_device = 0;
+      for (const auto &loc : gpu.topology.expert_vram_cache) {
+        if (loc.gpu_id != device || loc.pool_layer != -1) continue;
+        ++on_device;
+        const std::uintptr_t address =
+            reinterpret_cast<std::uintptr_t>(loc.device_ptr);
+        const bool in_bounds = loc.offset <= device_info.expert_cache_size &&
+            loc.size <= device_info.expert_cache_size - loc.offset;
+        if (!loc.device_ptr || !in_bounds || loc.size !=
+                gpu.topology.expert_max_slab_size || loc.offset % 16 != 0 ||
+            loc.size % 16 != 0 || address % 16 != 0 || address < pool_base ||
+            address - pool_base != loc.offset)
+          return std::unexpected(
+              "compact shared dynamic pool contains an out-of-bounds or misaligned slot on GPU " +
+              std::to_string(device));
+      }
+      shared_dynamic_slots += on_device;
+      LOG_STREAM_INFO() << "[PIN] compact shared dynamic pool: GPU "
+                        << device << " has " << on_device
+                        << " cross-layer staging slot(s), base_mod16="
+                        << pool_base % 16 << "\n";
+    }
+    if (shared_dynamic_slots !=
+        (size_t)config.full_moe_vram_dynamic_slots)
+      return std::unexpected(
+          "compact shared dynamic pool slot count does not match the configured VRAM reserve");
+  }
+  const bool per_gpu_dynamic_reserve =
+      (config.require_full_moe_residency ||
+       config.deepseek_v41_strategy_test_isolation) &&
       !gpu.topology.expert_compact_layout &&
       config.full_moe_vram_dynamic_slots > 0;
   if (per_gpu_dynamic_reserve) {
@@ -1349,6 +1470,20 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
                         "single-expert-at-a-time load for this whole pass"))
           << "\n";
 
+      const bool global_tiers = config.pin_global_tiers && global_topn &&
+                                !prefix_vram &&
+                                !engine.qwen4exp_option_b_committed;
+      if (selective_strategy_manifest && !global_tiers)
+        return std::unexpected(
+            "selective DeepSeek strategy isolation requires global_topn tiers "
+            "to preload its exact frozen manifest");
+      const std::string ram_preload_label =
+          config.ram_preload_all_experts
+              ? "all experts within each layer's RAM cap"
+              : (selective_strategy_manifest
+                     ? "all frozen-manifest experts within each layer's RAM cap"
+                     : "next " + std::to_string(ram_n) + "/layer RAM");
+
       LOG_STREAM_INFO()
           << "[PIN] Preloading from " << config.pin_file << " ("
           << entries.size() << " known experts, max count " << maxc << "): "
@@ -1358,10 +1493,7 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
                                             "/layer VRAM-pinned")))
           << ", next " << (prefix_vram ? 0 : vram_lru_n)
           << "/layer VRAM-unpinned, "
-          << (config.ram_preload_all_experts
-                  ? "all experts within each layer's RAM cap"
-                  : ("next " + std::to_string(ram_n) + "/layer RAM"))
-          << "...\n";
+          << ram_preload_label << "...\n";
       // Previously, a preload attempt failing anywhere in this loop
       // (disk read producing no usable slab, or upload_expert
       // rejecting it) was completely silent -- a real run lost
@@ -1376,8 +1508,6 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
       // pin_global_tiers: per-layer VRAM-LRU and RAM preload counts from one
       // global ranking of what remains after each layer's pinned prefix.
       // The totals equal what the per-layer rule would have loaded.
-      const bool global_tiers = config.pin_global_tiers && global_topn && !prefix_vram &&
-                                !engine.qwen4exp_option_b_committed;
       std::unordered_map<int, int> global_lru_count, global_ram_count;
       if (global_tiers) {
         struct TierCand {
@@ -1489,13 +1619,26 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
               headroom_bytes_f > (double)std::numeric_limits<size_t>::max())
             return std::unexpected("full-residency host request headroom is not representable");
           const size_t headroom_bytes = (size_t)std::ceil(headroom_bytes_f);
-          if (required_ram_bytes > std::numeric_limits<size_t>::max() - headroom_bytes ||
-              required_ram_bytes + headroom_bytes > ram_mgr.ram_expert_budget_bytes)
+          const bool required_with_headroom_overflow =
+              required_ram_bytes >
+              std::numeric_limits<size_t>::max() - headroom_bytes;
+          const size_t required_with_headroom =
+              required_with_headroom_overflow
+                  ? std::numeric_limits<size_t>::max()
+                  : required_ram_bytes + headroom_bytes;
+          if (required_with_headroom_overflow ||
+              required_with_headroom > ram_mgr.ram_expert_budget_bytes)
             return std::unexpected("full-residency DDR complement plus " +
                                    std::to_string(config.full_moe_host_headroom_gb) +
-                                   " GB prefill/request headroom exceeds the safe byte budget " +
+                                   " GB prefill/request headroom requires " +
+                                   std::to_string((double)required_ram_bytes / 1.0e9) +
+                                   " GB DDR + " +
+                                   std::to_string((double)headroom_bytes / 1.0e9) +
+                                   " GB headroom (" +
+                                   std::to_string((double)required_with_headroom / 1.0e9) +
+                                   " GB total), exceeding safe byte budget " +
                                    std::to_string((double)ram_mgr.ram_expert_budget_bytes / 1.0e9) +
-                                   " GB; increase VRAM placement or lower other host allocations");
+                                   " GB; increase compact VRAM placement or host budget");
           ram_mgr.full_residency_cap_by_layer = std::move(ram_caps);
           LOG_STREAM_INFO() << "[FULL-RESIDENCY-PLAN] DDR=" << required_ram_slots << " slots/"
                             << (double)required_ram_bytes / 1.0e9
@@ -1519,7 +1662,9 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
                                 : layer_ram_limit(layer);
           ram_room[layer] = std::max(0, std::min(limit, n - s0));
           ram_budget +=
-              config.ram_preload_all_experts ? ram_room[layer] : std::min(ram_n, ram_room[layer]);
+              (config.ram_preload_all_experts || selective_strategy_manifest)
+                  ? ram_room[layer]
+                  : std::min(ram_n, ram_room[layer]);
         }
         const long ram_taken = rank_remaining(ram_start, ram_room, ram_budget, global_ram_count);
         if (config.require_full_moe_residency) {
@@ -2031,6 +2176,54 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
     if (missing_experts != 0)
       return std::unexpected("full-residency verification found " +
                              std::to_string(missing_experts) + " cold experts: " + missing_sample);
+  }
+
+  if (config.deepseek_v41_strategy_test_isolation &&
+      !config.require_full_moe_residency) {
+    if (strategy_test_manifest.empty())
+      return std::unexpected(
+          "selective DeepSeek strategy isolation has an empty usage manifest");
+    size_t resident = 0;
+    size_t missing = 0;
+    std::string missing_sample;
+    for (const auto &entry : strategy_test_manifest) {
+      const bool in_vram =
+          gpu.topology.main_layer_has(entry.layer, entry.expert);
+      bool in_ddr = false;
+      if (!in_vram && entry.layer >= 0 &&
+          entry.layer < (int)engine.layers_experts.size()) {
+        const auto &slots = engine.layers_experts[(size_t)entry.layer];
+        const size_t cap = std::min(
+            slots.size(),
+            (size_t)std::max(0, ram_mgr.cap_for_layer(entry.layer)));
+        for (size_t i = 0; i < cap; ++i) {
+          if (slots[i].expert_id == entry.expert && slots[i].slab_buffer) {
+            in_ddr = true;
+            break;
+          }
+        }
+      }
+      if (in_vram || in_ddr) {
+        ++resident;
+      } else {
+        if (missing < 8) {
+          if (!missing_sample.empty()) missing_sample += ", ";
+          missing_sample += "(" + std::to_string(entry.layer) + "," +
+                            std::to_string(entry.expert) + ")";
+        }
+        ++missing;
+      }
+    }
+    LOG_STREAM_INFO()
+        << "[DSV41-STRATEGY-RESIDENCY] frozen manifest="
+        << strategy_test_manifest.size() << " resident=" << resident
+        << " missing=" << missing << " (DDR+VRAM)\n";
+    if (missing != 0)
+      return std::unexpected(
+          "selective DeepSeek strategy manifest has " +
+          std::to_string(missing) +
+          " cold experts; refusing the test before the first request: " +
+          missing_sample);
   }
 
   // 2026-08-29: EngineConfig::ram_pin_eager_preregister's FIRST

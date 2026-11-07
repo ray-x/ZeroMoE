@@ -6,6 +6,7 @@
 #include "graph_settings_global.hpp"
 #include "ggml_bailingmoe3_graph.hpp"
 #include "ggml_mimo2_graph.hpp"
+#include <numeric>
 
 // True when the GLM full graph (glm5next implementation) is the active execution path of this engine's family.
 static bool glm_graph_in_use(const StreamingEngine &engine) {
@@ -76,11 +77,22 @@ std::expected<void, std::string> EngineRunner::plan_expert_cache() {
                 << "[GPU] Full-layer cache row alignment overflow at layer "
                 << l << "; leaving the 4 KiB compact stride\n";
           } else if (row_alignment > 1) {
-            // The direct-view path only needs row alignment. Do
-            // not take the LCM with 4096 here: for IQ formats the
-            // LCM can be tens of MiB per expert and would waste
-            // most of the cache on alignment padding alone.
-            slot_alignment = row_alignment;
+            // The direct-view path needs row alignment and CUDA's 16-byte
+            // base/stride alignment. Do not take the LCM with 4096 here: for
+            // IQ formats that can be tens of MiB per expert. The extra
+            // 16-byte factor is small and keeps every compact region base
+            // valid after the previous layer's slots are laid out.
+            constexpr size_t view_alignment = 16;
+            const size_t factor =
+                view_alignment / std::gcd(row_alignment, view_alignment);
+            if (row_alignment > SIZE_MAX / factor) {
+              LOG_STREAM_WARN()
+                  << "[GPU] Compact layer " << l
+                  << " row/16-byte stride alignment overflow; retaining the "
+                     "4 KiB region stride\n";
+            } else {
+              slot_alignment = row_alignment * factor;
+            }
           }
         }
         const size_t rem = layer_slot_bytes % slot_alignment;
@@ -322,15 +334,31 @@ if (graph_mode && qwen_hybrid_graph_placement && graph_model) {
            "on the legacy path (see mtp_speculative.cpp's target_forward, "
            "which never calls the full graph).\n";
   }
-  if (engine.family_ops.family == ModelFamily::DeepSeek_V41 &&
-      zeromoe::graphsettings::active_settings().tun.cache_moe_graph.value != 0) {
-    // This path binds each complete pool as a strided MUL_MAT_ID tensor.
-    // The global LRU (already supported by GpuTopology) lets one layer's
-    // required set borrow free slots across the pool. Validate its uniform
-    // geometry again in the graph builder before exposing any CUDA view.
-    expert_layer_slab_bytes.clear();
-    LOG_INFO("[DSV41-CACHE-GRAPH] uniform native VRAM pools, stride=%zu; "
-             "graph-owned expert bytes=0\n", expert_slab_bytes);
+  const auto &active_graph_tuning =
+      zeromoe::graphsettings::active_settings().tun;
+  const bool dsv41_cache_graph =
+      engine.family_ops.family == ModelFamily::DeepSeek_V41 &&
+      (active_graph_tuning.cache_moe_graph.value != 0 ||
+       active_graph_tuning.cache_moe_decode.value != 0);
+  if (dsv41_cache_graph) {
+    // DeepSeek's graph builder can bind one compact, row-aligned region per
+    // layer. Preserve the layer geometry instead of inflating every slot to
+    // the model-wide maximum slab size: the uniform layout wastes substantial
+    // VRAM on this checkpoint's mixed-width experts and can make strict
+    // DDR+VRAM residency fail despite adequate physical memory. The adapter
+    // validates each layer's region before exposing it to MUL_MAT_ID.
+    size_t compact_layers = 0;
+    size_t compact_bytes = 0;
+    for (size_t bytes : expert_layer_slab_bytes) {
+      if (bytes == 0) continue;
+      ++compact_layers;
+      compact_bytes += bytes;
+    }
+    LOG_INFO("[DSV41-CACHE-GRAPH] compact native VRAM regions: %zu MoE layers, "
+             "max_slot=%zu bytes, summed_layer_stride=%zu bytes; "
+             "shared dynamic slots=%d; graph-owned expert bytes=0\n",
+             compact_layers, expert_slab_bytes, compact_bytes,
+             std::max(0, config.full_moe_vram_dynamic_slots));
   }
   return {};
 }
@@ -674,10 +702,26 @@ std::expected<void, std::string> EngineRunner::setup_vram_expert_cache() {
                "Layer-13 staging proof despite zero legacy-cache fallback\n",
                fallback_config.active_layer_capacity);
     }
+    const auto &graph_tuning =
+        zeromoe::graphsettings::active_settings().tun;
+    const bool dsv41_shared_dynamic_pool =
+        engine.family_ops.family == ModelFamily::DeepSeek_V41 &&
+        (graph_tuning.cache_moe_graph.value != 0 ||
+         graph_tuning.cache_moe_decode.value != 0);
+    const int compact_shared_dynamic_slots = dsv41_shared_dynamic_pool
+        ? std::max(0, config.full_moe_vram_dynamic_slots)
+        : 0;
+    const int compact_shared_dynamic_gpu_id =
+        dsv41_shared_dynamic_pool && gpu.topology.core_gpu >= 0
+            ? gpu.topology.devices[(size_t)gpu.topology.core_gpu].id
+            : -1;
     gpu.setup_expert_cache(expert_slab_bytes, cfg.n_experts, fallback_config,
                            expert_layer_slab_bytes,
                            fallback_gb <= 0.0 ||
-                               option_b_disable_legacy_cache);
+                               option_b_disable_legacy_cache,
+                           dsv41_shared_dynamic_pool
+                               ? compact_shared_dynamic_slots : 0,
+                           compact_shared_dynamic_gpu_id);
   }
   return {};
 }

@@ -65,6 +65,10 @@ struct GpuConfig {
 
 // Full engine configuration
 struct EngineConfig {
+  // Original TOML path, retained for targeted request-boundary reloads of
+  // explicitly hot-reloadable test settings. Model weights and pool layout
+  // are never reloaded by this path.
+  std::string source_config_path;
   // Root graph_* keys, collected verbatim and validated by the typed resolver.
   zeromoe::graphsettings::ConfigValues graph_settings;
   // Graph settings supplied through --graph-<name>; applied after legacy env.
@@ -74,6 +78,13 @@ struct EngineConfig {
   int api_port = 8080;
   std::string api_model = "zeromoe";
   std::string api_key;
+  // Experimental DeepSeek V4.1 decode policy for DDR-resident expert misses.
+  // In API mode, only this key may be re-read from source_config_path at a
+  // request boundary; it never reconstructs the engine or resident pools.
+  std::string deepseek_v41_decode_moe_strategy = "h2d";
+  // Benchmark isolation: pin the startup VRAM hot set, reserve the configured
+  // dynamic slots, and flush only those dynamic identities between requests.
+  bool deepseek_v41_strategy_test_isolation = false;
   // Model paths
   std::string model_path; // Primary model GGUF (experts + architecture)
   // Optional DeepSeek-V4.1 Engram lookup-table GGUF. Keep it separate so
@@ -539,6 +550,7 @@ struct EngineConfig {
   long mem_guard_warn_mb = 32768;  // warn with 32 GiB left
   long mem_guard_stop_mb = 10240;  // retain at least 10 GiB for the host
   int  mem_guard_poll_ms = 500;
+  double mem_guard_swapout_mib_s = 64.0; // sustained swap-out rate that blocks new host allocations
 
   // Per-layer VRAM budget cap for attn_score_gpu's persistent KV latent
   // cache GPU mirror (d_lc_by_layer/d_rc_by_layer, cuda_manager.hpp),
@@ -2379,6 +2391,7 @@ inline Document parse_file(const std::string &path) {
 // EngineConfig implementation
 // ============================================================
 inline bool EngineConfig::load(const std::string &path) {
+  source_config_path = path;
   auto doc = toml::parse_file(path);
   const std::pair<const char *, const char *> removed_spec_keys[] = {
       {"mtp_enabled", "spec_type"},
@@ -2400,6 +2413,10 @@ inline bool EngineConfig::load(const std::string &path) {
   }
 
   model_path = doc.root.get_str("model_path");
+  deepseek_v41_decode_moe_strategy = doc.root.get_str(
+      "deepseek_v41_decode_moe_strategy", deepseek_v41_decode_moe_strategy);
+  deepseek_v41_strategy_test_isolation = doc.root.get_bool(
+      "deepseek_v41_strategy_test_isolation", deepseek_v41_strategy_test_isolation);
   engram_model_path = doc.root.get_str("engram_model_path");
   model_format = doc.root.get_str("model_format", model_format);
   exl3_backend = doc.root.get_str("exl3_backend", exl3_backend);
@@ -2777,6 +2794,8 @@ inline bool EngineConfig::load(const std::string &path) {
   mem_guard_warn_mb = (long)doc.root.get_int("mem_guard_warn_mb", (int64_t)mem_guard_warn_mb);
   mem_guard_stop_mb = (long)doc.root.get_int("mem_guard_stop_mb", (int64_t)mem_guard_stop_mb);
   mem_guard_poll_ms = (int)doc.root.get_int("mem_guard_poll_ms", mem_guard_poll_ms);
+  mem_guard_swapout_mib_s = doc.root.get_double(
+      "mem_guard_swapout_mib_s", mem_guard_swapout_mib_s);
   attn_score_gpu_max_vram_gb = doc.root.get_double("attn_score_gpu_max_vram_gb",
                                                    attn_score_gpu_max_vram_gb);
   if (attn_score_gpu_max_vram_gb < 0.0) {
@@ -3010,9 +3029,33 @@ gdn_proj_ggml = doc.root.get_bool("gdn_proj_ggml", gdn_proj_ggml);
 }
 
 inline bool EngineConfig::validate() {
+  if (deepseek_v41_decode_moe_strategy != "h2d" &&
+      deepseek_v41_decode_moe_strategy != "cpu" &&
+      deepseek_v41_decode_moe_strategy != "split") {
+    std::cerr << "[CONFIG] deepseek_v41_decode_moe_strategy must be h2d, cpu, or split\n";
+    return false;
+  }
+  if (deepseek_v41_strategy_test_isolation &&
+      (!full_moe_vram_dynamic_slots_explicit ||
+       full_moe_vram_dynamic_slots <= 0)) {
+    std::cerr << "[CONFIG] DeepSeek strategy isolation requires an explicit positive dynamic VRAM slot count\n";
+    return false;
+  }
+  if (deepseek_v41_strategy_test_isolation && !require_full_moe_residency &&
+      (ram_preload_all_experts || !freeze_usage_stats || pin_file.empty())) {
+    std::cerr << "[CONFIG] selective DeepSeek strategy isolation requires "
+                 "ram_preload_all_experts=false, freeze_usage_stats=true, "
+                 "and a non-empty pin_file usage manifest\n";
+    return false;
+  }
   if (!std::isfinite(host_ram_startup_margin_gib) || host_ram_startup_margin_gib < 0.0 ||
       host_ram_startup_margin_gib > 1024.0) {
     std::cerr << "[CONFIG] host_ram_startup_margin_gib must be finite and in [0, 1024]\n";
+    return false;
+  }
+  if (!std::isfinite(mem_guard_swapout_mib_s) ||
+      mem_guard_swapout_mib_s < 1.0 || mem_guard_swapout_mib_s > 4096.0) {
+    std::cerr << "[CONFIG] mem_guard_swapout_mib_s must be finite and in [1, 4096]\n";
     return false;
   }
   if (full_moe_vram_dynamic_slots < 0 || full_moe_vram_dynamic_slots > 100000) {

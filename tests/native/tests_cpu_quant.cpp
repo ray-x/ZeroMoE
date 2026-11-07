@@ -1,5 +1,7 @@
 // Native test harness: tests_cpu_quant (split from tests/native/main_test.cpp).
 #include "native_tests.hpp"
+#include "cpu_expert_executor.hpp"
+#include "expert_activation.hpp"
 
 // ------------------------------------------------------------------
 // 6. AVX-512 K-quant Dequant Correctness (vs ggml's own reference)
@@ -603,6 +605,41 @@ bool test_cpu_iq_matmul_paths() {
              ok;
     }
 
+    // DeepSeek's IQ1_M down projections consume a different post-SwiGLU
+    // activation per routed expert. Check the grouped-input kernel against
+    // independent one-expert GGML calls before using it in the DDR executor.
+    {
+        std::vector<std::vector<float>> expert_inputs(
+            (size_t)M, std::vector<float>((size_t)I));
+        std::vector<const float *> expert_input_ptr((size_t)M);
+        std::vector<std::vector<float>> grouped_output(
+            (size_t)M, std::vector<float>((size_t)O, 0.0f));
+        std::vector<std::vector<float>> single_output(
+            (size_t)M, std::vector<float>((size_t)O, 0.0f));
+        std::vector<float *> grouped_output_ptr((size_t)M),
+            single_output_ptr((size_t)M);
+        for (int m = 0; m < M; ++m) {
+            for (float &v : expert_inputs[(size_t)m]) v = dist(rng);
+            expert_input_ptr[(size_t)m] = expert_inputs[(size_t)m].data();
+            grouped_output_ptr[(size_t)m] = grouped_output[(size_t)m].data();
+            single_output_ptr[(size_t)m] = single_output[(size_t)m].data();
+            ok = matmul_iq1_m_ggml_q8k(
+                     single_output_ptr[(size_t)m], expert_input_ptr[(size_t)m],
+                     wp[(size_t)m], 1, I, O) &&
+                 ok;
+        }
+        ok = matmul_iq1_m_ggml_q8k_grouped_inputs(
+                 grouped_output_ptr.data(), expert_input_ptr.data(), wp.data(),
+                 M, 1, I, O) &&
+             ok;
+        for (int m = 0; m < M; ++m)
+            ok = compare_iq_outputs(
+                     "IQ1_M grouped distinct inputs vs single",
+                     grouped_output[(size_t)m].data(),
+                     single_output[(size_t)m].data(), O, 1e-6f, 1e-6f) &&
+                 ok;
+    }
+
     // The direct Qwen strided path uses IQ4_NL down projections with a
     // separate SwiGLU activation for each selected expert.  Check the
     // grouped-input wrapper against one-matrix calls as well; this catches
@@ -860,6 +897,114 @@ bool test_cpu_iq_matmul_paths() {
                     grouped[(size_t)m].data(), reference_one.data(), O, 0.20f,
                     0.25f);
             ok = semantic_ok && ok;
+        }
+    }
+
+    // Exercise the exact DDR helper used by DeepSeek decode: expert identity,
+    // route weighting, grouped IQ1_M gate/up, and grouped distinct-input down.
+    {
+        constexpr int D = 256;
+        constexpr int FF = 256;
+        constexpr int N = 3;
+        std::mt19937 expert_rng(20261105);
+        std::uniform_real_distribution<float> expert_dist(-0.2f, 0.2f);
+        std::vector<float> input((size_t)D);
+        for (float &v : input) v = expert_dist(expert_rng);
+        const int gate_row_bytes = row_bytes(GGUFType::IQ1_M, D);
+        const int down_row_bytes = row_bytes(GGUFType::IQ1_M, FF);
+        std::array<std::vector<uint8_t>, N> gate_weights, up_weights,
+            down_weights;
+        std::array<MoEExpertBlock, N> owned_blocks{};
+        std::vector<MoEExpertBlock *> expert_blocks;
+        std::array<float, N> route_weights{0.2f, 0.3f, 0.5f};
+        bool quantized = true;
+        for (int e = 0; e < N && quantized; ++e) {
+            auto quantize_matrix = [&](std::vector<uint8_t> &packed,
+                                       int rows, int columns, int rb) {
+                std::vector<float> values((size_t)rows * columns);
+                for (float &v : values) v = expert_dist(expert_rng);
+                packed.resize((size_t)rows * rb);
+                for (int row = 0; row < rows; ++row) {
+                    if (!ggml_quantize_row_ref(
+                            (uint32_t)GGUFType::IQ1_M,
+                            values.data() + (size_t)row * columns,
+                            packed.data() + (size_t)row * rb, columns))
+                        return false;
+                }
+                return true;
+            };
+            quantized = quantize_matrix(gate_weights[(size_t)e], FF, D,
+                                        gate_row_bytes) &&
+                quantize_matrix(up_weights[(size_t)e], FF, D,
+                                gate_row_bytes) &&
+                quantize_matrix(down_weights[(size_t)e], D, FF,
+                                down_row_bytes);
+            auto &block = owned_blocks[(size_t)e];
+            block.expert_id = e;
+            block.gate_proj.meta.type = GGUFType::IQ1_M;
+            block.up_proj.meta.type = GGUFType::IQ1_M;
+            block.down_proj.meta.type = GGUFType::IQ1_M;
+            block.gate_proj.meta.size_bytes = gate_weights[(size_t)e].size();
+            block.up_proj.meta.size_bytes = up_weights[(size_t)e].size();
+            block.down_proj.meta.size_bytes = down_weights[(size_t)e].size();
+            block.gate_proj.host_ptr = gate_weights[(size_t)e].data();
+            block.up_proj.host_ptr = up_weights[(size_t)e].data();
+            block.down_proj.host_ptr = down_weights[(size_t)e].data();
+            expert_blocks.push_back(&block);
+        }
+        if (!quantized) {
+            std::cout << "  -> DeepSeek grouped IQ1_M executor skipped "
+                         "(reference quantizer unavailable)\n";
+            ok = false;
+        } else {
+            std::vector<float> actual((size_t)D, 0.0f),
+                expected((size_t)D, 0.0f);
+            ok = expert_ffn_cpu_grouped_ddr(
+                     input.data(), actual.data(), expert_blocks,
+                     route_weights.data(), D, FF, 0.0f, 0) &&
+                 ok;
+
+            std::array<std::vector<float>, N> gate, up, down;
+            std::array<float *, N> gate_ptr{}, up_ptr{};
+            std::array<const uint8_t *, N> gate_weight_ptr{},
+                up_weight_ptr{}, down_weight_ptr{};
+            std::array<const float *, N> down_input_ptr{};
+            for (int e = 0; e < N; ++e) {
+                gate[(size_t)e].resize((size_t)FF);
+                up[(size_t)e].resize((size_t)FF);
+                down[(size_t)e].resize((size_t)D);
+                gate_ptr[(size_t)e] = gate[(size_t)e].data();
+                up_ptr[(size_t)e] = up[(size_t)e].data();
+                gate_weight_ptr[(size_t)e] = gate_weights[(size_t)e].data();
+                up_weight_ptr[(size_t)e] = up_weights[(size_t)e].data();
+                down_weight_ptr[(size_t)e] = down_weights[(size_t)e].data();
+            }
+            const bool pair_ok = matmul_iq1_m_ggml_q8k_grouped_pair(
+                gate_ptr.data(), up_ptr.data(), input.data(),
+                gate_weight_ptr.data(), up_weight_ptr.data(), N, 1, D, FF);
+            ok = pair_ok && ok;
+            for (int e = 0; e < N; ++e) {
+                if (swiglu_clamp_fused()) {
+                    swiglu_clamp_fused_inplace(gate[(size_t)e].data(),
+                        up[(size_t)e].data(), FF, 0.0f);
+                } else {
+                    silu_inplace(gate[(size_t)e].data(), FF);
+                    elem_mul(gate[(size_t)e].data(), gate[(size_t)e].data(),
+                             up[(size_t)e].data(), FF);
+                    swiglu_clamp_inplace(gate[(size_t)e].data(), FF, 0.0f);
+                }
+                down_input_ptr[(size_t)e] = gate[(size_t)e].data();
+                ok = matmul_iq1_m_ggml_q8k(
+                         down[(size_t)e].data(), down_input_ptr[(size_t)e],
+                         down_weight_ptr[(size_t)e], 1, FF, D) &&
+                     ok;
+                for (int d = 0; d < D; ++d)
+                    expected[(size_t)d] += route_weights[(size_t)e] *
+                        down[(size_t)e][(size_t)d];
+            }
+            ok = compare_iq_outputs("DeepSeek grouped IQ1_M DDR executor",
+                                    actual.data(), expected.data(), D,
+                                    1e-6f, 1e-6f) && ok;
         }
     }
     std::cout << "  -> CPU IQ path tests " << (ok ? "PASSED" : "FAILED")

@@ -29,6 +29,7 @@
 #include "moe_decode_batch.hpp" // decode-gap prototype: grouped per-token expert dispatch (no CUDA deps)
 #include "memory_guard.hpp" // deterministic host-budget admission arithmetic
 #include "dsv41_router_selection.hpp"
+#include "deepseek_cache_policy.hpp"
 #include "option_b_global_hot.hpp" // Option-B global-pool hot-set selection (header-only)
 #include <algorithm>
 #include <array>
@@ -3136,6 +3137,8 @@ void test_host_budget_admission() {
   assert(memory_reclaim_pressure_should_block(47.99, 0.0, 20.0, 0.0));
   assert(memory_reclaim_pressure_should_block(100.0, 0.0, 0.0, 64.0));
   assert(!memory_reclaim_pressure_should_block(100.0, -1.0, -1.0, 63.99));
+  assert(!memory_reclaim_pressure_should_block(16.0, 0.72, 0.72, 115.2, 128.0));
+  assert(memory_reclaim_pressure_should_block(16.0, 0.72, 0.72, 128.0, 128.0));
   std::cout << " PASSED\n";
 }
 
@@ -3164,6 +3167,28 @@ void test_dsv41_router_stable_boundary() {
   assert(!dsv41_select_topk_stable_boundary(clear_gap, 4, 2,
                                             2.0e-5f, clear_ids));
   assert((clear_ids == std::vector<int>{7, 6}));
+  std::cout << " PASSED\n";
+}
+
+void test_dsv41_decode_miss_strategy() {
+  using zeromoe::deepseek_graph::DecodeMissStrategy;
+  using zeromoe::deepseek_graph::decode_miss_uses_cpu;
+  using zeromoe::deepseek_graph::parse_decode_miss_strategy;
+  using zeromoe::deepseek_graph::requires_vram_route_validation;
+  std::cout << "[TEST] DeepSeek decode DDR-miss strategy policy..."
+            << std::flush;
+  assert(parse_decode_miss_strategy("h2d") == DecodeMissStrategy::H2D);
+  assert(parse_decode_miss_strategy("cpu") == DecodeMissStrategy::Cpu);
+  assert(parse_decode_miss_strategy("split") == DecodeMissStrategy::Split);
+  assert(!parse_decode_miss_strategy("all-cpu"));
+  for (size_t i = 0; i < 12; ++i) {
+    assert(!decode_miss_uses_cpu(DecodeMissStrategy::H2D, i));
+    assert(decode_miss_uses_cpu(DecodeMissStrategy::Cpu, i));
+    assert(decode_miss_uses_cpu(DecodeMissStrategy::Split, i) == ((i & 1U) == 0));
+  }
+  assert(requires_vram_route_validation(true, false));
+  assert(!requires_vram_route_validation(true, true));
+  assert(!requires_vram_route_validation(false, false));
   std::cout << " PASSED\n";
 }
 
@@ -3383,6 +3408,7 @@ int main(int argc, char **argv) {
       {"qwen4exp_ple_hash", test_qwen4exp_ple_hash},
       {"host_budget_admission", test_host_budget_admission},
       {"dsv41_router_stable_boundary", test_dsv41_router_stable_boundary},
+      {"dsv41_decode_miss_strategy", test_dsv41_decode_miss_strategy},
       {"tokenizer_metadata_shard", test_tokenizer_metadata_shard},
       {"moe_decode_batch", test_moe_decode_batch},
       {"safetensors_adapter", test_safetensors_adapter},

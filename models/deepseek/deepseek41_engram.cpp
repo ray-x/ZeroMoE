@@ -4,6 +4,7 @@
 // shard. This file intentionally maps only the table's byte range and reads
 // the small set of rows needed by the current token batch; no table is copied
 // into the resident dense pool.
+#include <unordered_set>
 #include "engine.hpp"
 #include "dense_dispatch.hpp"
 #include "dsv41_engram.hpp"
@@ -497,6 +498,49 @@ bool deepseek41_engram_embedding_rows(StreamingEngine &engine, int layer_idx,
   }
 
   embedding.resize((size_t)S * n_hash_cols * head_dim);
+  // Prefill (and every decode token) looks up S * n_hash_cols rows. With on-demand positional reads
+  // each miss is a random single-row read, so a serial loop pays the storage
+  // latency once per row. Fetch the distinct missing rows with a bounded
+  // number of concurrent reads first; the loop below then hits the row cache.
+  if (!table->rows && table->direct_fd && *table->direct_fd >= 0 &&
+      (size_t)S * n_hash_cols >= 8) {
+    std::vector<int64_t> missing;
+    {
+      std::unordered_set<int64_t> seen;
+      std::vector<float> probe((size_t)head_dim);
+      for (int s = 0; s < S; ++s)
+        for (int col = 0; col < n_hash_cols; ++col) {
+          const int64_t row = hashes[((size_t)s * c.dsv41_engram_layer_ids.size() +
+                                      (size_t)table_id) * n_hash_cols + col];
+          if (row < 0 || (uint64_t)row >= table->n_rows) continue;
+          if (!seen.insert(row).second) continue;
+          if (!g_row_cache.get(table_id, row, head_dim, probe.data()))
+            missing.push_back(row);
+        }
+    }
+    if (!missing.empty()) {
+      std::vector<float> fetched(missing.size() * (size_t)head_dim);
+      std::vector<char> ok(missing.size(), 0);
+      const int fd = *table->direct_fd;
+#pragma omp parallel for schedule(dynamic, 8) num_threads(16)
+      for (long long i = 0; i < (long long)missing.size(); ++i) {
+        std::vector<uint8_t> buf(table->row_bytes);
+        const off_t off = (off_t)(table->data_offset +
+                                 (size_t)missing[(size_t)i] * table->row_bytes);
+        if (::pread(fd, buf.data(), table->row_bytes, off) ==
+            (ssize_t)table->row_bytes) {
+          posix_fadvise(fd, off, (off_t)table->row_bytes, POSIX_FADV_DONTNEED);
+          dequant_row(table_it->second.type, buf.data(),
+                      fetched.data() + (size_t)i * head_dim, head_dim);
+          ok[(size_t)i] = 1;
+        }
+      }
+      for (size_t i = 0; i < missing.size(); ++i)
+        if (ok[i])
+          g_row_cache.put(table_id, missing[i],
+                          fetched.data() + i * (size_t)head_dim, head_dim);
+    }
+  }
   for (int s = 0; s < S; ++s) {
     for (int col = 0; col < n_hash_cols; ++col) {
       const int64_t row = hashes[((size_t)s * c.dsv41_engram_layer_ids.size() +

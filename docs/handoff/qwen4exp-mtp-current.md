@@ -993,7 +993,9 @@ Strict full residency passed: 15,360/15,360 experts, 12,821 DDR (110.141 GB), 2,
 
 Locally measured first request: 959 prompt tokens, 64 generated tokens, HTTP 200, 78.690 s total. Full-graph CPU-offload prefill: 39.335 s, 24.38 tok/s. Full-graph decode: 2.37 steady tok/s, 2.30 wall tok/s, 27.822 s decode wall; p50 427.32 ms and p95 461.546 ms/token. These do not meet the working targets of 100 tok/s prefill and 10 tok/s decode. A matched llama.cpp benchmark was not available; this is not relative-performance acceptance.
 
-The routed decode cache recorded 6,630 DDR-to-VRAM misses of 15,120 top-6 route slots (56.15% VRAM hits, 43.85% misses). The layer-miss report found zero real SSD fetches across 2,503 decode calls. The generic `Expert cache: 17032 hit / 0 miss` counter is not this routed VRAM hit rate. Per-layer hit rate ranged from 25.9% (layer 38) to 72.2% (layer 29). An offline approximation from the frozen five-prompt survey estimated 77.3% coverage for 2,539 resident entries; compact per-layer caps and tie ordering were not modeled, so treat that estimate as provisional. The 21-point difference from the measured single-prompt route hit rate warrants route-distribution tracing before changing the hot set.
+Transfer-counter correction: the previously quoted 23.75 GB/s is not a valid MoE H2D bandwidth. The global uploaded-byte counter includes dense/activation paths in `CudaManager`, while the per-GPU counters cover MoE cache upload call sites. v30 records 135.65 GB across those MoE counters and 141.36 GB in the global counter; the 5.951 s timer also mixes upload paths and does not measure completion time for asynchronous cache DMA. The run therefore has no trustworthy decode-only or per-GPU MoE transfer rate. The report labels in the continuation worktree now distinguish those scopes.
+
+The routed decode cache recorded 6,630 DDR-to-VRAM misses of 15,120 top-6 route slots (56.15% VRAM hits, 43.85% misses). The MoE layer-miss report found zero real expert-file fetches across 2,503 decode calls; this does not cover the separate Engram sidecar. The generic `Expert cache: 17032 hit / 0 miss` counter is not this routed VRAM hit rate. Per-layer hit rate ranged from 25.9% (layer 38) to 72.2% (layer 29). An offline approximation from the frozen five-prompt survey estimated 77.3% coverage for 2,539 resident entries; compact per-layer caps and tie ordering were not modeled, so treat that estimate as provisional. The 21-point difference from the measured single-prompt route hit rate warrants route-distribution tracing before changing the hot set.
 
 The sequential repeat was refused before tokenization (HTTP 500): the host request envelope needed about 0.558 GB while free memory was at the 4.5 GiB engine floor. MemAvailable later reached 4.483 GiB; process VmSwap stayed 0, system SwapUsed stayed 0.002 GiB, and swap-out/PSI remained zero. The 4.5 GiB watchdog sent SIGTERM and escalated after two seconds; no ZeroMoE process remains. No request was retried. The user then requested a separate 1 GiB watchdog emergency floor; code commit `187d751` adds `host_pressure_watchdog_floor_mb`, leaving the engine's 4.5 GiB request floor intact. v31 was prepared but not launched. Follow-up v32 supersedes it: v30 measured 64 active-layer slots allocated (0.787692 GB) with zero uploads/hits, so v32 disables that unused pool and moves the same bytes into the main MoE pools (3090: 17.540769 GB, 5060 Ti: 15.292438 GB), keeping 64 dynamic slots and total requested VRAM unchanged. v32 is prepared but unlaunched at `build_mtp_results/2026-11-04-c07a0d0-deepseek41-reuse-inactive-active-vram-v32/`; the runtime planner must confirm exact placement.
 
@@ -1011,3 +1013,259 @@ The user reports DeepSeek was the only running workload and suspects its memory 
 ### v35 fail-closed admission gate (prepared; not launched)
 
 The startup gate now aborts immediately on total SwapUsed above 2 GiB, growth above 128 MiB from its baseline, or any `pswpout` delta, recording the sample and reason before exiting. It retains the stable MemAvailable/GPU/CUDA requirements and the v32/v34 placement plan. A replay of v34's final saved sample triggers the abort before model launch. This is an offline policy check, not a hardware run. Candidate: `build_mtp_results/2026-11-04-2530fbc-deepseek41-active-reuse-host123-failclosedgate-v35/`.
+
+
+Engram clarification: v30 used storage mode 1 (buffered on-demand `pread`) with the default 8,192-row cache, about 8 MiB at 256-float rows. The log records 90,768 Engram row-cache misses / 95,088 lookups (4.5% hit). These are `pread` misses, not verified physical USB reads; OS page cache may satisfy some. The full sidecar is not loaded into the resident dense pool.
+
+
+## DeepSeek v37: watchdog PSI false positive before inference (2026-11-05)
+
+Artifact: `build_mtp_results/2026-11-05-47ef7b3-deepseek41-vram-reuse-fullgraph-v37/`. v36 rejected the 122 GB cap because the exact DDR complement (109.568 GB) plus 0.65 GB request headroom needed 110.218 GB, 0.126 GB above its 110.092 GB safe budget. v37 raised the cap to 122.9 GB with a 3.4 GiB startup reserve; admission and the exact full-residency planner passed (12,757 DDR experts, 2,603 VRAM residents, 64 dynamic slots).
+
+Before `/health`, the live watchdog stopped PID 14664 on one PSI-full avg10 sample of 1.01% at 12.626 GiB MemAvailable. VmSwap was 0, system swap growth was under 1 MiB, and swap-out was 0.226 MiB/s. No request was submitted and no OOM or NVIDIA Xid evidence appeared. This exposed the 1% one-sample PSI rule as too sensitive during SSD preload.
+
+The watchdog now requires PSI full >=4% for two samples while MemAvailable is below 32 GiB, or PSI some >=20% for two samples while MemAvailable is below 48 GiB. The 1 GiB emergency floor, 64 MiB process-swap limit, 128 MiB system-swap-growth limit, and sustained 64 MiB/s swap-out stop remain. The focused watchdog suite passes 20/20. v38 below used this corrected policy.
+
+## DeepSeek v38: swap growth during full-residency preload (2026-11-05)
+
+Artifact: `build_mtp_results/2026-11-05-47ef7b3-deepseek41-vram-reuse-fullgraph-v38/`. The admission gate and full-residency plan passed: 12,757 DDR experts / 109.568 GB, 2,603 resident VRAM experts, and 64 dynamic slots. After about 312 seconds, ZeroMoE RSS reached 105.7 GiB. The watchdog measured 12.626 GiB MemAvailable, SwapUsed growth of 0.261 GiB from a 0.002 GiB baseline, and swap-out of 243.3 MiB/s. It stopped the process before `/health`; no prompt was submitted. PSI some/full was 0.54%, so the corrected PSI rule did not trigger. No OOM or NVIDIA Xid evidence appeared.
+
+The system I/O monitor measured about 138.216 GB of physical reads from `/dev/sdc` during this preload; process `read_bytes` increased about 138.235 GB. These are startup reads, not prefill or decode traffic. After termination, MemAvailable recovered to 119.65 GiB but zram SwapUsed remained 0.903 GiB. `vm.swappiness` is 150.
+
+The repeated load stop is now due to real host swap growth. No further model load is started from this session. The next decision is how to prevent swap during preload while keeping all MoE experts in DDR+VRAM: adjust the host zram/swappiness policy or move more experts into available VRAM and lower the DDR footprint. The v37/v38 artifacts retain the admission, host-memory, USB-I/O, and watchdog logs.
+
+
+## DeepSeek v39: offline VRAM alternative with PCIe telemetry (2026-11-05)
+
+Prepared, not launched: `build_mtp_results/2026-11-05-47ef7b3-deepseek41-vram-reuse-pcie-monitored-v39/`. It adds 0.5 GB to the 3090 MoE cache (17.540769 -> 18.040769 GB), keeps the 5060 Ti at 15.292437624 GB, and retains 64 dynamic slots. Based on v38, 0.5 GB is about 40 VRAM slots; their DDR complement is estimated to fall by about 0.34 GB. The exact per-layer placement must be confirmed by the runtime planner.
+
+The 3090 had 1.75 GB free after v38's pools. This candidate leaves about 1.25 GB, roughly 0.10 GiB above the 1.062 GiB decode graph reserve. That margin is tight, especially for prefill, and is not validated. It keeps v38's 122.9 GB host cap, 3.4 GiB startup reserve, and swap watchdog. Its system monitor adds per-GPU PCIe RX/TX measurements using `nvidia-smi dmon`, alongside USB disk, host-memory, RSS, VmLck, and VmPin sampling. No model data was copied or loaded.
+
+
+Early-ready warning clarification: the generic placement warning comes from `DeepseekV41GraphModel::supports_cpu_lane() == false`. The DeepSeek adapter uses a custom cache graph: decode DDR misses call `upload_expert_async` and `graph_cache_moe_cpu_cold_decode=false`; batched prefill CPU spills use the adapter's own asynchronous CPU job and merge node. The warning is therefore a model-capability difference, not proof that the v30 decode path executed MoE on CPU or serialized all cache transfers. Do not flip the capability flag alone; a real shared-lane integration would need graph-boundary correctness and measured overlap.
+
+The v39 `nvidia-smi dmon` PCIe monitor parser was checked with an idle sample (GPU0 RX/TX 0/4 MB/s, GPU1 0/0 MB/s). This is parser validation only, not a DeepSeek transfer benchmark.
+
+The v39 guarded launch was rejected by automatic approval review after repeated preload swap pressure; no process launched. The review requires the user to choose/approve the next system-level or VRAM-placement action.
+
+
+## One-load DeepSeek decode strategy comparison (implemented; hardware validation pending)
+
+The DeepSeek API backend now rereads only `deepseek_v41_decode_moe_strategy` at each request boundary. Set it to `h2d`, `cpu`, or `split` in the TOML while the server stays loaded; the next request uses the new value. Requests are serialized by the API inference worker, so the strategy stays fixed throughout each request. Logs include a monotonically increasing strategy request number and mode. Model weights, graph, and pools are not reloaded. `graph_cache_moe_cpu_cold_decode=true` must be enabled before startup so the graph includes its CPU decode branch; this setting is intentionally not hot-reloaded. CPU mode computes DDR-only misses on CPU while VRAM hits remain on GPU. Split deterministically alternates DDR-only misses between CPU and H2D.
+
+For an isolated A/B, enable `deepseek_v41_strategy_test_isolation=true` with full MoE residency and a positive `full_moe_vram_dynamic_slots`. Startup pins the baseline VRAM hot set and leaves the configured number of dynamic slots unpinned. Before each API request, the test mode synchronizes device work and clears identities only from those dynamic slots, so every strategy starts from the same cache state and the pinned hot set remains resident. Implementation and binary provenance check pass in the continuation worktree; reset behavior has not been exercised against the loaded model. The host-swap risk from v38 remains unresolved, so no model load or hardware A/B has been run.
+
+The prepared v39 monitor samples PCIe RX/TX, USB bytes, VmPin, RSS, and swap. Planned workload remains the identical 959-token prompt, 64 generated tokens, context 4096, temperature 0; compare decode wall, H2D bytes/rate, CPU expert time, and output tokens. Preserve the prompt, exact config, command/environment, logs, and timing artifacts for each request.
+
+
+## DeepSeek v40 guarded start and disk-alias cleanup (2026-11-05)
+
+Artifact: `build_mtp_results/2026-11-05-47ef7b3-deepseek41-strategy-sweep-v40/`. The no-swap systemd scope was verified with `memory.swap.max=0`. Admission passed at 128.095 GB MemAvailable (required 124.945 GB), both GPUs idle, CUDA context/allocation checks passing, and no swap-out. ZeroMoE loaded dense tensors and allocated the two MoE VRAM pools, then exited with code 1 at strict full-residency preflight before DDR expert preload or `/health`. The 120.0 GB cap produced a 108.092070 GB safe expert budget; the complete DDR complement plus 0.65 GB prompt headroom did not fit. Process RSS was 6.26 GiB, VmSwap 0, system SwapUsed remained 0.348 GiB. No prompt was sent.
+
+Disk audit found actual GGUF copies under v33 (`232 GB`) and a partial v41 copy (`89 GB`). The partial copy was created when `shutil.copytree` followed v40's alias symlinks. Those entries are now six symlinks per alias directory pointing to the original `/mnt/usb-ssd/@/home/ray/models/DeepSeek-V4.1-Flash-1017-GSQ-RCO/` files. The source GGUFs were untouched. No regular `.gguf` files remain under `build_mtp_results`; the three alias directories each allocate 24 KiB. `/home` recovered from 4.2 GB free to about 325 GB free (77%).
+
+The v41 launcher now refuses startup below 20 GiB worktree free space, refuses regular GGUF files in `model-alias`, and caps the alias directory at 16 MiB and the run artifact at 4 GiB. v41 raises the host cap to 122.9 GB with a 4.0 GiB startup margin and retains the 0.65 GB headroom. Its request runner exits on a server failure before `/health`, with no request or retry. The former `build_dsv41_retry16` directory is now empty; rebuild and provenance verification are required before v41 can launch.
+
+Filesystem note: `/home` is Btrfs. Device stats show read/write/flush/generation errors at zero and `corruption_errs=51,321,018`; the kernel log recorded the same corruption counter at the Nov 4 mount and no later matching Btrfs I/O/checksum errors. `btrfs scrub status` reports no stats available. No scrub or repair has been run, so filesystem health is not certified.
+
+
+## DeepSeek v41 rebuild and guarded launch review (2026-11-05)
+
+The previous build directory had been removed, so v41 was rebuilt in `codex/deepseek-v41-continuation` using the cached nlohmann/json 3.11.3 and cpp-httplib pinned source, plus the existing patched GGML prebuild at base `8baabd53b77d1c48c6ef8d3b620436292f3f6231`. Binary SHA256 is `22dd37fbde26a6fc0d9a812616b8f72751b2e52058cbab626d9e27ce8094ecaa`; `tools/build_provenance.py check` passes. Build directory is 67 MiB and `/home` has 324 GiB free.
+
+The v41 profile uses host cap 122.9 decimal GB, 4 GiB startup margin, 0.65 GB headroom, v38 VRAM placement, 64 dynamic slots, and per-run `MemorySwapMax=0`. Its launcher now enforces at least 20 GiB free on `/home`, rejects any regular GGUF under `model-alias`, and enforces 16 MiB alias / 4 GiB run-artifact ceilings. The v33, v40, and v41 alias directories each contain six symlinks to the USB source and allocate 24 KiB; no regular GGUF remains under `build_mtp_results`. Cleaning the v33 232 GB copies and v41 89 GB partial copies restored `/home` from 4.2 GB free to about 324 GiB free.
+
+The v41 launch was submitted through the guarded no-swap scope but automatic approval review rejected it before execution, citing the previous system freezes and requiring explicit user approval for another memory-intensive model retry. No ZeroMoE process or request started. v40's earlier startup failure remains the only runtime attempt for this profile: it failed strict residency preflight at the 120 GB cap before DDR preload or `/health`. Await explicit user approval before another model load.
+
+Latest readiness sample (04:41 AEDT): MemAvailable 128.041 GB versus v41 gate 127.845 GB, swap used 0.350 GiB; however, `nvidia-smi` failed and the direct 1 MiB two-GPU CUDA probe returned error 100 (`no CUDA-capable device`). No model process is running. The guarded launch remains unstarted after review rejection.
+
+Btrfs on `/home` reports `corruption_errs=51,321,018`; read/write/flush/generation counters are 0. The kernel log recorded that same corruption counter at mount and no later matching Btrfs I/O/checksum errors. `btrfs scrub status` has no stats available. No scrub/repair was run; this counter means filesystem health is not certified.
+
+Latest check at 2026-11-05 04:43 AEDT: MemAvailable 124.984 GB is below the v41 127.845 GB startup gate; the direct context probe still returns CUDA error 100 and `nvidia-smi` cannot communicate with the driver. No ZeroMoE process is running. Do not launch until the user explicitly approves and GPU readiness recovers.
+
+
+### v41 H2D request after user authorized load (2026-11-05)
+
+The v41 guarded run subsequently passed admission and loaded full MoE residency: 12,757 DDR experts / 109.564 GB, 2,603 pinned VRAM experts, 64 dynamic slots. `check_full_graph_moe_run.py --full-fit` passes. One 959-token/64-token H2D request returned HTTP 200: full-graph CPU-offload prefill 24.34 tok/s; decode 2.32 tok/s by request stats, 2.26 tok/s by decode graph wall; shutdown process-level decode accounting is 1.53 tok/s. The absolute goals of 100 tok/s prefill and 10 tok/s decode remain unmet. CPU and split requests were skipped after system swap-out; the runner stopped the sweep and sent no retry.
+
+MoE expert-file disk fetches were zero in the request report. Physical `/dev/sdc` reads were about 0.511 GiB during prefill and 0.021 GiB during decode, with Engram still on-demand (`4352/95088` row-cache hits, 4.6%). The process reported 133.35 GB of total MoE cache H2D and sampled aggregate PCIe RX averaged about 3.47 GB/s during decode. The full graph cache log had 6,143 DDR misses among 15,120 routed slots (about 59.4% resident hits), and no CPU decode spill in H2D mode.
+
+The live watchdog stopped the server when system SwapUsed grew 0.133 GiB over baseline, above its 128 MiB threshold; the sample had 5.31 GiB MemAvailable and 23.99 MiB/s swap-out. ZeroMoE VmSwap remained zero under the per-run no-swap cgroup. No further strategy request or model reload was sent after this pressure event; wait for the user's instruction before another load.
+
+
+### DeepSeek CPU/split follow-up prepared (v42)
+
+After v41's H2D request, the host swap watchdog stopped the server at 0.134 GiB SwapUsed from a 0.001 GiB baseline. No further model request was sent. v42 is prepared to start directly in `cpu` mode and then try `split`, avoiding another known H2D case. In these modes, DDR-only decode misses are computed on CPU or alternated CPU/H2D, respectively; experts already resident in pinned VRAM remain GPU hits. Mock API tests pass for the CPU-to-split request order and for stopping after an injected HTTP 500 while leaving a healthy server up. The model has not been reloaded for v42; wait for the user's instruction after the swap-triggered stop.
+
+
+### DeepSeek v41 swap attribution and selective CPU/split profile v43 (2026-11-05)
+
+The v41 inference was H2D decode, not CPU decode. Its 959-token full-graph prefill did use CPU cold-expert execution: 5,085 scalar expert calls, 33.242 seconds in the CPU expert counter, and no grouped CPU calls. CPU workers read the existing DDR `host_ptr` blocks; the log reports `graph-owned MoE bytes=0`, so this path did not create a second copy of all expert weights.
+
+The memory trace shows little headroom after full residency. Around prefill completion and decode-graph initialization, RSS rose from 109.559 GiB at 09:47:15 to 114.215 GiB at 09:47:18, while MemAvailable fell from 9.493 to 5.300 GiB. The logged graph workspace is 0.63 GiB and does not account for the full 4.656 GiB RSS increase; available logs do not identify the remaining allocator. The 64-token H2D decode then completed. System SwapUsed stayed at 0.002 GiB through request completion; it began rising about 71 seconds later while ZeroMoE RSS remained about 114.197 GiB and VmSwap stayed at zero. The watchdog stopped the process at 5.31 GiB MemAvailable and 0.134 GiB SwapUsed. This confirms dangerously low headroom from loading all 15,360 experts; it does not establish CPU expert execution as the source of the later swap-out.
+
+The CPU/split continuation is prepared at `build_mtp_results/2026-11-05-47ef7b3-deepseek41-cpu-split-selective-v43/`. Its frozen usage manifest is the positive counter delta from before and after the successful H2D replay: 9,825 unique routed experts total, including 9,490 in prefill; the full route count is 245,280 and the prefill count is 230,160. Placement estimates 2,603 pinned VRAM experts plus 7,222 DDR experts. The manifest is saved with source hashes and can be regenerated by `make_test_route_manifest.py`.
+
+Selective strategy isolation now preserves only these usage identities, reserves 64 dynamic VRAM slots, keeps DDR source copies on promotion, and fails startup before serving if a manifest identity is absent from both DDR and VRAM. Unobserved experts are not inserted during preload. A route outside the frozen manifest can still demand-load and must be counted as a cold miss. The config uses host_ram_gb=114.5 decimal GB, a 4 GiB startup margin, 6 GiB request headroom, a 4.5 GiB live floor, a 10,000-slot DDR cap, and the existing host swap watchdog. API requests require at least 10.5 GiB MemAvailable.
+
+Prepared only: no model was loaded and no CPU or split request was sent after the v41 watchdog stop. The full CMake build completed and `tools/build_provenance.py check` passed for this worktree snapshot. Binary SHA256 is 6e3596c8a4309173eb6c300e5e6920490700a2d3fe6261aecf3687285138f217, source snapshot SHA256 is 74891627613cd8bbee8934d98062444814554d4083d3c32c07c371e34521a2b8, and GGML base is 8baabd53b77d1c48c6ef8d3b620436292f3f6231. No model was loaded and no CPU or split request was sent after the v41 watchdog stop. Recheck provenance after any source change; the launcher fails closed on a stale or absent binary. Master remains untouched.
+
+
+### v43 live CPU request: prefill passed, decode graph validation failed (2026-11-05)
+
+
+The guarded v43 load passed admission: MemAvailable was 129.95 GB, both GPUs were idle, CUDA device count was 2, and no swap-out was observed. Systemd scope `run-p19059-i27676.scope` has `MemorySwapMax=0`. Startup verified all 9,825 frozen manifest identities resident in DDR or VRAM.
+
+The CPU strategy request completed the 959-token full-graph prefill at 26.52 tok/s (36.159 s; 4,201 CPU expert calls), then returned HTTP 500 before generating a decode token: `DeepSeek async cache graph could not hold uploaded expert`. The graph’s async-upload validation checked CPU-routed DDR misses as if they also required a VRAM slot. The source now records CPU-routed IDs and skips only those entries in that VRAM-only validation; a focused `dsv41_decode_miss_strategy` component test passes.
+
+The prefill encountered 492 routed experts absent from the H2D-derived manifest, loading them on demand and incurring 4.28 GB of SSD reads / 13.61 s disk time. The watchdog did not stop the process: MemAvailable remained about 51.2 GiB, ZeroMoE VmSwap was zero, SwapUsed stayed at 0.066 GiB, and pswpout was unchanged.
+
+The corrected binary is built and provenance-checked: SHA256 `d127bd2f6613128f3fa9bcab9c440d0e95dd5d622ce2cf0187ddce8bbc78eea0`, source snapshot `21bb5d70d315d3b97b096c4c6da6dd77e1d9a4531770d38de323b469be2a336c`, GGML base `8baabd53b77d1c48c6ef8d3b620436292f3f6231`. The running server still has the previous binary (SHA256 `6e3596c8a4309173eb6c300e5e6920490700a2d3fe6261aecf3687285138f217`); it remains loaded in the no-swap scope. The split request was not sent and no retry or reload was performed after the failure.
+
+For the next guarded load, `ZEROMOE_ROUTE_LOG` is enabled to capture exact per-layer/per-token IDs; `aggregate_observed_routes.py` converts them into prefill and all-phase usage files. The current instance started without that logger, so its 492 extra route identities were not recorded. Decode performance remains unmeasured; the objective is still open.
+
+
+### v43 prefill bottleneck counters
+
+The successful full-graph prefill reported 26.52 tok/s. Its CPU expert counter was 20.41 s over 4,201 scalar expert calls (zero grouped calls); the `get_experts_batch` path spent 9.84 s and recorded 492 main-thread DDR misses. The request also reported 13.61 s disk time for 4.28 GB of expert reads. These counters overlap across the graph and must not be summed as exclusive wall time. This establishes that removing the CPU-route cold reads is necessary but cannot by itself reach 100 tok/s; the CPU expert kernel path also needs profiling/optimization. Decode generated zero tokens, so no decode speed was measured.
+
+
+### DeepSeek CPU prefill microbenchmark follow-up (2026-11-05)
+
+A prefill-only flattened-row OpenMP candidate produced bitwise-identical output at DeepSeek expert shapes (S=8; IQ2_XXS gate/up 5120->2304; IQ3_XXS down 2304->5120). It measured 0.99x for IQ2_XXS (2.3231 vs 2.3425 ms) and 1.00x for IQ3_XXS (4.4249 vs 4.4183 ms), so the candidate was reverted. This is CPU-kernel microbenchmark evidence, not an end-to-end model speed measurement. The current source/binary remains the CPU-route async-validation fix, with no prefill speed optimization merged into the production path.
+
+
+### CPU/split route survey and decode-ranked placement
+
+The route capture from the corrected-binary run contains two full same-prompt requests (CPU then split): 81,760 layer/token rows, 490,560 route selections, and a 9,965-identity union. Prefill accounts for 460,320 selections / 9,602 identities; the 126 generated decode forwards account for 30,240 selections / 4,330 identities.
+
+The next guarded profile now ranks pinned VRAM from the decode-only histogram and loads the separate prefill histogram into the DDR+VRAM resident union. With the measured 2,603-slot VRAM pin set, the exact observed union needs 7,362 DDR experts; per-layer DDR demand is 132-228, within the existing 250-slot cap. The simulated pinned hotset covers 91.6% of observed decode route selections. The exact repeat workload should therefore remain resident without the 492 SSD cold loads seen in its first CPU prefill; this prediction still requires live startup verification.
+
+
+### CPU offload hit/miss and route-trace follow-up (2026-11-05)
+
+The user explicitly prohibited further H2D testing. No H2D requests were sent in v47-v50. The v46 single H2D probe predates that instruction and is retained only as historical data.
+
+v47 (`build_mtp_results/2026-11-05-47ef7b3-deepseek41-cpu-split-routefit-v47/`) loaded the exact 10,575-route CPU/split survey into 2,539 pinned VRAM + 8,036 DDR experts and passed `check_full_graph_moe_run.py --full-fit --require-full-graph-prefill`. With 959 prompt and 64 generated tokens, CPU measured 51.58 tok/s prefill / 1.39 tok/s output decode; split measured 35.35 / 1.79. Split had 441 main-thread DDR claims. Across the pair, `/dev/sdc` read about 4.85 GB. CPU repeat later recorded 46.90 / 1.49 and did not reproduce the first CPU completion; the route union grew to 10,839. A second CPU request was skipped by the request guard after host pswpout changed. The process was gracefully stopped; no H2D was used.
+
+v48-v50 (`build_mtp_results/2026-11-05-47ef7b3-deepseek41-cpu-route-trace-v48/` and `...cpu-route-trace-quick-v50/`) collected a layer-1 prefill trace. v48 passed route residency (10,839/10,839) and full-graph checking, but the host watchdog stopped its CPU request after system SwapUsed rose 0.143 GiB from baseline at 40.8 GiB MemAvailable; ZeroMoE VmSwap was 0. The user asked for a quick-test-only guard relaxation. v49's 512 MiB growth allowance still stopped during preload at 0.576 GiB growth while MemAvailable was 71.4 GiB. v50 raised only the quick-run system growth cap to 1 GiB and kept the absolute 2 GiB SwapUsed cap, `MemorySwapMax=0`, process VmSwap cap, swap-rate guard, and 4.5 GiB engine floor. It completed two CPU-only trace requests without an emergency stop; the loaded v50 service remains available.
+
+For v50 CPU decode, each 64-token request had 15,120 routed slots. Request 1 had 8,727 VRAM hits (57.72%) and 6,393 non-VRAM CPU misses; request 2 had 9,041 VRAM hits (59.79%) and 6,079 CPU misses. DDR claim hits were 98.69% (6,933 hits, 92 cold main-thread reads) and 99.21% (7,140 hits, 57 cold reads). This separates the VRAM hit rate from the DDR hit rate: most non-VRAM decode routes were available in DDR, though the current route set still produced cold reads. Prefill used 128 dynamic VRAM slots during execution; after prefill all 2,667 VRAM slots were occupied (2,539 static pins plus 128 dynamic), and the DDR tier had 8,386 then 8,441 occupied slots. The runtime does not currently rebalance those dynamic slots at the prefill/decode boundary; decode starts with the same shared LRU contents.
+
+The route trace exposes a repeatability problem. For the same temperature-0 CPU request, v48's first CPU prefill and v50 CPU request 1 had bit-identical layer-1 HC-FFN input, router scores/probabilities, and routed IDs across all prompt tokens. Within the same v50 process, CPU request 1 and request 2 produced different completion text; 4,894,687/4,910,080 layer-1 HC-FFN input floats changed (max abs 0.00739), 366,617/368,256 router selection scores changed (max abs 0.01968), and 164/5,754 routed IDs changed. Layer-0 prefill route IDs matched, while layer-1 route sets first differed at prompt token 16 and layer 2 differed from token 0. The exact source of this in-process state/numeric drift is unresolved. The trace snapshots and comparisons are in the v50 artifact.
+
+Measured CPU offload remains far below the user's GLM report and the DeepSeek 100/10 tok/s targets: v50 prefill was 45.51 and 47.09 tok/s; output decode was 1.26 and 1.34 tok/s. The v47 CPU/split run included about 4.85 GB physical SSD reads despite passing startup residency. The v50 process stayed at zero VmSwap; system SwapUsed increased 0.38 GiB from its baseline, within the quick-test cap. No H2D was tested in these runs. The GLM figures are user-reported and were not remeasured.
+
+Next action: fix or isolate the repeated-request state/route divergence before treating the route survey as stable, then profile CPU expert execution. The CPU logs show a substantial expert compute path and low GPU utilization; decode needs an early-ready CPU/GPU overlap path or much faster grouped CPU kernels. After prefill, decode-pool re-ranking is not implemented; the current pool is a fixed pinned set plus a shared 128-slot dynamic LRU. Full DeepSeek acceptance remains open: v50 is still loaded, and its full-graph gate summary awaits shutdown.
+
+
+### CPU/split route-fit v47: measured results and repeatability problem (2026-11-05)
+
+Artifact: `build_mtp_results/2026-11-05-47ef7b3-deepseek41-cpu-split-routefit-v47/`. Source/worktree: `codex/deepseek-v41-continuation`, HEAD `47ef7b30ed0e7d3230cb56e252072f8a8387e573`, dirty snapshot. Binary SHA-256 `75b7392308e0dc2a250d8be8d97b8b6c981665af7ebfaa5a5d5c033f392200a3`; GGML base `8baabd53b77d1c48c6ef8d3b620436292f3f6231`, patch manifest SHA-256 `5c4c17e7164237cf7da1570a5dcf1194fbd700df0ee3ca980bf96dcc4530f95b`. Toolchain and GPU details are in `binary.build-info.json`.
+
+The v47 startup gate passed under `MemorySwapMax=0`; its preflight reported all 10,575 identities from the CPU/split-only survey resident at startup (8,036 DDR, 2,539 pinned VRAM, 128 dynamic slots). The planner added 665 DDR-fit VRAM pins before global ranking. `[DSV41-STRATEGY-RESIDENCY]` reported 10,575/10,575 resident. The requested workload was unchanged: 959 prompt tokens, 64 generated tokens, context 4096, temperature 0.
+
+Initial CPU mode measured 51.58 tok/s prefill and 1.39 tok/s decode-output rate; its request log counted 48 main-thread DDR claims. Initial split measured 35.35 tok/s prefill and 1.79 tok/s decode-output rate; it counted 441 main-thread DDR claims. Physical `/dev/sdc` reads across that pair were about 4.85 GB. A CPU-only repeat measured 46.90 tok/s prefill and 1.49 tok/s decode-output rate, with 79 main-thread DDR claims and about 0.72 GiB of additional physical reads. All responses returned HTTP 200 with 64 generated tokens.
+
+The route profile was not stable across identical temperature-0 CPU requests. The first CPU response and a later CPU repeat differed in text. Their first routed-set divergence was during prefill at layer 1, token 9: the first selected expert 300 and the repeat selected expert 239 in the final top-6 slot. The observed route union grew from 10,575 at startup to 10,839 after the repeat. This makes the current route-derived performance measurement provisional and points to numerical or state-path variation that needs isolation before treating the survey as complete.
+
+The v47 process stayed under the 4.5 GiB live floor: minimum observed MemAvailable was about 38.1 GiB, process VmSwap remained zero, and no emergency stop fired. A second CPU-only repeat was skipped before tokenization because the request guard saw host `pswpout` activity since the launch gate; SwapUsed had risen about 7 MiB from baseline. The server remained alive. No H2D request was run in v47. Per the user's latest instruction, do not run H2D again.
+
+The user-reported GLM-5.3-Flash reference remains 272 tok/s prefill and 14 tok/s decode; it was not remeasured here. DeepSeek's CPU/split figures are far below the user's 100/10 tok/s goals. The full-graph runtime evidence and timing files are preserved in the v47 artifact. `check_full_graph_moe_run.py --full-fit` has not passed yet because `[MOE-GRAPH-GATE]` is emitted only at server shutdown; no onboarding or performance acceptance is claimed. Next action: use a CPU-only trace run to compare layer-1 router scores/IDs for repeated identical requests, then stabilize the route profile and revisit CPU grouped execution. Preserve the loaded v47 server until a guarded shutdown/reload is needed.
+
+
+### CPU-only MoE hit/miss and repeated-request trace (v48-v50; 2026-11-05)
+
+The user prohibited further H2D tests. No H2D request was sent in v47-v50. v48/v49/v50 are run-scoped CPU diagnostics; v50 remains loaded under `MemorySwapMax=0` and no request is currently active.
+
+v48 loaded its 10,839-route survey completely and passed the full-graph checker, but the layer-1 trace CPU request was stopped after 3 generated tokens when the host watchdog saw SwapUsed grow 0.143 GiB from 0.073 GiB at 40.8 GiB MemAvailable. Process VmSwap was 0. The layer-1 prefill trace files remain in `build_mtp_results/2026-11-05-47ef7b3-deepseek41-cpu-route-trace-v48/trace/` (about 494 MiB). v49's 512 MiB quick-test cap stopped during preload at 0.576 GiB growth with 71.4 GiB MemAvailable and no inference request.
+
+v50 uses a run-scoped 1 GiB system swap-growth allowance, 2 GiB absolute SwapUsed limit, 128 MiB/s sustained-rate stop, 64 MiB process VmSwap cap, `MemorySwapMax=0`, and the existing memory floors. Two CPU-only requests completed, each with 959 prompt and 64 generated tokens:
+
+| Request | Prefill | Decode output rate | VRAM decode hits | Non-VRAM CPU routes | DDR claim hits | Cold DDR claims |
+|---|---:|---:|---:|---:|---:|---:|
+| CPU 1 | 45.51 tok/s | 1.26 tok/s | 8,727/15,120 (57.72%) | 6,393 (42.28%) | 6,933/7,025 (98.69%) | 92 |
+| CPU 2 | 47.09 tok/s | 1.34 tok/s | 9,041/15,120 (59.79%) | 6,079 (40.21%) | 7,140/7,197 (99.21%) | 57 |
+
+The DDR claim rate is distinct from VRAM route hit rate. In CPU mode, non-VRAM decode routes use CPU when their expert is in DDR. The route union seen by the two requests was 10,735 identities, including 155 absent from the 10,839-identity startup survey. The process read about 2.06 GiB physically from `/dev/sdc` during those two requests. MemAvailable stayed above 38 GiB, process VmSwap stayed 0, SwapUsed rose about 0.38 GiB from the v50 baseline, and no emergency stop fired.
+
+The trace confirms a repeatability issue. For the first CPU request, v48 and v50 recorded bit-identical layer-1 HC-FFN inputs, router scores/probabilities, route IDs, and route weights over the full prompt. In the second CPU request within v50, the completion changed; 4,894,687/4,910,080 layer-1 HC-FFN input floats and 366,617/368,256 router selection scores differed, and 164/5,754 route IDs changed. Layer-0 prefill route IDs matched between the two CPU requests; layer-1 route sets first differed at prefill token 16 and layer 2 differed from token 0. The current traces are under `build_mtp_results/2026-11-05-47ef7b3-deepseek41-cpu-route-trace-quick-v50/trace-cpu-1/` and `trace-cpu-2/`; the v48 reference trace is linked there as well. The exact state or numerical source remains unresolved.
+
+Pool behavior: current startup pins 2,539 experts and reserves 128 dynamic VRAM slots. Prefill fills those dynamic slots; decode starts with the same pool contents. There is no explicit prefill/decode re-ranking at the phase boundary. v50 logged 2,667/2,667 VRAM slots occupied after prefill (2,539 pinned) and 8,386 then 8,441 DDR slots occupied. A decode-phase handoff that replaces the dynamic slots with decode-ranked experts is a candidate design change, not implemented.
+
+v47's `check_full_graph_moe_run.py --full-fit --require-full-graph-prefill` passed after clean shutdown. None of the CPU/split runs meets the user's 100 tok/s prefill or 10 tok/s decode targets. The user-reported GLM values remain reference-only and were not remeasured. The v50 service was later shut down gracefully; see the v51 full-residency run below.
+
+### DeepSeek full-residency CPU run v51 (2026-11-05)
+
+Source/worktree: `/home/ray/Projects/ZeroMoE/.worktrees/deepseek-v41-continuation`, branch `codex/deepseek-v41-continuation`, HEAD `47ef7b30ed0e7d3230cb56e252072f8a8387e573`, dirty source snapshot SHA-256 `6ae492790bf61e644659fdc04f70619a11b28061c3a6ec6f96adf6c97283a778`. Binary SHA-256 `7181c8609c29d7278b1a467661cba120bc4c94ebad830ade6d8be0b39f26b973`; GGML base `8baabd53b77d1c48c6ef8d3b620436292f3f6231`; GGML patch manifest SHA-256 `5c4c17e7164237cf7da1570a5dcf1194fbd700df0ee3ca980bf96dcc4530f95b`. Toolchain: CUDA 13.3.73, GCC 16.2.1, driver 610.57.04, native targets `86;120` (RTX 3090 + RTX 5060 Ti). Exact TOML, prompt, request JSON, command, logs, raw system/host samples, unit checks, route log, and trace files are in `build_mtp_results/2026-11-05-47ef7b3-deepseek41-cpu-fullresident-grouped-v51/`.
+
+Strict full residency passed: 15,360/15,360 expert identities, with 11,694 DDR experts (100.562 GB) and 3,666 pinned VRAM experts; 128 dynamic slots remained. The model shards remained symlinks to the USB model directory. `check_full_graph_moe_run.py --full-fit --require-full-graph-prefill` passed after graceful shutdown. No H2D decode-miss strategy was run; decode logged zero staged misses. Startup and prefill cache uploads reported 41.35 GB of H2D traffic. The shutdown report counted 21,638 DDR claim hits and zero main-thread or prefetch claims. The process performed some physical reads during prompt processing; current counters do not attribute those bytes to Engram versus other files.
+
+| Request | Prefill | Decode output rate | Decode p50 / p95 | VRAM hits | CPU DDR misses |
+|---|---:|---:|---:|---:|---:|
+| 1 | 12.16 tok/s | 2.22 tok/s | 430.6 / 470.0 ms | 10,292/15,120 (68.1%) | 4,828 (31.9%) |
+| 2 | 11.54 tok/s | 2.28 tok/s | 445.5 / 476.2 ms | 9,986/15,120 (66.0%) | 5,134 (34.0%) |
+
+The compact layout fixed a layer-11 graph-view failure: compact strides now satisfy both quantized row alignment and the graph's 16-byte view alignment. The CPU decode cache race also received an early hit hold plus a resident-DDR recovery path. Both requests completed 64 tokens. The first full-resident request before these changes completed prefill but failed in decode with `DeepSeek CPU decode miss was not included in the batched DDR set`; that log is archived under `attempt-4-compact-fullres-prefill-decode-error/`.
+
+The full-residency compact layout explains the prefill regression against v50. v50's selective uniform pool staged 5,120 experts across its 40 layers and spilled 1,905 to CPU. v51's compact layout staged only 128 total and spilled 5,675 to CPU. CPU worker time rose from 7.8 s to 76.2 s per prompt, while prefill fell from about 45 tok/s to 11.5-12.2 tok/s. Compact per-layer storage improved byte efficiency and full residency, while its dynamic slots became layer-local.
+
+Decode remains CPU-bound. Each v51 request used about 13.6-14.1 s of CPU expert worker time and 13.0-13.4 s of merge wait; the 3090 averaged 6.9-8.4% GPU utilization and the 5060 Ti 1.3-2.2% during decode. A short process sample during prefill was 306-312% CPU, roughly three cores. The graph reports `cpu_lane=0`; current DDR expert work is not overlapped enough with GPU work. Both temperature-0 responses differed. The full layer-1 prefill traces were bit-identical, but the route log first diverged at layer 9, prompt token 87 (experts 196/197 exchanged); decode routes first diverged at output token 0, layer 11 (experts 56/317 exchanged). Correctness/reproducibility still needs a teacher-forced comparison against llama.cpp.
+
+Memory stayed bounded during the two successful requests: MemAvailable low-water 14.925 GiB, process VmSwap 0, SwapUsed 1.235-1.287 GiB, no emergency stop. The guarded test used a configurable 128 MiB/s swap-out cutoff; the previous fixed 64 MiB/s cutoff had refused an allocation during a transient 115 MiB/s sample with 16.2 GiB MemAvailable.
+
+Next: retain compact per-layer static slots but carve a shared, preallocated uniform-stride dynamic VRAM segment out of the same pool. Let prefill reuse those slots across layers, then refill them at the prefill/decode boundary from the prompt's measured routes, retaining the DDR source copies. This should restore prefill staging flexibility without restoring the padding cost of a fully uniform pool. Decode and prefill remain below the 10/100 tok/s targets; model support remains in progress.
+
+### DeepSeek full-residency CPU run, compact VRAM graph, and decode diagnosis (2026-11-05)
+
+Source/worktree: `/home/ray/Projects/ZeroMoE/.worktrees/deepseek-v41-continuation`, branch `codex/deepseek-v41-continuation`, HEAD `47ef7b30ed0e7d3230cb56e252072f8a8387e573`, dirty snapshot SHA-256 `6ae492790bf61e644659fdc04f70619a11b28061c3a6ec6f96adf6c97283a778`. Binary `build_dsv41_retry16/zeromoe`, SHA-256 `7181c8609c29d7278b1a467661cba120bc4c94ebad830ade6d8be0b39f26b973`. GGML base `8baabd53b77d1c48c6ef8d3b620436292f3f6231`; applied GGML patch manifest SHA-256 `5c4c17e7164237cf7da1570a5dcf1194fbd700df0ee3ca980bf96dcc4530f95b`. Toolchain: CUDA 13.3.73, NVIDIA driver 610.57.04, GCC 16.2.1, native targets `86;120` (RTX 3090 + RTX 5060 Ti).
+
+The selected GGUF files remain symlinked from `/mnt/usb-ssd/@/home/ray/models/DeepSeek-V4.1-Flash-1017-GSQ-RCO/`; no model payload was copied into the worktree. Artifact directory: `build_mtp_results/2026-11-05-47ef7b3-deepseek41-cpu-fullresident-grouped-v51/`.
+
+DeepSeek's graph cache previously discarded per-layer expert sizes and allocated each VRAM slot at the largest layer stride. The compact per-layer layout raised physical capacity to 3,794 slots. Startup's strict residency check passed with all 15,360/15,360 identities present: 3,666 in pinned VRAM and 11,694 in DDR (100.562 GB), plus 128 dynamic VRAM slots and 5 GB request headroom. `check_full_graph_moe_run.py --full-fit --require-full-graph-prefill` passed after graceful shutdown. The compact slot alignment was corrected to satisfy both GGML row alignment and the graph's 16-byte view alignment.
+
+Two frozen CPU-strategy requests used the same 959-token prompt, context 4096, temperature 0, and 64-token decode. Both returned HTTP 200 and the server remained healthy:
+
+| Request | Prefill | Decode output-to-output | Decode p50 / p95 | VRAM route hits | DDR CPU misses |
+|---|---:|---:|---:|---:|---:|
+| 1 | 12.16 tok/s | 2.22 tok/s | 430.6 / 470.0 ms | 10,292/15,120 (68.1%) | 4,828 (31.9%) |
+| 2 | 11.54 tok/s | 2.28 tok/s | 445.5 / 476.2 ms | 9,986/15,120 (66.0%) | 5,134 (34.0%) |
+
+There were zero staged decode misses: the selected strategy remained CPU-only for DDR misses. CPU grouped execution covered 3,390 and 3,598 of the two requests' CPU expert misses; the rest used the scalar path. Summed CPU expert worker time was 13.65 s and 14.14 s per 64-token decode, with 12.99 s and 13.44 s of merge wait. The graph reports `cpu_lane=0` and warns that DeepSeek does not advertise the shared early-ready CPU lane, so CPU and GPU branches do not overlap enough. Sampled decode GPU utilization averaged about 8.4%/1.3% on request 1 and 6.9%/2.2% on request 2 (3090/5060 Ti). A brief process sample during request 2's prefill was 306-312% CPU, roughly three cores; the run did not retain a per-core CPU time series.
+
+The prefill regression is traced to slot sharing. The earlier v50 selective/uniform run staged 5,120 prompt experts across its 40 layers and spilled 1,905 to CPU; its CPU workers accumulated 7.8 s and prefill measured 45.51 tok/s, but it did not have full model residency and read disk during requests. The v51 full-residency compact run staged only 128 total experts and spilled 5,675 to CPU; CPU workers accumulated 76.2 s and prefill measured 12.16 tok/s. Compact per-layer regions prevent the same dynamic slots from being reused across successive layers. The v50 and v51 rates are not a matched performance comparison because residency/layout changed.
+
+Full-residency evidence: `[FULL-RESIDENCY-CHECK] resident=15360/15360`; the shutdown report counted 21,638 DDR claim hits and zero main-thread or prefetch-worker claims. The request logs show no main-thread cold MoE reads. The process did perform a small amount of physical I/O during prompts for on-demand sidecar work; the current counters do not attribute those bytes to Engram versus other files. Startup plus prefill cache uploads totalled 41.35 GB H2D. No H2D decode-miss strategy was tested; decode logs recorded `staged=0`.
+
+Memory remained guarded: MemAvailable low-water was 14.925 GiB, process VmSwap stayed 0, SwapUsed ranged 1.235-1.287 GiB, and no emergency stop fired. The test profile set `mem_guard_swapout_mib_s=128` to match the quick watchdog; the previous fixed 64 MiB/s cutoff had refused an allocation on a transient 115 MiB/s swap-out sample despite 16.2 GiB MemAvailable.
+
+Repeated identical temperature-0 prompts still differed in text (339 versus 310 characters). Layer-1 prefill traces were bit-identical across both requests, but the complete router log first diverged at layer 9, prompt token 87 (experts 196/197 exchanged near the top-k boundary). Decode routes first diverged at output token 0, layer 11 (experts 56/317 exchanged). Correctness/reproducibility is unresolved; teacher-forced boundary comparisons against llama.cpp are still required before acceptance.
+
+Next action: keep the pinned compact VRAM set but add a shared, preallocated dynamic VRAM segment that any layer can reuse during prefill. Use the prefill route counts to stage its most useful DDR experts, then re-rank that segment at the prefill/decode boundary for decode. This must preserve fixed slot addresses and DDR source copies. Continue CPU-lane profiling and work on the route divergence. The 10 tok/s decode and 100 tok/s prefill targets remain open; no completion or llama.cpp-relative performance acceptance is claimed.
+
+
+### DeepSeek v52 graph probe and v53 fixes (2026-11-05)
+
+The corrected model source is `/mnt/usb-ssd/DeepSeek-V4.1-Flash-1017-GSQ-RCO/`. v52 used symlink-only aliases to that directory; no GGUF payload was copied. Its 959-token prompt request was sent after the host/GPU gate passed and the server confirmed full residency (`15360/15360`: 3,611 VRAM and 11,749 DDR experts). The request returned HTTP 500 before prefill tokens were processed. The graph builder reported that the GPU0 shared dynamic pool address was 8 bytes off 16-byte alignment (`stride=12,307,680`, `addr_mod16=8`); the full-graph checker correctly failed because no graph gate summary or successful replay was recorded. No prefill or decode rate is available for v52.
+
+The v52 run stayed within the memory guard: MemAvailable low-water was 19.582 GiB, system SwapUsed stayed at 1.190–1.193 GiB, process VmSwap was zero, and no emergency stop was recorded. The ZeroMoE process remained alive and `/health` returned 200 after the request; no second prompt was sent to that binary. The run artifacts are under `build_mtp_results/2026-11-05-47ef7b3-deepseek41-cpu-prefill-handoff-v52/`.
+
+The source fixes now in the continuation worktree are:
+
+- Compact shared VRAM tails align their start down to 16 bytes. The configured GPU0 pool is 17,540,769,000 bytes; the fix leaves its final 8 bytes unused. Startup validates pool base, slot offset, stride, pointer alignment, and bounds before the large DDR preload.
+- Prefill CPU spill results use the graph's `D x S` output length. The previous merge loop used `site.cpu_output.size()`, which is zero for prefill because its output is stored in the existing prompt-sized scratch buffer; that omitted the CPU contribution.
+- The CPU/GPU merge node releases the completed layer's VRAM compute holds. Previously, per-layer holds survived until the whole graph ended, preventing later layers from reusing the shared dynamic LRU slots.
+
+The rebuilt binary passes `python3 tools/build_provenance.py check` (SHA-256 `2846094c7dfeb3ff0b7476371b85611a8c3142d2a550355ecc572e6b2735bf08`; source commit `47ef7b30ed0e7d3230cb56e252072f8a8387e573`, dirty; GGML base `8baabd53b77d1c48c6ef8d3b620436292f3f6231`; GGML patch manifest `5c4c17e7164237cf7da1570a5dcf1194fbd700df0ee3ca980bf96dcc4530f95b`; CUDA 13.3.73, driver 610.57.04, GCC 16.2.1, native targets 86 and 120). Focused compact-cache/alignment/hold-release and grouped CPU IQ1_M tests pass. These are unit checks only; the corrected graph has not yet been exercised on the model.
+
+Offline route replay exposed a likely VRAM-placement mismatch. The frozen five-prompt survey contains 690,480 prefill selections versus 45,360 decode selections (15.22x). Startup merged 5,839 prefill-exclusive experts into the global VRAM ranking, despite the test profile's decode-only comment. On the captured two-request decode route log, unconstrained top-3,611 from the frozen decode survey covers 80.668% of recorded selections; the current prefill-merged ranking simulation covers 62.483%, close to the measured 66.0% and 68.1% VRAM hit rates. Ranking the exact two-request route log covers 96.634%, but that is an overfit upper-bound estimate, not an accepted profile. Compact per-layer byte caps and route changes are not included in those simulations.
+
+v53 therefore leaves `prefill_pin_file` empty for permanent VRAM pin selection while strict full residency puts the entire unpinned complement in DDR. Prefill still uses the full graph, CPU spill fallback, and its existing shared dynamic VRAM slots; after prefill, the request route counts refill those preallocated slots for decode. Decode misses remain CPU-only. No H2D decode strategy is enabled.
+
+The source drive disconnected at 19:32:40 and re-enumerated as `/dev/sde1` at 19:32:43, while `/mnt/usb-ssd` still points to the old `/dev/sdc1` mount and returns I/O errors. No remount, filesystem repair, or disk writes were attempted. v53 is prepared but has not launched; its model alias directory is empty. The v52 process remains loaded and healthy, but its binary has the alignment defect and should receive no further inference requests.
+
+Next action: once `/mnt/usb-ssd/DeepSeek-V4.1-Flash-1017-GSQ-RCO/` is readable on the re-enumerated drive, stop the stale v52 process, verify the v53 symlinks and provenance, then run the same guarded CPU-only 959-token prefill plus 64-token decode workload. The 100 tok/s prefill and 10 tok/s decode targets remain unmet; correctness, llama.cpp boundary comparison, full-graph gate, and matched performance acceptance remain open.
+
+### DeepSeek V4.1 Flash handoff update (2026-11-07)
+
+The current DeepSeek handoff is [deepseek-v41-flash-current.md](deepseek-v41-flash-current.md). v53 did load all 15,360 experts, then its first CPU-only request failed before prefill at the layer-0 same-layer dummy preflight (`local_dynamic_slots=0` despite the configured 128-slot shared pool). It generated no tokens and has no speed result. The old server is no longer running. The detailed handoff replaces the earlier v53 “prepared but not launched” status and records the current readable model path, safety measurements, offline route placement analysis, code fixes, and next steps.

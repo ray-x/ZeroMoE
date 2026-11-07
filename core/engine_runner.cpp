@@ -317,6 +317,12 @@ std::expected<void, std::string> EngineRunner::apply_engine_config() {
   engine.decode_async_prewarm = mode == "sync" || mode == "async";
   engine.decode_async_prewarm_max_batch = config.decode_async_prewarm_max_batch;
   engine.decode_async_prewarm_nonblocking = mode == "async";
+  engine.dsv41_decode_moe_miss_strategy.store(
+      config.deepseek_v41_decode_moe_strategy == "cpu" ? 1 :
+      config.deepseek_v41_decode_moe_strategy == "split" ? 2 : 0,
+      std::memory_order_relaxed);
+  engine.dsv41_strategy_test_isolation =
+      config.deepseek_v41_strategy_test_isolation;
   engine.cpu_offload_max_experts = config.cpu_offload_max_experts;
   engine.prefill_retention_decay = config.prefill_retention_decay;
   engine.prefill_hint_order_by_earliest_token =
@@ -396,7 +402,8 @@ std::expected<void, std::string> EngineRunner::init_host_and_gpu() {
   static MemoryGuard g_mem_guard;
   if (config.mem_guard)
     g_mem_guard.start(config.mem_guard_warn_mb, config.mem_guard_stop_mb,
-                      config.mem_guard_poll_ms);
+                    config.mem_guard_poll_ms,
+                    config.mem_guard_swapout_mib_s);
   // Graph-owned expert arenas and the legacy RAM-tier slabs are allocated by
   // different subsystems.  Configure one process-wide admission ceiling so
   // a graph source allocation cannot silently sit outside host_ram_gb.  For
@@ -429,9 +436,15 @@ std::expected<void, std::string> EngineRunner::init_host_and_gpu() {
   ram_mgr.reactive_promote_gpu1_every_n = config.reactive_promote_gpu1_every_n;
   ram_mgr.pin_threshold = (uint32_t)std::max(0, config.pin_threshold);
   ram_mgr.expert_fetch_threads = std::max(1, config.expert_fetch_threads);
-  ram_mgr.move_on_promotion = config.require_full_moe_residency ? false : config.move_on_promotion;
+  ram_mgr.move_on_promotion =
+      (config.require_full_moe_residency ||
+       config.deepseek_v41_strategy_test_isolation)
+          ? false
+          : config.move_on_promotion;
   if (config.require_full_moe_residency)
     LOG_INFO("[FULL-RESIDENCY] DDR source copies are retained during VRAM promotion\n");
+  else if (config.deepseek_v41_strategy_test_isolation)
+    LOG_INFO("[DSV41-STRATEGY] DDR manifest sources are retained during VRAM promotion\n");
   ram_mgr.ram_copy_reclaim_threshold = config.ram_copy_reclaim_threshold;
   ram_mgr.disk_batch_padding = config.disk_batch_padding;
   ram_mgr.disk_batch_padding_target = config.disk_batch_padding_target;

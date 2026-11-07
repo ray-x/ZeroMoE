@@ -835,7 +835,18 @@ Cleanup note: after Trial 47 the measurement-only code was removed (evict/lock t
 
 Update (2026-10-20): `ZEROMOE_OFFLOAD_RETARGET` is now on by default whenever SSD offload is active; `=0` disables. See `docs/offload-retarget.md`.
 
-## DeepSeek V4.1 Flash (2026-10-21)
+## DeepSeek V4.1 Flash (2026-11-07) -- CURRENT BASELINE (performance only; not parity-validated)
+RTX 3090 (PCIe Gen3 x16) + RTX 5060 Ti (Gen3 x8), Xeon W-2235, 131.6 GB DDR, Release, CUDA 13.3.73, GGML 8baabd53, source `47ef7b3` + the commit that adds this entry.
+Model: DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS (5 shards, IQ2_XXS mix) + Engram IQ4_NL sidecar, USB SSD. Config `configs/bench/deepseek_v41_iq2xxs_fullres_dual_gpu.toml`; workload `bench/deepseek41/workload_959tok_prompt.txt` (959 prompt, 64 generated, temp 0).
+
+| Metric | Value (3 requests) | Previous |
+|---|---|---|
+| Prefill | 70.37 / 71.81 / 71.66 tok/s | 31 cold / 66.5 warm |
+| Decode (first-to-last output) | 10.73 / 10.81 / 10.81 tok/s (p50 ~91 ms) | 3.6-3.8 |
+
+Rounding-changing optimizations are not compared with llama.cpp; no matched llama.cpp run. Recipe and gaps: `docs/models/deepseek41-flash.md`; evidence: `docs/handoff/deepseek-v41-flash-current.md`.
+
+## DeepSeek V4.1 Flash (2026-10-21, superseded)
 3090 + 5060 Ti, Release, coherent chat-template text at temp 0.8, `configs/bench/deepseek_v41_100gib_ddr_17gib_vram_dual_gpu.toml`:
 decode about 4.0-4.5 tok/s (about 230 ms/token), up from 0.88 -> 1.30 -> 3.5 over earlier sessions. 10 tok/s target not met.
 Prefill about 29 tok/s on 817 tokens (older measurement). Details, switches and verification:

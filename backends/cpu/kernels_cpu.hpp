@@ -194,6 +194,9 @@ bool matmul_iq1_m_ggml_q8k_grouped_inputs(
 bool matmul_iq2_xxs_ggml_q8k_grouped(
     float *const *y, const float *x, const uint8_t *const *W_quantized,
     int n_matrices, int S, int I, int O);
+bool matmul_iq2_xs_ggml_q8k_grouped(
+    float *const *y, const float *x, const uint8_t *const *W_quantized,
+    int n_matrices, int S, int I, int O);
 bool matmul_iq3_xxs_ggml_q8k_grouped(
     float *const *y, const float *x, const uint8_t *const *W_quantized,
     int n_matrices, int S, int I, int O);

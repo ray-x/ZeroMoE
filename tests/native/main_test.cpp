@@ -803,6 +803,10 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
+    if (std::getenv("ZEROMOE_TEST_ONLY_CPU_IQ_MATMUL"))
+        return test_cpu_iq_matmul_paths() ? 0 : 1;
+    if (std::getenv("ZEROMOE_TEST_ONLY_COMPACT_VRAM"))
+        return test_compact_vram_slot_planner() ? 0 : 1;
     if (std::getenv("ZEROMOE_TEST_ONLY_EXL3_GGML_CONFIG"))
         return test_exl3_ggml_graph_capture_config() ? 0 : 1;
     if (!test_exl3_cpu_dispatch()) return 1;

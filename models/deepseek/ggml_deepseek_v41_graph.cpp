@@ -21,10 +21,14 @@
 #include "prefill_warmup_manager.hpp"
 #include "cpu_expert_executor.hpp"
 #include <algorithm>
+#include <omp.h>
+#include <thread>
+#include <cstdlib>
 #include <chrono>
 #include <cstring>
 #include <future>
 #include <stdexcept>
+#include <unordered_set>
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
 
@@ -649,7 +653,38 @@ struct V41CachePool {
   uint8_t *base = nullptr;
   size_t stride = 0;
   int slots = 0;
+  bool shared_dynamic = false;
 };
+
+static bool v41_cache_pool_slot(const V41CachePool &pool, const uint8_t *ptr,
+                                int &physical) {
+  if (!pool.base || !ptr || pool.stride == 0 || pool.slots <= 0 ||
+      pool.stride > SIZE_MAX / (size_t)pool.slots)
+    return false;
+  const uintptr_t base = reinterpret_cast<uintptr_t>(pool.base);
+  const uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
+  if (address < base) return false;
+  const size_t offset = (size_t)(address - base);
+  const size_t span = pool.stride * (size_t)pool.slots;
+  if (offset >= span || offset % pool.stride) return false;
+  const size_t slot = offset / pool.stride;
+  if (slot >= (size_t)pool.slots || slot > (size_t)std::numeric_limits<int>::max())
+    return false;
+  physical = (int)slot;
+  return true;
+}
+
+static bool v41_cache_pool_matches_location(const V41CachePool &pool,
+                                            const ExpertLocation &loc,
+                                            int layer, bool compact) {
+  if (loc.gpu_id != pool.device) return false;
+  if (compact &&
+      (pool.shared_dynamic ? loc.pool_layer != -1 : loc.pool_layer != layer))
+    return false;
+  int physical = -1;
+  return v41_cache_pool_slot(pool, loc.device_ptr, physical);
+}
+
 struct V41CacheHold {
   GpuTopology *topo;
   int layer, expert;
@@ -670,6 +705,7 @@ struct V41CacheMoeSite {
   std::vector<float> cpu_input;
   std::vector<float> cpu_output;
   float *cpu_output_data = nullptr;
+  size_t cpu_output_elements = 0;
   double cpu_job_ms = 0.0;
   size_t cpu_ggml_grouped_experts = 0;
   size_t cpu_quant_grouped_experts = 0;
@@ -773,7 +809,7 @@ void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
     }
   } ram_pins(*ram, (size_t)c.n_experts);
   RamPinGuard cpu_spill_pins(*ram, (size_t)c.n_experts);
-  const bool async_upload = !site.cpu_cold_graph &&
+  const bool async_upload = !site.cpu_cold_prefill &&
       zeromoe::graphsettings::active_settings().tun.cache_moe_async_upload.value != 0;
   const bool prefer_bounce_upload = async_upload &&
       zeromoe::graphsettings::active_settings().tun.cache_moe_async_bounce_upload.value != 0;
@@ -787,6 +823,7 @@ void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
       // reuse it for the asynchronous DDR contribution instead of retaining
       // another D x prompt buffer for every layer site.
       site.cpu_output_data = scratch->moe_out.data();
+      site.cpu_output_elements = (size_t)g.D * g.S;
       std::fill(site.cpu_output_data,
                 site.cpu_output_data + (size_t)g.D * g.S, 0.0f);
     } else {
@@ -796,10 +833,17 @@ void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
       const float *normed = scratch->normed.data();
       site.cpu_input.assign(normed, normed + (size_t)g.D * g.S);
       site.cpu_output_data = site.cpu_output.data();
+      site.cpu_output_elements = site.cpu_output.size();
     }
   }
   int misses = 0;
+  int gpu_misses = 0;
+  size_t decode_ddr_miss_ordinal = 0;
   int staged_misses = 0;
+  // CPU-selected DDR misses have no VRAM location by design. Keep them out
+  // of the async-upload completion validation below; their pinned DDR blocks
+  // are consumed by the CPU lane and merged into the graph output separately.
+  std::vector<uint8_t> cpu_routed((size_t)c.n_experts, 0);
   std::vector<MoEExpertBlock *> batch_blocks((size_t)c.n_experts, nullptr);
   std::vector<int> load_ids;
   if (site.cpu_cold_prefill) {
@@ -815,16 +859,20 @@ void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
           throw std::runtime_error("DeepSeek prefill could not hold resident expert");
         site.holds.push_back({topo, site.layer, expert, loc->device_ptr});
         held_locations[(size_t)expert] = loc;
-        if (topo->expert_compact_layout && loc->pool_layer != site.layer)
+        if (topo->expert_compact_layout && loc->pool_layer != site.layer &&
+            loc->pool_layer != -1)
           throw std::runtime_error("DeepSeek compact cache returned an expert from the wrong layer region");
         for (size_t b = 0; b < site.pools.size(); ++b) {
           const auto &pool = site.pools[b];
-          if (loc->gpu_id != pool.device) continue;
-          const size_t offset = (size_t)(loc->device_ptr - pool.base);
-          if (offset % pool.stride || offset / pool.stride >= (size_t)pool.slots)
+          int physical_slot = -1;
+          if (!v41_cache_pool_matches_location(
+                  pool, *loc, site.layer, topo->expert_compact_layout) ||
+              !v41_cache_pool_slot(pool, loc->device_ptr, physical_slot))
+            continue;
+          if (physical_slot < 0)
             throw std::runtime_error("DeepSeek prefill resident slot is out of bounds");
           owner[(size_t)expert] = (int)b;
-          physical[(size_t)expert] = (int)(offset / pool.stride);
+          physical[(size_t)expert] = physical_slot;
           break;
         }
         if (owner[(size_t)expert] < 0)
@@ -836,13 +884,27 @@ void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
     std::stable_sort(load_ids.begin(), load_ids.end(), [&](int a, int b) {
       return scratch->expert_freq[(size_t)a] > scratch->expert_freq[(size_t)b];
     });
-  } else if (!site.cpu_cold_graph) {
+  } else if (!site.cpu_cold_prefill) {
     load_ids.reserve((size_t)c.topk);
+    // Snapshot and hold the routed VRAM hits atomically with respect to the
+    // cache LRU before claiming DDR misses. Without this early hold, an
+    // asynchronous promotion/eviction can remove a route after this scan
+    // classified it as resident. The later dispatch then treats it as a CPU
+    // miss even though it was omitted from load_ids, leaving no pinned DDR
+    // block to hand to the CPU worker.
+    std::lock_guard<std::recursive_mutex> cache_lock(topo->cache_mutex);
     for (int expert = 0; expert < c.n_experts; ++expert) {
       if (!scratch->expert_freq[(size_t)expert]) continue;
       auto *loc = topo->find_expert(site.layer, expert);
-      if (!loc || !loc->device_ptr || !loc->upload_ready)
+      if (!loc || !loc->device_ptr || !loc->upload_ready) {
         load_ids.push_back(expert);
+        continue;
+      }
+      if (!topo->hold_for_compute(site.layer, expert, loc->device_ptr, false))
+        throw std::runtime_error(
+            "DeepSeek decode could not hold a routed VRAM expert during DDR miss planning");
+      site.holds.push_back({topo, site.layer, expert, loc->device_ptr});
+      held_locations[(size_t)expert] = loc;
     }
   }
   if (!load_ids.empty()) {
@@ -904,16 +966,20 @@ void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
       ram_pins.release((size_t)expert);
       ++staged;
       ++staged_misses;
-      if (topo->expert_compact_layout && loc->pool_layer != site.layer)
+      if (topo->expert_compact_layout && loc->pool_layer != site.layer &&
+          loc->pool_layer != -1)
         throw std::runtime_error("DeepSeek compact cache returned an expert from the wrong layer region");
       for (size_t b = 0; b < site.pools.size(); ++b) {
         const auto &pool = site.pools[b];
-        if (loc->gpu_id != pool.device) continue;
-        const size_t offset = (size_t)(loc->device_ptr - pool.base);
-        if (offset % pool.stride || offset / pool.stride >= (size_t)pool.slots)
+        int physical_slot = -1;
+        if (!v41_cache_pool_matches_location(
+                pool, *loc, site.layer, topo->expert_compact_layout) ||
+            !v41_cache_pool_slot(pool, loc->device_ptr, physical_slot))
+          continue;
+        if (physical_slot < 0)
           throw std::runtime_error("DeepSeek prefill staged slot is out of bounds");
         owner[(size_t)expert] = (int)b;
-        physical[(size_t)expert] = (int)(offset / pool.stride);
+        physical[(size_t)expert] = physical_slot;
         break;
       }
       if (owner[(size_t)expert] < 0)
@@ -925,25 +991,69 @@ void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
       ExpertLocation* loc = nullptr;
       if (async_upload) {
         // Keep identity lookup and hold atomic with respect to cache eviction.
-        std::lock_guard<std::recursive_mutex> cache_lock(topo->cache_mutex);
-        loc = topo->find_expert(site.layer, expert);
-        if (loc && loc->device_ptr && loc->upload_ready) {
-          if (!topo->hold_for_compute(site.layer, expert, loc->device_ptr, false))
-            throw std::runtime_error("DeepSeek async cache graph could not hold resident expert");
-          site.holds.push_back({topo, site.layer, expert, loc->device_ptr});
-          held_locations[(size_t)expert] = loc;
+        loc = held_locations[(size_t)expert];
+        if (!loc) {
+          std::lock_guard<std::recursive_mutex> cache_lock(topo->cache_mutex);
+          loc = topo->find_expert(site.layer, expert);
+          if (loc && loc->device_ptr && loc->upload_ready) {
+            if (!topo->hold_for_compute(site.layer, expert, loc->device_ptr, false))
+              throw std::runtime_error("DeepSeek async cache graph could not hold resident expert");
+            site.holds.push_back({topo, site.layer, expert, loc->device_ptr});
+            held_locations[(size_t)expert] = loc;
+          }
         }
       } else {
-        loc = topo->find_expert(site.layer, expert);
+        loc = held_locations[(size_t)expert];
+        if (!loc) {
+          std::lock_guard<std::recursive_mutex> cache_lock(topo->cache_mutex);
+          loc = topo->find_expert(site.layer, expert);
+        }
       }
       if (loc && loc->device_ptr && loc->upload_ready && ram_pins.blocks[(size_t)expert])
         ram_pins.release((size_t)expert);
       if (!loc || !loc->device_ptr || !loc->upload_ready) {
-        if (site.cpu_cold_graph) {
+        bool cpu_miss = false;
+        if (g.decode_mode && site.cpu_cold_graph) {
+          const auto strategy = static_cast<zeromoe::deepseek_graph::DecodeMissStrategy>(
+              e.dsv41_decode_moe_miss_strategy.load(std::memory_order_relaxed));
+          cpu_miss = zeromoe::deepseek_graph::decode_miss_uses_cpu(
+              strategy, decode_ddr_miss_ordinal++);
+        }
+        if (cpu_miss) {
           ++misses;
           site.cpu_experts.push_back(expert);
+          cpu_routed[(size_t)expert] = 1;
+          // Normally every CPU-selected miss is already pinned by the
+          // batched load_ids pass. A concurrent cache promotion can make a
+          // routed VRAM hit disappear between that classification and this
+          // dispatch. Full-residency mode keeps an authoritative DDR source,
+          // so recover the exact expert from that tier instead of failing the
+          // entire request or attempting an H2D miss path.
+          if (!ram_pins.blocks[(size_t)expert]) {
+            auto *recovered = ram->get_expert(e, site.layer, expert);
+            if (!recovered || !recovered->slab_buffer)
+              throw std::runtime_error(
+                  "DeepSeek CPU decode miss escaped the batched DDR set and "
+                  "has no resident DDR source: layer=" +
+                  std::to_string(site.layer) + " expert=" +
+                  std::to_string(expert));
+            ram->ram_pin(*recovered);
+            ram_pins.blocks[(size_t)expert] = recovered;
+            batch_blocks[(size_t)expert] = recovered;
+            LOG_WARN("[DSV41-CACHE-MOE-CPU] layer=%d expert=%d recovered a DDR-resident CPU miss omitted by the initial cache snapshot\n",
+                     site.layer, expert);
+          }
+          auto *block = ram_pins.blocks[(size_t)expert];
+          if (!block || !block->slab_buffer)
+            throw std::runtime_error(
+                "DeepSeek CPU decode miss lost its pinned DDR source: layer=" +
+                std::to_string(site.layer) + " expert=" +
+                std::to_string(expert));
+          cpu_spill_pins.blocks[(size_t)expert] =
+              ram_pins.take((size_t)expert);
           continue;
         }
+        ++misses;
         auto* block = batch_blocks[(size_t)expert];
         if (!block) {
           block = ram->get_expert(e, site.layer, expert);
@@ -954,7 +1064,7 @@ void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
         }
         const size_t bytes = block->gate_proj.meta.size_bytes + block->up_proj.meta.size_bytes +
                              block->down_proj.meta.size_bytes;
-        const int preferred = site.pools[(size_t)(misses++ % site.pools.size())].device;
+        const int preferred = site.pools[(size_t)(gpu_misses++ % site.pools.size())].device;
         if (async_upload && (!loc || !loc->device_ptr)) {
           bool upload_was_already_ready = false;
           {
@@ -1002,7 +1112,8 @@ void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
         }
       }
       if (async_upload) continue;
-      if (topo->expert_compact_layout && loc && loc->pool_layer != site.layer)
+      if (topo->expert_compact_layout && loc &&
+          loc->pool_layer != site.layer && loc->pool_layer != -1)
         throw std::runtime_error(
             "DeepSeek compact cache returned an expert from the wrong layer region");
       if (!loc || !loc->device_ptr || (!loc->upload_ready && !async_upload) ||
@@ -1015,12 +1126,15 @@ void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
       }
       for (size_t b = 0; b < site.pools.size(); ++b) {
         const auto& pool = site.pools[b];
-        if (loc->gpu_id != pool.device) continue;
-        const size_t offset = (size_t)(loc->device_ptr - pool.base);
-        if (offset % pool.stride || offset / pool.stride >= (size_t)pool.slots)
+        int physical_slot = -1;
+        if (!v41_cache_pool_matches_location(
+                pool, *loc, site.layer, topo->expert_compact_layout) ||
+            !v41_cache_pool_slot(pool, loc->device_ptr, physical_slot))
+          continue;
+        if (physical_slot < 0)
           throw std::runtime_error("DeepSeek cache graph physical slot out of bounds");
         owner[(size_t)expert] = (int)b;
-        physical[(size_t)expert] = (int)(offset / pool.stride);
+        physical[(size_t)expert] = physical_slot;
       }
       if (owner[(size_t)expert] < 0)
         if (!pending_locations[(size_t)expert])
@@ -1048,7 +1162,10 @@ void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
         }
       }
       for (int expert = 0; expert < c.n_experts; ++expert) {
-        if (!scratch->expert_freq[(size_t)expert]) continue;
+        if (!zeromoe::deepseek_graph::requires_vram_route_validation(
+                scratch->expert_freq[(size_t)expert] != 0,
+                cpu_routed[(size_t)expert] != 0))
+          continue;
         auto* loc = held_locations[(size_t)expert];
         if (!loc) loc = topo->find_expert(site.layer, expert);
         auto* pending = pending_locations[(size_t)expert];
@@ -1064,12 +1181,15 @@ void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
         owner[(size_t)expert] = -1;
         for (size_t b = 0; b < site.pools.size(); ++b) {
           const auto& pool = site.pools[b];
-          if (loc->gpu_id != pool.device) continue;
-          const size_t offset = (size_t)(loc->device_ptr - pool.base);
-          if (offset % pool.stride || offset / pool.stride >= (size_t)pool.slots)
+          int physical_slot = -1;
+          if (!v41_cache_pool_matches_location(
+                  pool, *loc, site.layer, topo->expert_compact_layout) ||
+              !v41_cache_pool_slot(pool, loc->device_ptr, physical_slot))
+            continue;
+          if (physical_slot < 0)
             throw std::runtime_error("DeepSeek async cache graph slot is out of bounds");
           owner[(size_t)expert] = (int)b;
-          physical[(size_t)expert] = (int)(offset / pool.stride);
+          physical[(size_t)expert] = physical_slot;
           break;
         }
         if (owner[(size_t)expert] < 0)
@@ -1104,21 +1224,20 @@ void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
           if (dummy[b].size() >= (size_t)c.topk) break;
           if (loc.gpu_id != pool.device || loc.layer_idx != site.layer ||
               !loc.upload_ready ||
-              (topo->expert_compact_layout && loc.pool_layer != site.layer))
+              !v41_cache_pool_matches_location(
+                  pool, loc, site.layer, topo->expert_compact_layout))
             continue;
           ++ready_same_layer;
           if (!topo->hold_for_compute(loc.layer_idx, loc.expert_id,
                                       loc.device_ptr, false))
             continue;
-          const size_t offset = (size_t)(loc.device_ptr - pool.base);
-          if (pool.stride == 0 || offset % pool.stride ||
-              offset / pool.stride >= (size_t)pool.slots) {
+          int physical_id = -1;
+          if (!v41_cache_pool_slot(pool, loc.device_ptr, physical_id)) {
             topo->release_hold(loc.layer_idx, loc.expert_id,
                                loc.device_ptr, false);
             throw std::runtime_error(
                 "DeepSeek same-layer dummy cache slot is out of bounds");
           }
-          const int physical_id = (int)(offset / pool.stride);
           if (std::find(dummy[b].begin(), dummy[b].end(), physical_id) !=
               dummy[b].end()) {
             topo->release_hold(loc.layer_idx, loc.expert_id,
@@ -1142,7 +1261,10 @@ void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
             if (slot_index >= topo->expert_vram_cache.size()) continue;
             const auto &slot = topo->expert_vram_cache[slot_index];
             if (slot.gpu_id == pool.device && !slot.memcpy_broken)
-              ++local_dynamic_slots;
+              if (!topo->expert_compact_layout ||
+                  (pool.shared_dynamic ? slot.pool_layer == -1
+                                       : slot.pool_layer == site.layer))
+                ++local_dynamic_slots;
           }
           for (int expert = 0; expert < c.n_experts; ++expert) {
             auto *block = cpu_spill_pins.blocks[(size_t)expert];
@@ -1163,6 +1285,36 @@ void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
                 site.cpu_cold_prefill, dummy[b].size(), local_dynamic_slots,
                 stage_candidates);
         if (!stage_plan) {
+          {
+            // Per-filter breakdown of every slot, to show which condition
+            // removes the shared dynamic slots from the dummy search.
+            std::lock_guard<std::recursive_mutex> lock(topo->cache_mutex);
+            std::vector<char> in_unpinned(topo->expert_vram_cache.size(), 0);
+            for (size_t i : topo->unpinned_slot_indices)
+              if (i < in_unpinned.size()) in_unpinned[i] = 1;
+            size_t total = 0, on_gpu = 0, shared = 0, shared_unpinned = 0,
+                   shared_pinned = 0, shared_held = 0, shared_broken = 0,
+                   shared_occupied = 0, shared_noptr = 0;
+            for (size_t i = 0; i < topo->expert_vram_cache.size(); ++i) {
+              const auto &s = topo->expert_vram_cache[i];
+              ++total;
+              if (s.gpu_id != pool.device) continue;
+              ++on_gpu;
+              if (s.pool_layer != -1) continue;
+              ++shared;
+              shared_unpinned += in_unpinned[i];
+              shared_pinned += s.pinned;
+              shared_held += s.temp_pin_count > 0;
+              shared_broken += s.memcpy_broken;
+              shared_occupied += s.layer_idx >= 0;
+              shared_noptr += s.device_ptr == nullptr;
+            }
+            LOG_ERROR("[DSV41-CACHE-MOE] slot census layer=%d GPU=%d total=%zu on_gpu=%zu shared=%zu in_unpinned_index=%zu pinned=%zu held=%zu memcpy_broken=%zu occupied=%zu null_ptr=%zu unpinned_index_size=%zu\n",
+                      site.layer, pool.device, total, on_gpu, shared,
+                      shared_unpinned, shared_pinned, shared_held,
+                      shared_broken, shared_occupied, shared_noptr,
+                      topo->unpinned_slot_indices.size());
+          }
           LOG_ERROR("[DSV41-CACHE-MOE] layer=%d GPU=%d dummy preflight failed: %s; pool_slots=%d ready_same_layer=%zu pinned_DDR_candidates=%zu local_dynamic_slots=%zu compact=%d\n",
                     site.layer, pool.device, stage_plan.error.c_str(),
                     pool.slots, ready_same_layer, ddr_dummy_candidates,
@@ -1185,11 +1337,14 @@ void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
             loc = topo->find_expert(site.layer, expert);
             if (loc && loc->gpu_id == pool.device && loc->device_ptr &&
                 loc->upload_ready &&
-                (!topo->expert_compact_layout ||
-                 loc->pool_layer == site.layer)) {
+                v41_cache_pool_matches_location(
+                    pool, *loc, site.layer, topo->expert_compact_layout)) {
               held = topo->hold_for_compute(site.layer, expert,
                                             loc->device_ptr, false);
-            } else if (!loc) {
+            } else if (!loc ||
+                       !v41_cache_pool_matches_location(
+                           pool, *loc, site.layer,
+                           topo->expert_compact_layout)) {
               // Use the existing cache allocation. The DDR source remains
               // pinned by cpu_spill_pins while the CPU worker uses it.
               auto *victim = topo->evict_lru(
@@ -1200,22 +1355,22 @@ void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
                                           pool.device);
               held = loc && loc->gpu_id == pool.device && loc->device_ptr &&
                   loc->upload_ready &&
-                  (!topo->expert_compact_layout ||
-                   loc->pool_layer == site.layer) &&
+                  v41_cache_pool_matches_location(
+                      pool, *loc, site.layer,
+                      topo->expert_compact_layout) &&
                   topo->hold_for_compute(site.layer, expert,
                                          loc->device_ptr, false);
             }
             if (held) {
-              const size_t offset = (size_t)(loc->device_ptr - pool.base);
-              if (pool.stride == 0 || offset % pool.stride ||
-                  offset / pool.stride >= (size_t)pool.slots) {
+              int physical_id = -1;
+              if (!v41_cache_pool_slot(pool, loc->device_ptr, physical_id)) {
                 topo->release_hold(site.layer, expert, loc->device_ptr, false);
                 throw std::runtime_error(
                     "DeepSeek staged dummy slot is outside its GPU pool");
               }
               site.holds.push_back(
                   {topo, site.layer, expert, loc->device_ptr});
-              dummy[b].push_back((int)(offset / pool.stride));
+              dummy[b].push_back(physical_id);
             }
           }
           if (!dummy[b].empty()) {
@@ -1292,6 +1447,15 @@ void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
         cpu_spill_ids_match,
         cpu_spill_pins = std::move(cpu_spill_pins), clamp]() mutable {
       const auto cpu_begin = std::chrono::steady_clock::now();
+      if (!cpu_prefill) {
+        // Decode misses are bandwidth-bound single-token dots. SMT siblings
+        // only add contention, so use one OpenMP thread per physical core.
+        // This worker is a fresh std::async thread, so the setting applies
+        // to its own team only (measured: decode +3.5%, prefill unchanged).
+        static const int decode_threads =
+            std::max(1, (int)std::thread::hardware_concurrency() / 2);
+        omp_set_num_threads(decode_threads);
+      }
       std::vector<int> worker_expert_ids;
       std::vector<MoEExpertBlock *> blocks;
       if (cpu_prefill) {
@@ -1337,28 +1501,18 @@ void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
             throw std::runtime_error(
                 "DeepSeek CPU spill list invalid before DDR lookup: index=" +
                 std::to_string(i) + " id=" + std::to_string(expert));
+          blocks[i] = cpu_spill_pins.blocks[(size_t)expert];
+          if (!blocks[i])
+            throw std::runtime_error(
+                "DeepSeek CPU spill block lost its DDR pin before worker start");
         }
-        ram->get_experts_batch(e, layer, worker_expert_ids.data(),
-                               (int)worker_expert_ids.size(), blocks.data());
       }
       const size_t count = worker_expert_ids.size();
-      struct CpuRamPins {
-        RAMSafetyManager &ram;
-        std::vector<MoEExpertBlock *> &blocks;
-        size_t pinned = 0;
-        ~CpuRamPins() {
-          for (size_t i = 0; i < pinned; ++i) ram.ram_unpin(*blocks[i]);
-        }
-      } pins{*ram, blocks};
       for (size_t i = 0; i < count; ++i) {
         auto *block = blocks[i];
         if (!block || !block->gate_proj.host_ptr || !block->up_proj.host_ptr ||
             !block->down_proj.host_ptr)
           throw std::runtime_error("DeepSeek CPU cold lane could not resolve DDR expert");
-        if (!cpu_prefill) {
-          ram->ram_pin(*block);
-          ++pins.pinned;
-        }
       }
       if (cpu_prefill) {
         struct Route {
@@ -1435,7 +1589,7 @@ void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
             static_cast<int>(count), site.cpu_route_weights.data(), dim,
             inter, static_cast<int>(count), clamp);
       }
-      const bool quant_grouped = !ggml_grouped && count >= 2 &&
+      const bool quant_grouped = !ggml_grouped && count >= 1 &&
           expert_ffn_cpu_grouped_ddr(
               site.cpu_input.data(), site.cpu_output.data(), blocks,
               site.cpu_route_weights.data(), dim, inter, clamp, layer);
@@ -1534,12 +1688,35 @@ void v41_cache_cpu_merge_node(ggml_tensor *dst, int ith, int, void *ud) {
   const ggml_tensor *src = dst->src[0];
   if (!src) throw std::runtime_error("DeepSeek CPU cold-lane merge is missing GPU output");
   const size_t bytes = ggml_nbytes(dst);
-  if (bytes != ggml_nbytes(src) || !site.cpu_output_data)
+  if (bytes != ggml_nbytes(src) || !site.cpu_output_data ||
+      bytes % sizeof(float) != 0)
     throw std::runtime_error("DeepSeek CPU cold-lane merge tensor size mismatch");
+  const size_t graph_elements =
+      static_cast<size_t>(ggml_nelements(dst));
+  const size_t merge_elements =
+      zeromoe::deepseek_graph::cpu_merge_element_count(
+          site.cpu_cold_prefill, graph_elements, site.cpu_output_elements);
+  if (graph_elements != bytes / sizeof(float) ||
+      merge_elements != graph_elements ||
+      site.cpu_output_elements != graph_elements)
+    throw std::runtime_error(
+        "DeepSeek CPU cold-lane merge output element count mismatch");
   std::memcpy(dst->data, src->data, bytes);
   auto *out = static_cast<float *>(dst->data);
-  for (size_t i = 0; i < site.cpu_output.size(); ++i)
+  for (size_t i = 0; i < merge_elements; ++i)
     out[i] += site.cpu_output_data[i];
+
+  // This merge node is the completion boundary for this layer's GPU and CPU
+  // expert branches. The graph owns one site per layer, so retaining every
+  // site's compute holds until the whole prompt finishes makes the shared
+  // compact dynamic pool unusable after its first 128 uploads. Release this
+  // layer's holds now: its output is materialized, and later layers may reuse
+  // those preallocated LRU slots without moving or reallocating tensor data.
+  const size_t released_holds = site.holds.size();
+  site.release();
+  LOG_INFO("[DSV41-CACHE-MOE-RELEASE] layer=%d cpu_prefill=%d merge_elements=%zu released=%zu slot holds after merged output; shared dynamic slots are reusable\n",
+           site.layer, site.cpu_cold_prefill ? 1 : 0, merge_elements,
+           released_holds);
 }
 
 ggml_tensor *build_v41_cache_moe(FullGraph &g, ggml_tensor *cur, int layer,
@@ -1606,42 +1783,82 @@ ggml_tensor *build_v41_cache_moe(FullGraph &g, ggml_tensor *cur, int layer,
       for (const auto &loc : topo.expert_vram_cache)
         if (loc.gpu_id == dev.id && loc.pool_layer == layer)
           slots.push_back(&loc);
-      if (slots.empty()) continue;
-      std::sort(slots.begin(), slots.end(), [](const auto *a, const auto *b) {
-        return a->offset < b->offset;
-      });
-      const size_t base_offset = slots.front()->offset;
-      const size_t stride = slots.front()->size;
-      const size_t declared_stride =
-          layer >= 0 && (size_t)layer < topo.expert_layer_slab_bytes.size()
-              ? topo.expert_layer_slab_bytes[(size_t)layer]
-              : 0;
-      bool valid = stride >= required_bytes && stride != 0 &&
-                   stride == declared_stride &&
-                   base_offset <= dev.expert_cache_size &&
-                   slots.size() <= (dev.expert_cache_size - base_offset) / stride;
-      for (size_t i = 0; valid && i < slots.size(); ++i) {
-        const auto &slot = *slots[i];
-        valid = slot.pool_layer == layer && slot.size == stride &&
-                i <= (std::numeric_limits<size_t>::max() - base_offset) / stride &&
-                slot.offset == base_offset + i * stride &&
-                slot.offset <= dev.expert_cache_size &&
-                slot.size <= dev.expert_cache_size - slot.offset &&
-                slot.device_ptr == dev.expert_cache_pool + slot.offset;
+      if (!slots.empty()) {
+        std::sort(slots.begin(), slots.end(), [](const auto *a, const auto *b) {
+          return a->offset < b->offset;
+        });
+        const size_t base_offset = slots.front()->offset;
+        const size_t stride = slots.front()->size;
+        const size_t declared_stride =
+            layer >= 0 && (size_t)layer < topo.expert_layer_slab_bytes.size()
+                ? topo.expert_layer_slab_bytes[(size_t)layer]
+                : 0;
+        bool valid = stride >= required_bytes && stride != 0 &&
+                     stride == declared_stride &&
+                     base_offset <= dev.expert_cache_size &&
+                     slots.size() <=
+                         (dev.expert_cache_size - base_offset) / stride;
+        for (size_t i = 0; valid && i < slots.size(); ++i) {
+          const auto &slot = *slots[i];
+          valid = slot.pool_layer == layer && slot.size == stride &&
+                  i <= (std::numeric_limits<size_t>::max() - base_offset) / stride &&
+                  slot.offset == base_offset + i * stride &&
+                  slot.offset <= dev.expert_cache_size &&
+                  slot.size <= dev.expert_cache_size - slot.offset &&
+                  slot.device_ptr == dev.expert_cache_pool + slot.offset;
+        }
+        if (!valid) {
+          LOG_ERROR("[DSV41-CACHE-MOE] compact layer=%d GPU=%d slot region failed bounds/contiguity checks\n",
+                    layer, dev.id);
+          return nullptr;
+        }
+        site->pools.push_back({dev.id, backend, marker,
+            dev.expert_cache_pool + base_offset, stride, (int)slots.size(),
+            false});
       }
-      if (!valid || slots.size() < (size_t)c.topk) {
-        LOG_ERROR("[DSV41-CACHE-MOE] compact layer=%d GPU=%d slot region failed bounds/contiguity checks or has fewer than top-k slots\n",
-                  layer, dev.id);
-        return nullptr;
+
+      // The global-stride tail can be borrowed by any layer during prefill
+      // and decode. It has its own GGML MUL_MAT_ID view because its slot
+      // stride differs from the compact per-layer regions on this GPU.
+      std::vector<const ExpertLocation *> dynamic_slots;
+      for (const auto &loc : topo.expert_vram_cache)
+        if (loc.gpu_id == dev.id && loc.pool_layer == -1)
+          dynamic_slots.push_back(&loc);
+      if (!dynamic_slots.empty()) {
+        std::sort(dynamic_slots.begin(), dynamic_slots.end(),
+                  [](const auto *a, const auto *b) {
+                    return a->offset < b->offset;
+                  });
+        const size_t base_offset = dynamic_slots.front()->offset;
+        const size_t stride = topo.expert_max_slab_size;
+        bool valid = stride >= required_bytes && stride != 0 &&
+                     base_offset <= dev.expert_cache_size &&
+                     dynamic_slots.size() <=
+                         (dev.expert_cache_size - base_offset) / stride;
+        for (size_t i = 0; valid && i < dynamic_slots.size(); ++i) {
+          const auto &slot = *dynamic_slots[i];
+          valid = slot.pool_layer == -1 && slot.size == stride &&
+                  i <= (std::numeric_limits<size_t>::max() - base_offset) / stride &&
+                  slot.offset == base_offset + i * stride &&
+                  slot.offset <= dev.expert_cache_size &&
+                  slot.size <= dev.expert_cache_size - slot.offset &&
+                  slot.device_ptr == dev.expert_cache_pool + slot.offset;
+        }
+        if (!valid) {
+          LOG_ERROR("[DSV41-CACHE-MOE] layer=%d GPU=%d shared dynamic pool failed bounds/contiguity checks\n",
+                    layer, dev.id);
+          return nullptr;
+        }
+        site->pools.push_back({dev.id, backend, marker,
+            dev.expert_cache_pool + base_offset, stride,
+            (int)dynamic_slots.size(), true});
       }
-      site->pools.push_back({dev.id, backend, marker,
-          dev.expert_cache_pool + base_offset, stride, (int)slots.size()});
     } else {
       if (topo.expert_slab_size == 0 ||
           dev.expert_cache_size < topo.expert_slab_size) continue;
       site->pools.push_back({dev.id, backend, marker, dev.expert_cache_pool,
           topo.expert_slab_size,
-          int(dev.expert_cache_size / topo.expert_slab_size)});
+          int(dev.expert_cache_size / topo.expert_slab_size), false});
     }
   }
   if (site->pools.empty()) {
@@ -1684,12 +1901,20 @@ ggml_tensor *build_v41_cache_moe(FullGraph &g, ggml_tensor *cur, int layer,
         return (ggml_tensor *)nullptr;
       }
       const size_t plane_bytes = t->nb[1] * (size_t)ne1;
-      if (offset > pool.stride || plane_bytes > pool.stride - offset)
+      if (offset > pool.stride || plane_bytes > pool.stride - offset) {
+        LOG_ERROR("[DSV41-CACHE-MOE] layer=%d GPU=%d tensor plane exceeds compact slot: offset=%zu plane=%zu stride=%zu type=%u shape=[%d,%d]\n",
+                  layer, pool.device, offset, plane_bytes, pool.stride,
+                  (unsigned)m->type, ne0, ne1);
         return (ggml_tensor *)nullptr;
+      }
       const uintptr_t tensor_address =
           reinterpret_cast<uintptr_t>(pool.base + offset);
-      if ((tensor_address % 16) != 0 || (pool.stride % 16) != 0)
+      if ((tensor_address % 16) != 0 || (pool.stride % 16) != 0) {
+        LOG_ERROR("[DSV41-CACHE-MOE] layer=%d GPU=%d tensor view lacks 16-byte alignment: addr_mod16=%zu stride_mod16=%zu stride=%zu offset=%zu type=%u shape=[%d,%d]\n",
+                  layer, pool.device, tensor_address % 16, pool.stride % 16,
+                  pool.stride, offset, (unsigned)m->type, ne0, ne1);
         return (ggml_tensor *)nullptr;
+      }
       t->nb[2] = pool.stride; t->nb[3] = pool.stride * pool.slots;
       t->data = pool.base + offset; t->buffer = pool.marker;
       ggml_set_name(t, ("dsv41_cache_view_gpu" + std::to_string(pool.device)).c_str());
@@ -1700,8 +1925,9 @@ ggml_tensor *build_v41_cache_moe(FullGraph &g, ggml_tensor *cur, int layer,
     ew.up = tensor(um, gb, g.D, c.moe_inter);
     ew.down = tensor(dm, gb + ub, c.moe_inter, g.D);
     if (!ew.valid()) {
-      LOG_ERROR("[DSV41-CACHE-MOE] layer=%d expert weight view invalid on GPU %d\n",
-                layer, pool.device);
+      LOG_ERROR("[DSV41-CACHE-MOE] layer=%d expert weight view invalid on GPU %d: gate=%p up=%p down=%p stride=%zu slots=%d gate_bytes=%zu up_bytes=%zu down_bytes=%zu\n",
+                layer, pool.device, (void *)ew.gate, (void *)ew.up,
+                (void *)ew.down, pool.stride, pool.slots, gb, ub, db);
       return nullptr;
     }
     const size_t offset = (size_t)(g.D + b * 2 * c.topk) * sizeof(float);
@@ -2012,6 +2238,112 @@ ggml_tensor *v41_build_cache_moe(FullGraph &g, ggml_tensor *cur, int layer,
 
 using namespace glm5next_graph;
 
+bool deepseek_v41_rebalance_prefill_dynamic_cache(
+    StreamingEngine &engine, RAMSafetyManager &ram,
+    const std::vector<uint64_t> &prefill_route_counts) {
+  if (!engine.dsv41_strategy_test_isolation ||
+      !engine.qwen_ram_preload_all_experts || !engine.gpu)
+    return false;
+  auto &topo = engine.gpu->topology;
+  const size_t dynamic_slots =
+      (size_t)std::max(0, topo.expert_compact_shared_dynamic_slots);
+  const int n_experts = engine.model_file.architecture_config.n_experts;
+  const int n_layers = engine.model_file.architecture_config.n_layers;
+  if (!topo.expert_compact_layout || dynamic_slots == 0 || n_experts <= 0 ||
+      n_layers <= 0 ||
+      prefill_route_counts.size() < (size_t)n_layers * (size_t)n_experts)
+    return false;
+
+  struct Candidate { int layer; int expert; uint64_t count; };
+  std::vector<std::vector<Candidate>> by_layer((size_t)n_layers);
+  std::unordered_set<uint64_t> pinned;
+  const auto key = [n_experts](int layer, int expert) {
+    return ((uint64_t)(uint32_t)layer << 32) | (uint32_t)expert;
+  };
+  {
+    std::lock_guard<std::recursive_mutex> lock(topo.cache_mutex);
+    for (const auto &loc : topo.expert_vram_cache) {
+      if (loc.pinned && loc.layer_idx >= 0 && loc.expert_id >= 0)
+        pinned.insert(key(loc.layer_idx, loc.expert_id));
+    }
+  }
+  size_t observed = 0;
+  for (int layer = 0; layer < n_layers; ++layer) {
+    auto &ranked = by_layer[(size_t)layer];
+    for (int expert = 0; expert < n_experts; ++expert) {
+      const uint64_t count = prefill_route_counts[
+          (size_t)layer * (size_t)n_experts + (size_t)expert];
+      if (!count) continue;
+      ++observed;
+      if (pinned.contains(key(layer, expert))) continue;
+      ranked.push_back({layer, expert, count});
+    }
+    std::stable_sort(ranked.begin(), ranked.end(),
+        [](const Candidate &a, const Candidate &b) {
+          if (a.count != b.count) return a.count > b.count;
+          return a.expert < b.expert;
+        });
+  }
+
+  // Round-robin ranks across layers so one concentrated layer cannot use the
+  // entire shared dynamic pool. The physical pool is global; its candidate
+  // set is therefore a balanced extension of the pinned decode hot set.
+  std::vector<Candidate> selected;
+  selected.reserve(dynamic_slots);
+  for (size_t rank = 0; selected.size() < dynamic_slots; ++rank) {
+    bool added = false;
+    for (int layer = 0; layer < n_layers && selected.size() < dynamic_slots;
+         ++layer) {
+      const auto &ranked = by_layer[(size_t)layer];
+      if (rank >= ranked.size()) continue;
+      selected.push_back(ranked[rank]);
+      added = true;
+    }
+    if (!added) break;
+  }
+  if (selected.empty()) {
+    LOG_WARN("[DSV41-PREFILL-DECODE-POOL] no non-pinned prompt experts to stage into the dynamic pool\n");
+    return false;
+  }
+
+  std::string reason;
+  if (!topo.reset_unpinned_expert_cache(dynamic_slots, &reason)) {
+    LOG_WARN("[DSV41-PREFILL-DECODE-POOL] cannot reset shared dynamic slots: %s\n",
+             reason.c_str());
+    return false;
+  }
+
+  size_t uploaded = 0;
+  size_t source_misses = 0;
+  size_t uploaded_bytes = 0;
+  for (const Candidate &candidate : selected) {
+    if (topo.main_layer_has(candidate.layer, candidate.expert)) continue;
+    auto *block = ram.get_expert(engine, candidate.layer, candidate.expert);
+    if (!block || !block->slab_buffer) {
+      ++source_misses;
+      continue;
+    }
+    ram.ram_pin(*block);
+    const size_t bytes = block->gate_proj.meta.size_bytes +
+        block->up_proj.meta.size_bytes + block->down_proj.meta.size_bytes;
+    auto *loc = topo.upload_expert(candidate.layer, candidate.expert,
+                                   block->slab_buffer, bytes);
+    const bool ready = loc && loc->device_ptr && loc->upload_ready &&
+        (!topo.expert_compact_layout || loc->pool_layer == -1);
+    ram.ram_unpin(*block);
+    if (!ready) {
+      ++source_misses;
+      continue;
+    }
+    ++uploaded;
+    uploaded_bytes += bytes;
+  }
+  LOG_INFO("[DSV41-PREFILL-DECODE-POOL] prompt experts=%zu selected=%zu uploaded=%zu bytes=%.3f GB DDR_source_misses=%zu; shared preallocated slots were reused\n",
+           observed, selected.size(), uploaded,
+           (double)uploaded_bytes / 1.0e9, source_misses);
+  return uploaded > 0;
+}
+
 bool deepseek_v41_full_graph_enabled() { return v41_full_graph_enabled(); }
 
 int deepseek_v41_full_graph_device_expert_layers() {
@@ -2236,6 +2568,12 @@ bool deepseek_v41_full_graph_run(StreamingEngine &engine, float *hidden_states,
 }
 
 #else
+
+bool deepseek_v41_rebalance_prefill_dynamic_cache(
+    StreamingEngine &, RAMSafetyManager &,
+    const std::vector<uint64_t> &) {
+  return false;
+}
 
 bool deepseek_v41_full_graph_enabled() { return false; }
 int deepseek_v41_full_graph_device_expert_layers() { return 0; }

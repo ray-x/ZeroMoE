@@ -22,6 +22,14 @@ import tomllib
 
 GIB = 1024 ** 3
 MIB = 1024 ** 2
+PSI_FULL_LIMIT_PCT = 4.0
+PSI_FULL_SAMPLES = 2
+PSI_FULL_LOW_MEM_GIB = 32.0
+PSI_SOME_LIMIT_PCT = 20.0
+PSI_SOME_SAMPLES = 2
+PSI_SOME_LOW_MEM_GIB = 48.0
+SWAPOUT_LIMIT_MIB_S = 64.0
+SWAPOUT_SAMPLES = 2
 
 
 def parse_meminfo(path: Path = Path("/proc/meminfo")) -> dict[str, int]:
@@ -40,7 +48,7 @@ def parse_status(path: Path) -> dict[str, int]:
     result: dict[str, int] = {}
     for line in path.read_text().splitlines():
         key, sep, value = line.partition(":")
-        if sep and key in {"VmRSS", "VmSwap", "VmLck"}:
+        if sep and key in {"VmRSS", "VmSwap", "VmLck", "VmPin"}:
             result[key] = int(value.split()[0]) * 1024
     return result
 
@@ -63,15 +71,22 @@ def pressure_reasons(
     swapout_mib_s: float,
     swapout_streak: int,
     live_floor_gib: float,
+    psi_some_avg10_pct: float = 0.0,
+    some_psi_streak: int = 0,
     # The previous DeepSeek run escalated to 39+ GiB system swap and froze
     # the host. Stop on early signs of new swapping instead of waiting for
-    # severe pressure.
+    # severe pressure. PSI-only stops are gated on low MemAvailable because
+    # SSD-heavy preload showed small PSI with ample RAM and no material swap.
     process_swap_limit_gib: float = 0.0625,  # 64 MiB
     system_swap_growth_limit_gib: float = 0.125,  # 128 MiB
-    psi_full_limit_pct: float = 1.0,
-    psi_full_samples: int = 1,
-    swapout_limit_mib_s: float = 1.0,
-    swapout_samples: int = 1,
+    psi_full_limit_pct: float = PSI_FULL_LIMIT_PCT,
+    psi_full_samples: int = PSI_FULL_SAMPLES,
+    psi_full_low_mem_gib: float = PSI_FULL_LOW_MEM_GIB,
+    psi_some_limit_pct: float = PSI_SOME_LIMIT_PCT,
+    psi_some_samples: int = PSI_SOME_SAMPLES,
+    psi_some_low_mem_gib: float = PSI_SOME_LOW_MEM_GIB,
+    swapout_limit_mib_s: float = SWAPOUT_LIMIT_MIB_S,
+    swapout_samples: int = SWAPOUT_SAMPLES,
 ) -> list[str]:
     """Pure policy function, also used by the synthetic safety test."""
     reasons: list[str] = []
@@ -84,11 +99,21 @@ def pressure_reasons(
             "system SwapUsed grew more than "
             f"{system_swap_growth_limit_gib:.2f} GiB from launch baseline"
         )
-    if (psi_full_avg10_pct > psi_full_limit_pct and
+    if (memavailable_gib < psi_full_low_mem_gib and
+            psi_full_avg10_pct > psi_full_limit_pct and
             full_psi_streak >= psi_full_samples):
         reasons.append(
             "memory PSI full avg10 exceeded "
-            f"{psi_full_limit_pct:.1f}% for consecutive samples"
+            f"{psi_full_limit_pct:.1f}% below {psi_full_low_mem_gib:.1f} GiB "
+            "MemAvailable for consecutive samples"
+        )
+    if (memavailable_gib < psi_some_low_mem_gib and
+            psi_some_avg10_pct > psi_some_limit_pct and
+            some_psi_streak >= psi_some_samples):
+        reasons.append(
+            "memory PSI some avg10 exceeded "
+            f"{psi_some_limit_pct:.1f}% below {psi_some_low_mem_gib:.1f} GiB "
+            "MemAvailable for consecutive samples"
         )
     if (swapout_mib_s > swapout_limit_mib_s and
             swapout_streak >= swapout_samples):
@@ -201,6 +226,7 @@ def run(args: argparse.Namespace) -> int:
     previous_pages: int | None = None
     previous_mono: float | None = None
     full_psi_streak = 0
+    some_psi_streak = 0
     swapout_streak = 0
     output = args.output.resolve()
     emergency_path = args.emergency_output.resolve()
@@ -209,7 +235,7 @@ def run(args: argparse.Namespace) -> int:
         writer = csv.writer(stream)
         writer.writerow([
             "utc", "elapsed_s", "pid", "MemAvailable_GiB", "SwapUsed_GiB",
-            "SwapGrowth_GiB", "VmRSS_GiB", "VmSwap_GiB", "VmLck_GiB",
+            "SwapGrowth_GiB", "VmRSS_GiB", "VmSwap_GiB", "VmLck_GiB", "VmPin_GiB",
             "psi_some_avg10", "psi_full_avg10", "swapout_MiB_s",
             "emergency_stop", "emergency_reason",
         ])
@@ -244,12 +270,23 @@ def run(args: argparse.Namespace) -> int:
                     elapsed = max(0.001, now - previous_mono)
                     swapout_mib_s = max(0, pages - previous_pages) * page_size / MIB / elapsed
                 previous_pages, previous_mono = pages, now
-                full_psi_streak = full_psi_streak + 1 if psi_full > 1.0 else 0
-                swapout_streak = swapout_streak + 1 if swapout_mib_s > 1.0 else 0
+                full_psi_streak = (
+                    full_psi_streak + 1
+                    if psi_full > PSI_FULL_LIMIT_PCT else 0
+                )
+                some_psi_streak = (
+                    some_psi_streak + 1
+                    if psi_some > PSI_SOME_LIMIT_PCT else 0
+                )
+                swapout_streak = (
+                    swapout_streak + 1
+                    if swapout_mib_s > SWAPOUT_LIMIT_MIB_S else 0
+                )
                 sample = {
                     "memavailable_gib": available / GIB,
                     "vm_swap_gib": status.get("VmSwap", 0) / GIB,
                     "swap_used_gib": swap_used_gib,
+                    "psi_some_avg10_pct": psi_some,
                     "psi_full_avg10_pct": psi_full,
                     "swapout_mib_s": swapout_mib_s,
                 }
@@ -257,6 +294,7 @@ def run(args: argparse.Namespace) -> int:
                     **sample,
                     baseline_swap_gib=baseline_swap_gib,
                     full_psi_streak=full_psi_streak,
+                    some_psi_streak=some_psi_streak,
                     swapout_streak=swapout_streak,
                     live_floor_gib=live_floor_gib,
                 )
@@ -268,6 +306,7 @@ def run(args: argparse.Namespace) -> int:
                     round(status.get("VmRSS", 0) / GIB, 3),
                     round(sample["vm_swap_gib"], 3),
                     round(status.get("VmLck", 0) / GIB, 3),
+                    round(status.get("VmPin", 0) / GIB, 3),
                     psi_some, psi_full, round(swapout_mib_s, 3),
                     bool(reasons), "; ".join(reasons),
                 ])

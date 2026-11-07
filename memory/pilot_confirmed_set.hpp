@@ -67,3 +67,12 @@ inline bool was_pilot_confirmed_resident(int layer_idx, int expert_id) {
     }
     return false;
 }
+
+// Request-boundary cache-isolation tests restore a fixed pinned hot set and
+// empty only their reserved dynamic slots. The previous request's pilot
+// confirmation must not protect an identity from that fresh baseline.
+inline void clear_pilot_confirmed_resident() {
+    auto& s = pilot_confirmed_resident_set();
+    std::lock_guard<std::mutex> lock(s.m);
+    s.count = 0;
+}

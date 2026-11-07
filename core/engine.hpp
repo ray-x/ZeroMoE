@@ -376,6 +376,10 @@ public:
         zeromoe::graph::MoEExecutionKind::CacheBacked;
     zeromoe::graph::MoEExecutionKind moe_decode_execution =
         zeromoe::graph::MoEExecutionKind::CacheBacked;
+    // DeepSeek V4.1 DDR-miss mode, reloaded at API request boundaries for
+    // strategy A/B tests without rebuilding the model or cache pools.
+    std::atomic<int> dsv41_decode_moe_miss_strategy{0};
+    bool dsv41_strategy_test_isolation = false;
 
     std::unordered_map<std::string, QuantizedTensor> resident_layers;
     std::vector<std::vector<MoEExpertBlock>> layers_experts;

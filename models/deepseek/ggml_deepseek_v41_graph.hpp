@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cstdint>
+#include <vector>
+
 // Whole-prefill graph for DeepSeek-V4.1-Flash. The graph covers Engram,
 // shared ratio-compressed attention, hyper-connections, and routed FFNs.
 
@@ -33,6 +36,9 @@ bool deepseek_v41_full_graph_decode_run(StreamingEngine &engine,
                                         float *logits = nullptr, int vocab = 0);
 void deepseek_v41_full_graph_decode_shutdown();
 int deepseek_v41_full_graph_device_expert_layers();
+bool deepseek_v41_rebalance_prefill_dynamic_cache(
+    StreamingEngine &engine, RAMSafetyManager &ram,
+    const std::vector<uint64_t> &prefill_route_counts);
 bool deepseek_v41_full_graph_prepare(StreamingEngine &engine, int S,
                                      int pos_base, const int *token_ids);
 bool deepseek_v41_full_graph_run(StreamingEngine &engine, float *hidden_states,

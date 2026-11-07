@@ -1,5 +1,6 @@
 // Native test harness: tests_expert_cache (split from tests/native/main_test.cpp).
 #include "native_tests.hpp"
+#include "deepseek_cache_policy.hpp"
 
 // ------------------------------------------------------------------
 // 19. sanity_check_unpacked_format()'s RELAXATION itself, exercised
@@ -239,11 +240,120 @@ bool test_compact_vram_slot_planner() {
             100, 4, layer_bytes, 0, std::vector<int>{1});
     ok = ok && cpu_affinity_excluded == std::vector<int>({4, 0, 4});
 
+    // DeepSeek keeps a small uniform-stride shared pool at the tail of the
+    // same allocation so prefill can reuse those slots across compact layer
+    // regions. The per-layer planner must fit inside the bytes left after
+    // reserving that shared segment.
+    constexpr size_t shared_slot_bytes = 40;
+    constexpr size_t shared_slots = 1;
+    const size_t compact_static_bytes = 100 - shared_slot_bytes * shared_slots;
+    const std::vector<int> hybrid = GpuTopology::compact_layer_slot_counts(
+        compact_static_bytes, 4, layer_bytes);
+    size_t hybrid_static_used = 0;
+    for (size_t l = 0; l < hybrid.size(); ++l)
+        hybrid_static_used += (size_t)hybrid[l] * layer_bytes[l];
+    ok = ok && hybrid_static_used <= compact_static_bytes &&
+         hybrid_static_used + shared_slot_bytes * shared_slots <= 100 &&
+         hybrid[0] > 0 && hybrid[1] > 0 && hybrid[2] > 0;
+
+    // A DeepSeek-style hybrid pool keeps variable-size compact layer regions
+    // and reserves a byte-proportional uniform tail for cross-layer prefill
+    // staging. Verify the global slot count is exact and its per-GPU byte
+    // slices remain inside the original pools.
+    const std::vector<size_t> gpu_pool_bytes = {17540800000ULL, 15292400000ULL};
+    constexpr size_t shared_stride = 12307680;
+    const auto shared = GpuTopology::compact_shared_dynamic_slot_counts(
+        128, gpu_pool_bytes, shared_stride);
+    const auto core_shared =
+        GpuTopology::compact_shared_dynamic_slot_counts(
+            128, gpu_pool_bytes, shared_stride, 0);
+    size_t shared_total = 0;
+    bool shared_fits = shared.size() == gpu_pool_bytes.size();
+    for (size_t i = 0; i < shared.size(); ++i) {
+        shared_total += shared[i];
+        const size_t dynamic_bytes = shared[i] * shared_stride;
+        shared_fits = shared_fits && dynamic_bytes <= gpu_pool_bytes[i];
+        const auto local = GpuTopology::compact_layer_slot_counts(
+            gpu_pool_bytes[i] - dynamic_bytes, 4, layer_bytes);
+        size_t local_bytes = 0;
+        for (size_t layer = 0; layer < local.size(); ++layer)
+            local_bytes += (size_t)local[layer] * layer_bytes[layer];
+        shared_fits = shared_fits && local_bytes + dynamic_bytes <= gpu_pool_bytes[i];
+    }
+    ok = ok && shared_fits && shared_total == 128 &&
+         shared[0] > 0 && shared[1] > 0 &&
+         core_shared == std::vector<size_t>({128, 0});
+
+    // Match the configured decimal-byte pools from the DeepSeek run. The
+    // 3090 pool ends at 8 mod 16, so reserving a 16-byte-aligned dynamic tail
+    // must align its start down and leave only the final 8 bytes unused.
+    constexpr size_t configured_3090_pool = 17540769000ULL;
+    constexpr size_t configured_dynamic_slots = 128;
+    constexpr size_t configured_dynamic_bytes =
+        configured_dynamic_slots * shared_stride;
+    const size_t dynamic_start =
+        GpuTopology::compact_shared_dynamic_static_bytes(
+            configured_3090_pool, configured_dynamic_slots, shared_stride, 16);
+    ok = ok && dynamic_start != std::numeric_limits<size_t>::max() &&
+         dynamic_start % 16 == 0 &&
+         dynamic_start + configured_dynamic_bytes <= configured_3090_pool &&
+         configured_3090_pool -
+                 (dynamic_start + configured_dynamic_bytes) < 16;
+    const size_t invalid_dynamic_start =
+        GpuTopology::compact_shared_dynamic_static_bytes(
+            100, 3, 40, 16);
+    ok = ok && invalid_dynamic_start == std::numeric_limits<size_t>::max();
+
+    // Prefill spill data lives in the graph-sized scratch buffer even though
+    // the decode output vector is empty. Decode instead merges its D x 1
+    // per-site vector. This guards the element-count choice used by the CPU
+    // merge node for both phases.
+    const size_t prefill_merge_elements =
+        zeromoe::deepseek_graph::cpu_merge_element_count(true, 20'000, 0);
+    const size_t decode_merge_elements =
+        zeromoe::deepseek_graph::cpu_merge_element_count(false, 5'120, 5'120);
+    ok = ok && prefill_merge_elements == 20'000 &&
+         decode_merge_elements == 5'120;
+
+    // A per-layer graph completion must release its compute hold before the
+    // next layer tries to reuse the shared dynamic slot. While held, LRU must
+    // refuse the slot; after release, the same preallocated slot is evictable.
+    GpuTopology hold_topology;
+    std::array<uint8_t, 16> held_bytes{};
+    ExpertLocation held_slot;
+    held_slot.gpu_id = 0;
+    held_slot.device_ptr = held_bytes.data();
+    held_slot.offset = 0;
+    held_slot.size = held_bytes.size();
+    held_slot.pool_layer = -1;
+    held_slot.layer_idx = 7;
+    held_slot.expert_id = 11;
+    held_slot.upload_ready = true;
+    hold_topology.expert_vram_cache.push_back(held_slot);
+    hold_topology.expert_vram_cache_cap = 1;
+    hold_topology.unpinned_slot_indices.push_back(0);
+    const bool hold_acquired = hold_topology.hold_for_compute(
+        7, 11, held_bytes.data(), false);
+    const bool held_slot_protected =
+        hold_topology.evict_lru(1, nullptr, nullptr, -1, 8) == nullptr;
+    hold_topology.release_hold(7, 11, held_bytes.data(), false);
+    const auto reusable_slot =
+        hold_topology.evict_lru(1, nullptr, nullptr, -1, 8);
+    const bool released_slot_reusable = reusable_slot ==
+        &hold_topology.expert_vram_cache[0] &&
+        hold_topology.expert_vram_cache[0].layer_idx == -1;
+    ok = ok && hold_acquired && held_slot_protected && released_slot_reusable;
+
     std::cout << "  counts=";
     for (int count : counts) std::cout << count << " ";
-    std::cout << "used=" << used << " bytes, full-prefix=";
+    std::cout << "used=" << used << " bytes, hybrid-static-used="
+              << hybrid_static_used << " bytes, full-prefix=";
     for (int count : full_prefix) std::cout << count << " ";
-    std::cout << "-> " << (ok ? "PASSED" : "FAILED") << "\n";
+    std::cout << "shared-dynamic-start=" << dynamic_start
+              << " per-layer-release-reuse="
+              << (released_slot_reusable ? "PASSED" : "FAILED")
+              << " prefill-cpu-merge-elements=" << prefill_merge_elements
+              << " -> " << (ok ? "PASSED" : "FAILED") << "\n";
     return ok;
 }
 

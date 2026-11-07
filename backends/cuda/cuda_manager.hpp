@@ -108,6 +108,11 @@ extern "C" void launch_dequant_wuv_int8(
 extern "C" void launch_dsv4_score_softmax(
     float* scores, const float* sinks, int H, int T, float scale, cudaStream_t stream);
 
+extern "C" void launch_dsv41_head_attention(
+    const float* q, const float* win, const float* comp, const int* sel,
+    int nsel, const float* sinks, int pos, int past, int window, int qh,
+    int H, float scale, float* out, cudaStream_t stream);
+
 class CudaManager {
 public:
     GpuTopology topology;
@@ -136,6 +141,9 @@ public:
     float* d_outproj_y = nullptr;
     size_t d_outproj_x_cap = 0;
     size_t d_outproj_y_cap = 0;
+    // DeepSeek-V4.1 single-token head attention scratch (dsv41_head_attention.cu).
+    void* d_ha_in = nullptr; void* h_ha_in = nullptr; size_t d_ha_in_cap = 0;
+    float* d_ha_out = nullptr; float* h_ha_out = nullptr; size_t d_ha_out_cap = 0;
 
     // Event-ordered copy path for dense_matmul_host. It is opt-in because
     // the legacy default-stream path remains the compatibility baseline for
@@ -569,6 +577,14 @@ public:
         if (dense_compute_done) cudaEventDestroy(dense_compute_done);
         if (dense_copy_stream) cudaStreamDestroy(dense_copy_stream);
         if (outproj_stream) cudaStreamDestroy(outproj_stream);
+        for (auto& l : dsv41_ha_layers) {
+            if (l.d_win) cudaFree(l.d_win);
+            if (l.d_comp) cudaFree(l.d_comp);
+        }
+        if (d_ha_in) cudaFree(d_ha_in);
+        if (d_ha_out) cudaFree(d_ha_out);
+        if (h_ha_in) cudaFreeHost(h_ha_in);
+        if (h_ha_out) cudaFreeHost(h_ha_out);
         if (d_outproj_x) cudaFree(d_outproj_x);
         if (d_outproj_y) cudaFree(d_outproj_y);
         if (d_x) cudaFree(d_x);
@@ -2342,9 +2358,13 @@ public:
     // Allocate expert VRAM cache on vault GPU(s) based on model geometry
     void setup_expert_cache(size_t expert_slab_bytes, int n_experts, const EngineConfig& config,
                             const std::vector<size_t>& layer_slab_bytes = {},
-                            bool disable_auto_cache = false) {
+                            bool disable_auto_cache = false,
+                            int compact_shared_dynamic_slots = 0,
+                            int compact_shared_dynamic_gpu_id = -1) {
         topology.allocate_expert_cache(expert_slab_bytes, n_experts, &config,
-                                       layer_slab_bytes, disable_auto_cache);
+                                       layer_slab_bytes, disable_auto_cache,
+                                       compact_shared_dynamic_slots,
+                                       compact_shared_dynamic_gpu_id);
 
         // Three-tier caching: Allocate active layer area for temporary expert storage
         // This provides a workspace for current-layer experts without evicting LRU residents
@@ -3269,6 +3289,155 @@ public:
             return false;
         if (cudaStreamSynchronize(outproj_stream) != cudaSuccess) return false;
         perf().n_dense_gpu_calls.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    // Grouped attention output projection for quantized types that have no
+    // purpose-built grouped kernel (Q2_K has launch_q2_K_grouped_dot_f32_batch).
+    // One F32-activation matvec per group over that group's contiguous weight
+    // rows, so the activation stays F32 exactly as in the CPU F32 fallback.
+    // x_host: [groups * group_in]; y_host: [groups * rank]; single token.
+    bool grouped_output_proj_dense_host(
+            GGUFType wtype, const void* d_WOA, size_t group_stride_bytes,
+            int o_groups, int o_rank, int group_in, const float* x_host,
+            float* y_host) {
+        if (!d_WOA || !x_host || !y_host || o_groups <= 0 || o_rank <= 0 ||
+            group_in <= 0 || group_stride_bytes == 0)
+            return false;
+        const size_t x_bytes = (size_t)o_groups * group_in * sizeof(float);
+        const size_t y_bytes = (size_t)o_groups * o_rank * sizeof(float);
+        if (!ensure_outproj_buffers(x_bytes, y_bytes)) return false;
+        cudaSetDevice(device_id);
+        if (cudaMemcpy(d_outproj_x, x_host, x_bytes,
+                       cudaMemcpyHostToDevice) != cudaSuccess)
+            return false;
+        for (int g = 0; g < o_groups; ++g) {
+            if (!dense_matmul_device(
+                    wtype,
+                    static_cast<const uint8_t*>(d_WOA) +
+                        (size_t)g * group_stride_bytes,
+                    d_outproj_x + (size_t)g * group_in,
+                    d_outproj_y + (size_t)g * o_rank, 1, group_in, o_rank))
+                return false;
+        }
+        if (cudaGetLastError() != cudaSuccess) return false;
+        if (cudaMemcpy(y_host, d_outproj_y, y_bytes,
+                       cudaMemcpyDeviceToHost) != cudaSuccess)
+            return false;
+        perf().n_dense_gpu_calls.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    // DeepSeek-V4.1 single-token compressed-layer head attention. q/out are
+    // [H, qh]; win is the layer's sliding-window key cache [window, qh];
+    // comp rows [0, comp_blocks) are the compressed keys and sel the nsel
+    // indexer-selected block ids. K == V. Output excludes the inverse RoPE.
+    // Per-layer device mirrors of the sliding-window keys and the compressed
+    // keys. The window changes by one row per decoded token and committed
+    // compressed rows are write-once, so only new rows are uploaded; any
+    // discontinuity (position not previous+1, new request) re-uploads fully.
+    struct Dsv41HaLayer {
+        float* d_win = nullptr; int win_rows = 0; long long synced_pos = -1;
+        float* d_comp = nullptr; int comp_cap = 0; int synced_blocks = 0;
+    };
+    std::vector<Dsv41HaLayer> dsv41_ha_layers;
+    void dsv41_head_attention_invalidate() {
+        for (auto& l : dsv41_ha_layers) { l.synced_pos = -1; l.synced_blocks = 0; }
+    }
+
+    bool dsv41_head_attention_host(
+            int layer, const float* q_host, int H, int qh, const float* win_host,
+            int window, int pos, int past, const float* comp_host,
+            int comp_blocks, const int* sel_host, int nsel,
+            const float* sinks_host, float scale, float* out_host) {
+        if (layer < 0 || layer > 1024 || !q_host || !win_host || !out_host ||
+            !outproj_stream || H <= 0 || qh <= 0 || qh % 4 != 0 ||
+            window <= 0 || past <= 0 || nsel < 0 ||
+            (nsel > 0 && (!sel_host || !comp_host || comp_blocks <= 0)))
+            return false;
+        if ((size_t)layer >= dsv41_ha_layers.size())
+            dsv41_ha_layers.resize((size_t)layer + 1);
+        Dsv41HaLayer& L = dsv41_ha_layers[(size_t)layer];
+        cudaSetDevice(device_id);
+        cudaStream_t st = outproj_stream;
+        const size_t row_bytes = (size_t)qh * sizeof(float);
+        auto fail = [&]() { L.synced_pos = -1; L.synced_blocks = 0; cudaGetLastError(); return false; };
+
+        if (!L.d_win || L.win_rows != window) {
+            if (L.d_win) cudaFree(L.d_win);
+            L.d_win = nullptr;
+            if (cudaMalloc((void**)&L.d_win, (size_t)window * row_bytes) != cudaSuccess) return fail();
+            L.win_rows = window; L.synced_pos = -1;
+        }
+        if (nsel > 0 && comp_blocks > L.comp_cap) {
+            if (L.d_comp) cudaFree(L.d_comp);
+            L.d_comp = nullptr;
+            const int cap = std::max(comp_blocks, std::max(64, L.comp_cap * 2));
+            if (cudaMalloc((void**)&L.d_comp, (size_t)cap * row_bytes) != cudaSuccess) {
+                L.comp_cap = 0; return fail();
+            }
+            L.comp_cap = cap; L.synced_blocks = 0;
+        }
+        // Small per-call block: q, sinks, selected ids (one pinned copy).
+        auto align16 = [](size_t v) { return (v + 15) & ~(size_t)15; };
+        const size_t q_bytes = (size_t)H * row_bytes;
+        const size_t sink_off = q_bytes;
+        const size_t sel_off = sink_off + align16((size_t)H * sizeof(float));
+        const size_t in_bytes = sel_off + align16((size_t)std::max(nsel, 1) * sizeof(int));
+        if (in_bytes > d_ha_in_cap) {
+            if (d_ha_in) { cudaFree(d_ha_in); d_ha_in = nullptr; }
+            if (h_ha_in) { cudaFreeHost(h_ha_in); h_ha_in = nullptr; }
+            d_ha_in_cap = 0;
+            const size_t want = std::max(in_bytes, (size_t)(1u << 20));
+            if (cudaMalloc((void**)&d_ha_in, want) != cudaSuccess ||
+                cudaMallocHost((void**)&h_ha_in, want) != cudaSuccess) {
+                if (d_ha_in) { cudaFree(d_ha_in); d_ha_in = nullptr; }
+                return fail();
+            }
+            d_ha_in_cap = want;
+        }
+        if (q_bytes > d_ha_out_cap) {
+            if (d_ha_out) { cudaFree(d_ha_out); d_ha_out = nullptr; }
+            if (h_ha_out) { cudaFreeHost(h_ha_out); h_ha_out = nullptr; }
+            d_ha_out_cap = 0;
+            if (cudaMalloc((void**)&d_ha_out, q_bytes) != cudaSuccess ||
+                cudaMallocHost((void**)&h_ha_out, q_bytes) != cudaSuccess) return fail();
+            d_ha_out_cap = q_bytes;
+        }
+        char* h = static_cast<char*>(h_ha_in);
+        std::memcpy(h, q_host, q_bytes);
+        if (sinks_host) std::memcpy(h + sink_off, sinks_host, (size_t)H * sizeof(float));
+        if (nsel > 0) std::memcpy(h + sel_off, sel_host, (size_t)nsel * sizeof(int));
+
+        bool ok = cudaMemcpyAsync(d_ha_in, h_ha_in, in_bytes, cudaMemcpyHostToDevice, st) == cudaSuccess;
+        if (L.synced_pos == (long long)pos - 1) {
+            const size_t row = (size_t)(pos % window);
+            ok = ok && cudaMemcpyAsync(L.d_win + row * qh, win_host + row * qh, row_bytes,
+                                       cudaMemcpyHostToDevice, st) == cudaSuccess;
+        } else {
+            ok = ok && cudaMemcpyAsync(L.d_win, win_host, (size_t)window * row_bytes,
+                                       cudaMemcpyHostToDevice, st) == cudaSuccess;
+        }
+        if (nsel > 0 && comp_blocks > L.synced_blocks) {
+            ok = ok && cudaMemcpyAsync(L.d_comp + (size_t)L.synced_blocks * qh,
+                                       comp_host + (size_t)L.synced_blocks * qh,
+                                       (size_t)(comp_blocks - L.synced_blocks) * row_bytes,
+                                       cudaMemcpyHostToDevice, st) == cudaSuccess;
+        }
+        if (!ok) { cudaStreamSynchronize(st); return fail(); }
+        const char* d = static_cast<const char*>(d_ha_in);
+        launch_dsv41_head_attention(
+            reinterpret_cast<const float*>(d), L.d_win, L.d_comp,
+            reinterpret_cast<const int*>(d + sel_off), nsel,
+            sinks_host ? reinterpret_cast<const float*>(d + sink_off) : nullptr,
+            pos, past, window, qh, H, scale, d_ha_out, st);
+        if (cudaGetLastError() != cudaSuccess) { cudaStreamSynchronize(st); return fail(); }
+        if (cudaMemcpyAsync(h_ha_out, d_ha_out, q_bytes, cudaMemcpyDeviceToHost, st) != cudaSuccess)
+            return fail();
+        if (cudaStreamSynchronize(st) != cudaSuccess) return fail();
+        L.synced_pos = pos;
+        if (nsel > 0) L.synced_blocks = std::max(L.synced_blocks, comp_blocks);
+        std::memcpy(out_host, h_ha_out, q_bytes);
         return true;
     }
 

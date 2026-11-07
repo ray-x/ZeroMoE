@@ -6,6 +6,7 @@
 
 namespace {
 using namespace zeromoe::server;
+std::atomic<uint64_t> dsv41_strategy_request_sequence{0};
 
 class NativeBackend final : public Backend {
 public:
@@ -14,6 +15,38 @@ public:
         : engine(engine), ram(ram), tokenizer(tokenizer), prefetcher(prefetcher), config(config), kind(kind) {}
 
     Prepared prepare(const Request &request) override {
+        if (engine.family_ops.family == ModelFamily::DeepSeek_V41 &&
+            !config.source_config_path.empty()) {
+            // Reload only the testable DDR-miss strategy. The loaded model,
+            // graph, dense tensors, and cache pools remain resident. The API
+            // inference owner serializes prepare()/generate() calls, so the
+            // atomic mode is stable for the full request.
+            const auto doc = toml::parse_file(config.source_config_path);
+            if (doc.root.has("deepseek_v41_decode_moe_strategy")) {
+                const std::string mode = doc.root.get_str(
+                    "deepseek_v41_decode_moe_strategy", "h2d");
+                const int strategy = mode == "h2d" ? 0 : mode == "cpu" ? 1 :
+                                     mode == "split" ? 2 : -1;
+                if (strategy < 0)
+                    throw ApiError(400,
+                        "deepseek_v41_decode_moe_strategy must be h2d, cpu, or split");
+                if (strategy != 0 &&
+                    zeromoe::graphsettings::active_settings().tun.cache_moe_cpu_cold_decode.value == 0)
+                    throw ApiError(400,
+                        "CPU decode strategies require graph_cache_moe_cpu_cold_decode=true at startup");
+                const int previous = engine.dsv41_decode_moe_miss_strategy.exchange(
+                    strategy, std::memory_order_relaxed);
+                if (previous != strategy)
+                    LOG_INFO("[DSV41-STRATEGY] request-boundary reload: %s\n",
+                             mode.c_str());
+                const uint64_t request_id =
+                    dsv41_strategy_request_sequence.fetch_add(
+                        1, std::memory_order_relaxed) + 1;
+                LOG_INFO("[DSV41-STRATEGY] request=%llu mode=%s\n",
+                         static_cast<unsigned long long>(request_id),
+                         mode.c_str());
+            }
+        }
         Prepared p;
         const auto segments = render_chat(request, kind, config.enable_thinking,
                                           config.system_prompt, config.reasoning_effort);
@@ -55,6 +88,18 @@ public:
 
     Result generate(const Request &request, const Prepared &prepared, const std::atomic_bool &cancel,
                     const std::function<bool(const std::string &)> &emit) override {
+        if (engine.family_ops.family == ModelFamily::DeepSeek_V41 &&
+            engine.dsv41_strategy_test_isolation) {
+            std::string reason;
+            if (!engine.gpu ||
+                !engine.gpu->topology.reset_unpinned_expert_cache_for_test(
+                    static_cast<size_t>(config.full_moe_vram_dynamic_slots),
+                    &reason))
+                throw std::runtime_error(
+                    "DeepSeek strategy cache isolation failed: " +
+                    (reason.empty() ? std::string("GPU topology is unavailable") : reason));
+            LOG_INFO("[DSV41-STRATEGY] dynamic VRAM slots reset before request\n");
+        }
         GenerationControl control;
         control.cancelled = [&] { return cancel.load(std::memory_order_relaxed); };
         control.emit = emit;

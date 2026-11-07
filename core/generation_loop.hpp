@@ -14,6 +14,7 @@
 #include "async_prefetcher.hpp"
 #include "ggml_qwen4exp_graph.hpp"
 #include "ggml_glm5next_graph.hpp"
+#include "ggml_deepseek_v41_graph.hpp"
 #include "mtp_speculative.hpp"
 #include "qwen4exp_graph_mtp.hpp"
 #include "shutdown.hpp"
@@ -497,6 +498,17 @@ inline void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GG
         return stop;
     };
     if (cancelled()) return;
+    const bool dsv41_prefill_cache_handoff =
+        engine.family_ops.family == ModelFamily::DeepSeek_V41 &&
+        engine.dsv41_strategy_test_isolation &&
+        engine.qwen_ram_preload_all_experts && !engine.route_freq.empty();
+    std::vector<uint64_t> dsv41_route_freq_before;
+    if (dsv41_prefill_cache_handoff) {
+        dsv41_route_freq_before.resize(engine.route_freq.size());
+        for (size_t i = 0; i < engine.route_freq.size(); ++i)
+            dsv41_route_freq_before[i] =
+                engine.route_freq[i].load(std::memory_order_relaxed);
+    }
     engine.qwen4exp_full_graph_failure.clear();
     int max_ctx = prompt_ids.size() + max_new_tokens;
     ram_mgr.calculate_safe_cache_capacity(engine, max_ctx);
@@ -1055,6 +1067,36 @@ const bool token_loop_diag_enabled =
         pc_save(prompt_ids);
         engine.prompt_state_cache.last_hidden.assign(
             hidden_states.end() - D, hidden_states.end());
+    }
+
+    // DeepSeek's full-residency compact layout has a small, shared dynamic
+    // VRAM segment in addition to its pinned per-layer regions. Prefill has
+    // now observed the exact routes for this prompt, so rank those DDR-resident
+    // experts once and refill the existing dynamic slots before decode starts.
+    // The DDR source copies and all device allocations remain in place.
+    if (dsv41_prefill_cache_handoff) {
+        std::vector<uint64_t> request_prefill_routes(
+            engine.route_freq.size(), 0);
+        bool any_request_routes = false;
+        for (size_t i = 0; i < engine.route_freq.size(); ++i) {
+            const uint64_t current =
+                engine.route_freq[i].load(std::memory_order_relaxed);
+            const uint64_t before = dsv41_route_freq_before[i];
+            request_prefill_routes[i] = current >= before ? current - before : 0;
+            any_request_routes = any_request_routes ||
+                request_prefill_routes[i] != 0;
+        }
+        if (any_request_routes) {
+            const auto rebalance_start = std::chrono::steady_clock::now();
+            const bool rebalanced =
+                deepseek_v41_rebalance_prefill_dynamic_cache(
+                    engine, ram_mgr, request_prefill_routes);
+            const double rebalance_ms =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - rebalance_start).count();
+            LOG_INFO("[PREFILL-DECODE-POOL] request route ranking %s in %.3f ms\n",
+                     rebalanced ? "applied" : "not applied", rebalance_ms);
+        }
     }
 
     // Snapshot VRAM slot occupancy RIGHT HERE, at the exact prefill/decode

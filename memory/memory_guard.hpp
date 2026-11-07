@@ -100,13 +100,13 @@ inline bool physical_host_budget_allows(size_t startup_available,
 inline bool memory_reclaim_pressure_should_block(double mem_available_gib,
                                                  double psi_full_avg10_pct,
                                                  double psi_some_avg10_pct,
-                                                 double swapout_mib_per_sec) {
+                                                 double swapout_mib_per_sec,
+                                                 double swapout_limit_mib_per_sec = 64.0) {
   constexpr double kFullPressurePct = 4.0;
   constexpr double kFullPressureMemGiB = 32.0;
   constexpr double kSomePressurePct = 20.0;
   constexpr double kSomePressureMemGiB = 48.0;
-  constexpr double kSwapoutMiBPerSec = 64.0;
-  return swapout_mib_per_sec >= kSwapoutMiBPerSec ||
+  return swapout_mib_per_sec >= swapout_limit_mib_per_sec ||
          (psi_full_avg10_pct >= kFullPressurePct &&
           mem_available_gib < kFullPressureMemGiB) ||
          (psi_some_avg10_pct >= kSomePressurePct &&
@@ -172,7 +172,8 @@ public:
         return kb < 0 ? -1 : kb / 1024;
     }
 
-    void start(long warn_mb, long stop_mb, int poll_ms) {
+    void start(long warn_mb, long stop_mb, int poll_ms,
+               double swapout_limit_mib_per_sec = 64.0) {
         if (running_.load()) return;
     // Explicit graph setting can lower the default floor, but only to the
     // supported 4.5 GiB minimum. The config parser enforces the same bound.
@@ -181,6 +182,7 @@ public:
         zeromoe::graphsettings::active_settings().tun.mem_guard_floor_mb.value);
         warn_mb_ = std::max(warn_mb, stop_mb_);
         poll_ms_ = poll_ms > 0 ? poll_ms : 500;
+        swapout_limit_mib_per_sec_ = swapout_limit_mib_per_sec;
         stop_limit_mb_.store(stop_mb_, std::memory_order_relaxed);
         if (read_available_mb() < 0) {
             LOG_WARN("[MEM-GUARD] /proc/meminfo unreadable -- guard disabled\n");
@@ -190,7 +192,9 @@ public:
         thread_ = std::thread([this] { loop(); });
         LOG_STREAM_INFO() << "[MEM-GUARD] started: warn below " << warn_mb_
                           << " MB, STOP allocating below " << stop_mb_
-                          << " MB, polling every " << poll_ms_ << " ms\n";
+                          << " MB, sustained swap-out block at "
+                          << swapout_limit_mib_per_sec_ << " MiB/s, polling every "
+                          << poll_ms_ << " ms\n";
     }
 
     void stop() {
@@ -368,7 +372,8 @@ if (pressure.swapout_valid && previous_pressure.swapout_valid &&
 }
 const bool pressure_high = memory_reclaim_pressure_should_block(
     static_cast<double>(mb) / 1024.0, pressure.full_avg10_pct,
-    pressure.some_avg10_pct, swapout_mib_per_sec);
+    pressure.some_avg10_pct, swapout_mib_per_sec,
+    swapout_limit_mib_per_sec_);
 pressure_streak = pressure_high ? std::min(pressure_streak + 1, 2) : 0;
 const bool pressure_block = pressure_streak >= 2;
 const bool block = (mb < stop_mb_) || pressure_block;
@@ -407,6 +412,7 @@ previous_pressure = pressure;
     std::atomic<bool> running_{false};
     long warn_mb_ = 4096, stop_mb_ = 4096;
     int poll_ms_ = 500;
+    double swapout_limit_mib_per_sec_ = 64.0;
     static inline std::atomic<bool> blocked_{false};
     static inline std::atomic<long> last_mb_{-1};
     static inline std::atomic<long> min_mb_{1L << 40};

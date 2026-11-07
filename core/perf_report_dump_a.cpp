@@ -60,12 +60,10 @@ void PerfCounters::dump_report_part1(double session_elapsed_s) const {
                  bm, bsum > 0 ? 100.0 * bm / bsum : 0.0);
     }
     LOG_INFO("Host alloc/setup:    %8.3f s\n", t_host_alloc.load());
-    LOG_INFO("GPU upload (H2D):    %8.3f s  (%6.2f GB/s, %.2f GB total) -- cache PROMOTION "
-             "slab uploads only (RAM->VRAM); expert_ffn's own small per-call activation "
-             "upload is now tracked separately, see 'GPU round-trip total' below\n",
-             t_gpu_upload.load(),
-             t_gpu_upload > 0 ? (bytes_gpu_uploaded / 1e9) / t_gpu_upload : 0.0,
-             bytes_gpu_uploaded / 1e9);
+    LOG_INFO("H2D upload-path timer: %8.3f s; global tracked upload bytes: %.2f GB "
+             "(mixed dense, activation, and expert-cache sources; these counters do not "
+             "form a transfer-bandwidth measurement)\n",
+             t_gpu_upload.load(), bytes_gpu_uploaded / 1e9);
     // Qwen4Exp hybrid attention split -- see t_attn_qwen_gdn's comment.
     // Prints only when nonzero, so every other family is unaffected.
     {
@@ -177,9 +175,8 @@ void PerfCounters::dump_report_part1(double session_elapsed_s) const {
                      bytes_uring_stage_memcpy_saved.load() / 1e9);
         }
     }
-    LOG_INFO("Promotions (H2D):    %lu uploads / %.2f GB total\n",
-        (unsigned long)n_expert_promote.load(),
-        bytes_gpu_uploaded.load() / 1e9);
+    LOG_INFO("MoE cache promotions (H2D): %lu uploads; cache bytes are reported by GPU below\n",
+        (unsigned long)n_expert_promote.load());
     {
         const uint64_t h = n_prefill_stream_vram_hit.load(), m = n_prefill_stream_vram_miss.load();
         if (h + m > 0)
@@ -959,9 +956,9 @@ void PerfCounters::dump_report_part3(double session_elapsed_s) const {
             }
         }
         {
-            // Direct answer to "do all data transfers go to one GPU" --
-            // combined across all four H2D upload call sites.
-            std::string line = "H2D upload bytes by GPU (all 4 upload call sites combined): ";
+            // MoE cache promotion bytes only, across the four cache-upload call sites.
+            // This excludes dense/activation uploads and has no matching per-device DMA timer.
+            std::string line = "MoE cache H2D bytes by GPU (four cache-upload call sites; bytes only): ";
             int64_t total_b = 0;
             bool any = false;
             for (int g = 0; g < PERF_MAX_GPU_SLOTS; ++g) {

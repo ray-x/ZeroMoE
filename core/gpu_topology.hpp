@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <numeric>
 #include <limits>
 #include <mutex>
 #include <unordered_map>
@@ -489,6 +490,12 @@ public:
     // preserves the same redistributed physical ownership.
     std::vector<int> expert_cpu_affinity_layers;
     bool expert_compact_layout = false;
+    // Optional uniform-stride tail inside a compact cache. DeepSeek uses this
+    // shared dynamic segment to let the same preallocated slots serve every
+    // layer during prompt prefill; per-layer compact slots keep the static
+    // hot set byte-efficient.
+    int expert_compact_shared_dynamic_slots = 0;
+    int expert_compact_shared_dynamic_gpu_id = -1;
     int expert_full_layer_prefix = 0;
     uint64_t cache_clock = 0;
 
@@ -1331,10 +1338,87 @@ public:
         return counts;
     }
 
+    // Reserve a shared uniform-stride tail across physical pools in
+    // proportion to their byte capacities. Compact per-layer slots use the
+    // remaining bytes. This is pure planning arithmetic, so the split is
+    // testable without touching CUDA.
+    static std::vector<size_t> compact_shared_dynamic_slot_counts(
+        size_t requested, const std::vector<size_t> &pool_bytes,
+        size_t slot_stride, int preferred_pool_index = -1) {
+        std::vector<size_t> counts(pool_bytes.size(), 0);
+        if (!requested || !slot_stride) return counts;
+        if (preferred_pool_index >= 0 &&
+            (size_t)preferred_pool_index < pool_bytes.size() &&
+            requested <= pool_bytes[(size_t)preferred_pool_index] / slot_stride) {
+            counts[(size_t)preferred_pool_index] = requested;
+            return counts;
+        }
+        size_t total_bytes = 0;
+        for (size_t bytes : pool_bytes) {
+            if (bytes > std::numeric_limits<size_t>::max() - total_bytes)
+                return counts;
+            total_bytes += bytes;
+        }
+        if (!total_bytes) return counts;
+        struct Remainder { size_t index; long double fraction; };
+        std::vector<Remainder> remainders;
+        remainders.reserve(pool_bytes.size());
+        size_t assigned = 0;
+        for (size_t i = 0; i < pool_bytes.size(); ++i) {
+            const size_t capacity = pool_bytes[i] / slot_stride;
+            const long double exact = (long double)requested *
+                (long double)pool_bytes[i] / (long double)total_bytes;
+            const size_t whole = (size_t)exact;
+            counts[i] = std::min(capacity, whole);
+            assigned += counts[i];
+            remainders.push_back({i, exact - (long double)whole});
+        }
+        std::stable_sort(remainders.begin(), remainders.end(),
+            [](const Remainder &a, const Remainder &b) {
+                if (a.fraction != b.fraction)
+                    return a.fraction > b.fraction;
+                return a.index < b.index;
+            });
+        while (assigned < requested) {
+            bool progressed = false;
+            for (const auto &remainder : remainders) {
+                if (assigned >= requested) break;
+                if (counts[remainder.index] >=
+                    pool_bytes[remainder.index] / slot_stride)
+                    continue;
+                ++counts[remainder.index];
+                ++assigned;
+                progressed = true;
+            }
+            if (!progressed) break;
+        }
+        return counts;
+    }
+
+    // Return the aligned start of a uniform-stride shared tail, leaving any
+    // sub-alignment remainder unused at the end of the CUDA allocation. The
+    // CUDA pool's byte capacity can come from a decimal-GB config value, so
+    // subtracting an aligned dynamic tail directly can still leave its base
+    // misaligned (for example, a pool ending in 8 mod 16 bytes).
+    static size_t compact_shared_dynamic_static_bytes(
+        size_t pool_bytes, size_t dynamic_slots, size_t slot_stride,
+        size_t alignment = 16) {
+        const size_t invalid = std::numeric_limits<size_t>::max();
+        if (alignment == 0 || (alignment & (alignment - 1)) != 0 ||
+            (slot_stride != 0 &&
+             dynamic_slots > std::numeric_limits<size_t>::max() / slot_stride))
+            return invalid;
+        const size_t dynamic_bytes = dynamic_slots * slot_stride;
+        if (dynamic_bytes > pool_bytes) return invalid;
+        return (pool_bytes - dynamic_bytes) & ~(alignment - 1);
+    }
+
     void allocate_expert_cache(size_t expert_slab_bytes, int n_experts_total,
                                 const EngineConfig* config = nullptr,
                                 const std::vector<size_t>& layer_slab_bytes = {},
-                                bool disable_auto_cache = false) {
+                                bool disable_auto_cache = false,
+                                int compact_shared_dynamic_slots = 0,
+                                int compact_shared_dynamic_gpu_id = -1) {
         expert_max_slab_size = expert_slab_bytes;
         expert_n_experts = n_experts_total;
         expert_layer_slab_bytes = layer_slab_bytes;
@@ -1355,6 +1439,10 @@ public:
                 break;
             }
         }
+        expert_compact_shared_dynamic_slots = expert_compact_layout
+            ? std::max(0, compact_shared_dynamic_slots) : 0;
+        expert_compact_shared_dynamic_gpu_id = expert_compact_layout
+            ? compact_shared_dynamic_gpu_id : -1;
         // The scalar is still the legacy fallback and the staging-buffer
         // maximum. It is intentionally hidden from consumers that need a
         // contiguous resident-layer view when compact mode is active.
@@ -1485,21 +1573,71 @@ public:
 
         if (expert_compact_layout && expert_n_experts > 0 &&
             !expert_layer_slab_bytes.empty()) {
+            const int requested_dynamic = expert_compact_shared_dynamic_slots;
+            std::vector<size_t> vault_pool_bytes;
+            vault_pool_bytes.reserve(vault_gpus.size());
+            int preferred_dynamic_pool = -1;
+            for (int vi : vault_gpus)
+            {
+                const int device = devices[(size_t)vi].id;
+                if (device == expert_compact_shared_dynamic_gpu_id)
+                    preferred_dynamic_pool =
+                        (int)vault_pool_bytes.size();
+                vault_pool_bytes.push_back(devices[(size_t)vi].expert_cache_size);
+            }
+            const std::vector<size_t> dynamic_by_vault =
+                compact_shared_dynamic_slot_counts(
+                    (size_t)std::max(0, requested_dynamic), vault_pool_bytes,
+                    expert_slab_bytes, preferred_dynamic_pool);
+            const size_t assigned_dynamic = std::accumulate(
+                dynamic_by_vault.begin(), dynamic_by_vault.end(), size_t{0});
+            if (assigned_dynamic != (size_t)std::max(0, requested_dynamic))
+                LOG_STREAM_ERROR()
+                    << "[GPU] Compact shared dynamic pool requested "
+                    << requested_dynamic << " slot(s), but only "
+                    << assigned_dynamic << " fit at the uniform maximum stride\n";
+
+            std::vector<size_t> static_bytes_by_vault(vault_gpus.size(), 0);
+            for (size_t i = 0; i < vault_gpus.size(); ++i) {
+                static_bytes_by_vault[i] =
+                    compact_shared_dynamic_static_bytes(
+                        devices[(size_t)vault_gpus[i]].expert_cache_size,
+                        dynamic_by_vault[i], expert_slab_bytes, 16);
+                if (static_bytes_by_vault[i] ==
+                    std::numeric_limits<size_t>::max()) {
+                    LOG_STREAM_ERROR()
+                        << "[GPU] Compact shared dynamic pool exceeds or cannot "
+                           "align GPU "
+                        << devices[(size_t)vault_gpus[i]].id
+                        << " expert cache allocation\n";
+                    expert_vram_cache_cap = 0;
+                    expert_vram_cache.clear();
+                    unpinned_slot_indices.clear();
+                    return;
+                }
+            }
+
             expert_vram_cache_cap = 0;
-            for (int vi : vault_gpus) {
+            for (size_t i = 0; i < vault_gpus.size(); ++i) {
+                const size_t static_bytes = static_bytes_by_vault[i];
                 const auto counts = compact_layer_slot_counts(
-                    devices[vi].expert_cache_size, expert_n_experts,
+                    static_bytes, expert_n_experts,
                     expert_layer_slab_bytes, expert_full_layer_prefix,
                     expert_cpu_affinity_layers);
                 for (int count : counts) expert_vram_cache_cap += (size_t)count;
+                expert_vram_cache_cap += dynamic_by_vault[i];
             }
             expert_vram_cache.resize(expert_vram_cache_cap);
 
             size_t slot_index = 0;
-            for (int vi : vault_gpus) {
+            for (size_t i = 0; i < vault_gpus.size(); ++i) {
+                const int vi = vault_gpus[i];
                 auto& dev = devices[vi];
+                const size_t dynamic_bytes =
+                    dynamic_by_vault[i] * expert_slab_bytes;
+                const size_t static_bytes = static_bytes_by_vault[i];
                 const auto counts = compact_layer_slot_counts(
-                    dev.expert_cache_size, expert_n_experts,
+                    static_bytes, expert_n_experts,
                     expert_layer_slab_bytes, expert_full_layer_prefix,
                     expert_cpu_affinity_layers);
                 size_t offset = 0;
@@ -1523,10 +1661,33 @@ public:
                         offset += layer_bytes;
                     }
                 }
+                for (size_t dynamic = 0; dynamic < dynamic_by_vault[i]; ++dynamic) {
+                    auto& slot = expert_vram_cache[slot_index++];
+                    slot.gpu_id = dev.id;
+                    slot.device_ptr = dev.expert_cache_pool + static_bytes +
+                        (size_t)dynamic * expert_slab_bytes;
+                    slot.offset = static_bytes +
+                        (size_t)dynamic * expert_slab_bytes;
+                    slot.size = expert_slab_bytes;
+                    slot.pool_layer = -1;  // shared across compact MoE layers
+                    slot.layer_idx = -1;
+                    slot.expert_id = -1;
+                    slot.last_used_clock = 0;
+                    slot.hit_count = 0;
+                    if (!slot.upload_event) {
+                        cudaSetDevice(dev.id);
+                        cudaEventCreate(&slot.upload_event);
+                    }
+                }
                 LOG_STREAM_INFO() << "[GPU] Compact expert pool: GPU " << dev.id
                                   << " uses " << slot_index << " total slots so far, "
-                                  << offset / 1e9 << " GB laid out across "
+                                  << offset / 1e9 << " GB compact across "
                                   << expert_layer_slab_bytes.size() << " layer regions\n";
+                if (dynamic_by_vault[i] > 0)
+                    LOG_STREAM_INFO() << "[GPU] Compact shared dynamic pool: GPU "
+                                      << dev.id << " reserves "
+                    << dynamic_by_vault[i] << " uniform slot(s) ("
+                                      << dynamic_bytes / 1e9 << " GB) for cross-layer prefill/decode reuse\n";
             }
 
             unpinned_slot_indices.clear();
@@ -2422,7 +2583,8 @@ public:
     // slot is not interchangeable with a slot from another layer.
     ExpertLocation* evict_lru(size_t needed_bytes, int* out_old_layer = nullptr,
                               int* out_old_expert = nullptr, int restrict_gpu_id = -1,
-                              int required_layer = -1) {
+                              int required_layer = -1,
+                              bool skip_shared_dynamic = false) {
         GPU_TOPO_TIMED_LOCK(lock);
         // Whole-function cost -- never directly timed before. Unlike a plain
         // comparison-only scan, this loop can call cudaEventQuery (a real
@@ -2443,12 +2605,15 @@ public:
         for (size_t _idx : unpinned_slot_indices) {
             auto& loc = expert_vram_cache[_idx];
             if (loc.memcpy_broken) continue;  // permanently excluded -- see its own comment
+            // Startup pins must never consume the shared dynamic reserve:
+            // a pinned shared slot is permanently lost to prefill staging.
+            if (skip_shared_dynamic && loc.pool_layer == -1) continue;
             if (restrict_gpu_id >= 0 && loc.gpu_id != restrict_gpu_id) {
                 continue;  // targeted scan: this device ONLY -- restrict_gpu_id=-1 (default) never filters at all
             }
             if (expert_compact_layout && required_layer >= 0 &&
-                loc.pool_layer != required_layer) {
-                continue;  // compact slots are reusable only within their layer region
+                loc.pool_layer != required_layer && loc.pool_layer != -1) {
+                continue;  // compact layer slots stay local; shared slots are global
             }
             if (needed_bytes > loc.size) {
                 continue;  // never truncate an expert into a smaller compact slot
@@ -2580,6 +2745,123 @@ public:
         return victim;
     }
 
+    // Clear the preallocated unpinned cache slots at a synchronized phase or
+    // request boundary. Shared compact dynamic slots may be repopulated from
+    // already-resident DDR experts after prefill; pinned VRAM slots and the
+    // underlying device allocations remain untouched.
+    bool reset_unpinned_expert_cache(size_t expected_dynamic_slots,
+                                     std::string *reason = nullptr) {
+        auto fail = [&](const char *message) {
+            if (reason) *reason = message;
+            return false;
+        };
+        if (expected_dynamic_slots == 0)
+            return fail("strategy isolation requires nonzero dynamic VRAM slots");
+
+        int original_device = -1;
+        (void)cudaGetDevice(&original_device);
+        struct RestoreCudaDevice {
+            int id;
+            ~RestoreCudaDevice() {
+                if (id >= 0) (void)cudaSetDevice(id);
+            }
+        } restore_device{original_device};
+        for (const auto &device : devices) {
+            if (device.role == GpuRole::Unused) continue;
+            const cudaError_t selected = cudaSetDevice(device.id);
+            if (selected != cudaSuccess)
+                return fail("could not select every GPU while resetting strategy cache");
+            const cudaError_t synchronized = cudaDeviceSynchronize();
+            if (synchronized != cudaSuccess) {
+                cudaGetLastError();
+                return fail("GPU work was not complete at strategy cache reset");
+            }
+        }
+
+        GPU_TOPO_TIMED_LOCK(lock);
+        reap_pending_host_unregisters();
+        if (unpinned_slot_indices.size() != expected_dynamic_slots)
+            return fail("unpinned VRAM slot count does not match strategy-test dynamic reserve");
+
+        const std::vector<size_t> initial_indices = unpinned_slot_indices;
+        for (size_t index : initial_indices) {
+            if (index >= expert_vram_cache.size())
+                return fail("strategy-test dynamic slot index is out of bounds");
+            auto &slot = expert_vram_cache[index];
+            if (expert_compact_layout && slot.pool_layer != -1)
+                return fail("unpinned VRAM slot is not in the shared dynamic reserve");
+            if (slot.pinned || slot.temp_pin_count != 0 || slot.demand_async_pending)
+                return fail("strategy-test dynamic slot is pinned or still held");
+            if (!slot.upload_ready) {
+                if (!slot.copy_dispatched || !slot.upload_event)
+                    return fail("strategy-test dynamic slot has an unrecorded upload");
+                if (cudaSetDevice(slot.gpu_id) != cudaSuccess)
+                    return fail("could not select a slot GPU while resetting strategy cache");
+                if (cudaEventQuery(slot.upload_event) != cudaSuccess) {
+                    cudaGetLastError();
+                    return fail("strategy-test dynamic upload is still in flight");
+                }
+                slot.upload_ready = true;
+            }
+        }
+
+        clear_pilot_confirmed_resident();
+        std::vector<size_t> temporarily_pinned;
+        temporarily_pinned.reserve(expected_dynamic_slots);
+        auto remove_unpinned_index = [&](size_t index) {
+            for (size_t i = 0; i < unpinned_slot_indices.size(); ++i) {
+                if (unpinned_slot_indices[i] != index) continue;
+                unpinned_slot_indices[i] = unpinned_slot_indices.back();
+                unpinned_slot_indices.pop_back();
+                return true;
+            }
+            return false;
+        };
+        auto restore_temporary_pins = [&] {
+            for (size_t index : temporarily_pinned) {
+                auto &slot = expert_vram_cache[index];
+                slot.pinned = false;
+                unpinned_slot_indices.push_back(index);
+            }
+            temporarily_pinned.clear();
+        };
+
+        // Temporarily hide empty slots so evict_lru selects each occupied
+        // dynamic slot and performs its normal identity/index cleanup.
+        for (size_t index : initial_indices) {
+            auto &slot = expert_vram_cache[index];
+            if (slot.layer_idx != -1) continue;
+            slot.pinned = true;
+            if (!remove_unpinned_index(index)) {
+                restore_temporary_pins();
+                return fail("empty strategy-test slot disappeared from the unpinned index");
+            }
+            temporarily_pinned.push_back(index);
+        }
+        while (!unpinned_slot_indices.empty()) {
+            ExpertLocation *victim = evict_lru(0, nullptr, nullptr, -1, -1);
+            if (!victim || victim->layer_idx != -1) {
+                restore_temporary_pins();
+                return fail("could not evict an occupied strategy-test dynamic slot");
+            }
+            const size_t index = (size_t)(victim - expert_vram_cache.data());
+            victim->pinned = true;
+            if (!remove_unpinned_index(index)) {
+                restore_temporary_pins();
+                return fail("evicted strategy-test slot disappeared from the unpinned index");
+            }
+            temporarily_pinned.push_back(index);
+        }
+        restore_temporary_pins();
+        return true;
+    }
+
+    // Preserve the older explicit name for strategy-isolation callers.
+    bool reset_unpinned_expert_cache_for_test(size_t expected_dynamic_slots,
+                                              std::string *reason = nullptr) {
+        return reset_unpinned_expert_cache(expected_dynamic_slots, reason);
+    }
+
     // Halve every slot's hit_count periodically so frequency signal reflects
     // recent behavior instead of accumulating forever (bounded "hotness" decay).
     void decay_hit_counts() {
@@ -2625,8 +2907,10 @@ public:
 
         // Get a slot (evict LRU if needed)
         int old_layer = -1, old_expert = -1;
-        ExpertLocation* slot = evict_lru(bytes, &old_layer, &old_expert,
-                                          target_gpu_id, layer);
+        ExpertLocation* slot = evict_lru(
+            bytes, &old_layer, &old_expert, target_gpu_id, layer,
+            startup_plain_copy && expert_compact_layout &&
+                expert_compact_shared_dynamic_slots > 0);
         if (!slot || !slot->device_ptr) {
             // Previously silent -- a real run showed this path (or the
             // cudaMemcpy failure below) responsible for a startup preload

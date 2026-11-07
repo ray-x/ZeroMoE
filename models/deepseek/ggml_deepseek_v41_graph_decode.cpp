@@ -361,6 +361,7 @@ void compressed_context_node(ggml_tensor *dst, int ith, int, void *ud) {
       std::chrono::steady_clock::now() - t0).count();
   g.node_ms_total[kAttentionHost] += ms;
   g.layer_attention_ms[(size_t)s.layer][0] += ms;
+  g.layer_attention_ms[(size_t)s.layer][1] += ms;
 }
 
 void grouped_outproj_node(ggml_tensor *dst, int ith, int, void *ud) {
@@ -400,6 +401,18 @@ void grouped_outproj_node(ggml_tensor *dst, int ith, int, void *ud) {
     gpu_woa = e.gpu->grouped_output_proj_q2k_host(
         wa_it->second->data, group_stride, groups, rank, group_in, context,
         grouped.data());
+  }  else if (wa_it->second && wa_it->second->data && e.gpu &&
+           wa_meta->device_ptr == wa_it->second->data &&
+           (wa_it->second->type == GGML_TYPE_Q5_K ||
+            wa_it->second->type == GGML_TYPE_Q4_K ||
+            wa_it->second->type == GGML_TYPE_Q6_K)) {
+    // Resident non-Q2_K grouped weights: per-group F32-activation matvec on
+    // the GPU instead of streaming the dequantized F32 matrix from DDR.
+    const size_t row_bytes = ggml_row_size(wa_it->second->type, group_in);
+    gpu_woa = e.gpu->grouped_output_proj_dense_host(
+        static_cast<GGUFType>(wa_it->second->type), wa_it->second->data,
+        row_bytes * (size_t)rank, groups, rank, group_in, context,
+        grouped.data());
   }
   if (!gpu_woa) {
     static std::unordered_map<std::string, std::vector<float>> woa_cache;
@@ -434,6 +447,7 @@ void grouped_outproj_node(ggml_tensor *dst, int ith, int, void *ud) {
       std::chrono::steady_clock::now() - t0).count();
   g.node_ms_total[kAttentionHost] += ms;
   g.layer_attention_ms[(size_t)s.layer][0] += ms;
+  g.layer_attention_ms[(size_t)s.layer][2] += ms;
 }
 
 // Preserve the legacy Q2_K F32-activation projection here. ggml-cuda
@@ -1069,6 +1083,17 @@ void deepseek_v41_full_graph_decode_shutdown() {
                decode->runs > 1
                    ? decode->warm_node_ms_total[i] / (decode->runs - 1)
                    : 0.0);
+    {
+      double a0 = 0, a1 = 0, a2 = 0;
+      for (const auto &a : decode->layer_attention_ms) {
+        a0 += a[0]; a1 += a[1]; a2 += a[2];
+      }
+      LOG_INFO("[GGML-DSV41-DECODE-NODES] attention split (ms/token over %llu runs): "
+               "total=%.3f context_node=%.3f outproj_node=%.3f other(swa/qkv-host)=%.3f\n",
+               static_cast<unsigned long long>(decode->runs),
+               a0 / decode->runs, a1 / decode->runs, a2 / decode->runs,
+               (a0 - a1 - a2) / decode->runs);
+    }
     std::vector<std::pair<double, int>> hottest;
     for (size_t l = 0; l < decode->layer_moe_ms.size(); ++l)
       hottest.emplace_back(decode->layer_moe_ms[l][0] / decode->runs,

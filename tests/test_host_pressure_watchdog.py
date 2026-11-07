@@ -4,6 +4,7 @@
 import signal
 from pathlib import Path
 import importlib.util
+import tempfile
 import unittest
 from unittest import mock
 
@@ -12,6 +13,20 @@ SPEC = importlib.util.spec_from_file_location("host_pressure_watchdog", MODULE_P
 WATCHDOG = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(WATCHDOG)
+
+
+class ProcessStatusParsingTests(unittest.TestCase):
+    def test_reads_pinned_and_locked_memory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            status = Path(tmp) / "status"
+            status.write_text(
+                "VmRSS: 1024 kB\nVmSwap: 8 kB\nVmLck: 16 kB\nVmPin: 32 kB\n"
+            )
+            self.assertEqual(
+                WATCHDOG.parse_status(status),
+                {"VmRSS": 1024 * 1024, "VmSwap": 8 * 1024,
+                 "VmLck": 16 * 1024, "VmPin": 32 * 1024},
+            )
 
 
 class PressureReasonTests(unittest.TestCase):
@@ -23,6 +38,8 @@ class PressureReasonTests(unittest.TestCase):
             "baseline_swap_gib": 1.317,
             "psi_full_avg10_pct": 1.0,
             "full_psi_streak": 0,
+            "psi_some_avg10_pct": 1.0,
+            "some_psi_streak": 0,
             "swapout_mib_s": 0.0,
             "swapout_streak": 0,
             "live_floor_gib": 4.5,
@@ -41,6 +58,8 @@ class PressureReasonTests(unittest.TestCase):
             baseline_swap_gib=1.317,
             psi_full_avg10_pct=98.4,
             full_psi_streak=3,
+            psi_some_avg10_pct=98.4,
+            some_psi_streak=3,
             swapout_mib_s=100.0,
             swapout_streak=3,
         )
@@ -54,13 +73,55 @@ class PressureReasonTests(unittest.TestCase):
         reasons = self.reasons(swap_used_gib=1.426, baseline_swap_gib=1.300)
         self.assertTrue(any("SwapUsed" in reason for reason in reasons))
 
-    def test_first_swapout_sample_trips(self):
-        reasons = self.reasons(swapout_mib_s=1.1, swapout_streak=1)
+    def test_v38_preload_swap_growth_stops_before_request(self):
+        reasons = self.reasons(
+            memavailable_gib=10.925,
+            vm_swap_gib=0.0,
+            swap_used_gib=0.2626,
+            baseline_swap_gib=0.002,
+            psi_full_avg10_pct=0.54,
+            full_psi_streak=0,
+            psi_some_avg10_pct=0.54,
+            some_psi_streak=0,
+            swapout_mib_s=243.303,
+            swapout_streak=1,
+        )
+        self.assertTrue(any("SwapUsed grew" in reason for reason in reasons))
+
+    def test_sustained_high_swapout_trips(self):
+        reasons = self.reasons(swapout_mib_s=65.0, swapout_streak=2)
         self.assertTrue(any("swap-out" in reason for reason in reasons))
 
-    def test_first_psi_full_sample_trips(self):
-        reasons = self.reasons(psi_full_avg10_pct=1.1, full_psi_streak=1)
+    def test_v37_watchdog_sample_with_ample_headroom_is_allowed(self):
+        reasons = self.reasons(
+            memavailable_gib=12.625,
+            vm_swap_gib=0.0,
+            swap_used_gib=0.0017,
+            baseline_swap_gib=0.001,
+            psi_full_avg10_pct=1.01,
+            full_psi_streak=1,
+            psi_some_avg10_pct=1.01,
+            some_psi_streak=1,
+            swapout_mib_s=0.226,
+            swapout_streak=0,
+        )
+        self.assertEqual(reasons, [])
+
+    def test_psi_full_requires_low_mem_and_two_samples(self):
+        reasons = self.reasons(
+            memavailable_gib=12.0,
+            psi_full_avg10_pct=4.1,
+            full_psi_streak=2,
+        )
         self.assertTrue(any("PSI full" in reason for reason in reasons))
+
+    def test_psi_some_requires_low_mem_and_two_samples(self):
+        reasons = self.reasons(
+            memavailable_gib=40.0,
+            psi_some_avg10_pct=20.1,
+            some_psi_streak=2,
+        )
+        self.assertTrue(any("PSI some" in reason for reason in reasons))
 
     def test_process_swap_is_separately_gated(self):
         reasons = self.reasons(vm_swap_gib=0.3)
