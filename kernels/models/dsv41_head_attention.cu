@@ -88,45 +88,6 @@ __global__ void dsv41_head_attn_kernel(
     for (int i = tid; i < n; i += blockDim.x) scores[i] *= inv;
     __syncthreads();
 
-    if (qh == 2 * (int)blockDim.x) {
-        // Each thread owns output d0 = tid and d1 = tid + blockDim.x. The two
-        // accumulator chains are independent and each still adds the keys in
-        // order i = 0..n-1 with the same fused multiply-add, so every output is
-        // bit-identical to the generic loop below; unrolling by 4 issues the
-        // key loads before the dependent FMAs to hide memory latency.
-        const int d0 = tid, d1 = tid + (int)blockDim.x;
-        float a0 = 0.0f, a1 = 0.0f;
-        int i = 0;
-        for (; i + 4 <= n; i += 4) {
-            float k0[4], k1[4], sc[4];
-            #pragma unroll
-            for (int u = 0; u < 4; ++u) {
-                const int r = koff[i + u];
-                const float* key = (r & 0x40000000)
-                    ? comp + (size_t)(r & 0x3fffffff) * qh
-                    : win + (size_t)r * qh;
-                k0[u] = key[d0];
-                k1[u] = key[d1];
-                sc[u] = scores[i + u];
-            }
-            #pragma unroll
-            for (int u = 0; u < 4; ++u) {
-                a0 = fmaf(sc[u], k0[u], a0);
-                a1 = fmaf(sc[u], k1[u], a1);
-            }
-        }
-        for (; i < n; ++i) {
-            const int r = koff[i];
-            const float* key = (r & 0x40000000)
-                ? comp + (size_t)(r & 0x3fffffff) * qh
-                : win + (size_t)r * qh;
-            a0 = fmaf(scores[i], key[d0], a0);
-            a1 = fmaf(scores[i], key[d1], a1);
-        }
-        out[(size_t)h * qh + d0] = a0;
-        out[(size_t)h * qh + d1] = a1;
-        return;
-    }
     for (int d = tid; d < qh; d += blockDim.x) {
         float acc = 0.0f;
         for (int i = 0; i < n; ++i) {
