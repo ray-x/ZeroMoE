@@ -2517,6 +2517,9 @@ bool deepseek_v41_full_graph_run(StreamingEngine &engine, float *hidden_states,
     const int qh = g.qk_nope + g.qk_rope;
     const int window = engine.sliding_window > 0 ? engine.sliding_window : engine.max_t;
     for (auto &state : engine.dsv41_compressed) state.reset();
+    // The GPU head-attention and indexer mirrors hold the previous request's
+    // window, compressed keys and indexer keys; drop them with the host state.
+    if (engine.gpu) engine.gpu->dsv41_head_attention_invalidate();
     for (const auto &lt : g.dsv41_layers) {
       std::vector<float> raw((size_t)S * qh);
       ggml_backend_tensor_get(lt.raw_kv, raw.data(), 0, raw.size() * sizeof(float));
