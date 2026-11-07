@@ -479,6 +479,26 @@ void qkv_source_node(ggml_tensor *dst, int ith, int, void *ud) {
   auto *query = ql_out + ql;
   auto *raw_kv = query + query_n;
   dsv41_trace::save("attn-input", s.layer, g.pos, input, g.D);
+  // One device pass for the whole Q/KV chain when every weight takes the plain
+  // device path (same kernels and order as the host-staged calls below).
+  const auto *kvw = resident(e, p + "attn_kv.weight");
+  if (e.gpu && e.gpu->device_id == g.device && !cpu_only_mode() &&
+      an->device_ptr && qa->device_ptr && qb->device_ptr && kvn->device_ptr &&
+      !qa->gpu_fast_ptr && kvw && kvw->device_ptr && !kvw->gpu_fast_ptr &&
+      e.gpu->dsv41_qkv_chain_host(
+          input, g.D, c.eps, an->device_ptr, qa->meta.type, qa->device_ptr, ql,
+          resident(e, p + "attn_q_a_norm.weight") ?
+              resident(e, p + "attn_q_a_norm.weight")->device_ptr : nullptr,
+          qb->meta.type, qb->device_ptr, query_n, kvw->meta.type,
+          kvw->device_ptr, qh, kvn->device_ptr, out)) {
+    dsv41_trace::save("attn-norm", s.layer, g.pos, normed, g.D);
+    dsv41_trace::save("q-lora", s.layer, g.pos, ql_out, ql);
+    dsv41_trace::save("query", s.layer, g.pos, query, (size_t)g.H * qh);
+    dsv41_trace::save("raw-kv", s.layer, g.pos, raw_kv, qh);
+    g.node_ms_total[kNativeQkv] += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    return;
+  }
   rmsnorm_proj(e, p + "attn_norm.weight", input, normed, 1, g.D, c.eps);
   dsv41_trace::save("attn-norm", s.layer, g.pos, normed, g.D);
   dense_proj(e, p + "attn_q_a.weight", normed, ql_out, 1, g.D, ql);

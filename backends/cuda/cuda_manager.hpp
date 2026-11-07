@@ -142,6 +142,7 @@ public:
     size_t d_outproj_x_cap = 0;
     size_t d_outproj_y_cap = 0;
     // DeepSeek-V4.1 single-token head attention scratch (dsv41_head_attention.cu).
+    float* d_qkv_chain = nullptr; size_t d_qkv_chain_cap = 0;
     void* d_ha_in = nullptr; void* h_ha_in = nullptr; size_t d_ha_in_cap = 0;
     float* d_ha_out = nullptr; float* h_ha_out = nullptr; size_t d_ha_out_cap = 0;
 
@@ -581,6 +582,7 @@ public:
             if (l.d_win) cudaFree(l.d_win);
             if (l.d_comp) cudaFree(l.d_comp);
         }
+        if (d_qkv_chain) cudaFree(d_qkv_chain);
         if (d_ha_in) cudaFree(d_ha_in);
         if (d_ha_out) cudaFree(d_ha_out);
         if (h_ha_in) cudaFreeHost(h_ha_in);
@@ -3453,6 +3455,64 @@ public:
         launch_rmsnorm(d_y, d_x, (const float*)d_w, S, D, eps);
         cudaMemcpy(y_host, d_y, bytes, cudaMemcpyDeviceToHost);
         return true;
+    }
+
+    // DeepSeek-V4.1 decode Q/KV projection chain on one device pass:
+    //   normed = rmsnorm(x, an); ql = rmsnorm(qa * normed, qan);
+    //   query = qb * ql; raw_kv = rmsnorm(kv * normed, kvn).
+    // Same kernels and operation order as the five separate host-staged calls
+    // (rmsnorm_gpu_host / dense_matmul_host), but intermediates stay on the
+    // device: one upload and one download instead of six. Output layout is the
+    // contiguous host block [normed D | ql | query | raw_kv]. The caller must
+    // pass only weights that dense_proj would send down the plain device path
+    // (no BF16 fast-path buffer); returns false (nothing written) otherwise.
+    bool dsv41_qkv_chain_host(const float* x_host, int D, float eps,
+                              const void* d_an,
+                              GGUFType qa_t, const void* d_qa, int ql,
+                              const void* d_qan,
+                              GGUFType qb_t, const void* d_qb, int query_n,
+                              GGUFType kv_t, const void* d_kv, int qh,
+                              const void* d_kvn, float* out_host) {
+        if (!x_host || !out_host || !d_an || !d_qa || !d_qan || !d_qb ||
+            !d_kv || !d_kvn || D <= 0 || ql <= 0 || query_n <= 0 || qh <= 0)
+            return false;
+        auto plain = [](GGUFType t) {
+            return t != GGUFType::BF16;  // BF16 needs the matched cuBLAS path
+        };
+        if (!plain(qa_t) || !plain(qb_t) || !plain(kv_t)) return false;
+        const size_t out_n = (size_t)D + ql + query_n + qh;
+        const size_t want = (out_n + (size_t)ql + qh) * sizeof(float);
+        cudaSetDevice(device_id);
+        if (want > d_qkv_chain_cap) {
+            if (d_qkv_chain) { cudaFree(d_qkv_chain); d_qkv_chain = nullptr; }
+            d_qkv_chain_cap = 0;
+            if (cudaMalloc((void**)&d_qkv_chain, want) != cudaSuccess) {
+                cudaGetLastError();
+                d_qkv_chain = nullptr;
+                return false;
+            }
+            d_qkv_chain_cap = want;
+        }
+        if (!ensure_buffers((size_t)D * sizeof(float), 0)) return false;
+        float* d_normed = d_qkv_chain;
+        float* d_ql = d_normed + D;
+        float* d_query = d_ql + ql;
+        float* d_rawkv = d_query + query_n;
+        float* d_qa_raw = d_rawkv + qh;      // pre-norm q_a output
+        float* d_kv_raw = d_qa_raw + ql;     // pre-norm kv output
+        if (cudaMemcpy(d_x, x_host, (size_t)D * sizeof(float),
+                       cudaMemcpyHostToDevice) != cudaSuccess) return false;
+        launch_rmsnorm(d_normed, d_x, (const float*)d_an, 1, D, eps);
+        if (!dense_matmul_device(qa_t, d_qa, d_normed, d_qa_raw, 1, D, ql))
+            return false;
+        launch_rmsnorm(d_ql, d_qa_raw, (const float*)d_qan, 1, ql, eps);
+        if (!dense_matmul_device(qb_t, d_qb, d_ql, d_query, 1, ql, query_n))
+            return false;
+        if (!dense_matmul_device(kv_t, d_kv, d_normed, d_kv_raw, 1, D, qh))
+            return false;
+        launch_rmsnorm(d_rawkv, d_kv_raw, (const float*)d_kvn, 1, qh, eps);
+        return cudaMemcpy(out_host, d_qkv_chain, out_n * sizeof(float),
+                          cudaMemcpyDeviceToHost) == cudaSuccess;
     }
 
     // Transfer a small vector between GPUs (expert output → core for residual add)
