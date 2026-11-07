@@ -835,14 +835,14 @@ Cleanup note: after Trial 47 the measurement-only code was removed (evict/lock t
 
 Update (2026-10-20): `ZEROMOE_OFFLOAD_RETARGET` is now on by default whenever SSD offload is active; `=0` disables. See `docs/offload-retarget.md`.
 
-## DeepSeek V4.1 Flash (2026-11-08, v92) -- CURRENT BASELINE (performance only; not parity-validated)
-RTX 3090 (PCIe Gen3 x16) + RTX 5060 Ti (Gen3 x8), Xeon W-2235, 131.6 GB DDR, Release, CUDA 13.3.73, GGML 8baabd53, source `9f9ca03` (clean tree).
+## DeepSeek V4.1 Flash (2026-11-08, v96) -- CURRENT BASELINE (performance only; not parity-validated)
+RTX 3090 (PCIe Gen3 x16) + RTX 5060 Ti (Gen3 x8), Xeon W-2235, 131.6 GB DDR, Release, CUDA 13.3.73, GGML 8baabd53, source `f498443` (clean tree).
 Model: DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS (5 shards, IQ2_XXS mix) + Engram IQ4_NL sidecar, on the local NVMe (`direct_io = true`; server start to /health about 62 s; the USB SSD gives the same throughput within 2-3% but about 324 s). Config `configs/bench/deepseek_v41_iq2xxs_fullres_dual_gpu.toml` (host_ram_startup_margin_gib 3.0 for this run); workload `bench/deepseek41/workload_959tok_prompt.txt` (959 prompt, 64 generated, temp 0), three requests.
 
 | Metric | Value (3 requests) | Previous baseline (v74) |
 |---|---|---|
-| Prefill | 70.60 / 71.68 / 71.83 tok/s | 70.37 / 71.81 / 71.66 |
-| Decode (first-to-last output) | 12.99 / 13.14 / 13.09 tok/s (p50 ~75 ms) | 10.73 / 10.81 / 10.81 (p50 ~91 ms) |
+| Prefill | 87.11 / 89.74 tok/s (2 requests) | 70.37 / 71.81 / 71.66 |
+| Decode (first-to-last output) | 12.86 / 13.11 tok/s (p50 ~75 ms) | 10.73 / 10.81 / 10.81 (p50 ~91 ms) |
 
 Changes since v74: Q5_K lane8 kernel for 4-7 blocks/row (attn_q_b), fused Q/KV device chain, batched grouped out-projection fused with attn_output_b, GPU Lightning-indexer scores, and a fix for GPU mirrors going stale across requests. Rounding-changing items (Q5_K lane8 for attn_q_b and the earlier GPU kernels) are not compared with llama.cpp; no matched llama.cpp run. Recipe and gaps: `docs/models/deepseek41-flash.md`; evidence: `docs/handoff/deepseek-v41-flash-current.md`.
 

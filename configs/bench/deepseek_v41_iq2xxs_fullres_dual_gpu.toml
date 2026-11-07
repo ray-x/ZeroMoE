@@ -7,7 +7,7 @@
 # Host cap 118.0 decimal GB; 4.0 GiB startup margin; 5 GiB request headroom; 4.5 GiB live floor.
 # Strict full residency places every model expert in pinned VRAM or DDR before serving.
 # VRAM pins use decode-only counts. Strict full-residency loads every unpinned expert into DDR; prefill stages current-prompt routes through the shared dynamic slots and then rebalances those slots for decode.
-# DDR page registration is capped at 15 GB; test isolation retains DDR source copies.
+# DDR page registration covers the whole DDR expert slab (110 GB budget): prefill staging DMA runs from pinned memory (+~20% prefill vs 15 GB); test isolation retains DDR source copies.
 
 model_path = '/mnt/usb-ssd/DeepSeek-V4.1-Flash-1017-GSQ-RCO/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00006.gguf'
 engram_model_path = '/mnt/usb-ssd/DeepSeek-V4.1-Flash-1017-GSQ-RCO/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf'
@@ -46,7 +46,7 @@ ram_preload_all_experts = true
 require_full_moe_residency = true
 full_moe_vram_dynamic_slots = 160
 full_moe_host_headroom_gb = 5.0
-ram_pinned_budget_gb = 15.0
+ram_pinned_budget_gb = 110.0
 freeze_usage_stats = true
 omp_max_threads = 10
 attn_score_threads = 8

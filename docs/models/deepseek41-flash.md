@@ -6,22 +6,21 @@
   optimizations below have not been compared with llama.cpp (teacher-forced), and the 90%-of-llama.cpp
   and `check_full_graph_moe_perf.py` gates have not been run. See "Open acceptance gaps".
 
-## Current baseline (2026-11-08, v92)
+## Current baseline (2026-11-08, v96)
 
 Hardware: RTX 3090 24 GB (PCIe Gen3 x16) + RTX 5060 Ti 16 GB (Gen3 x8), Xeon W-2235 (6C/12T), 131.6 GB DDR.
 Model: `DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-0000{1..5}-of-00006.gguf` (IQ2_XXS mix with IQ1_M/IQ2_XS
 experts) + `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` sidecar, on the local NVMe (`direct_io = true`).
 Workload: `bench/deepseek41/workload_959tok_prompt.txt` (959 prompt tokens, 64 generated, temp 0, ctx 4096).
-Source: `9f9ca03`, clean tree; GGML `8baabd53`; CUDA 13.3.73; Release.
+Source: `f498443`, clean tree; `ram_pinned_budget_gb = 110` (whole DDR slab page-registered); GGML `8baabd53`; CUDA 13.3.73; Release.
 
 | Request | Prefill tok/s | Decode tok/s (steady, first-to-last output) |
 |---|---:|---:|
-| 1 | 70.60 | 12.99 |
-| 2 | 71.68 | 13.14 |
-| 3 | 71.83 | 13.09 |
+| 1 | 87.11 | 12.86 |
+| 2 | 89.74 | 13.11 |
 
-Decode p50 about 75 ms/token (was about 91 ms at v74). `tools/check_full_graph_moe_run.py --full-fit --require-full-graph-prefill` passes.
-Raw evidence and history: `docs/handoff/deepseek-v41-flash-current.md` (v70-v92).
+Decode p50 about 75 ms/token; start to ready about 76 s (was about 91 ms at v74). `tools/check_full_graph_moe_run.py --full-fit --require-full-graph-prefill` passes.
+Raw evidence and history: `docs/handoff/deepseek-v41-flash-current.md` (v70-v96).
 
 ## How to run
 

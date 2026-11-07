@@ -315,3 +315,18 @@ Head-attention multi-head-per-block variant (tried 2026-11-08, not kept): sharin
 ## Host-side CUDA API cost per decoded token (nsys v83, 63 decode tokens, profiling-inflated 101 ms/token)
 
 From `build_mtp_results/2026-11-07-nsys-graphnode-v83/decode.sqlite` (runtime API calls inside the decode window, per token): `cudaStreamSynchronize` 1,599 calls (30.1 ms, avg 18.8 us), `cudaMemcpy` (synchronous) 399 calls (12.9 ms, avg 32 us), `cudaGraphLaunch` 157 calls (9.8 ms, avg 62 us), `cudaMemcpyAsync` 618 calls (4.4 ms), `cudaLaunchKernel` 785 calls (3.8 ms), `cudaMemcpyPeerAsync` 160 calls (1.7 ms). Roughly 40 stream syncs, 10 synchronous copies and 4 ggml graph launches per layer per token. These include time spent waiting for GPU work, so they are not pure overhead, but the 3090 is busy only ~27% of the decode window (5060 Ti ~6%), so a large part is serialized host/GPU hand-offs. Next structural step (not started): cut the number of graph splits and host-staged round trips per layer (fewer CPU custom nodes, pinned device-resident intermediates, event-based instead of full-stream sync). Unit of progress so far per removed round trip: the Q/KV chain and the out-projection A+B fusion each saved ~1-3 ms/token.
+
+## v93-v96: pinned DDR budget -- prefill 71 to 88 tok/s (2026-11-08)
+
+The prefill breakdown of the v92 log showed 7.1 s of the 13.3 s prefill spent staging ~150 experts per layer (~74 GB total, ~10 GB/s) from DDR to VRAM, while only 15 GB of the DDR slab was page-registered (`ram_pinned_budget_gb = 15`). Raising the budget (config only, no code, no numerics change) with the same binary (source f498443, 2 requests each, host quiet, models on NVMe):
+
+| ram_pinned_budget_gb | prefill tok/s | decode tok/s | staging upload (s) | start to /health |
+|---:|---:|---:|---:|---:|
+| 15 (v92, 3 requests) | 70.60 / 71.68 / 71.83 | 12.99 / 13.14 / 13.09 | ~7.1 | 58 s |
+| 40 (v94) | 72.85 / 75.09 | 12.36 / 13.02 | 6.4 | 66 s |
+| 90 (v95) | 84.15 / 87.73 | 12.55 / 13.16 | 4.6 | 76 s |
+| 110 (v96, whole slab) | **87.11 / 89.74** | 12.86 / 13.11 | 4.4 | 76 s |
+
+Request 1 decode routes are identical to v92 in all runs (0 of 2,520); request 2 differs from v92 by 19 lines in v95 and v96 (identical to each other: a deterministic placement effect, same kind as the earlier request-2 variation). `check_full_graph_moe_run.py --full-fit --require-full-graph-prefill` PASS for v94, v95, v96. Staging now moves ~74 GB in 4.4 s (~17 GB/s), close to the combined PCIe Gen3 x16 + x8 limit, so more prefill gain needs overlapping staging with compute (stage layer l+1 while layer l computes) or staging fewer bytes. The committed config now uses 110.
+
+Note on earlier "HTTP 408" failures in v85c/d/f/v93: the cause was this session's wait loop (early exit on a stale runner's "skipping" line, then `kill <server pid>` mid-request), not the server. Check `pgrep -af run_request_when_ready` before launching.
