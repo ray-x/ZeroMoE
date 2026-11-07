@@ -205,3 +205,22 @@ Artifact: `build_mtp_results/2026-11-07-0709643-deepseek41-fused-qkv-v75/` (bina
 - `check_full_graph_moe_run.py --full-fit --require-full-graph-prefill`: PASS.
 - Gain is small (about +2% decode, native_qkv -3 ms). Request-1 prefill (69.91) is just under the 70 tok/s target; two requests on a shared host are not enough to call it a regression or a gain. The attention timers rose (context 16.6 -> 18.0, other 6.8 -> 9.0 ms), so some of the saving is eaten elsewhere or is run-to-run noise; v74 baseline is left unchanged.
 - Fusing only saved 3 of the estimated 5-8 ms; the remaining Q/KV cost is kernel time, not hop latency. Next: nsys to split the ~25 ms unattributed bucket before fusing attention.
+
+## v76-v78: nsys profile and Q5_K attn_q_b kernel (2026-11-07)
+
+**nsys (v76, `build_mtp_results/2026-11-07-0c585d1-deepseek41-nsys-v76/decode.nsys-rep`, capture covers prefill and decode of two requests).** The plain per-element `q5_K_kquant_matmul_kernel` ran 5,040 times on the RTX 3090 (grid O=32,768, S=1; one call per layer per token = `attn_q_b`, I=1024 so 4 blocks/row, below the `lane8` threshold of 8) at 250.6 us/call: about 10 ms/token, roughly 10% of memory bandwidth. Other large items in the capture (mostly prefill): ggml `mul_mat_q` for IQ types, `dequantize_block_iq1_m` (16,419 calls, 733 ms), `q5_K_kquant_matmul_kernel_lane8` (small shapes), `dsv41_head_attn_kernel` 130 us/call (4,788 calls, about 5 ms/token). `cudaStreamSynchronize` is 52.7% of CUDA API time (220,771 calls).
+
+**v77 (commit 8a132a0, reverted as ec264ca).** Unrolling the 4-block loop in the per-element kernel (bit-identical arithmetic) changed nothing: routes 0/2,520 different, `native_qkv` 12.48 ms. The kernel is limited by per-element dequant work, not load latency.
+
+**v78 (commit ed1c9a5): Q5_K uses the `lane8` kernel for 4-7 blocks/row.** Two requests, same 959+64 workload and config as v75 (startup margin 3.0 GiB):
+
+| | v75 | v78 |
+|---|---:|---:|
+| Decode tok/s | 10.95 / 11.07 | **11.63 / 11.91** |
+| Decode p50 ms | 89.8 / 87.7 | 84.2 / 82.0 |
+| native_qkv ms/token | 12.56 | **6.82** |
+| Warm decode mean ms | 91.6 | 83.9 |
+| Prefill tok/s | 69.91 / 71.86 | 70.96 / 71.92 |
+
+- `check_full_graph_moe_run.py --full-fit --require-full-graph-prefill`: PASS. Generated text starts identically and is coherent.
+- This is a rounding change (different reduction tree): 438 and 407 of 2,520 decode route lines differ from v75 in the two requests (free-running, so later divergence compounds). Not compared with llama.cpp. Treat as a candidate: v74 stays the documented baseline until the teacher-forced check is run.
