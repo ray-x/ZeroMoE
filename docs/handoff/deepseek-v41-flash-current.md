@@ -169,3 +169,22 @@ NOT done (acceptance gates in CLAUDE.md section 2 still open):
 2. `check_full_graph_moe_run.py --full-fit --require-full-graph-prefill` now PASSES on the v74 log (it failed on the v56 log). It checks graph policy/counters only, not correctness or speed.
 3. Matched llama.cpp performance (>= 90% bar) and `check_full_graph_moe_perf.py --minimum-tps` not run.
 4. Nothing is committed. Run-to-run noise: single profile, one machine, three requests.
+
+## Decode profile of the 91 ms token (v74 log, 2026-11-07)
+
+Source: `build_mtp_results/2026-11-07-47ef7b3-deepseek41-final-confirm-v74/server.log` (request 3; 63 decode runs, warm mean 92.4 ms/token). Timers are host-side per node; MoE numbers come from the per-layer `[DSV41-CACHE-MOE]` / `[DSV41-CACHE-MOE-CPU]` log lines.
+
+| Bucket | ms/token | Note |
+|---|---:|---|
+| attention_host total | 31.6 | context node 16.6 (GPU head attention incl. staging copies), out-projection 8.2, SWA/qkv-host 6.8 |
+| native_qkv (Q/KV dense projections) | 15.6 | about 0.39 ms/layer, each a host-to-device round trip |
+| MoE CPU merge wait | 13.0 | 11.65 cold experts/token in 9.0 layers; CPU worker 16.8 ms/token (1.44 ms per cold expert), only ~4 ms overlapped |
+| MoE route + upload | 4.8 | 3.35 route, 1.43 upload |
+| HC/Engram + logits | 1.8 | |
+| Unattributed (GPU graph compute for resident experts, shared expert, norms, sync) | ~25 | derived: 92.4 minus the rows above; not directly measured |
+
+Findings:
+1. About 47 ms (attention 31.6 + qkv 15.6) is 120 small host-to-device round trips per token (3 per layer), each ~0.4 ms: latency-bound, not compute-bound. Making Q/KV projection, attention context and out-projection one GPU-resident chain per layer (no host staging), ideally CUDA-graph captured, is the largest lever (estimated 20-30 ms).
+2. The CPU cold-expert lane costs 13 ms of exposed wait. Launching it earlier (route prediction / pilot) or pinning more of the hot set in VRAM would hide most of it (estimated 8-10 ms).
+3. The ~25 ms unattributed bucket needs a per-node GPU timer (CUDA events) before tuning.
+Estimated reachable decode with 1+2: about 55-60 ms/token (16-18 tok/s) if the estimates hold; not measured. Any new GPU attention/projection path changes rounding and needs the llama.cpp teacher-forced check.
