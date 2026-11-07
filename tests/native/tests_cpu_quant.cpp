@@ -823,7 +823,7 @@ bool test_cpu_iq_matmul_paths() {
         }
     }
 
-    for (GGUFType type : {GGUFType::IQ2_XXS, GGUFType::IQ3_XXS}) {
+    for (GGUFType type : {GGUFType::IQ2_XXS, GGUFType::IQ2_XS, GGUFType::IQ3_XXS}) {
         const int rb = row_bytes(type, I);
         wb.assign((size_t)M, std::vector<uint8_t>{});
         wp.assign((size_t)M, nullptr);
@@ -863,15 +863,21 @@ bool test_cpu_iq_matmul_paths() {
             ok = (type == GGUFType::IQ2_XXS
                       ? matmul_iq2_xxs_ggml_q8k_grouped(
                             &one_y, x.data(), &one_w, 1, 1, I, O)
-                      : matmul_iq3_xxs_ggml_q8k_grouped(
-                            &one_y, x.data(), &one_w, 1, 1, I, O)) &&
+                      : type == GGUFType::IQ2_XS
+                            ? matmul_iq2_xs_ggml_q8k_grouped(
+                                  &one_y, x.data(), &one_w, 1, 1, I, O)
+                            : matmul_iq3_xxs_ggml_q8k_grouped(
+                                  &one_y, x.data(), &one_w, 1, 1, I, O)) &&
                  ok;
         }
         ok = (type == GGUFType::IQ2_XXS
                   ? matmul_iq2_xxs_ggml_q8k_grouped(
                         grouped_ptr.data(), x.data(), wp.data(), M, 1, I, O)
-                  : matmul_iq3_xxs_ggml_q8k_grouped(
-                        grouped_ptr.data(), x.data(), wp.data(), M, 1, I, O)) &&
+                  : type == GGUFType::IQ2_XS
+                        ? matmul_iq2_xs_ggml_q8k_grouped(
+                              grouped_ptr.data(), x.data(), wp.data(), M, 1, I, O)
+                        : matmul_iq3_xxs_ggml_q8k_grouped(
+                              grouped_ptr.data(), x.data(), wp.data(), M, 1, I, O)) &&
              ok;
         for (int m = 0; m < M; ++m)
             ok = compare_iq_outputs(
