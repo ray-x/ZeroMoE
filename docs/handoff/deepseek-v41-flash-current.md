@@ -279,3 +279,10 @@ Cause of the v85c/d/f request cancellations (HTTP 408 "generation cancelled") --
 - **Fix (commit c114120).** `dsv41_head_attention_invalidate()` is now also called where the full-graph prefill resets the compressed state.
 - **Evidence.** (a) v86 (GPU indexer off, batched out-projection on, old mirror reset) is bit-identical to v78 for all three requests, so the batched out-projection is exact. (b) v85g/v87/v88 (GPU indexer on, stale mirror) differ from v78 only in requests 2 and 3. (c) v89 (fix, GPU indexer on) vs v90 (fix, GPU indexer off via temporary edit, reverted): 0, 0, 0 differing decode route lines across three requests, so the GPU indexer is bit-identical to the CPU loop including after the first request. (d) v89 request 1 is bit-identical to v78 (0 of 2,520). v89 requests 2 and 3 differ from v78 (396 lines) because v78's own requests 2/3 were affected by the stale head-attention mirror. Request 2 vs 3 inside v89 differ by 22 lines (residual state variation not explained; also present without the GPU indexer, v90).
 - **v89 timing (3 requests, 959+64, host quiet, models on NVMe, direct_io=true, startup margin 3.0 GiB):** decode 12.59 / 12.75 / 12.70 tok/s (p50 78.1 / 76.6 / 76.7 ms), prefill 70.46 / 71.61 / 71.66 tok/s; attention total 28.5 ms/token (context_node 14.75, outproj_node 7.44). Same fix without the GPU indexer (v90): decode 11.67 / 11.74 / 11.77. `check_full_graph_moe_run.py --full-fit --require-full-graph-prefill` PASS.
+
+## v91: grouped out-projection A+B in one device pass (commit 9636e1a), 2026-11-07
+
+`grouped_output_proj_ab_host`: the [groups*rank] intermediate stays on the GPU between attn_output_a and attn_output_b (one upload, one download, same kernels and order). Run `build_mtp_results/2026-11-07-outproj-ab-v91/` (clean tree, models on NVMe, 3 requests, host quiet):
+- Decode 12.86 / 12.96 / 12.92 tok/s (v89: 12.59 / 12.75 / 12.70), p50 76.5 / 75.3 / 75.9 ms; prefill 70.58 / 71.81 / 71.89 tok/s.
+- `outproj_node` 7.44 to 6.10 ms/token; attention total 27.3 ms/token (context_node 14.65, other 6.5).
+- Decode routes bit-identical to v89 for all three requests (0, 0, 0 differing lines); graph checker PASS.
