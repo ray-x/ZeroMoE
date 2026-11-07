@@ -226,9 +226,23 @@ __global__ void NAME##_kquant_matmul_kernel( \
     const BLOCKT* w_row = W + (size_t)o * bpr; \
     const float* x_row = x + (size_t)s * I; \
     float acc = 0.0f; \
-    for (int b = 0; b < bpr; ++b) { \
-        float wv = DEQUANT(&w_row[b], tid); \
-        acc += x_row[b * 256 + tid] * wv; \
+    if (bpr == 4) { \
+        /* Short rows (e.g. DeepSeek attn_q_b, I=1024): issue all four block \
+           loads/dequants first, then accumulate in the same order and with \
+           the same fused multiply-add as the loop below (bit-identical). */ \
+        float wv4[4], xv4[4]; \
+        _Pragma("unroll") \
+        for (int b = 0; b < 4; ++b) { \
+            wv4[b] = DEQUANT(&w_row[b], tid); \
+            xv4[b] = x_row[b * 256 + tid]; \
+        } \
+        _Pragma("unroll") \
+        for (int b = 0; b < 4; ++b) acc += xv4[b] * wv4[b]; \
+    } else { \
+        for (int b = 0; b < bpr; ++b) { \
+            float wv = DEQUANT(&w_row[b], tid); \
+            acc += x_row[b * 256 + tid] * wv; \
+        } \
     } \
     _Pragma("unroll") \
     for (int off = 16; off > 0; off /= 2) acc += __shfl_down_sync(0xffffffff, acc, off); \
