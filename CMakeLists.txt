@@ -1002,6 +1002,25 @@ add_test(NAME vram_dynamic_slot_plan COMMAND vram_dynamic_slot_plan_test)
         endif()
     endif()
 
+    # Accuracy of the GPU Q5_K F32-activation matvec against float64 and the CPU dot.
+    if(ZEROMOE_USE_GGML_CUDA)
+        add_executable(dsv41_q5k_matvec_test EXCLUDE_FROM_ALL
+            tests/test_dsv41_q5k_matvec.cpp
+            backends/cpu/kernels_cpu.cpp
+            backends/cpu/ggml_grids.cpp
+            kernels/quant/kquant_matmul.cu)
+        target_include_directories(dsv41_q5k_matvec_test PRIVATE
+            ${ZEROMOE_GGML_SRC_DIR})
+        target_compile_options(dsv41_q5k_matvec_test PRIVATE
+            ${ZEROMOE_AVX512_FLAGS})
+        set_target_properties(dsv41_q5k_matvec_test PROPERTIES
+            CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
+        target_link_libraries(dsv41_q5k_matvec_test PRIVATE CUDA::cudart ggml)
+        if(OpenMP_CXX_FOUND)
+            target_link_libraries(dsv41_q5k_matvec_test PRIVATE OpenMP::OpenMP_CXX)
+        endif()
+    endif()
+
     # Bitwise parity of the GPU Lightning-indexer scores with the host loop.
     if(ZEROMOE_USE_GGML_CUDA)
         add_executable(dsv41_indexer_score_test EXCLUDE_FROM_ALL
