@@ -904,6 +904,46 @@ void dequantize_row_iq1_m_avx512(const uint8_t *block, float *y, int64_t k) {
   }
 }
 
+// IQ1_S: d(2) + qs[32] + qh[8] (uint16) = 50 bytes per 256 values. Same grid table
+// and the same per-value arithmetic as ggml's dequantize_row_iq1_s
+// (dl * ((float)grid + delta)), so the output is bit-identical.
+void dequantize_row_iq1_s_avx512(const uint8_t *block, float *y, int64_t k) {
+  static std::atomic<bool> logged{false};
+  if (should_log_once(logged))
+    LOG_INFO("[AVX512-DEQUANT] dequantize_row_iq1_s_avx512 is live\n");
+
+  constexpr int QK_K = 256;
+  constexpr size_t BLOCK_BYTES = 50;
+  constexpr float IQ1S_DELTA = 0.125f;
+  const int64_t nb = k / QK_K;
+  const uint8_t *grid = static_cast<const uint8_t *>(ms_grid_iq1s());
+
+  for (int64_t i = 0; i < nb; ++i) {
+    const uint8_t *base = block + (size_t)i * BLOCK_BYTES;
+    uint16_t d_half;
+    std::memcpy(&d_half, base, 2);
+    const float d = fp16_to_fp32(d_half);
+    const uint8_t *qs = base + 2;
+    uint16_t qh[8];
+    std::memcpy(qh, base + 34, sizeof(qh));
+    float *yy = y + (size_t)i * QK_K;
+    for (int ib = 0; ib < QK_K / 32; ++ib) {
+      const float delta = (qh[ib] & 0x8000) ? -IQ1S_DELTA : IQ1S_DELTA;
+      const float dl = d * (float)(2 * ((qh[ib] >> 12) & 7) + 1);
+      for (int l = 0; l < 4; ++l) {
+        const uint32_t idx = qs[l] | (((uint32_t)qh[ib] >> (3 * l)) & 7) << 8;
+        uint64_t g;
+        std::memcpy(&g, grid + (size_t)idx * 8, sizeof(g));
+        __m256 v = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_cvtsi64_si128((long long)g)));
+        v = _mm256_add_ps(v, _mm256_set1_ps(delta));
+        v = _mm256_mul_ps(v, _mm256_set1_ps(dl));
+        _mm256_storeu_ps(yy + ib * 32 + l * 8, v);
+      }
+      qs += 4;
+    }
+  }
+}
+
 void dequantize_row_iq3_xxs_avx512(const uint8_t *block, float *y, int64_t k) {
   static std::atomic<bool> logged{false};
   if (should_log_once(logged))
