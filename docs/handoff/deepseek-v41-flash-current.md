@@ -286,3 +286,8 @@ Cause of the v85c/d/f request cancellations (HTTP 408 "generation cancelled") --
 - Decode 12.86 / 12.96 / 12.92 tok/s (v89: 12.59 / 12.75 / 12.70), p50 76.5 / 75.3 / 75.9 ms; prefill 70.58 / 71.81 / 71.89 tok/s.
 - `outproj_node` 7.44 to 6.10 ms/token; attention total 27.3 ms/token (context_node 14.65, other 6.5).
 - Decode routes bit-identical to v89 for all three requests (0, 0, 0 differing lines); graph checker PASS.
+
+## llama.cpp teacher-forced validation: not possible at the pinned commit (checked 2026-11-07)
+
+- The main GGUF declares `general.architecture = deepseek41` (plus `deepseek41.engram.*` keys, split.count 6). Pinned llama.cpp `8baabd53` registers `deepseek4` only (`LLM_ARCH_DEEPSEEK4`), has no `deepseek41`, and contains no Engram implementation (the only "engram" text in `src` is a comment in `llama-model-loader.h`). The Engram sidecar `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` is a 2-tensor file with architecture `deepseek41-engram` and no split metadata, so llama.cpp could not load it as shard 6 either.
+- So `scripts/validate_vs_llama.sh` cannot produce a reference for this model at the pinned commit. Options: a llama.cpp revision that supports `deepseek41` + Engram (none known here), or an in-project reference: compare each rounding-changing GPU kernel against the project's CPU reference (as `tests/test_dsv41_grouped_outproj.cpp` does for the grouped out-projection) and track decode route/logit drift against a CPU-only ZeroMoE run with the same tokens.
