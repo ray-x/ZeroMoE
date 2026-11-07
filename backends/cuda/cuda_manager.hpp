@@ -3340,6 +3340,51 @@ public:
         return true;
     }
 
+    // Grouped output projection A followed by output projection B in one device
+    // pass: the [groups*rank] intermediate never leaves the GPU (one upload of the
+    // attention context, one download of the D-wide result). Same kernels and
+    // order as grouped_output_proj_dense_host + dense_matmul_host, so results are
+    // bit-identical. BF16 B weights take the matched cuBLAS path elsewhere and are
+    // refused here (returns false, nothing written).
+    bool grouped_output_proj_ab_host(
+            GGUFType wtype_a, const void* d_WOA, size_t group_stride_bytes,
+            int o_groups, int o_rank, int group_in,
+            GGUFType wtype_b, const void* d_WOB, int out_dim,
+            const float* x_host, float* y_host) {
+        if (!d_WOA || !d_WOB || !x_host || !y_host || o_groups <= 0 || o_rank <= 0 ||
+            group_in <= 0 || out_dim <= 0 || group_stride_bytes == 0 ||
+            wtype_b == GGUFType::BF16)
+            return false;
+        const size_t x_bytes = (size_t)o_groups * group_in * sizeof(float);
+        const size_t mid_bytes = (size_t)o_groups * o_rank * sizeof(float);
+        const size_t z_bytes = (size_t)out_dim * sizeof(float);
+        if (!ensure_outproj_buffers(x_bytes, mid_bytes + z_bytes)) return false;
+        cudaSetDevice(device_id);
+        float* d_mid = d_outproj_y;
+        float* d_z = reinterpret_cast<float*>(reinterpret_cast<char*>(d_outproj_y) + mid_bytes);
+        if (cudaMemcpy(d_outproj_x, x_host, x_bytes, cudaMemcpyHostToDevice) != cudaSuccess)
+            return false;
+        bool batched = false;
+        if (wtype_a == GGUFType::Q5_K)
+            batched = launch_q5_K_matmul_grouped(d_mid, d_outproj_x, d_WOA,
+                                                 o_groups, group_stride_bytes, group_in, o_rank);
+        for (int g = 0; !batched && g < o_groups; ++g) {
+            if (!dense_matmul_device(
+                    wtype_a,
+                    static_cast<const uint8_t*>(d_WOA) + (size_t)g * group_stride_bytes,
+                    d_outproj_x + (size_t)g * group_in,
+                    d_mid + (size_t)g * o_rank, 1, group_in, o_rank))
+                return false;
+        }
+        if (!dense_matmul_device(wtype_b, d_WOB, d_mid, d_z, 1, o_groups * o_rank, out_dim))
+            return false;
+        if (cudaGetLastError() != cudaSuccess) return false;
+        if (cudaMemcpy(y_host, d_z, z_bytes, cudaMemcpyDeviceToHost) != cudaSuccess)
+            return false;
+        perf().n_dense_gpu_calls.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
     // DeepSeek-V4.1 single-token compressed-layer head attention. q/out are
     // [H, qh]; win is the layer's sliding-window key cache [window, qh];
     // comp rows [0, comp_blocks) are the compressed keys and sel the nsel

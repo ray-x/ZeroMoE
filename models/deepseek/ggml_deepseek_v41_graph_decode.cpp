@@ -393,6 +393,28 @@ void grouped_outproj_node(ggml_tensor *dst, int ith, int, void *ud) {
 
   std::vector<float> grouped((size_t)groups * rank);
   const auto *context = static_cast<const float *>(dst->src[0]->data);
+  // Fast path: grouped A and B in one device pass when both are resident
+  // non-Q2_K quantized weights (no host round trip of the intermediate).
+  if (wa_it->second && wa_it->second->data && e.gpu &&
+      wa_meta->device_ptr == wa_it->second->data &&
+      (wa_it->second->type == GGML_TYPE_Q5_K ||
+       wa_it->second->type == GGML_TYPE_Q4_K ||
+       wa_it->second->type == GGML_TYPE_Q6_K) &&
+      wb_it->second && wb_it->second->data &&
+      e.gpu->grouped_output_proj_ab_host(
+          static_cast<GGUFType>(wa_it->second->type), wa_it->second->data,
+          ggml_row_size(wa_it->second->type, group_in) * (size_t)rank, groups,
+          rank, group_in, wb_meta->meta.type, wb_it->second->data, g.D, context,
+          static_cast<float *>(dst->data))) {
+    dsv41_trace::save("attn-out-projected", s.layer, g.pos,
+                      static_cast<const float *>(dst->data), g.D);
+    const double ms_ab = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    g.node_ms_total[kAttentionHost] += ms_ab;
+    g.layer_attention_ms[(size_t)s.layer][0] += ms_ab;
+    g.layer_attention_ms[(size_t)s.layer][2] += ms_ab;
+    return;
+  }
   bool gpu_woa = false;
   if (wa_it->second && wa_it->second->data && e.gpu &&
       wa_it->second->type == GGML_TYPE_Q2_K) {
