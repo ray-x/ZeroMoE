@@ -567,7 +567,10 @@ extern "C" void launch_q4_K_matmul(float* y, const float* x, const void* w, int 
         q4_K_kquant_matmul_kernel<<<dim3(O, S), 256>>>(y, x, (const block_q4_K_cu*)w, S, I, O);
 }
 extern "C" void launch_q5_K_matmul(float* y, const float* x, const void* w, int S, int I, int O) {
-    if (kquant_lane8_ok(I))
+    // Q5_K also takes the lane8 kernel for 4-7 blocks per row (DeepSeek attn_q_b,
+    // I=1024: the per-element kernel ran 250 us/call at ~10% of memory bandwidth,
+    // nsys 2026-11-07). Different reduction tree than the per-element kernel.
+    if (kquant_lane8_ok(I) || ((I / 256) >= 4 && (I % 4) == 0))
         q5_K_kquant_matmul_kernel_lane8<<<dim3(O, S), 256>>>(y, x, (const block_q5_K_cu*)w, S, I, O);
     else
         q5_K_kquant_matmul_kernel<<<dim3(O, S), 256>>>(y, x, (const block_q5_K_cu*)w, S, I, O);
