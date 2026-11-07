@@ -6,23 +6,22 @@
   optimizations below have not been compared with llama.cpp (teacher-forced), and the 90%-of-llama.cpp
   and `check_full_graph_moe_perf.py` gates have not been run. See "Open acceptance gaps".
 
-## Current baseline (2026-11-07)
+## Current baseline (2026-11-07, v89)
 
 Hardware: RTX 3090 24 GB (PCIe Gen3 x16) + RTX 5060 Ti 16 GB (Gen3 x8), Xeon W-2235 (6C/12T), 131.6 GB DDR.
 Model: `DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-0000{1..5}-of-00006.gguf` (IQ2_XXS mix with IQ1_M/IQ2_XS
-experts) + `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` sidecar, on a USB SSD (Samsung T7, exFAT).
+experts) + `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` sidecar, on the local NVMe (`direct_io = true`).
 Workload: `bench/deepseek41/workload_959tok_prompt.txt` (959 prompt tokens, 64 generated, temp 0, ctx 4096).
-Source: base `47ef7b3` + this commit's changes; GGML `8baabd53`; CUDA 13.3.73; Release.
+Source: `c114120`, clean tree; GGML `8baabd53`; CUDA 13.3.73; Release.
 
 | Request | Prefill tok/s | Decode tok/s (steady, first-to-last output) |
 |---|---:|---:|
-| 1 (cold Engram rows) | 70.37 | 10.73 |
-| 2 | 71.81 | 10.81 |
-| 3 | 71.66 | 10.81 |
+| 1 | 70.46 | 12.59 |
+| 2 | 71.61 | 12.75 |
+| 3 | 71.66 | 12.70 |
 
-Decode p50 about 91 ms/token. Previous baseline on this tree: decode 3.6-3.8, prefill 31 cold / 66.5 warm.
-`tools/check_full_graph_moe_run.py --full-fit --require-full-graph-prefill` passes on the run log.
-Raw evidence: `docs/handoff/deepseek-v41-flash-current.md` (v70-v74).
+Decode p50 about 77 ms/token (was about 91 ms at v74). `tools/check_full_graph_moe_run.py --full-fit --require-full-graph-prefill` passes.
+Raw evidence and history: `docs/handoff/deepseek-v41-flash-current.md` (v70-v90).
 
 ## How to run
 
@@ -33,7 +32,7 @@ residency needs >= ~118). Stop other large processes first; no swap is allowed i
 # 1. Build (Release, provenance-stamped; re-run cmake after any source edit or the stamp is rejected)
 cmake -S . -B build_dsv41 -DCMAKE_BUILD_TYPE=Release && cmake --build build_dsv41 -j
 # 2. Serve (config uses model paths under /mnt/usb-ssd/DeepSeek-V4.1-Flash-1017-GSQ-RCO/; edit if different.
-#    A local NVMe copy of the six GGUFs cuts start-to-/health from ~324 s to ~62 s with the same throughput within noise)
+#    A local NVMe copy of the six GGUFs cuts start-to-/health from ~324 s to ~62 s; throughput within 2-3%)
 CUDA_VISIBLE_DEVICES=0,1 NVIDIA_TF32_OVERRIDE=0 OMP_NUM_THREADS=10 \
   ./build_dsv41/zeromoe --serve --config configs/bench/deepseek_v41_iq2xxs_fullres_dual_gpu.toml \
   --host 127.0.0.1 --port 18081 --alias deepseek-v41-flash
