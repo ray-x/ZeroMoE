@@ -1715,12 +1715,13 @@ void v41_prefill_prefetch(V41CacheMoeSite &next) {
     ram->ram_pin(*block);
     const size_t bytes = block->gate_proj.meta.size_bytes +
                          block->up_proj.meta.size_bytes + block->down_proj.meta.size_bytes;
-    const int preferred = next.pools[issued % next.pools.size()].device;
     ExpertLocation *loc = nullptr;
     {
+      // Device-targeted eviction finds no victim in the shared dynamic region
+      // (the staging path falls back to the general pool, target -1, as well).
       std::lock_guard<std::recursive_mutex> lock(topo->cache_mutex);
       loc = topo->upload_expert_async(next.layer, expert, block->slab_buffer, bytes,
-                                      preferred, block->slab_pinned, false);
+                                      -1, block->slab_pinned, false);
     }
     if (!loc) {
       ram->ram_unpin(*block);
