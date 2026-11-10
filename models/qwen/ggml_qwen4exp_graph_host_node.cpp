@@ -533,17 +533,48 @@ extern "C" int zeromoe_ggml_sched_early_cpu(
     ggml_backend_t backend, ggml_cgraph *graph,
     int64_t *wait_us, int64_t *compute_us) {
   EarlyReadyLane *context = nullptr;
+  int markers = 0;
+  const char *other_op = nullptr;
   for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
     auto *node = ggml_graph_node(graph, i);
     if (node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
         node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE)
       continue;
-    if (node->op != GGML_OP_MAP_CUSTOM1 || !node->extra || context) return 0;
+    if (node->op != GGML_OP_MAP_CUSTOM1 || !node->extra) {
+      if (!other_op) other_op = ggml_op_name(node->op);
+      continue;
+    }
     auto *candidate = static_cast<EarlyReadyLane *>(node->extra);
-    if (candidate->magic != EarlyReadyLane::kMagic) return 0;
+    if (candidate->magic != EarlyReadyLane::kMagic) {
+      LOG_WARN("[EARLY-BRIDGE] marker magic mismatch extra=%p magic=0x%llx "
+               "expect=0x%llx name=%s\n",
+               static_cast<void *>(candidate),
+               (unsigned long long)candidate->magic,
+               (unsigned long long)EarlyReadyLane::kMagic,
+               node->name);
+      if (!other_op) other_op = "MAP_CUSTOM1(non-marker)";
+      continue;
+    }
     context = candidate;
+    ++markers;
   }
-  if (!context || context->cpu != backend) return 0;
+  if (!context) return 0;
+  // The scheduler may place a marker in a split with other CPU work (for
+  // example the GPU1-hot route maps). Running the lane there would skip the
+  // other nodes, and leaving it to the ordinary path hits the marker's
+  // fallback assert. Refuse anything that is not exactly one marker.
+  if (markers != 1 || other_op) {
+    LOG_WARN("[EARLY-BRIDGE] refusing marker split: markers=%d other=%s nodes=%d\n",
+             markers, other_op ? other_op : "none",
+             ggml_graph_n_nodes(graph));
+    return 0;
+  }
+  if (context->cpu != backend) {
+    LOG_WARN("[EARLY-BRIDGE] marker backend mismatch: cpu=%p split=%p layer=%d\n",
+             static_cast<void *>(context->cpu), static_cast<void *>(backend),
+             context->trace_layer);
+    return 0;
+  }
   const int64_t w = context->wait_us, c = context->compute_us;
   if (context->strategy) {
     // One complete invocation through the lifecycle (§3.8): begin() records the (layer,
@@ -563,6 +594,8 @@ extern "C" int zeromoe_ggml_sched_early_cpu(
   } else {
     context->run(); ++context->early_calls;
   }
+  LOG_DEBUG("[EARLY-BRIDGE] run layer=%d calls=%llu\n", context->trace_layer,
+            (unsigned long long)context->calls);
   *wait_us = context->wait_us - w; *compute_us = context->compute_us - c;
   return 1;
 }

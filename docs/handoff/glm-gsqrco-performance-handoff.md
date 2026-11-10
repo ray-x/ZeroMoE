@@ -1,4 +1,4 @@
-# GLM-5.3-Flash GSQ-RCO: performance handoff (2026-10-29, status updated 2026-10-30)
+# GLM-5.3-Flash GSQ-RCO: performance handoff (2026-10-29, status updated 2026-11-09)
 
 ## Latest status (2026-10-30)
 
@@ -21,6 +21,37 @@ comparison with the AJ IQ2_XXS file (87.35 GB, 2.230 bpw): `configs/bench/perf-b
 | shipped + ranking matched to the pilot prompts | 63.1 ms = 15.84 tok/s | **in-sample** (ranking built from the same 6 prompts): an upper bound, not a general gain |
 | AJ IQ2_XXS, same binary, same prompts | 75.4 ms = 13.26 tok/s | the 70.1 ms record of 2026-10-15 was a different binary, prompt and placement and is not reproduced |
 | 3090 only | not re-measured (the 10.7 tok/s of 2026-10-29 needs a smaller pool or more memory than is safe, see the GLM page); two pool-84 runs (about 1 SSD miss per token) gave 9.42 and 8.11 tok/s but both were contaminated by compile load (63 and 711 samples): **no valid 3090-only speed**; memory is valid: min 19.6-20.7 GiB available at pool 84, so pool 88 should leave ~15 GiB | not re-run by decision |
+
+**2026-11-09: 3090 + 2080 Ti (11 GB) validation and two current-master config issues**
+
+| measurement | result | note |
+|---|---|---|
+| decode, 3090 + 2080 Ti, 9.0 GiB hot, pool 88, 10 threads | **68.1 ms = 14.69 tok/s** (STATS 14.77; p50 68.6, p95 73.9) | `e821a91` dirty, CUDA `86;75`; 1,126 hot experts (9.00 GiB) on the 2080 Ti, 1,397 slots (12.4 GB) on the 3090; cold routes 54.9%; best token 48.9 ms = 20.4 tok/s; prefill 22.77 tok/s (23 tokens); early-ready lane disabled (`graph_early_ready=false`) |
+| same box, 3090-only | not run | the 2080 Ti hot set is worth keeping: the documented 3090-only result is 10.7 tok/s (6 threads) |
+| 6 pilot prompts x 100, **shipped ranking** (control) | **69.1 ms = 14.47 tok/s** (14.51/13.72/14.22/14.76/14.33/14.86) | `graph_lane_with_gpu1=false`; 1,126 hot experts |
+| same prompts, **pilot6 GSQ ranking** | **62.7 ms = 15.96 tok/s** (+10.3%; 16.42/15.73/15.93/16.43/15.82/15.05; p50 62.2) | **IN-SAMPLE**: the ranking was built from these six prompts; not a held-out gain. 1,144 hot experts; best token 48.3 ms = 20.7 tok/s |
+
+- **Dead env aliases.** `ZEROMOE_GLM5NEXT_GPU1_HOT_GIB` and `ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB` are not
+  wired to the settings resolver on current master. The launcher now writes the root TOML keys
+  `graph_gpu1_hot_gib` (9.0 on the 11 GB 2080 Ti, 14.2 on the 16 GB 5060 Ti) and
+  `graph_alloc_floor_mib = 512`. The GSQ-RCO dense arena is 9.02 GB; 12.4 GB cache + dense leaves
+  ~1.9 GiB free, just under the 2 GiB default floor.
+- **GPU1-hot + early-ready lane: fixed, but slower here.** The abort was not the split shape: the lane's
+  `magic` was corrupted by C++20 parenthesized aggregate initialization
+  (`make_unique<EarlyReadyLane>(layer)` wrote the layer number into the first member), so the scheduler
+  bridge rejected every lane and the marker fallback aborted. Default-constructing the lane
+  (`models/graph/early_ready_graph_builder.hpp`) fixes it: the bridge now runs all 42 markers per token
+  with zero fallbacks. On this placement the overlap is a net loss: 67.0 ms = **14.92 tok/s** versus
+  62.7 ms = **15.96 tok/s** with the synchronous lane (wait 3.8 + compute 6.4 ms/token; the extra
+  fork/handoff/merge outweighs the overlap). The profile keeps `graph_lane_with_gpu1 = false`. The
+  scheduler-bridge generalization (`patches/ggml-host-node/0003-...`) is retained.
+- **Held-out 25 prompts** (75 train / 25 test): shipped 67.8 ms = 14.74 tok/s; raw `train_routes`
+  64.0 ms = 15.62 tok/s (+6.0%); byte-weighted 64.9 ms = 15.41 tok/s (+4.5%). The raw ranking generalizes;
+  the cost-weighted one is worse than raw.
+- **Promotion A/B (2400 vs 1100)**: the 1100 run aborted on the 86-token prompt (CUDA1 OOM: 9.0 GiB GPU1
+  hot set + 2.9 GiB prefill graph buffer on the 11 GB card); the 2400 control completed. Needs
+  `graph_prefill_gpu1 = 0` or ~8.0 GiB GPU1 hot, plus a per-layer unpinned reserve (63 tier-2 `no victim`
+  lines remained at 1100).
 
 **Changes on master from this work**
 - decode CPU lane 10 threads by default; prefill thread count independent (6); pool 88 GiB recipe, config `configs/bench/glm53flash_gsqrco_offload_pool.toml`, launcher
@@ -96,7 +127,7 @@ neighbour compiled: **never quote a number without the contamination report** (t
 | 10 CPU threads for the **decode** lane (was 6) | lane compute 45.7 -> 39.9 ms: 13.0 -> 14.2 tok/s on the 3090 + 5060 Ti | `ggml_glm5next_graph_decode.cpp` |
 | prefill threads independent of the decode setting (6) | 10 prefill threads grew host memory ~16 GiB after seeding and tripped the watchdog | `ggml_glm5next_graph.cpp`; since the 2026-10-30 env cleanup the env var is gone and both counts come from `omp_max_threads` (prefill = min(it, 6)) |
 | ~~dense host copies freed once the decode graph holds them~~ | **removed 2026-10-30**: it zeroed attention/logits for every request after the first (found with a 6-prompt session) | see the warning in `docs/models/glm53-flash.md` |
-| 5060 Ti holds 14.2 GiB of hot experts | 10.7 -> 13.0-14.2 tok/s | `ZEROMOE_GLM5NEXT_GPU1_HOT_GIB=14.2` |
+| 5060 Ti holds 14.2 GiB of hot experts | 10.7 -> 13.0-14.2 tok/s | `graph_gpu1_hot_gib = 14.2` (root TOML; the old `ZEROMOE_GLM5NEXT_GPU1_HOT_GIB` alias is not wired on current master) |
 
 ### 1.4 Levers tried and rejected (do not repeat without a new idea)
 
@@ -149,7 +180,9 @@ worse on 2026-10-13).
 - `configs/bench/glm53flash_gsqrco_offload_pool.toml`: the run config (offload-pool mode, `graph_offload_ddr_gib = 88`,
   `graph_offload_first_layer = 3`, one `[[gpus]]` entry for the 3090, no GPU assist).
 - `bench/glm_gsqrco_pool.sh TAG [POOL_GIB] [prompt]`: the launcher. Needs `GLM_MODEL=/path/to/...gguf`. `CVD=0` for the 3090 alone
-  (default `0,1`), `GPU1_HOT_GIB` (14.2), `CPUT` (decode threads, default engine 10), `PREFILL_THREADS` (6). It waits for a quiet box
+  (default `0,1`), `GPU1_HOT_GIB` (14.2 on a 16 GB 5060 Ti, 9.0 on an 11 GB 2080 Ti; written as the
+  `graph_gpu1_hot_gib` root TOML key), `CPUT` (decode threads, default engine 10). Both thread counts now
+  come from the shared thread limit; the prefill count is min(CPUT, 6). It waits for a quiet box
   (idle GPUs, no other model run, load < 3, > 100 GiB free), runs under `scripts/run_capped.sh --limit-gb 118`, stops the engine below
   6 GiB MemAvailable, prints steady ms/token, the lane line and **which other processes used >= 20% CPU during the run**,
   writes `TAG.log/.out/.mem.csv`, a CUDA driver error log `TAG.cudalog` and preloads `bench/abort_backtrace.c` (prints a stack on

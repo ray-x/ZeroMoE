@@ -50,7 +50,12 @@ inline std::unique_ptr<EarlyReadyLane> build_early_ready_graph_lane(
     return nullptr;
   }
 
-  auto lane = std::make_unique<EarlyReadyLane>(s.layer);
+  // Default-construct: `EarlyReadyLane` is an aggregate, so the old
+  // `make_unique<EarlyReadyLane>(s.layer)` used C++20 parenthesized aggregate
+  // initialization and wrote the layer number into `magic` (the first member).
+  // That made the scheduler bridge reject the lane and the marker fall back to
+  // the abort path. Set `trace_layer` explicitly below, as the other caller does.
+  auto lane = std::make_unique<EarlyReadyLane>();
   lane->swiglu_clamp = s.swiglu_clamp;
   lane->swiglu_clamp_fused = s.swiglu_clamp_fused;
   const auto host_table = [&](ggml_tensor *src) -> ggml_tensor * {

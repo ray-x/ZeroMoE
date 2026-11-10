@@ -75,6 +75,25 @@ vram_preload_prefix_layers = 0
 graph_offload_first_layer = 3
 graph_offload_ddr_gib = 88
 # graph_gpu_assist_slots = 1   # K-quant GPU assist: +10% on the 3090 alone, -15% with two GPUs; keep it off for the dual config
+# Second-GPU hot-expert budget, in GiB. The launcher writes this root key from
+# GPU1_HOT_GIB (9.0 fits an 11 GB 2080 Ti; 14.2 was measured on a 16 GB 5060 Ti).
+# The old ZEROMOE_GLM5NEXT_GPU1_HOT_GIB env alias is not wired to the settings
+# resolver on current master, so do not rely on it.
+# graph_gpu1_hot_gib = 9.0
+# GPU1-hot decode currently aborts in the early-ready overlap lane
+# (models/graph/early_ready_lane.hpp:785: a marker is executed outside the
+# scheduler bridge on a later token). Keep the synchronous CPU lane for this
+# profile: the 3090 + 2080 Ti run measured 14.69 tok/s this way.
+# GPU1-hot + early-ready overlap lane: the lane magic bug is fixed, but on this
+# 3090 + 2080 Ti GSQ-RCO placement it measured 14.92 tok/s versus 15.96 with the
+# synchronous lane (lane wait 3.8 + compute 6.4 ms/token; the extra fork/handoff/
+# merge outweighs the overlap). Keep it off for this profile; enable per profile.
+graph_lane_with_gpu1 = false
+# The GSQ-RCO dense arena (9.02 GB) plus the 12.4 GB 3090 cache leaves about
+# 1.9 GiB free, just below the 2 GiB default graph-allocator floor. 512 MiB
+# still covers the 0.16 GiB graph workspace. The old
+# ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB env alias is not wired either.
+graph_alloc_floor_mib = 512
 graph_offload_model = "/path/to/models/GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf"
 
 [[gpus]]

@@ -35,8 +35,11 @@ Prefill graph batches default to 2048 tokens. Set llama.cpp-compatible `-ub/--ub
 
 - `host_ram_gb=106` needs `106 + 21.5 = 127.5 GiB` of `MemAvailable`; on a 125 GiB box preflight
   refuses, so run under `run_capped.sh` with .
-- `ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512` is required or the dense arena refuses and decode
-  silently falls back to legacy.
+- `graph_alloc_floor_mib = 512` (root TOML) is required for the GSQ-RCO profile or the dense arena
+  refuses and decode silently falls back to legacy. The old
+  `ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB` env alias is not wired to the settings resolver on current
+  master. The GSQ-RCO dense arena is 9.02 GB, so with the 12.4 GB 3090 cache only ~1.9 GiB is free
+  after the prompt graph — just below the 2 GiB default floor.
 - A fresh binary's first run spends ~67 s in CUDA JIT (sm_75 PTX on sm_86); warm it once.
 
 ## GSQ-RCO 3.0-bit (117 GB, Q2_K/Q3_K/Q4_K experts), offload-pool mode (2026-10-29)
@@ -67,9 +70,12 @@ files is not equivalent (teacher-forced top-1 agreement 77%, mean KL 0.35, see t
   `graph_offload_ddr_gib = 88`, `host_ram_gb = 16`, one `[[gpus]]` entry for the 3090 with `moe_cache_gb = 12.4` so the dense arena
   fits, `vram_cache_full_layer_prefix = 0`, no GPU assist, `ram_pinned_budget_gb = 16`).
 - Launcher: `bench/glm_gsqrco_pool.sh TAG [POOL_GIB] [prompt]` from the repo root. It waits for a quiet box, sets
-  `CUDA_VISIBLE_DEVICES`, `ZEROMOE_GLM5NEXT_GPU1_HOT_GIB=14.2` (hot experts on the 5060 Ti; `CVD=0` runs the 3090 alone), `ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512`,
+  `CUDA_VISIBLE_DEVICES`, writes the root TOML keys `graph_gpu1_hot_gib` from `GPU1_HOT_GIB` (14.2 on a 16 GB
+  5060 Ti; 9.0 on an 11 GB 2080 Ti; `CVD=0` runs the 3090 alone) and `graph_alloc_floor_mib = 512`, then sets
   the engine thread limit (`--threads`, launcher variable `CPUT`, default 10; or `omp_max_threads` in the config): decode CPU lane = that value, prefill = min(that, 6); runs under `scripts/run_capped.sh --limit-gb 118`, watches MemAvailable at 1 Hz
   (stops the engine below 6 GiB) and prints the steady decode rate and the lane breakdown. `CVD=0` runs the 3090 alone.
+  The old `ZEROMOE_GLM5NEXT_GPU1_HOT_GIB` / `ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB` env aliases are not wired on
+  current master; the generated TOML is authoritative.
 - Run: `--temp 0 --predict 100 --force-start`, prompt "Write a Python function that checks whether a string is a palindrome,
   and explain it.", `--graph-offload-usage-file docs/ssd-offload/data/glm53flash_usage_combined_old_plus_survey5.txt`
   (the same file is the pin ranking in the toml; prefill ranking `glm53flash_survey5_usage_prefill.txt`).
@@ -127,6 +133,34 @@ placement change. Run: `GLM_RANKING=<file> bench/glm_gsqrco_pool.sh ...`.
 **Full-graph prefill is the default for GLM** (like every other family; the opt-in variable `ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL` was removed 2026-10-30; MTP is the only opt-out). On this file at pool 88: 20-104 token prompts prefill in
 0.7-3.6 s (20-31 tok/s) instead of ~46 s for 20 tokens on the layered path; 6 consecutive prompts in one session all decode on the
 graph path (`graph_prefill_runs=6`). Validation of the new default is listed in the handoff (section 3.1b and the status block); long prompts are covered there.
+
+### 3090 + 2080 Ti (11 GB), 2026-11-09
+
+- Decode: **68.1 ms = 14.69 tok/s** steady (STATS 14.77; p50 68.6, p95 73.9; best token 48.9 ms = 20.4 tok/s),
+  prefill 22.77 tok/s on 23 tokens, pool 88, 10 threads, `e821a91` dirty + CUDA `86;75`.
+- Placement: 1,126 hot experts / 9.00 GiB on the 2080 Ti; 1,397 slots / 12.4 GB on the 3090; cold routes 54.9%.
+- The GPU1-hot overlap lane was broken by a C++20 aggregate-initialization bug:
+  `make_unique<EarlyReadyLane>(layer)` wrote the layer number into `magic` (the first member), so the
+  scheduler bridge rejected every lane and the marker fallback aborted. Fixed by default-constructing the
+  lane (`models/graph/early_ready_graph_builder.hpp`). The lane now runs with no abort, but on this
+  placement it is **slower**: 67.0 ms = 14.92 tok/s versus 62.7 ms = 15.96 tok/s with the synchronous
+  lane (lane wait 3.8 + compute 6.4 ms/token; the extra fork/handoff/merge outweighs the overlap). This
+  profile keeps `graph_lane_with_gpu1 = false`.
+- 6-prompt A/B on the same prompts the ranking was built from: shipped ranking **69.1 ms = 14.47 tok/s**;
+  pilot6 GSQ ranking **62.7 ms = 15.96 tok/s** (+10.3%, per-request gains on all six). **In-sample**, not a
+  held-out gain; the best token was 48.3 ms = 20.7 tok/s, the median 62.2 ms.
+- **Held-out 25 prompts** (75-prompt train survey, 25 test prompts): shipped **67.8 ms = 14.74 tok/s**;
+  held-out raw `train_routes` **64.0 ms = 15.62 tok/s (+6.0%)**; byte-weighted **64.9 ms = 15.41 tok/s
+  (+4.5%)**. The raw ranking generalizes; the cost-weighted ranking is worse than raw.
+- **Promotion A/B (2400 vs 1100) is not valid yet**: the 1100 run aborted on the 86-token prompt with a
+  CUDA1 OOM (9.0 GiB GPU1 hot set + 2.9 GiB prefill graph buffer on the 11 GB 2080 Ti); the 2400 control
+  completed. Leave room for the long-prompt prefill graph (`graph_prefill_gpu1 = 0` or ~8.0 GiB hot) and
+  add a per-layer unpinned reserve; the 1100 run still hit 63 tier-2 `no victim` lines.
+- **Q3_K/Q4_K AVX/VNNI**: stock Q4_K ~37 GB/s and Q3_K ~23 GB/s at 10 threads; a 512-bit VNNI Q4_K variant
+  was 0.975-0.986x (slower) and numerically wrong. No gain; the early-layer cost is bytes/routes.
+- Use the root TOML keys `graph_gpu1_hot_gib` (9.0 for an 11 GB card, 14.2 for a 16 GB 5060 Ti) and
+  `graph_alloc_floor_mib = 512`. The old `ZEROMOE_GLM5NEXT_*` env aliases are not wired to the settings
+  resolver on current master.
 
 Gotchas:
 - **Memory figures below were measured with a feature that has since been removed (2026-10-30).** Until then the engine freed its

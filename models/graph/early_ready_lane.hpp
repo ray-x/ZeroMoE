@@ -778,12 +778,18 @@ struct EarlyReadyLane {
     ++calls; completed = true;
   }
 
-  static void fallback(ggml_tensor *, const ggml_tensor *, int ith, int,
+  static void fallback(ggml_tensor *node, const ggml_tensor *, int ith, int,
                        void *userdata) {
     // Never run a nested GGML graph inside the CPU worker team.
     GGML_ASSERT(ith == 0);
+    auto *lane = static_cast<EarlyReadyLane *>(userdata);
+    LOG_ERROR("[EARLY-FALLBACK] layer=%d calls=%llu ith=%d name=%s userdata=%p "
+              "magic=0x%llx\n",
+              lane ? lane->trace_layer : -1,
+              lane ? (unsigned long long)lane->calls : 0ULL, ith,
+              node ? ggml_get_name(node) : "?",
+              userdata, lane ? (unsigned long long)lane->magic : 0ULL);
     GGML_ABORT("early-ready marker requires the scheduler bridge");
-    (void)userdata;
   }
 
   // Host-node variant: D2H copies are already complete when this is called,

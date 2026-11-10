@@ -28,7 +28,7 @@
 +        int64_t early_wait_us = 0;
 +        int64_t early_compute_us = 0;
 +#if defined(__GNUC__) && !defined(_WIN32)
-+        if (!sched->callback_eval && split->n_inputs == 0 &&
++        if (!sched->callback_eval &&
 +            ggml_backend_dev_type(ggml_backend_get_device(split_backend)) ==
 +                GGML_BACKEND_DEVICE_TYPE_CPU &&
 +            zeromoe_ggml_sched_early_cpu != nullptr) {
