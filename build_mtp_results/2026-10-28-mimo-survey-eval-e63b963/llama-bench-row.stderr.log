@@ -1,9 +1,0 @@
-[run_capped] launching under systemd --user scope: MemoryMax=110G, MemorySwapMax=0
-Running as unit: run-p1074451-i1097868.scope; invocation ID: 91b4814f10684bffa80aad7af6ecfcaa
-ggml_cuda_init: found 2 CUDA devices (Total VRAM: 40003 MiB):
-  Device 0: NVIDIA GeForce RTX 3090, compute capability 8.6, VMM: yes, VRAM: 24123 MiB
-  Device 1: NVIDIA GeForce RTX 5060 Ti, compute capability 12.0, VMM: yes, VRAM: 15880 MiB
-llama-bench: benchmark 1/2: starting
-llama_model_load: error loading model: device CUDA0 does not support split buffers
-llama_model_load_from_file_impl: failed to load model
-llama_bench: error: failed to load model '/mnt/usb-ssd/@/home/ray/models/MiMo-V2.6-Flash-RL-GSQ-RCO-3bit.gguf'

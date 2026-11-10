@@ -1,8 +1,0 @@
-ZeroMoE source: e63b96329acc58144262a0fade8eae72c90b810c dirty=False
-GGML base: 8baabd53b77d1c48c6ef8d3b620436292f3f6231
-GGML patch manifest sha256: bc15a89242db58386ab4335048ea55bb15233f18c40fe23881802097fe1f4f71
-llama.cpp source: 8baabd53b77d1c48c6ef8d3b620436292f3f6231
-CUDA toolkit: 13.3.73; arch targets 86;120a
-GPUs: RTX 3090 + RTX 5060 Ti
-Profile: configs/bench/mimo26_flash_gsq_rco_3bit_ingraph_dual.toml; eval prompts: bench/mimo_eval_prompts.txt
-Run correction: include graph-offload-ddr-gib=100 and graph-offload-usage-file=bench/profiles/mimo26_combined.usage as in bench/mimo_survey.sh.

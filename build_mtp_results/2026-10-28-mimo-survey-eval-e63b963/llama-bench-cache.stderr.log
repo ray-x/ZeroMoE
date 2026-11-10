@@ -1,6 +1,0 @@
-[run_capped] launching under systemd --user scope: MemoryMax=110G, MemorySwapMax=0
-Running as unit: run-p1109316-i1123831.scope; invocation ID: 75ba36f659ad479892d8b0a2c77c7141
-ggml_cuda_init: found 2 CUDA devices (Total VRAM: 40003 MiB):
-  Device 0: NVIDIA GeForce RTX 3090, compute capability 8.6, VMM: yes, VRAM: 24123 MiB
-  Device 1: NVIDIA GeForce RTX 5060 Ti, compute capability 12.0, VMM: yes, VRAM: 15880 MiB
-error: invalid parameter for argument: --cpu-moe

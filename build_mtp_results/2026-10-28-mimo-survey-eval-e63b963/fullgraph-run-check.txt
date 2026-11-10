@@ -1,7 +1,0 @@
-Command:
-  python3 tools/check_full_graph_moe_run.py zeromoe.engine.log --full-fit
-Result:
-  FAIL: full-fit run must report policy=required and memory_plan=fits
-Observed ZeroMoE summary:
-  [MOE-GRAPH-GATE] family=mimo2 policy=required memory_plan=unknown graph_prefill_runs=4 graph_decode_runs=252 graph_decode_run_ms=16161.000 steady_decode_tps=15.59 layered_s1_forwards=0 legacy_s1_expert_dispatches=0
-This is a planner-evidence gap; do not mark Mimo onboarding accepted from this baseline.
