@@ -3,6 +3,7 @@ build/
 build-api/
 build-api-asan/
 build_*/
+build-*/
 build_mtp_results/
 /build-cpu/
 /build-cuda/
